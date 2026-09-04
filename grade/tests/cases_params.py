@@ -337,13 +337,24 @@ CASES = [
       doc="show_mask replaces the picture with the greyscale matte"),
 ]
 
-# Parameters whose effect is only visible in an encoded file, so they are
-# asserted in the output group against a real render rather than a still.
+# Parameters asserted in another group instead of by a lo/hi sweep here.
+# The output ones are only visible in an encoded file. The window ones are all
+# one geometry, so sweeping them one at a time would say much less than the
+# window group's own matte and gating assertions do.
 COVERED_ELSEWHERE = {
     "output.codec": "output.codec_and_profile",
     "output.profile": "output.codec_and_profile",
     "output.crf": "output.crf_and_preset",
     "output.preset": "output.crf_and_preset",
+    "window.enabled": "window.disabled_is_byte_identical",
+    "window.shape": "window.rect_rotated_45_moves_the_corners",
+    "window.cx": "window.matte_scales_with_the_frame",
+    "window.cy": "window.matte_scales_with_the_frame",
+    "window.w": "window.geq_matte_matches_numpy",
+    "window.h": "window.geq_matte_matches_numpy",
+    "window.rotation": "window.rect_rotated_45_moves_the_corners",
+    "window.softness": "window.softness_zero_is_binary",
+    "window.invert": "window.invert_swaps_inside_and_outside",
 }
 
 
@@ -428,7 +439,7 @@ def test_every_default_is_covered(ctx):
     stale = sorted(covered - declared)
     ctx.note(f"{len(declared)} leaf parameters in DEFAULTS, "
              f"{len(CASES)} tested here, "
-             f"{len(COVERED_ELSEWHERE)} tested in the output group")
+             f"{len(COVERED_ELSEWHERE)} tested in the output and window groups")
     ctx.expect_true("every DEFAULTS parameter has a test",
                     not missing, f"untested: {missing}" if missing else "none missing")
     ctx.expect_true("no test targets a parameter that no longer exists",

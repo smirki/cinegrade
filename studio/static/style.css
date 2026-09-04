@@ -853,6 +853,22 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 #stage.gpu-live #frameImg { display: none; }
 #stage.gpu-live #gpuCanvas { display: block; }
 
+/* Bypass (job: compare). #bypassCanvas is the same idea one layer over: the
+   bypassed picture when the GPU produced it, #beforeImg when the server did.
+   The class that swaps them sits on #beforeLayer, not on #stage, on purpose.
+   #stage.gpu-live answers "is the canvas the graded picture on screen", and
+   setStageLayer is its single writer precisely so that question has one
+   answer; which of two elements is holding the BYPASSED picture is a
+   different question with a different answer (the graded picture can come
+   from the server while the bypass came from the GPU, after a mid-render
+   fallback), and folding it into the same class would make setStageLayer
+   resolve two independent states from one input again -- the exact bug the
+   comment above describes. Same neutral background as the layers it sits
+   beside, same reason: no colour of its own next to a picture being judged. */
+#bypassCanvas { display: none; background: #0e0e0e; }
+#beforeLayer.gpu #beforeImg { display: none; }
+#beforeLayer.gpu #bypassCanvas { display: block; }
+
 /* The GPU/server toggle reuses .btn.toggle's existing accent-on-active look
    (see .btn.toggle.active above); this is only its own state, for when the
    renderer genuinely cannot be trusted (see gpuAllowed in app.js) and the
@@ -896,30 +912,48 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 #stage.mode-lr #beforeLayer { border-right: 1px solid var(--accent); }
 #stage.mode-tb #beforeLayer { border-bottom: 1px solid var(--accent); }
 
-/* Wipe: unchanged from the original split behaviour. beforeLayer overlays
-   afterLayer and only its own width, driven by the drag handle, changes
-   what is revealed; the inner img is pinned to the wrap's top left so the
-   clip is the only thing that varies, never the image's own position. */
-#stage.mode-wipe #beforeLayer {
-  display: block; position: absolute; inset: 0; overflow: hidden; width: 50%;
-  border-right: 1px solid var(--accent);
-}
-#stage.mode-wipe #beforeLayer img { position: absolute; top: 0; left: 0; }
+/* Wipe: the GRADED layer is the clipped one now, sitting over a full size
+   bypassed layer beneath it. That is the other way round from the
+   width-clipped overlay this used to be, and the swap is what lets the
+   bypassed picture come from a canvas: a canvas cannot be revealed by its
+   parent's width the way an absolutely positioned <img> could, because its
+   drawing surface is its own size, so clipping had to move to the layer
+   that is always an overlay. clip-path clips everything inside #afterLayer
+   identically (server <img>, GPU canvas, playing video) without any of the
+   three knowing the wipe exists. --wipe is written by setSplitPos in
+   app.js, which is also the only writer of the handle's own left, so the
+   clip edge and the thing you drag cannot come apart. The 50% fallback is
+   what shows before app.js has written the property once. */
+#stage.mode-wipe #beforeLayer { display: block; position: absolute; inset: 0; }
+#stage.mode-wipe #beforeLayer img,
+#stage.mode-wipe #beforeLayer canvas { position: absolute; top: 0; left: 0; }
+/* Two positioned siblings at the same z-index paint in DOM order, and
+   #beforeLayer comes second, so without this the bypassed layer would cover
+   the graded one outright rather than sit under it. */
+#stage.mode-wipe #afterLayer { z-index: 1; clip-path: inset(0 0 0 var(--wipe, 50%)); }
 /* afterLayer's label sits at the same top-left corner as beforeLayer's, and
-   beforeLayer paints over it (it is the top layer of the overlay), so in
-   this one mode it would otherwise be permanently invisible. Moving it to
-   the opposite corner keeps both readable without touching the shared
-   .layer b rule every other mode relies on. */
+   in this mode that corner belongs to the bypassed side of the split, so
+   the graded label moves to the opposite corner to keep both readable
+   without touching the shared .layer b rule every other mode relies on. */
 #stage.mode-wipe #afterLayer b { left: auto; right: 0; }
 #splitHandle {
-  position: absolute; top: 0; bottom: 0; width: 9px; margin-left: -4px;
-  left: 50%; cursor: ew-resize; display: none;
+  position: absolute; top: 0; bottom: 0; width: 14px; margin-left: -7px;
+  left: 50%; cursor: ew-resize; display: none; z-index: 2; touch-action: none;
 }
 #stage.mode-wipe #splitHandle { display: block; }
-#splitHandle::after {
-  content: ""; position: absolute; top: 50%; left: 1px; width: 7px; height: 26px;
-  margin-top: -13px; background: var(--accent);
+/* The split line itself. It used to be #beforeLayer's border-right, which
+   only worked while that layer was the clipped one; drawing it on the
+   handle keeps the visible line and the grab target in one element, so the
+   line can never sit a pixel away from what the pointer actually moves. */
+#splitHandle::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 7px; width: 1px;
+  background: var(--accent);
 }
+#splitHandle::after {
+  content: ""; position: absolute; top: 50%; left: 4px; width: 7px; height: 26px;
+  margin-top: -13px; background: var(--accent); border-radius: 2px;
+}
+#splitHandle.dragging::after { height: 44px; margin-top: -22px; }
 
 /* Column now (image on top, the Match Reference toolbar below it), not the
    single centred child this used to be: the toolbar needs its own row

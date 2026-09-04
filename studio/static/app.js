@@ -37,6 +37,11 @@
     refCropFrac: null,
     viewMode: "after",
     beforeHold: false,
+    // Where the wipe's split sits, as a percentage of the frame's width.
+    // State, not an inline style read back off the handle, so leaving wipe
+    // and coming back lands on the same split for the rest of the session
+    // instead of snapping to the middle every time.
+    splitPos: 50,
     mask: false,
     sheet: false,
     zoom: "fit",
@@ -348,6 +353,31 @@
     var t0 = performance.now();
     var mode = S.mask ? "mask" : "graded";
 
+    // Bypass (job: compare). Before-only means the bypassed picture is the
+    // ONLY picture on screen, because #stage.mode-before hides #afterLayer
+    // outright. So the graded render is skipped here rather than paid for
+    // and then hidden, and leaving bypass re-renders it, which on the GPU
+    // path is a second pass over a source frame live.js already has cached:
+    // no network request at all. The matte view is excluded because it is a
+    // diagnostic of the secondary qualifier, not a picture that a bypass
+    // comparison means anything against.
+    if (mode === "graded" && effectiveMode() === MODE_BEFORE) {
+      renderBypassOnly(t0);
+      return;
+    }
+
+    // Every other before-showing mode (left/right, top/bottom, wipe) has the
+    // bypassed picture on screen NEXT to the graded one, so it has to be
+    // produced as well. On the GPU path that is gpuBypassStep, and it runs
+    // before the graded render rather than after it because both present to
+    // the same canvas: the bypass is copied off into #bypassCanvas and the
+    // graded render then overwrites the GPU canvas the viewer shows.
+    // Deciding this up front instead of inside the promise chain is what
+    // keeps the "does the server still owe us a before frame" test at the
+    // bottom of this function a plain synchronous one.
+    var gpuBefore = mode === "graded" && S.gpu && StudioLive.available()
+      && needsBefore(effectiveMode());
+
     // GPU preview (job: live GPU viewer, mode 1). Only the graded picture
     // itself goes through gpu.js; mask mode is a diagnostic view of the
     // secondary qualifier, not the grade the user is judging, and stays on
@@ -357,9 +387,11 @@
     // GPU failure must never leave the viewer showing nothing.
     if (mode === "graded" && S.gpu && StudioLive.available()) {
       inflight++;
-      StudioLive.renderStill({
-        clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
-        config: cfg(), sourceWidth: clipSourceWidth()
+      gpuBypassStep(gpuBefore).then(function () {
+        return StudioLive.renderStill({
+          clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
+          config: cfg(), sourceWidth: clipSourceWidth()
+        });
       }).then(function (r) {
         setStageLayer("gpu");
         $("renderTime").textContent = Math.round(r.ms) + " ms (GPU, "
@@ -381,8 +413,17 @@
 
     // Only after-only can go without the before frame; every other mode has
     // it on screen somewhere, so this is the one place that decides whether
-    // that second request is worth paying for.
-    if (needsBefore(effectiveMode())) renderBefore();
+    // that second request is worth paying for. gpuBypassStep has already
+    // taken that job whenever the GPU is driving, and pays no network for it.
+    // Handing the layer back to the server frame here (rather than only in
+    // the GPU path's own failure branch) is what keeps the matte view
+    // honest: it forces the server path with the wipe still on, and without
+    // this the layer would keep showing the last GPU bypass, which is a
+    // different frame as soon as the time moves.
+    if (needsBefore(effectiveMode()) && !gpuBefore) {
+      setBypassSource("server");
+      renderBefore();
+    }
   }
 
   function doRenderServer(mode, t0) {
@@ -401,11 +442,150 @@
       .finally(function () { inflight--; });
   }
 
-  function renderBefore() {
+  // t0 is passed only by the bypass-only path, where this frame is not a
+  // second picture beside the graded one but the ONLY picture on screen, so
+  // it also owes the viewer a render time and a set of measurements. Every
+  // other caller passes nothing and gets exactly the old behaviour.
+  function renderBefore(t0) {
     frameRequest("before", basePayload({
       mode: "flat", keep_exposure: $("beforeExposure").checked
     })).then(function (r) { return showBlob("before", $("beforeImg"), r); })
+      .then(function (ok) {
+        if (!ok || t0 === undefined) return;
+        $("renderTime").textContent = Math.round(performance.now() - t0) + " ms";
+        $("viewerMsg").classList.remove("on");
+        if (S.scopesAuto) { refreshStats(); refreshScopes(); }
+      })
       .catch(function (e) { showError(e); });
+  }
+
+  /* ---- bypass and the split wipe (job: compare) --------------------------
+     Bypass here means the technical conversion and nothing creative: the
+     engine defaults, with tone map, working space and output encode copied
+     from the live config because those three ARE the conversion, not the
+     grade. It is deliberately not the raw log image; a log frame next to a
+     graded one compares the grade against an unwatchable picture instead of
+     against the neutral one the grade started from. This mirrors
+     server.py's flat_config exactly, function for function, so the GPU's
+     bypassed picture and the server's mode=flat frame are the same picture
+     rather than two nearby ones. */
+  function bypassConfig() {
+    // S.defaults is empty until GET /api/state lands. Returning null rather
+    // than a half-built config makes every caller fall back to the server
+    // path, which needs no client-side defaults at all.
+    var live = cfg();
+    if (!S.defaults || !S.defaults.convert || !live) return null;
+    var flat = clone(S.defaults);
+    ["tonemap", "working_space", "encode"].forEach(function (k) {
+      flat.convert[k] = clone(live.convert[k]);
+    });
+    if ($("beforeExposure").checked) flat.convert.exposure = live.convert.exposure;
+    return flat;
+  }
+
+  // What the viewer is showing right now, which is what the stats and the
+  // scopes have to measure. With bypass on they must read the bypassed
+  // picture: numbers taken from the graded config while the bypassed frame
+  // is on screen describe a picture nobody can see, which is the one way a
+  // scope can actively mislead rather than merely lag.
+  function shownConfig() {
+    if (!S.mask && effectiveMode() === MODE_BEFORE) {
+      var b = bypassConfig();
+      if (b) return b;
+    }
+    return cfg();
+  }
+
+  // Which element inside #beforeLayer is holding the bypassed picture. Same
+  // shape as setStageLayer for the graded layer, and separate from it on
+  // purpose: the graded picture can come from the server while the bypass
+  // came from the GPU (a mid-render fallback does exactly that), so one
+  // class cannot answer both questions.
+  function setBypassSource(kind) {
+    $("beforeLayer").classList.toggle("gpu", kind === "gpu");
+  }
+
+  // Grade the bypassed picture on the GPU and copy it off the shared canvas.
+  // live.js presents to exactly one canvas, so the copy is what makes two
+  // pictures possible at once: this runs first, #bypassCanvas keeps the
+  // result, and the graded render then paints over the GPU canvas. gpu.js
+  // creates its context with preserveDrawingBuffer, so drawImage off it is
+  // defined rather than a race against the compositor. The source frame is
+  // already in live.js's still cache (same clip, time and width as the
+  // graded render), so this costs one more GPU pass and no network.
+  function renderGpuBypass(bcfg) {
+    return StudioLive.renderStill({
+      clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
+      config: bcfg, sourceWidth: clipSourceWidth()
+    }).then(function (r) {
+      var src = $("gpuCanvas"), dst = $("bypassCanvas");
+      if (dst.width !== src.width || dst.height !== src.height) {
+        dst.width = src.width;
+        dst.height = src.height;
+      }
+      dst.getContext("2d").drawImage(src, 0, 0);
+      return r;
+    });
+  }
+
+  // The bypass half of a split view. Resolves whatever happens: a bypass the
+  // GPU cannot produce falls back to the server's own flat frame on its own
+  // rather than taking the graded render down with it, because the graded
+  // picture is the one the user is actually judging.
+  function gpuBypassStep(want) {
+    if (!want) return Promise.resolve();
+    var bcfg = bypassConfig();
+    if (!bcfg) { setBypassSource("server"); renderBefore(); return Promise.resolve(); }
+    return renderGpuBypass(bcfg).then(function () {
+      setBypassSource("gpu");
+    }).catch(function () {
+      setBypassSource("server");
+      renderBefore();
+    });
+  }
+
+  // Bypass on its own (before-only). The bypassed picture is the whole
+  // viewer here, so this owns the badge, the render time and the
+  // measurements that doRender's graded paths normally own.
+  function renderBypassOnly(t0) {
+    var bcfg = bypassConfig();
+    if (bcfg && S.gpu && StudioLive.available()) {
+      inflight++;
+      renderGpuBypass(bcfg).then(function (r) {
+        setStageLayer("gpu");
+        setBypassSource("gpu");
+        $("renderTime").textContent = Math.round(r.ms) + " ms (GPU bypass, "
+          + Math.round(performance.now() - t0) + " ms incl. fetch)";
+        $("viewerMsg").classList.remove("on");
+        setRendererBadge("GPU (bypass)", r.grain);
+        fitViewer();
+        if (S.scopesAuto) { refreshStats(); refreshScopes(); }
+      }).catch(function (e) {
+        setStageLayer("still");
+        setBypassSource("server");
+        setRendererBadge("server bypass (GPU fallback: " + (e.message || e) + ")", false);
+        renderBefore(t0);
+      }).finally(function () { inflight--; });
+    } else {
+      setStageLayer("still");
+      setBypassSource("server");
+      setRendererBadge("server (bypass)", false);
+      renderBefore(t0);
+    }
+  }
+
+  // The wipe's split position, clamped so neither side can be dragged away
+  // entirely: at 0 or 100 the viewer looks like a plain before-only or
+  // after-only view with a stray handle in it, and the way back is not
+  // obvious. Percentages, not pixels, because the same number drives both
+  // #afterLayer's clip-path and the handle's own left, and those two are
+  // measured against different boxes in pixels but the same box in percent.
+  function setSplitPos(p) {
+    if (!isFinite(p)) return S.splitPos;
+    S.splitPos = Math.max(2, Math.min(98, p));
+    $("stage").style.setProperty("--wipe", S.splitPos + "%");
+    $("splitHandle").style.left = S.splitPos + "%";
+    return S.splitPos;
   }
 
   function showError(e) {
@@ -415,10 +595,13 @@
     $("renderTime").textContent = "error";
   }
 
+  // shownConfig, not cfg: with bypass on the picture on screen is the
+  // bypassed one, and a readout of the graded frame beside it would be a
+  // measurement of something nobody can see.
   function refreshStats() {
     fetch("/api/stats", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(basePayload({ width: 640 }))
+      body: JSON.stringify(basePayload({ width: 640, config: shownConfig() }))
     }).then(function (r) { return r.json(); })
       .then(function (j) { if (j.stats) drawStats(j.stats, j.size); })
       .catch(function () { /* stats are a nicety, never block the viewer */ });
@@ -444,7 +627,9 @@
       }
       var size = kind === "vectorscope" ? 210 : 300;
       GEN["scope_" + kind] = (GEN["scope_" + kind] || 0) + 1;
-      postJSON("/api/scope", basePayload({ width: 640, kind: kind, size: size }), {
+      postJSON("/api/scope", basePayload({
+        width: 640, kind: kind, size: size, config: shownConfig()
+      }), {
         "X-Studio-Client": CLIENT + ":scope_" + kind,
         "X-Studio-Gen": String(GEN["scope_" + kind])
       }).then(function (r) {
@@ -674,12 +859,49 @@
     $("modeLabel").textContent = MODE_LABELS[mode];
     $("maskBtn").classList.toggle("active", S.mask);
     $("sheetBtn").classList.toggle("active", S.sheet);
+    // The two comparison buttons (job: compare) are views of the same view
+    // mode the selector above shows, so they light up from it rather than
+    // keeping any state of their own. Bypass reads the EFFECTIVE mode, so a
+    // held space bar lights it too: it is describing what is on screen.
+    // Wipe reads the latched mode, because a space-bar peek does not leave
+    // wipe, and lighting a button for a mode you would return to on release
+    // would say otherwise.
+    $("bypassBtn").classList.toggle("active", mode === MODE_BEFORE);
+    $("wipeBtn").classList.toggle("active", S.viewMode === MODE_WIPE);
+    // Restores the session's split every time wipe comes back on screen,
+    // and is harmless in every other mode (the handle is display: none and
+    // nothing reads --wipe outside .mode-wipe).
+    setSplitPos(S.splitPos);
     $("viewport").classList.toggle("sheet", S.sheet);
     $("viewport").classList.toggle("withref", S.refShow && !!S.refName);
     fitViewer();
   }
 
+  // Everything the viewer owes after the mode on screen changes, given the
+  // mode that was on screen before it. Shared by the latched switch and the
+  // space-bar hold, which are the same transition as far as the picture,
+  // the stats and the scopes are concerned.
+  function refreshForViewChange(was) {
+    var now = effectiveMode();
+    if (was === now) return;
+    // Bypass in either direction goes through doRender: entering it skips
+    // the graded render, leaving it has to put the graded picture back, and
+    // both change which picture the stats and scopes are measuring. A split
+    // mode with the GPU driving goes there too, because the GPU produces
+    // the bypassed picture as part of the same render (gpuBypassStep).
+    // Everything else only needs the server's flat frame, which is the
+    // cheaper ask: a full doRender there would buy a second /api/frame for
+    // a graded picture that is already on screen and has not changed.
+    if (was === MODE_BEFORE || now === MODE_BEFORE
+        || (needsBefore(now) && S.gpu && StudioLive.available())) {
+      scheduleRender(0);
+    } else if (needsBefore(now)) {
+      renderBefore();
+    }
+  }
+
   function setViewMode(mode) {
+    var was = effectiveMode();
     // Playback only ever shows in #afterLayer (see #stage.playing in
     // style.css); every other mode either hides that layer outright
     // (before-only) or splits the viewer in a way a single played video
@@ -690,7 +912,7 @@
     if (S.looping || S.loopPreparing) stopLoop();
     S.viewMode = mode;
     applyViewerState();
-    if (needsBefore(effectiveMode())) renderBefore();
+    refreshForViewChange(was);
   }
 
   // \\ only ever flips between the two solo modes. From any split mode this
@@ -702,6 +924,12 @@
   function cycleSplitModes() {
     var i = SPLIT_CYCLE.indexOf(S.viewMode);
     setViewMode(SPLIT_CYCLE[(i + 1) % SPLIT_CYCLE.length]);
+  }
+  // W is a two-state switch, not a step in Y's cycle: the point of a
+  // dedicated key is that one press gets you into the wipe and the same
+  // press gets you back out, from whatever mode you were in.
+  function toggleWipe() {
+    setViewMode(S.viewMode === MODE_WIPE ? MODE_AFTER : MODE_WIPE);
   }
 
   function sizeLayer(img, wBox, hBox) {
@@ -747,33 +975,34 @@
     // setStageLayer is what decides whether either one is actually visible.
     sizeLayer($("playerVideo"), wBox, hBox);
     sizeLayer($("gpuCanvas"), wBox, hBox);
-
-    var beforeLayer = $("beforeLayer");
-    if (mode !== MODE_WIPE) {
-      // The wipe handle leaves an inline percentage width on this wrapper so
-      // the split position sticks around if you flip back to wipe later
-      // (matching the original behaviour). Left/Right and Top/Bottom lay
-      // this wrapper out as a normal flex item, and an inline width would
-      // set its flex-basis and fight that, so it has to be cleared in every
-      // mode except the one that actually uses it.
-      beforeLayer.style.width = "";
-    }
+    // bypassCanvas is to the before half exactly what gpuCanvas is to the
+    // after half, and it can be the picture in any before-showing mode, so
+    // it needs the same half-share treatment beforeImg gets.
+    sizeLayer($("bypassCanvas"), wBox, hBox);
 
     matchBeforeSize(mode);
   }
 
   function matchBeforeSize(mode) {
-    // Only the wipe overlay needs this: beforeImg sits inside a
-    // width-clipped, absolutely positioned wrapper, so percentage sizing
-    // cannot reach the true frame size and it has to be told in pixels.
-    // Left/Right and Top/Bottom already size both copies independently in
-    // sizeLayer() above, from the same source dimensions, so forcing a copy
-    // here would fight that instead of matching it.
+    // Only the wipe overlay needs this: the bypassed picture sits inside an
+    // absolutely positioned wrapper laid under the graded one, so percentage
+    // sizing cannot reach the true frame size and it has to be told in
+    // pixels. Left/Right and Top/Bottom already size both copies
+    // independently in sizeLayer() above, from the same source dimensions,
+    // so forcing a copy here would fight that instead of matching it.
     if (mode !== MODE_WIPE) return;
-    var main = $("frameImg"), before = $("beforeImg");
-    if (!main.clientWidth) return;
-    before.style.width = main.clientWidth + "px";
-    before.style.height = main.clientHeight + "px";
+    // The LAYER, not #frameImg. On the GPU path frameImg is display: none
+    // (see #stage.gpu-live in style.css) and measures zero, which used to
+    // leave the bypassed copy unsized for exactly the renderer that now
+    // produces both halves of the wipe. #afterLayer is sized by whichever
+    // of its three children is visible, so it reads correctly on every path.
+    var main = $("afterLayer");
+    var w = main.clientWidth, h = main.clientHeight;
+    if (!w) return;
+    [$("beforeImg"), $("bypassCanvas")].forEach(function (el) {
+      el.style.width = w + "px";
+      el.style.height = h + "px";
+    });
   }
 
   function setZoom(mode) {
@@ -1011,12 +1240,67 @@
      JPEG or PNG has none in it to extract). Full contract, every argument
      and failure mode: grade/tools/MATCH-REF-INTEGRATION.md.
 
-     Strength is deliberately NOT a control here: the cube POST /api/match
-     writes is baked at a fixed strength, and look.mix (already a slider in
-     Parameters, schema.js) is the same axis and needs no network round trip
-     to move. Re-fitting on every strength change would be a 1.4 to 3 second
-     wait per drag step for no reason, so this only ever calls the endpoint
-     once per click and leaves strength to the existing mix slider. */
+     Method, strength and luma preserve are real controls now (matchMethod,
+     matchStrength, matchLumaPreserve in the match panel), because
+     match_ref.py actually takes all three (METHODS is "reinhard" or
+     "histogram"). They only take effect on the next click of Match to
+     reference, not live, so this still calls the endpoint once per click
+     rather than refitting per drag step. Once a cube is baked, look.mix
+     (already a slider in Parameters, schema.js) still gives a zero cost
+     strength change on top of it. The three choices persist in
+     localStorage under studio.match.* (bindMatchControls) so they survive
+     a reload. */
+
+  var MATCH_METHOD_DESC = {
+    // Wording drawn from match_ref.py's own module docstring, not invented.
+    reinhard: "Mean and standard deviation transfer per channel in Lab " +
+      "space: a global affine move, robust and rarely catastrophic, but " +
+      "the weaker of the two.",
+    histogram: "Per channel cumulative histogram matching in display code: " +
+      "monotonic per channel so it cannot invert a hue, stronger, and " +
+      "slope limited and smoothed here so it does not posterise."
+  };
+
+  var MATCH_KEY = {
+    method: "studio.match.method",
+    strength: "studio.match.strength",
+    luma: "studio.match.luma_preserve"
+  };
+
+  function bindMatchControls() {
+    var methodSel = $("matchMethod");
+    var strengthInp = $("matchStrength");
+    var strengthVal = $("matchStrengthValue");
+    var lumaChk = $("matchLumaPreserve");
+    var descEl = $("matchMethodDesc");
+
+    function paintDesc() { descEl.textContent = MATCH_METHOD_DESC[methodSel.value] || ""; }
+    function paintStrength() { strengthVal.textContent = Number(strengthInp.value).toFixed(2); }
+
+    var storedMethod = localStorage.getItem(MATCH_KEY.method);
+    if (storedMethod === "reinhard" || storedMethod === "histogram") methodSel.value = storedMethod;
+    var storedStrength = parseFloat(localStorage.getItem(MATCH_KEY.strength));
+    if (!Number.isNaN(storedStrength)) {
+      strengthInp.value = String(Math.min(1, Math.max(0, storedStrength)));
+    }
+    var storedLuma = localStorage.getItem(MATCH_KEY.luma);
+    if (storedLuma === "0" || storedLuma === "1") lumaChk.checked = storedLuma === "1";
+
+    paintDesc();
+    paintStrength();
+
+    methodSel.addEventListener("change", function () {
+      localStorage.setItem(MATCH_KEY.method, methodSel.value);
+      paintDesc();
+    });
+    strengthInp.addEventListener("input", function () {
+      paintStrength();
+      localStorage.setItem(MATCH_KEY.strength, strengthInp.value);
+    });
+    lumaChk.addEventListener("change", function () {
+      localStorage.setItem(MATCH_KEY.luma, lumaChk.checked ? "1" : "0");
+    });
+  }
 
   var matchBusy = false;
 
@@ -1033,8 +1317,9 @@
       time: S.time,
       autorotate: S.autorotate,
       config: cfg(),
-      method: "reinhard",
-      luma_preserve: true
+      method: $("matchMethod").value,
+      strength: parseFloat($("matchStrength").value),
+      luma_preserve: $("matchLumaPreserve").checked
     };
     // Only sent when the user drew a box: server.py turns auto_crop off the
     // moment crop_frac is present, so a box always wins over the auto
@@ -1115,6 +1400,18 @@
       wl.textContent = w;
       host.appendChild(wl);
     });
+
+    // Same shape as match_ref.py's own print_report's method line: reads
+    // back what the server actually ran (result.method/.strength/
+    // .luma_preserve), not what the controls happened to show at click
+    // time, so this cannot drift from the cube that was actually written.
+    if (result.method) {
+      var mi = document.createElement("div");
+      mi.className = "mono muted";
+      mi.textContent = "method " + result.method + " strength=" + result.strength +
+        " luma_preserve=" + result.luma_preserve;
+      host.appendChild(mi);
+    }
 
     // Same shape as match_ref.py's own print_report, so the region a drawn
     // box produced (source "explicit-fraction") reads the same way the CLI
@@ -1611,8 +1908,13 @@
     "<h4>Viewer</h4><ul>",
     "<li><kbd>space</kbd> hold to see the ungraded frame, release to go back</li>",
     "<li><kbd>\\</kbd> toggle between after only and before only</li>",
+    "<li><kbd>b</kbd> bypass: the technical conversion with none of the grade. ",
+    "The stats and the scopes measure the bypassed picture while it is on screen</li>",
+    "<li><kbd>w</kbd> split wipe: bypassed left of the handle, graded right</li>",
     "<li><kbd>y</kbd> cycle left/right, top/bottom and wipe, then back to after only</li>",
-    "<li>In wipe mode, drag the blue handle to move the split</li>",
+    "<li>In wipe mode, drag the blue handle to move the split. It stops 2 percent ",
+    "from either edge so neither side can be dragged away entirely, and it stays ",
+    "where you left it for the rest of the session</li>",
     "<li><kbd>1</kbd> <kbd>2</kbd> switch to grade slot A or B</li>",
     "<li><kbd>shift 1</kbd> <kbd>shift 2</kbd> copy the live grade into that slot</li>",
     "<li><kbd>f</kbd> fit &nbsp; <kbd>0</kbd> 100 percent</li>",
@@ -1743,14 +2045,25 @@
     $("fitBtn").addEventListener("click", function () { setZoom("fit"); });
     $("oneToOneBtn").addEventListener("click", function () { setZoom("one"); });
     $("viewMode").addEventListener("change", function (e) { setViewMode(e.target.value); });
+    // Job: compare. Both buttons are the keyboard shortcuts' own functions,
+    // so the button and the key can never drift apart.
+    $("bypassBtn").addEventListener("click", toggleBeforeAfter);
+    $("wipeBtn").addEventListener("click", toggleWipe);
     $("gpuToggle").addEventListener("click", function () {
       S.gpu = !S.gpu;
       $("gpuToggle").classList.toggle("active", S.gpu);
       scheduleRender(0);
     });
     $("beforeExposure").addEventListener("change", function () {
-      // No point re-rendering a before frame nobody is looking at.
-      if (needsBefore(effectiveMode())) renderBefore();
+      // No point re-rendering a before frame nobody is looking at. When the
+      // bypassed picture is the whole viewer, or the GPU is the one making
+      // it, it comes out of doRender rather than a flat frame request.
+      if (!needsBefore(effectiveMode())) return;
+      if (effectiveMode() === MODE_BEFORE || (S.gpu && StudioLive.available())) {
+        scheduleRender(0);
+      } else {
+        renderBefore();
+      }
     });
     $("maskBtn").addEventListener("click", function () {
       S.mask = !S.mask; applyViewerState(); scheduleRender(0);
@@ -1768,24 +2081,49 @@
       toast("copied grade into slot " + other);
     });
 
-    // split handle (wipe mode only)
+    /* split handle (wipe mode only). Pointer events with a pointer capture,
+       not mousedown plus document-level mousemove/mouseup listeners: the
+       capture is what keeps a drag alive when the pointer leaves the handle
+       (which it does immediately, since the handle is 14px wide and the
+       drag is the full width of the frame) and what guarantees the matching
+       release arrives even if the pointer ends up over another element or
+       outside the window, so a drag cannot get stuck on. It also covers pen
+       and touch for free, where the old mouse-only pair covered neither. */
     (function () {
       var handle = $("splitHandle");
-      handle.addEventListener("mousedown", function (ev) {
+      var dragging = false;
+      function place(e) {
+        // #afterLayer, not #frameImg: the graded picture can be any of three
+        // elements and only the layer is the right box in all three cases.
+        var r = $("afterLayer").getBoundingClientRect();
+        if (!r.width) return;
+        setSplitPos(((e.clientX - r.left) / r.width) * 100);
+      }
+      handle.addEventListener("pointerdown", function (ev) {
         ev.preventDefault();
-        function move(e) {
-          var r = $("frameImg").getBoundingClientRect();
-          var p = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-          $("beforeLayer").style.width = (p * 100) + "%";
-          handle.style.left = (p * 100) + "%";
-        }
-        function up() {
-          document.removeEventListener("mousemove", move);
-          document.removeEventListener("mouseup", up);
-        }
-        document.addEventListener("mousemove", move);
-        document.addEventListener("mouseup", up);
+        // A capture needs a live pointer with this id. A programmatically
+        // dispatched PointerEvent (a UI test driving the handle) has no
+        // such pointer and this throws, which must not take the drag down
+        // with it, so the drag state is a flag of our own rather than a
+        // read of hasPointerCapture: it is the same answer for a real
+        // pointer and the only available one for a synthetic pointer.
+        try { handle.setPointerCapture(ev.pointerId); } catch (e) { /* see above */ }
+        dragging = true;
+        handle.classList.add("dragging");
+        place(ev);
       });
+      handle.addEventListener("pointermove", function (ev) {
+        if (dragging) place(ev);
+      });
+      function release(ev) {
+        dragging = false;
+        try {
+          if (handle.hasPointerCapture(ev.pointerId)) handle.releasePointerCapture(ev.pointerId);
+        } catch (e) { /* same as the capture above */ }
+        handle.classList.remove("dragging");
+      }
+      handle.addEventListener("pointerup", release);
+      handle.addEventListener("pointercancel", release);
     })();
 
     $("frameImg").addEventListener("load", fitViewer);
@@ -1889,6 +2227,7 @@
     });
     $("matchRefBtn").addEventListener("click", matchReference);
     bindRefCrop();
+    bindMatchControls();
 
     // LUTs
     $("importLutBtn").addEventListener("click", function () { $("lutFile").click(); });
@@ -1968,7 +2307,15 @@
     document.addEventListener("keydown", onKey);
     document.addEventListener("keyup", function (ev) {
       if (ev.code === "Space" && S.beforeHold) {
-        S.beforeHold = false; applyViewerState();
+        var wasHeld = effectiveMode();
+        S.beforeHold = false;
+        applyViewerState();
+        // Releasing the hold is a real transition now, not just a class
+        // swap: the graded picture was never rendered while the bypass was
+        // the whole viewer, so it has to be put back (on the GPU path from
+        // the source frame already cached, with no network request), and
+        // the stats and scopes have to come back with it.
+        refreshForViewChange(wasHeld);
       }
     });
   }
@@ -2323,11 +2670,22 @@
         // video is on screen that would mean showing beforeLayer behind a
         // still-playing video, so space stops playback instead of holding.
         if (S.playing || S.playPreparing) { stopPlayback(); break; }
-        if (!S.beforeHold) { S.beforeHold = true; applyViewerState(); renderBefore(); }
+        if (!S.beforeHold) {
+          var wasHeld = effectiveMode();
+          S.beforeHold = true;
+          applyViewerState();
+          // Same transition as the latched switch, so the same handler: the
+          // hold has to move the stats and the scopes onto the bypassed
+          // picture too, or they describe a frame that is no longer on
+          // screen for as long as the key is down.
+          refreshForViewChange(wasHeld);
+        }
         break;
       case "p": $("playBtn").click(); break;
       case "l": $("loopBtn").click(); break;
       case "\\": toggleBeforeAfter(); break;
+      case "b": $("bypassBtn").click(); break;
+      case "w": $("wipeBtn").click(); break;
       case "y": cycleSplitModes(); break;
       case "1": setSlot("A"); break;
       case "2": setSlot("B"); break;
@@ -2394,7 +2752,7 @@
      widgets" is the other half of what used to live here: scopes and
      timeline no longer have a user-draggable height at all (gs-no-resize in
      the HTML) and no longer get squeezed to fit a fixed row budget the way
-     GRID_ROWS/computeCellHeight below still sizes the viewer. Their cards
+     VIEWER_ROWS/computeCellHeight below still sizes the viewer. Their cards
      grow to their own natural content height instead, via GridStack's own
      sizeToContent feature (initAutosizeCards below, and the long comment on
      .autosize in style.css, just above .widgethead, for exactly what it
@@ -2432,7 +2790,12 @@
       { id: "timeline", x: 0, y: 11, w: 1, h: 3 }
     ]
   };
-  var GRID_ROWS = 14; // viewer(7) + scopes(4) + timeline(3), the seed layout's own row total
+  // Only the viewer still needs a row COUNT for computeCellHeight's own math
+  // below: scopes and timeline size to their real content in pixels (see
+  // AUTOSIZE_CARDS/reflowAutosizeCards further down), not to a fixed share
+  // of some assumed row total, so there is no longer one true "GRID_ROWS"
+  // for the whole column the way there was before sizeToContent existed.
+  var VIEWER_ROWS = 7;
   var GRID_MARGIN = 4; // the same 4px spacing grid the rest of the app uses
   // v2: per-column shape, not one flat array. Two now-unused keys from
   // earlier shapes are simply never read rather than migrated: "left" (from
@@ -2464,7 +2827,7 @@
 
   // The floor a row is ever allowed to shrink to. This used to be 24, which is
   // not a floor in practice: on anything shorter than about an 850px window
-  // (see avail/GRID_ROWS below) 24 is BIGGER than what avail leaves per row, so
+  // (see avail/VIEWER_ROWS below) 24 is BIGGER than what avail leaves per row, so
   // Math.max(24, h) picked h every time and cellHeight kept falling as the
   // window got shorter, with nothing to stop it. That is what squeezed the
   // timeline card down to a sliver too short to show its own toolbar, and
@@ -2492,11 +2855,143 @@
   // to scroll rather than a box it already fit.
   var MIN_ROW_HEIGHT = 54;
 
+  // The old formula was Math.floor((avail - (14 + 2) * GRID_MARGIN) / 14): a
+  // fixed 14-row guess (viewer 7 + scopes 4 + timeline 3, the seed layout's
+  // own row total) for a column where only the viewer's row count is
+  // actually fixed -- scopes and timeline size to their real content in
+  // pixels (see AUTOSIZE_CARDS/reflowAutosizeCards below), so their true row
+  // count at any given cellHeight is whatever their fixed pixel content
+  // happens to round up to, not a constant. Guessing 14 up front, and
+  // separately guessing a (14 + 2) * GRID_MARGIN margin budget on top of it
+  // that the vendored build never actually spends (read out of its own
+  // _updateStyles/_updateContainerHeight: an item's box height is exactly
+  // its row count times cellHeight -- `[gs-h="N"]{height: N*cellHeight}` --
+  // GRID_MARGIN is only an inset the item's OWN content is pushed in BY,
+  // shrinking what is visibly painted inside that box, never adding height
+  // beyond it; confirmed live, viewer gs-h="7" measures exactly 7 *
+  // cellHeight tall with zero margin term) -- both guesses being wrong in
+  // the same direction is what opened the roughly 72px empty band this
+  // fixes under the last card on a tall window: measured live at
+  // 2560x1200, the old formula left a 74px gap below the timeline card even
+  // on a load where the real row count landed on exactly 14 anyway.
+  // Dropping just the margin-budget guess and leaving the 14-row guess in
+  // place does not fix this in general, only relocates it: measured live,
+  // it turned the 2560x1200 case into an 87px band instead (a *bigger* one)
+  // by handing scopes/timeline a larger cellHeight, which is exactly enough
+  // pixel headroom that their real, fixed pixel content now rounds up to
+  // fewer rows than 14 assumed, so the column's real total row count no
+  // longer matches 14 either.
+  //
+  // Genuinely fixing it means never guessing a row count for scopes/
+  // timeline at all: measure their real pixel need directly
+  // (autosizeCardOuterHeight below, the same three terms measureContentRows'
+  // own r/h/n math resolves to for a settled card -- head height, natural
+  // content height, two margin insets) and hand the viewer everything left
+  // over in avail after that, divided by its own fixed VIEWER_ROWS. That
+  // measurement needs scopes/timeline's REAL content to already exist, which
+  // is not true yet at GridStack.init time: boot() deliberately lays the
+  // grid out before the state fetch (see boot's own comment) so the widgets
+  // are never visible unstyled while that fetch is in flight, which means
+  // scopes/timeline are still just their near-empty static HTML skeleton the
+  // first time anything could measure them. Measured live, using this real
+  // math for GridStack.init's own bootstrap cellHeight read that empty
+  // skeleton as the reserved figure and handed the viewer far too much of
+  // the column, which nothing then clawed back once real content landed --
+  // confirmed live, a 2560x1200 load ended up cutting the timeline off by
+  // 363px instead of leaving a band under it. SEED_ROW_GUESS below is only
+  // for that one bootstrap call, where nothing better is measurable yet;
+  // computeCellHeight's own grids[colKey] check switches to the real math
+  // the moment a grid object exists. watchAutosizeContentForCellHeight
+  // (below) is what re-runs that real math once real content actually
+  // lands: reflowAutosizeCards' own "change" event was tried first here and
+  // does not work for this -- it only fires when scopes/timeline's ROW
+  // COUNT moves, and a too-generous bootstrap cellHeight is exactly the
+  // condition where real content arriving does NOT move that row count (the
+  // oversized rows already had enough spare room to absorb the real content
+  // without needing another one), so nothing re-fires it; confirmed live,
+  // this genuinely got stuck at the wrong cellHeight forever, not just
+  // slowly. Watching #dock/#timeline's own box directly (the same signal
+  // AUTOSIZE_CARDS' own ResizeObserver in initAutosizeCards already uses,
+  // just a second, independent observer instance rather than a change to
+  // that one) reacts to the real pixel change directly, with no row
+  // quantization to hide it behind. computeCellHeight's own shrink-until-it-
+  // fits loop (below) is a second, separate correction for a second, separate
+  // rounding problem: scopes/timeline still round their own pixel need up to
+  // whole rows of whatever cellHeight this settles on (GridStack has no
+  // other unit), and naively solving for cellHeight as if they could take
+  // exactly their real pixel need provably overflows avail once that
+  // rounding is applied -- confirmed live, a 2560x1200 load without the loop
+  // undershot avail's own row math by exactly enough for scopes+timeline's
+  // rounding-up to push the total 130px past the scrollport, a real
+  // "needs a scroll" case on a window roomy enough that nothing about this
+  // fix should have introduced one. The loop below only ever gives up a few
+  // px to Math.floor, never a whole row, so what is left of any mismatch is
+  // genuinely sub-pixel-row, not a blank band and not new overflow.
+  var SEED_ROW_GUESS = 14; // viewer(7) + scopes(4) + timeline(3), bootstrap only, see above
+
+  function autosizeCardOuterHeight(gsId, contentId) {
+    var item = document.querySelector('#gridMid > .grid-stack-item[gs-id="' + gsId + '"]');
+    var content = document.getElementById(contentId);
+    if (!item || !content) return 0;
+    var head = item.querySelector(".widgethead");
+    var headH = head ? head.getBoundingClientRect().height : 0;
+    return headH + content.getBoundingClientRect().height + 2 * GRID_MARGIN;
+  }
+
   function computeCellHeight(colKey) {
     var host = $(colGridId(colKey));
     var avail = host ? host.clientHeight : 0;
-    var h = Math.floor((avail - (GRID_ROWS + 2) * GRID_MARGIN) / GRID_ROWS);
-    return Math.max(MIN_ROW_HEIGHT, h);
+    if (!grids[colKey]) {
+      return Math.max(MIN_ROW_HEIGHT, Math.floor(avail / SEED_ROW_GUESS));
+    }
+    var scopesNeed = autosizeCardOuterHeight("scopes", "dock");
+    var timelineNeed = autosizeCardOuterHeight("timeline", "timeline");
+    var h = Math.max(MIN_ROW_HEIGHT, Math.floor((avail - scopesNeed - timelineNeed) / VIEWER_ROWS));
+    // The line above sizes the viewer as if scopes/timeline could take up
+    // exactly their real pixel need, but GridStack can only give them whole
+    // rows of THIS cellHeight, rounded up (ceil, same as measureContentRows)
+    // -- so their actual allocated pixel height at this h can run past what
+    // was budgeted for them, past avail in total. Shrinking h one row-height
+    // step at a time until the WHOLE-ROW total actually fits inside avail is
+    // what turns that into sub-row flooring slack (at most a few px, from
+    // Math.floor above) instead of overflow past the scrollport on a window
+    // tall enough that MIN_ROW_HEIGHT was never the reason it stopped.
+    while (h > MIN_ROW_HEIGHT) {
+      var totalRows = VIEWER_ROWS + Math.ceil(scopesNeed / h) + Math.ceil(timelineNeed / h);
+      if (totalRows * h <= avail) break;
+      h--;
+    }
+    return h;
+  }
+
+  // Additive, not a replacement for AUTOSIZE_CARDS' own ResizeObserver in
+  // initAutosizeCards below (a second, independent observer instance on the
+  // same #dock/#timeline elements, not a change to that one): that observer
+  // exists to keep scopes/timeline's OWN row count matched to their real
+  // content; this one exists to keep the VIEWER's share matched to it too,
+  // which needs the raw pixel signal (any real size change at all), not the
+  // row-count-quantized one -- see the long comment on computeCellHeight for
+  // why reflowAutosizeCards' own "change" event does not work for this.
+  // Re-applying cellHeight only when it actually differs, and only reflowing
+  // again when it does, is what keeps this quiet once real content stops
+  // changing rather than re-triggering itself forever.
+  function watchAutosizeContentForCellHeight() {
+    if (!window.ResizeObserver) return;
+    COLUMNS.forEach(function (colKey) {
+      Object.keys(AUTOSIZE_CARDS).forEach(function (gsId) {
+        var content = $(AUTOSIZE_CARDS[gsId]);
+        if (!content) return;
+        new ResizeObserver(function () {
+          var grid = grids[colKey];
+          if (!grid) return;
+          var newH = computeCellHeight(colKey);
+          if (newH !== grid.getCellHeight()) {
+            grid.cellHeight(newH);
+            reflowAutosizeCards();
+          }
+        }).observe(content);
+      });
+    });
   }
 
   function saveGridLayout() {
@@ -2691,6 +3186,7 @@
     });
 
     initAutosizeCards();
+    watchAutosizeContentForCellHeight();
     initSidebarResizers();
 
     // The viewer's row-count height depends on cellHeight, which is a

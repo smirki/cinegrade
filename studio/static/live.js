@@ -66,6 +66,14 @@
   function checkStages(cfg) {
     var rep = StudioGPU.stageReport(cfg);
     var blocking = rep.unsupported.filter(function (id) { return id !== "grain"; });
+    // The power window exists in the ffmpeg engine only until its shader port
+    // lands. gpu.js has no window stage at all, so it would not report one as
+    // unsupported: it would simply grade the whole frame and show a picture
+    // that quietly ignores the shape the user just drew. That is the exact
+    // failure this function exists to prevent, so force the fall back.
+    if (cfg && cfg.window && cfg.window.enabled && blocking.indexOf("window") < 0) {
+      blocking = blocking.concat(["window"]);
+    }
     return { report: rep, blocking: blocking, grainOnly: !!(cfg.grain && cfg.grain.enabled) };
   }
 

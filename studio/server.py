@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import email.utils
+import getpass
 import hashlib
 import json
 import math
@@ -60,6 +61,14 @@ STATIC = STUDIO / "static"
 
 sys.path.insert(0, str(GRADE))
 import cinegrade as CG  # noqa: E402  (path has to be set first)
+
+# studio/ itself, so `import auth` and `import db` resolve no matter how this
+# file was invoked. Running it as a script already puts its own folder on
+# sys.path, but at whatever index it landed at before GRADE was pushed in
+# front, and importing server.py from elsewhere would not put it there at all.
+sys.path.insert(0, str(STUDIO))
+import auth as AUTH  # noqa: E402  (same reason)
+import db as DB      # noqa: E402  (same reason)
 
 # Every cached frame is the output of this exact engine file, so its hash
 # belongs in the cache key. Without it, editing cinegrade.py leaves the studio
@@ -184,7 +193,7 @@ def register_external_clip(raw: str) -> str:
 
 # Somewhere useful to start browsing from, rather than dropping the user at /
 # and making them click down through five levels of system folders.
-def browse_roots() -> list[dict]:
+def browse_roots(user: dict | None = None) -> list[dict]:
     """Three quick-jump shortcuts, down from the old wall of nine root
     buttons (job: file browser, "so many buttons"). Root itself is
     deliberately not one of these: the client's breadcrumb always starts
@@ -192,12 +201,21 @@ def browse_roots() -> list[dict]:
     there /Volumes, /Applications, anywhere else on the Mac -- is already one
     click away without needing its own dedicated shortcut here too.
     """
+    if AUTH.enabled():
+        # With logins on, home and workspace are outside what this account is
+        # allowed to open, so offering them as shortcuts would be offering
+        # buttons that answer 403. The account's own folder takes their place.
+        roots = [{"label": "footage", "path": str(FOOTAGE)}]
+        if user and user.get("id"):
+            roots.append({"label": "my footage",
+                          "path": str(AUTH.user_footage(user["id"]))})
+        return roots
     return [{"label": "home", "path": str(Path.home())},
             {"label": "workspace", "path": str(WORKSPACE)},
             {"label": "footage", "path": str(FOOTAGE)}]
 
 
-def browse_dir(raw: str | None) -> dict:
+def browse_dir(raw: str | None, user: dict | None = None) -> dict:
     """List one directory: subfolders, plus only the videos this tool can read.
 
     There is no path allow-list here on purpose. The user asked to navigate
@@ -214,6 +232,16 @@ def browse_dir(raw: str | None) -> dict:
         raise StudioError(f"bad path: {exc}") from exc
     if not p.is_dir():
         p = p.parent if p.parent.is_dir() else Path.home()
+    if AUTH.enabled():
+        # The docstring above explains why there is no allow-list when the
+        # server is on 127.0.0.1 with no accounts: the only caller is the
+        # user's own browser on their own machine. Turn logins on and that
+        # stops being true, so the same endpoint becomes a confined browser
+        # over the project footage plus this account's own folder. It raises
+        # a 403 rather than quietly substituting a different folder, because
+        # silently showing somewhere else is how a user comes to believe the
+        # confinement is not there.
+        p = AUTH.confine(p, AUTH.allowed_roots(user, FOOTAGE))
     dirs, files, error = [], [], ""
     try:
         for entry in sorted(p.iterdir(), key=lambda e: e.name.lower()):
@@ -233,12 +261,17 @@ def browse_dir(raw: str | None) -> dict:
         error = f"{exc}"
     return {"path": str(p),
             "parent": str(p.parent) if p.parent != p else "",
-            "roots": browse_roots(), "dirs": dirs, "files": files, "error": error}
+            "roots": browse_roots(user), "dirs": dirs, "files": files,
+            "error": error}
 
 
 def ensure_dirs() -> None:
+    # DB.DATA and AUTH.USERS_DIR are studio/data and studio/data/users: the
+    # accounts database and each account's own footage folder live there, and
+    # the whole folder is gitignored because it is user owned data.
     for d in (CACHE / "frames", CACHE / "img", CACHE / "thumbs", CACHE / "refs",
-              CACHE / "src", CACHE / "segments", STUDIO_TOOLS, OUT, PRESETS, LOOKS):
+              CACHE / "src", CACHE / "segments", STUDIO_TOOLS, OUT, PRESETS, LOOKS,
+              DB.DATA, AUTH.USERS_DIR):
         d.mkdir(parents=True, exist_ok=True)
     # A ".tmp" left in segments/ is a playback render a previous server
     # process was still streaming (and writing to disk for the cache) when
@@ -369,7 +402,15 @@ def flat_config(cfg: dict, keep_exposure: bool) -> dict:
 
 
 def mask_preview_config(cfg: dict) -> dict:
-    """Show the qualifier matte with nothing painted on top of it."""
+    """Show the qualifier matte with nothing painted on top of it.
+
+    The power window is deliberately LEFT ON. What the secondary actually
+    selects is the qualifier matte multiplied by the window matte, so a matte
+    view that ignored the shape would show a selection the grade will never
+    make. The engine handles the multiply: in show_mask mode the window's
+    maskedmerge composites the greyscale qualifier over black instead of over
+    the picture, so the two mattes come out multiplied together.
+    """
     out = deepcopy(cfg)
     out["secondary"]["show_mask"] = True
     out["look"]["lut"] = None
@@ -486,11 +527,12 @@ def source_frame(clip: str, time_s: float, width: int,
 def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
     """The non-source ffmpeg inputs for the grade-only pass.
 
-    Mirrors cinegrade.ffmpeg_inputs' own tail (mask, then grain) so the extra
-    inputs land at the same index the filter graph expects: input 0 is the
-    normalised source piped in over stdin here instead of ffmpeg decoding the
-    clip itself, but everything after it has to stay in the same order or the
-    graph reads the wrong input and produces a wrong picture silently.
+    Mirrors cinegrade.ffmpeg_inputs' own tail (radial mask, window matte, then
+    grain) so the extra inputs land at the same index the filter graph expects:
+    input 0 is the normalised source piped in over stdin here instead of ffmpeg
+    decoding the clip itself, but everything after it has to stay in the same
+    order or the graph reads the wrong input and produces a wrong picture
+    silently. CG.mask_input_indices is the one place that order is decided.
     """
     args = ["-f", "rawvideo", "-pix_fmt", "rgb48le",
             "-s", f"{width}x{height}", "-i", "-"]
@@ -498,6 +540,8 @@ def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
+    if CG.window_active(cfg):
+        args += ["-i", str(CG.window_mask(cfg, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -875,12 +919,12 @@ def _play_params(payload: dict) -> dict:
 def _play_extra_inputs(cfg: dict, info: dict) -> list[str]:
     """The mask/grain -i args for a preview-scaled segment.
 
-    Mirrors _grade_inputs' own tail above: same order (mask before grain),
-    same reason (build_graph fixes those input indices, so the order here
-    has to match what the filter graph expects). Kept as its own small copy
-    rather than shared with _grade_inputs, because that function's first
-    input is a rawvideo pipe from an already-decoded source frame and this
-    one decodes the clip itself as input 0; the two pipelines only share
+    Mirrors _grade_inputs' own tail above: same order (radial mask, window
+    matte, grain), same reason (build_graph fixes those input indices, so the
+    order here has to match what the filter graph expects). Kept as its own
+    small copy rather than shared with _grade_inputs, because that function's
+    first input is a rawvideo pipe from an already-decoded source frame and
+    this one decodes the clip itself as input 0; the two pipelines only share
     what comes after input 0.
     """
     args = []
@@ -888,6 +932,8 @@ def _play_extra_inputs(cfg: dict, info: dict) -> list[str]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
+    if CG.window_active(cfg):
+        args += ["-i", str(CG.window_mask(cfg, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -1409,7 +1455,7 @@ def match_reference_job(payload: dict) -> dict:
     """
     try:
         sys.path.insert(0, str(GRADE / "tools"))
-        from match_ref import match_reference, MatchError   # noqa: PLC0415
+        from match_ref import match_reference, MatchError, METHODS   # noqa: PLC0415
     except Exception as exc:                                # noqa: BLE001
         raise StudioError(f"match_ref.py is not usable: {exc}") from exc
 
@@ -1436,6 +1482,21 @@ def match_reference_job(payload: dict) -> dict:
     # rather than stacking with it; with no box, auto_crop stays on and the
     # detector runs exactly as before this option existed.
     crop_frac = payload.get("crop_frac")
+    # The match panel (static/index.html, static/app.js) exposes method,
+    # strength and luma_preserve as real controls: match_ref.py actually
+    # takes all three (METHODS is "reinhard" or "histogram"), so validated
+    # here rather than hardcoded and forwarded as given.
+    method = payload.get("method", "reinhard")
+    if method not in METHODS:
+        raise StudioError(f"unknown method {method!r}, expected one of "
+                          f"{', '.join(METHODS)}")
+    try:
+        strength = float(payload.get("strength", 1.0))
+    except (TypeError, ValueError):
+        raise StudioError(
+            f"strength must be a number, got {payload.get('strength')!r}")
+    strength = max(0.0, min(1.0, strength))
+    luma_preserve = bool(payload.get("luma_preserve", True))
     try:
         result = match_reference(
             ref=str(ref_path),
@@ -1443,12 +1504,16 @@ def match_reference_job(payload: dict) -> dict:
             time=float(payload.get("time", 0)),
             autorotate=bool(payload.get("autorotate", True)),
             preset=str(tmp),
-            method=payload.get("method", "reinhard"),
-            # Baked at full strength on purpose. strength and look.mix are the
-            # same axis and multiply, so baking at 1.0 leaves mix as a live
-            # control that needs no refit when the user drags it.
-            strength=1.0,
-            luma_preserve=bool(payload.get("luma_preserve", True)),
+            method=method,
+            # Baking anything other than full strength was previously
+            # disallowed on the theory that look.mix (schema.js, the same
+            # axis) makes a strength control redundant. The match panel now
+            # exposes strength directly, so this bakes exactly what the user
+            # asked for, clamped to what the slider offers; look.mix still
+            # gives a zero cost strength change on top of the baked result
+            # afterwards.
+            strength=strength,
+            luma_preserve=luma_preserve,
             crop_frac=crop_frac,
             auto_crop=crop_frac is None,
         )
@@ -1653,6 +1718,14 @@ def _nonfinite_path(o, path: str = "") -> str | None:
 class Handler(BaseHTTPRequestHandler):
     server_version = "FixxrStudio/1.0"
     protocol_version = "HTTP/1.1"
+
+    # Set fresh on every request by _dispatch(). Class level defaults so a
+    # route that reads self.user cannot trip over a missing attribute if it
+    # is ever reached by a path that skipped _dispatch. With logins off
+    # self.user stays None everywhere and every check below is a no-op, which
+    # is what "auth off changes nothing" means in practice.
+    user = None
+    auth_method = ""            # "cookie", "bearer" or ""
 
     def log_message(self, fmt, *args):                        # noqa: A003
         if VERBOSE:
@@ -1872,11 +1945,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str):
         path = urllib.parse.urlparse(self.path).path
+        self.user = None
+        self.auth_method = ""
         try:
+            if AUTH.enabled():
+                self.user, self.auth_method = AUTH.user_from_request(
+                    self.headers.get("Cookie", ""),
+                    self.headers.get("Authorization", ""))
             if path.startswith("/api/"):
                 self._api(method, path)
             else:
                 self._static(path)
+        except AUTH.AuthError as exc:
+            # 401, 403 and 429 mean three different things to a client, so
+            # they cannot all collapse into StudioError's 400 below.
+            self._json({"error": str(exc)}, exc.code)
         except StudioError as exc:
             self._json({"error": str(exc)}, 400)
         except CG.GradeError as exc:
@@ -1891,6 +1974,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _static(self, path: str):
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        # The app shell is the one static file that is gated. With logins on
+        # and no valid session, / and /index.html serve the login page
+        # instead. Every other file under static/ is served unconditionally,
+        # because the login page itself needs style.css, the fonts and
+        # theme.js, and none of them disclose anything.
+        if AUTH.enabled() and rel == "index.html" and self.user is None:
+            rel = "login.html"
         target = (STATIC / rel).resolve()
         if not str(target).startswith(str(STATIC.resolve())) or not target.is_file():
             self._send(404, b"not found", "text/plain")
@@ -1917,11 +2007,146 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), ctype,
                    {"Cache-Control": "no-cache", "Last-Modified": last_modified})
 
+    # --- auth ---------------------------------------------------------------
+
+    def _secure_cookie(self) -> bool:
+        """Whether to mark the session cookie Secure.
+
+        A Secure cookie is not sent over plain HTTP, so setting it while the
+        studio is genuinely being reached over http:// would lock the user
+        out with a login that appears to succeed and then bounces straight
+        back. It is therefore on only when the deployment says it is behind
+        TLS: the --behind-https-proxy flag, or the X-Forwarded-Proto header a
+        terminating proxy adds.
+        """
+        return (AUTH.behind_https_proxy()
+                or self.headers.get("X-Forwarded-Proto", "").strip().lower()
+                == "https")
+
+    def _require_admin(self) -> None:
+        if not AUTH.enabled():
+            return
+        if not self.user or self.user.get("role") != "admin":
+            raise AUTH.AuthError(403, "that action needs an admin account")
+
+    def _auth_api(self, method: str, route: str, q: dict):
+        if route == "auth/me" and method == "GET":
+            if not AUTH.enabled():
+                # The shape is identical to the signed in case on purpose, so
+                # the front end has one code path and no "is auth on" branch
+                # scattered through it.
+                self._json({"user": {"id": 0, "name": "local", "role": "admin"},
+                            "auth_required": False})
+                return
+            if self.user is None:
+                raise AUTH.AuthError(401, "not signed in")
+            self._json({"user": self.user, "auth_required": True})
+            return
+
+        if route == "auth/login" and method == "POST":
+            if not AUTH.enabled():
+                raise StudioError("this studio is running without logins, so "
+                                  "there is nothing to sign in to")
+            body = self._body()
+            name = str(body.get("username", "") or "")
+            password = str(body.get("password", "") or "")
+            addr = self.client_address[0] if self.client_address else "unknown"
+            if AUTH.rate_blocked(name, addr):
+                raise AUTH.AuthError(429, "too many failed sign ins. Wait five "
+                                          "minutes and try again")
+            user = AUTH.check_login(name, password)
+            if user is None:
+                AUTH.rate_record_failure(name, addr)
+                # One message for a wrong name and a wrong password alike:
+                # telling them apart is a free list of valid account names.
+                raise AUTH.AuthError(401, "invalid credentials")
+            AUTH.rate_clear(name)
+            token = AUTH.create_session(user["id"])
+            self._send(200, json.dumps({"user": user}).encode(),
+                       "application/json",
+                       {"Set-Cookie": AUTH.cookie_header(
+                           token, self._secure_cookie())})
+            return
+
+        if route == "auth/logout" and method == "POST":
+            AUTH.delete_session(AUTH.session_token_from_cookie(
+                self.headers.get("Cookie", "")))
+            self._send(204, b"", "application/json",
+                       {"Set-Cookie": AUTH.clear_cookie_header(
+                           self._secure_cookie())})
+            return
+
+        if route == "auth/token" and method == "POST":
+            if not AUTH.enabled():
+                raise StudioError("agent tokens need logins on: start the "
+                                  "server with --auth")
+            if self.user is None:
+                raise AUTH.AuthError(401, "sign in first")
+            made = AUTH.create_token(self.user["id"],
+                                     str(self._body().get("label", "") or ""))
+            # The only time the secret is ever readable. It is stored hashed,
+            # so there is no endpoint that can show it again later.
+            self._json({"token": made["token"], "id": made["id"],
+                        "label": made["label"]})
+            return
+
+        if route == "auth/tokens" and method == "GET":
+            if not AUTH.enabled() or self.user is None:
+                raise AUTH.AuthError(401, "sign in first")
+            self._json({"tokens": AUTH.list_tokens(self.user["id"])})
+            return
+
+        if route == "auth/token" and method == "DELETE":
+            if not AUTH.enabled():
+                raise StudioError("agent tokens need logins on: start the "
+                                  "server with --auth")
+            if self.user is None:
+                raise AUTH.AuthError(401, "sign in first")
+            raw_id = q.get("id", "")
+            bearer = ""
+            hdr = self.headers.get("Authorization", "").strip()
+            if hdr.lower().startswith("bearer "):
+                bearer = hdr[7:].strip()
+            # With no id, an agent deletes the very token it is calling with,
+            # which is how a script retires its own credential without having
+            # been told a row number.
+            gone = AUTH.delete_token(
+                self.user["id"],
+                int(raw_id) if raw_id.isdigit() else None, bearer)
+            self._json({"deleted": gone,
+                        "tokens": AUTH.list_tokens(self.user["id"])})
+            return
+
+        raise StudioError(f"no route for {method} /api/{route}")
+
     # --- api --------------------------------------------------------------
 
     def _api(self, method: str, path: str):
         q = self._query()
         route = path[len("/api/"):]
+
+        # Cross site request check, contract C2. It runs before the auth
+        # routes so that logout and token creation are covered too, and it
+        # only applies to a request authenticated by COOKIE: a cookie is what
+        # a browser attaches automatically to somebody else's form post, and
+        # an Authorization header is not. Sign in itself carries no cookie
+        # yet, so it passes through here untouched.
+        if (AUTH.enabled() and method in ("POST", "DELETE")
+                and self.auth_method == "cookie"
+                and not AUTH.csrf_ok(self.headers.get("Sec-Fetch-Site", ""),
+                                     self.headers.get("Origin", ""),
+                                     self.headers.get("Host", ""))):
+            raise AUTH.AuthError(403, "refused: this write did not come from "
+                                      "the studio page itself. If you are "
+                                      "scripting the studio, use an agent "
+                                      "token instead of the session cookie")
+
+        if route.startswith("auth/"):
+            self._auth_api(method, route, q)
+            return
+
+        if AUTH.enabled() and self.user is None:
+            raise AUTH.AuthError(401, "sign in to use the studio")
 
         if route == "state" and method == "GET":
             self._json({
@@ -1950,11 +2175,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "browse" and method == "GET":
-            self._json(browse_dir(q.get("path")))
+            self._json(browse_dir(q.get("path"), self.user))
             return
 
         if route == "open" and method == "POST":
-            name = register_external_clip(self._body().get("path", ""))
+            raw_open = self._body().get("path", "")
+            if AUTH.enabled():
+                raw_open = str(AUTH.confine(
+                    raw_open, AUTH.allowed_roots(self.user, FOOTAGE)))
+            name = register_external_clip(raw_open)
             self._json({"name": name, "clip": self._clip_entry(clip_path(name), name),
                         "clips": self._clips()})
             return
@@ -2170,6 +2399,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "rebuild" and method == "POST":
+            # Rebuilding the technical LUTs rewrites files every other
+            # session on this server reads, so it is an admin action once
+            # more than one person is connected.
+            self._require_admin()
             job = start_rebuild(self._body().get("which", "all"))
             self._json({"job": job.as_dict()})
             return
@@ -2201,6 +2434,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "reveal" and method == "POST":
+            # Reveal opens a Finder window on the machine running the server.
+            # Over a network that is somebody else's desktop, so it answers
+            # only a browser on this same machine. With logins off the server
+            # is bound to 127.0.0.1 and every caller is loopback, so this
+            # changes nothing for local use.
+            if not AUTH.is_loopback(
+                    self.client_address[0] if self.client_address else ""):
+                raise AUTH.AuthError(403, "Reveal opens a Finder window on the "
+                                          "computer running the studio, so it "
+                                          "only answers a browser on that same "
+                                          "computer")
             target = Path(self._body().get("path", ""))
             allowed = [OUT.resolve(), PRESETS.resolve(), LOOKS.resolve(),
                        REFS.resolve()]
@@ -2211,6 +2455,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "cache/clear" and method == "POST":
+            # Same reasoning as rebuild: the frame cache is shared, so one
+            # user clearing it slows every other session down.
+            self._require_admin()
             self._json({"cleared": clear_frame_cache()})
             return
 
@@ -2296,6 +2543,52 @@ class StudioServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+def _user_cli(args) -> bool:
+    """Handle --list-users / --delete-user / --create-user and stop.
+
+    These run before the ffmpeg check and before anything binds a port, so
+    an account can be created on a machine where the render tools are not
+    installed yet, and creating one never collides with a studio already
+    listening.
+
+    A password is never taken from argv: argv is visible in `ps` to every
+    other process on the box. getpass reads it from the terminal without
+    echoing; --password-stdin reads one line from stdin for scripts and for
+    the tests, which cannot type into a terminal.
+    """
+    if args.list_users:
+        users = AUTH.list_users()
+        if not users:
+            print("no accounts yet. Create one with:\n"
+                  "  studio/server.py --create-user NAME --role admin")
+        for u in users:
+            print("%4d  %-5s  %s" % (u["id"], u["role"], u["name"]))
+        return True
+
+    if args.delete_user:
+        if AUTH.delete_user(args.delete_user):
+            print(f"deleted {args.delete_user}")
+            return True
+        sys.exit(f"no account named {args.delete_user}")
+
+    if args.create_user:
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\n")
+        else:
+            password = getpass.getpass("password: ")
+            if password != getpass.getpass("again: "):
+                sys.exit("the two passwords did not match, so no account was "
+                         "created")
+        try:
+            user = AUTH.create_user(args.create_user, password, args.role)
+        except AUTH.AuthError as exc:
+            sys.exit(str(exc))
+        print(f"created {user['name']} (id {user['id']}, role {user['role']})")
+        return True
+
+    return False
+
+
 def main() -> None:
     global VERBOSE
     ap = argparse.ArgumentParser(description=__doc__,
@@ -2303,8 +2596,54 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=7431)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--auth", action="store_true",
+                    help="require a login. Also turned on by STUDIO_AUTH=1, "
+                         "and forced on by any non loopback --host")
+    ap.add_argument("--behind-https-proxy", action="store_true",
+                    help="a TLS terminating proxy is in front, so mark the "
+                         "session cookie Secure")
+    ap.add_argument("--create-user", metavar="NAME",
+                    help="create an account and exit (password is prompted "
+                         "for, never passed on the command line)")
+    ap.add_argument("--role", choices=AUTH.ROLES, default="user",
+                    help="role for --create-user (default user)")
+    ap.add_argument("--password-stdin", action="store_true",
+                    help="read the password for --create-user from stdin "
+                         "instead of prompting")
+    ap.add_argument("--list-users", action="store_true",
+                    help="list accounts and exit")
+    ap.add_argument("--delete-user", metavar="NAME",
+                    help="delete an account and exit")
     args = ap.parse_args()
     VERBOSE = args.verbose
+
+    if _user_cli(args):
+        return
+
+    # Three ways in, one of which is not a choice: binding anywhere reachable
+    # from another machine turns logins on whether or not they were asked for.
+    loopback = AUTH.is_loopback(args.host)
+    auth_on = (args.auth
+               or os.environ.get("STUDIO_AUTH", "").strip().lower()
+               in ("1", "true", "yes", "on")
+               or not loopback)
+    AUTH.set_enabled(auth_on)
+    AUTH.set_behind_https_proxy(args.behind_https_proxy)
+
+    if not loopback:
+        # The hard rule. This server is a file browser, a Finder opener and a
+        # subprocess launcher; putting it on a LAN with no accounts is handing
+        # all three to every device on that network. Refuse, and say what to
+        # do about it, rather than starting and hoping nobody looks.
+        # auth_on cannot be False here: a non loopback --host is itself one of
+        # the three ways logins get turned on, three lines up. So the only way
+        # a network bind can fail this gate is an empty account table.
+        if AUTH.user_count() == 0:
+            sys.exit(f"refusing to listen on {args.host}: logins are on but no "
+                     "account exists, so the first person to reach this port "
+                     "would meet a login page that nobody can get past. "
+                     "Create one first:\n"
+                     "  studio/server.py --create-user NAME --role admin")
 
     ensure_dirs()
     for tool in ("ffmpeg", "ffprobe"):
@@ -2318,6 +2657,13 @@ def main() -> None:
     # flush explicitly: piped into a log file Python block-buffers stdout, and a
     # launcher that prints the URL only after you kill it is no use to anybody.
     print(f"Fixxr Studio on http://{args.host}:{args.port}", flush=True)
+    if AUTH.enabled():
+        print(f"  logins  on, {AUTH.user_count()} account(s). This server "
+              "speaks plain HTTP: put a TLS reverse proxy in front before "
+              "using it over a network you do not control.", flush=True)
+    else:
+        print("  logins  off (local use). Pass --auth to require one.",
+              flush=True)
     print(f"  footage {FOOTAGE}\n  presets {PRESETS}\n  looks   {LOOKS}\n"
           f"  out     {OUT}", flush=True)
     try:

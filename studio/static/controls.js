@@ -564,9 +564,30 @@
 
   /* ---- curve editor ---------------------------------------------------- */
 
-  // Fritsch and Carlson monotone cubic, which is what ffmpeg's curves filter
-  // calls pchip. Drawing the same spline the render uses means the line on
-  // screen is the transfer function, not an artist's impression of it.
+  function pchipSgn(x) { return x > 0 ? 1 : (x < 0 ? -1 : 0); }
+
+  /* scipy's _edge_case, which is the end slope ffmpeg's curves filter uses
+   * (libavfilter/vf_curves.c). The plain end secant is NOT what it uses. */
+  function pchipEdgeSlope(h0, h1, m0, m1) {
+    var d = ((2 * h0 + h1) * m0 - h0 * m1) / (h0 + h1);
+    if (pchipSgn(d) !== pchipSgn(m0)) return 0;
+    if (pchipSgn(m0) !== pchipSgn(m1) && Math.abs(d) > 3 * Math.abs(m0)) return 3 * m0;
+    return d;
+  }
+
+  /* Fritsch and Carlson monotone cubic, which is what ffmpeg's curves filter
+   * calls pchip. Drawing the same spline the render uses means the line on
+   * screen is the transfer function, not an artist's impression of it.
+   *
+   * This used to take the two end slopes from the plain end secant, so the
+   * drawn line was a different curve from the one that rendered. Measured
+   * against ffmpeg 8.1.1 by pushing a 65536 entry 16 bit ramp through
+   * curves=all='0/0 0.25/0.18 0.75/0.82 1/1':interp=pchip and diffing: the
+   * old end slope drew 454/65535 away from the render at x = 0.0803, which is
+   * 1.77 code values at 8 bit. With the edge case above the drawn line is
+   * within 1/65535 of the render, which is the float versus integer rounding
+   * tie and nothing else. Two points is the other end of the same problem:
+   * ffmpeg extrapolates that line past both ends instead of holding flat. */
   function pchipEval(pts, xs) {
     var n = pts.length;
     if (n < 2) return xs.map(function () { return 0; });
@@ -575,9 +596,12 @@
       h.push(Math.max(1e-9, pts[i + 1][0] - pts[i][0]));
       d.push((pts[i + 1][1] - pts[i][1]) / h[i]);
     }
+    if (n === 2) {
+      return xs.map(function (x) { return pts[0][1] + (x - pts[0][0]) * d[0]; });
+    }
     var m = new Array(n);
-    m[0] = d[0];
-    m[n - 1] = d[n - 2];
+    m[0] = pchipEdgeSlope(h[0], h[1], d[0], d[1]);
+    m[n - 1] = pchipEdgeSlope(h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
     for (var k = 1; k < n - 1; k++) {
       if (d[k - 1] * d[k] <= 0) { m[k] = 0; continue; }
       var w1 = 2 * h[k] + h[k - 1], w2 = h[k] + 2 * h[k - 1];

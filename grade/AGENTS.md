@@ -14,12 +14,27 @@ CST IN     Apple Log / BT.2020 -> DaVinci Intermediate / DaVinci Wide Gamut
 PRIMARIES  lift-gamma-gain, contrast, saturation, vibrance, curves
            (runs inside DWG, where there is headroom)
 CST OUT    DaVinci Wide Gamut -> Rec.709, tone map applied here
+CURVES     the curves node, drawn in Rec.709 display code
+SECONDARY  HSL qualifier baked to a 33-cube, optionally gated by WINDOW
+WINDOW     power window: one ellipse or rectangle, all values fractions of
+           the frame. Gates the SECONDARY only, never the primaries or FX
 LOOK       creative .cube LUT, at a real opacity (look.mix)
 FX         halation -> bloom -> radial blur -> RGB split -> vignette
 DETAIL     soften, then sharpen
 GRAIN      film grain
 OUT        ProRes 422 HQ or H.264, retagged Rec.709
 ```
+
+WINDOW is not a stage of its own in the filter graph, it is a wrapper around
+SECONDARY: with `window.enabled` the tree splits just before the qualifier
+cube, grades one branch, and merges the two back together through an 8-bit
+grey matte (`split [a][b]; [b] lut3d=<cube> [b2]; [a][b2][matte] maskedmerge`).
+The matte is baked once by a `geq` expression into a cached PNG, the same
+technique the radial blur ramp uses, and `cinegrade.window_matte` is the numpy
+reference the expression is checked against pixel for pixel. With the window
+disabled, or with the secondary disabled, the stage drops out completely: no
+filter, no extra ffmpeg input, and the graph text is byte for byte what it was
+before the stage existed.
 
 Set `convert.working_space` to `direct` to collapse the two CSTs into one
 Apple-Log-to-Rec.709 LUT. `dwg` is the default and is what you want: primaries

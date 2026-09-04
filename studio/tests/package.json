@@ -1,0 +1,13 @@
+{
+  "name": "fixxr-studio-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser test harness for the Fixxr Studio front end, driving the installed Chrome with puppeteer-core (no Chromium download).",
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.10.0"
+  }
+}

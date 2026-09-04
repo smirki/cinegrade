@@ -163,6 +163,46 @@
     },
 
     {
+      id: "window", node: "4b", name: "Window (power window)",
+      note: "The shape half of the secondary. The qualifier above picks pixels "
+          + "by colour, this picks them by position, and the two multiply: the "
+          + "correction only lands where both agree. It gates the secondary "
+          + "and nothing else, so primaries, look and FX still cover the whole "
+          + "frame. Every number is a fraction of the frame, never a pixel "
+          + "count, which is why the same window means the same shape in the "
+          + "preview and in the render. One window, no tracking. Turning it on "
+          + "drops the viewer back to the server render until the GPU port "
+          + "lands, because the GPU preview would ignore the shape.",
+      enable: ["window", "enabled"],
+      controls: [
+        CHK(["window", "enabled"], "enabled",
+          { title: "Does nothing unless the secondary above is also on: there "
+                 + "is no other stage for the window to gate." }),
+        SEL(["window", "shape"], "shape", [
+          { value: "ellipse", label: "ellipse" },
+          { value: "rect", label: "rectangle" }
+        ]),
+        S(["window", "cx"], "centre x", 0, 1, 0.002, 0.5),
+        S(["window", "cy"], "centre y", 0, 1, 0.002, 0.5),
+        S(["window", "w"], "width", 0, 2, 0.002, 0.6,
+          { title: "Full extent, not the half axis, as a fraction of the frame "
+                 + "width. Past 1.0 the shape is wider than the frame, which is "
+                 + "how you feather in from one edge only." }),
+        S(["window", "h"], "height", 0, 2, 0.002, 0.6),
+        S(["window", "rotation"], "rotation", -180, 180, 0.5, 0,
+          { bipolar: true, precision: 1, unit: "deg",
+            title: "Degrees clockwise on screen. A rotation does not resize "
+                 + "the shape, so the covered area stays put." }),
+        S(["window", "softness"], "softness", 0, 1, 0.005, 0.15,
+          { title: "Feather width as a fraction of the shape's own radius, so "
+                 + "it scales with the shape. Exactly 0 is a hard edge with no "
+                 + "partial pixels at all." }),
+        CHK(["window", "invert"], "invert window",
+          { title: "Grades everything outside the shape instead of inside." })
+      ]
+    },
+
+    {
       id: "look", node: "5", name: "Look",
       note: "A creative .cube in Rec.709, applied after the conversion and "
           + "never to raw log. Full strength is usually too strong; 0.6 to 0.8 "

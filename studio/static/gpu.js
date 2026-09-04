@@ -174,12 +174,12 @@
 
   /* scipy's _edge_case, which is what ffmpeg's pchip uses at the two ends.
    *
-   * This is the one place Ctl.pchipEval in controls.js does NOT agree with the
-   * filter: the editor uses the plain end slope m0, ffmpeg uses this. On a
-   * four point S curve the gap reaches about 1.3 code values at 8 bit inside
-   * the first and last segments, so the render path has to use this version or
-   * the preview lies about the curve the user just drew. The editor is still
-   * the right thing to draw with; it is just slightly wrong at the ends. */
+   * Ctl.pchipEval in controls.js used to skip this and take the plain end
+   * secant instead, so the curve the editor drew was not the curve that
+   * rendered: on the four point S curve 0/0 0.25/0.18 0.75/0.82 1/1, measured
+   * against ffmpeg 8.1.1 on a 65536 entry ramp, the drawn line was 454/65535
+   * out at x = 0.0803, which is 1.77 code values at 8 bit. The editor now uses
+   * the same edge case, so the drawn line and this table agree. */
   function pchipEdgeCase(h0, h1, m0, m1) {
     var d = ((2 * h0 + h1) * m0 - h0 * m1) / (h0 + h1);
     if (sgn(d) !== sgn(m0)) return 0;
@@ -539,10 +539,9 @@
     add("cst_out", "CST out", true, "exact");
     add("curves", "Curves", curvesActive(cfg), "exact",
         cfg.curves && cfg.curves.enabled
-          ? "Note: controls.js Ctl.pchipEval uses a different end slope from "
-          + "ffmpeg, so the drawn curve and the rendered curve differ by up to "
-          + "about 1.3 code values inside the first and last segment. The GPU "
-          + "path follows ffmpeg, not the editor."
+          ? "The line drawn in the curve editor is the same spline: "
+          + "controls.js Ctl.pchipEval now uses ffmpeg's end slope, measured "
+          + "within 1/65535 of the filter on a 65536 entry ramp."
           : "");
     add("secondary", "Secondary", !!(cfg.secondary && cfg.secondary.enabled), "exact");
     add("look", "Look", !!cfg.look.lut, "exact");
@@ -1863,7 +1862,24 @@
    * _tone_ends_points in cinegrade.py. It is a toe and a shoulder that each
    * reach mid grey with slope 1, written as explicit points, so the mid tones
    * do not move. The 4 decimal rounding is reproduced because the rounded text
-   * is what ffmpeg's parser actually sees, not the full precision float. */
+   * is what ffmpeg's parser actually sees, not the full precision float.
+   *
+   * The untouched half has to be a SPREAD of points on y=x, not one endpoint.
+   * ffmpeg's pchip takes every node's slope from its neighbouring secants and
+   * weights those secants by the neighbouring interval widths, so one lone
+   * endpoint makes this half's interval enormous and lets the graded half
+   * dictate the slope at both of its ends. This port used to emit the lone
+   * endpoint while the engine emitted the spread, which is what made
+   * prim_black_lift and the four presets that inherit it fail parity.
+   *
+   * Measured, not reasoned: a 65536 entry 16 bit ramp pushed through
+   * `ffmpeg -vf curves=all='<engine points>':interp=pchip` (ffmpeg 8.1.1) and
+   * diffed against this file's pchipLut at the same indices, for black_lift
+   * 0.08 / highlight_rolloff 0 / pivot 0.336. With the lone endpoint the port
+   * was 278/65535 away from ffmpeg at index 44430 (x = 0.678, the middle of
+   * the one long segment above the pivot), which is 1.08 code values at 8 bit.
+   * With the spread the largest gap over all 65536 entries is 1/65535, which
+   * is the float versus integer rounding tie and nothing else. */
   function toneEndsPoints(bl, hr, pivot, n) {
     n = n || 6;
     // Past these the segment has no room to land on and the exponent blows up.
@@ -1877,7 +1893,11 @@
         pts.push([v * pivot, bl + (pivot - bl) * Math.pow(v, k)]);
       }
     } else {
-      pts.push([0, 0]);
+      // Untouched toe: n points on y=x, every local secant exactly 1.
+      for (i = 0; i < n; i++) {
+        v = i / (n - 1);
+        pts.push([v * pivot, v * pivot]);
+      }
     }
     pts.push([pivot, pivot]);
     if (Math.abs(hr) > 1e-6) {
@@ -1888,7 +1908,11 @@
                   pivot + (1.0 - hr - pivot) * (1.0 - Math.pow(1.0 - u, k))]);
       }
     } else {
-      pts.push([1, 1]);
+      // Untouched shoulder: the same spread, running up from the pivot.
+      for (i = 1; i < n; i++) {
+        u = i / (n - 1);
+        pts.push([pivot + u * (1.0 - pivot), pivot + u * (1.0 - pivot)]);
+      }
     }
     pts.sort(function (a, b) { return (a[0] - b[0]) || (a[1] - b[1]); });
     var seen = {}, out = [];

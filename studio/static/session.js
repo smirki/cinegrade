@@ -55,8 +55,17 @@
   function poll() {
     if (stopped) { return; }
     fetch("/api/session/wait?since=" + lastRev)
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        // 401 means the session is gone: signed out in another tab, expired, or
+        // the server came back with logins on. auth.js sees the same 401 and
+        // navigates to the login page; retrying here on the 2 second timer below
+        // would hammer a server that has already said no, for as long as the tab
+        // stays open. Stop instead and let the navigation happen.
+        if (r.status === 401) { stopped = true; return null; }
+        return r.json();
+      })
       .then(function (state) {
+        if (stopped) { return; }
         if (state && state.rev > lastRev) {
           lastRev = state.rev;
           // Only an edit from somewhere else should be pushed back into the

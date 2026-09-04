@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import subprocess
 import sys
@@ -109,6 +110,21 @@ DEFAULTS = {
         "lum_low": 0.0, "lum_high": 1.0, "lum_soft": 0.10,
         "hue_shift": 0.0, "sat_gain": 1.0, "lum_gain": 1.0,
         "tint": [0.0, 0.0, 0.0], "strength": 1.0,
+    },
+    # Power window: the shape half of a secondary. The qualifier above picks
+    # pixels by colour; this picks them by position, and the two multiply, so
+    # "the orange only inside this oval" is one grade rather than two.
+    #
+    # Every geometric value is a FRACTION of the frame, never a pixel count.
+    # That is what lets a 960 wide preview and a 3840 wide render agree without
+    # scale_for_preview needing a case for any of it: the same numbers describe
+    # the same shape at any size. cx/cy are the centre, w/h the FULL extent
+    # (not the half axis), rotation is degrees clockwise on screen, softness is
+    # the feather width as a fraction of the shape's own radius.
+    "window": {
+        "enabled": False, "shape": "ellipse",
+        "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
+        "rotation": 0.0, "softness": 0.15, "invert": False,
     },
     "output": {"codec": "prores_ks", "profile": 3, "crf": 16, "preset": "slow"},
 }
@@ -718,6 +734,193 @@ def f_secondary(cfg) -> list[str]:
     return [f"lut3d=file={esc(secondary_lut(s))}:interp=tetrahedral"]
 
 
+# --- power window (the shape half of a secondary) --------------------------
+#
+# One matte formula, written once here, evaluated three ways: in numpy
+# (window_matte, the reference), in an ffmpeg geq expression (window_geq, which
+# bakes the cached PNG the render actually uses) and later in a GPU shader.
+# The three must agree, so the formula is spelled out in full in
+# _window_geometry and both evaluators read the SAME already-rounded constants
+# from it. Rounding the constants once rather than at each print is the whole
+# trick: geq only ever sees a decimal string, so if numpy kept full precision
+# and geq got 12 places, a pixel sitting exactly on a matte step could round
+# the other way and the two references would disagree by a code value for no
+# reason a reader could ever find.
+#
+# Coordinates are integer pixel indices with no half-pixel offset, matching
+# what geq's X and Y actually are. A shader sampling at pixel centres has to
+# subtract the half itself.
+
+LUT_MASKS = ROOT / "luts" / "masks"
+
+# How the 8-bit matte gets into the 16-bit merge. See graph_with_mask.
+WINDOW_MASK_FORMAT = "format=gray16le,format=gbrp16le"
+
+
+def _window_block(cfg) -> dict:
+    """Accept either a whole config or the window block on its own."""
+    if not isinstance(cfg, dict):
+        return deepcopy(DEFAULTS["window"])
+    if "window" in cfg:
+        return deep_merge(DEFAULTS["window"], cfg["window"] or {})
+    if "shape" in cfg or "softness" in cfg:
+        return deep_merge(DEFAULTS["window"], cfg)
+    return deepcopy(DEFAULTS["window"])
+
+
+def _window_geometry(win: dict, width: int, height: int) -> dict:
+    """The window's parameters resolved to pixels, rounded once.
+
+    Fractions in, pixels out. Every consumer of the formula reads these
+    numbers, and they are passed through a decimal round trip so the float a
+    numpy expression sees is bit for bit the float ffmpeg parses out of the
+    geq string.
+    """
+    def q(x, places):
+        return float(f"{float(x):.{places}f}")
+
+    r = math.radians(float(win.get("rotation", 0.0)))
+    soft = max(0.0, float(win.get("softness", 0.0)))
+    g = {
+        "shape": "rect" if str(win.get("shape", "ellipse")) == "rect" else "ellipse",
+        "invert": bool(win.get("invert")),
+        "soft": soft,
+        "cr": q(math.cos(r), 12),
+        "sr": q(math.sin(r), 12),
+        "cxp": q(float(win.get("cx", 0.5)) * width, 10),
+        "cyp": q(float(win.get("cy", 0.5)) * height, 10),
+        # A half axis is clamped to one pixel so a zero width window is a
+        # one pixel line rather than a divide by zero.
+        "ax": q(max(float(win.get("w", 0.6)) * width / 2.0, 1.0), 10),
+        "ay": q(max(float(win.get("h", 0.6)) * height / 2.0, 1.0), 10),
+    }
+    # The feather edges, precomputed for the same reason: one rounding, shared.
+    g["hi"] = q(1.0 + soft, 10)
+    g["den"] = q(2.0 * soft, 10) if soft > 0 else 0.0
+    return g
+
+
+def window_matte(cfg, width: int, height: int):
+    """The reference implementation of the window matte, as 8-bit gray.
+
+    This is the definition. The geq expression below and any later GPU port
+    are ports of it, and the suite asserts they land on the same bytes.
+    """
+    import numpy as np
+
+    g = _window_geometry(_window_block(cfg), width, height)
+    X = np.arange(width, dtype=np.float64)[None, :]
+    Y = np.arange(height, dtype=np.float64)[:, None]
+    dx = X - g["cxp"]
+    dy = Y - g["cyp"]
+    ux = dx * g["cr"] + dy * g["sr"]
+    uy = dy * g["cr"] - dx * g["sr"]
+    if g["shape"] == "rect":
+        d = np.maximum(np.abs(ux) / g["ax"], np.abs(uy) / g["ay"])
+    else:
+        # np.hypot and C's hypot() are the same libm call, which is why the
+        # geq side can use hypot() and still match to the last bit.
+        d = np.hypot(ux / g["ax"], uy / g["ay"])
+    if g["soft"] <= 0:
+        m = (d <= 1.0).astype(np.float64)
+    else:
+        m = np.clip((g["hi"] - d) / g["den"], 0.0, 1.0)
+    if g["invert"]:
+        m = 1.0 - m
+    # floor(x + 0.5), not numpy's rint: rint rounds halves to even, ffmpeg's
+    # expression language has no such function, and "round" in the contract has
+    # to mean one thing in both places or the two references disagree on every
+    # pixel that lands exactly on a half.
+    return np.floor(m * 255.0 + 0.5).astype(np.uint8)
+
+
+def window_geq(cfg, width: int, height: int) -> str:
+    """The same matte as an ffmpeg geq expression, on a gray frame.
+
+    Written against the gray plane directly (see window_mask) rather than a
+    yuv one: geq writing 0-255 into a limited-range luma plane and then
+    converting to gray costs a tv-to-full expansion, which was measured at up
+    to 20 code values of error against the reference before the format=gray
+    was moved in front of the geq.
+    """
+    g = _window_geometry(_window_block(cfg), width, height)
+    ux = (f"((X-{g['cxp']:.10f})*{g['cr']:.12f}"
+          f"+(Y-{g['cyp']:.10f})*{g['sr']:.12f})")
+    uy = (f"((Y-{g['cyp']:.10f})*{g['cr']:.12f}"
+          f"-(X-{g['cxp']:.10f})*{g['sr']:.12f})")
+    if g["shape"] == "rect":
+        d = f"max(abs({ux})/{g['ax']:.10f},abs({uy})/{g['ay']:.10f})"
+    else:
+        d = f"hypot({ux}/{g['ax']:.10f},{uy}/{g['ay']:.10f})"
+    if g["soft"] <= 0:
+        m = f"lte({d},1)"
+    else:
+        m = f"clip(({g['hi']:.10f}-({d}))/{g['den']:.10f},0,1)"
+    if g["invert"]:
+        m = f"(1-({m}))"
+    return f"floor(255*({m})+0.5)"
+
+
+def window_mask(cfg, w: int, h: int):
+    """A cached greyscale window matte, generated the way radial_mask is.
+
+    Same technique as the radial-blur ramp: geq bakes a still once, ffmpeg
+    reads it back as an ordinary input, and the per-frame cost is a decode of a
+    small PNG instead of an expression evaluated per pixel per frame. The cache
+    key carries the size because the matte is a picture, even though the
+    parameters that made it are all fractions.
+    """
+    import hashlib
+
+    win = _window_block(cfg)
+    key = json.dumps(win, sort_keys=True)
+    tag = hashlib.sha1(key.encode()).hexdigest()[:16]
+    LUT_MASKS.mkdir(parents=True, exist_ok=True)
+    p = LUT_MASKS / f"window_{w}x{h}_{tag}.png"
+    if not p.exists():
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", f"color=c=black:s={w}x{h}:d=1",
+             "-vf", f"format=gray,geq=lum='{window_geq(win, w, h)}'",
+             "-frames:v", "1", str(p)], check=True)
+    return p
+
+
+def window_active(cfg) -> bool:
+    """True when the window stage has something to do.
+
+    The window gates the SECONDARY and only the secondary, so with the
+    qualifier off there is nothing for a shape to gate and the stage drops out
+    entirely: no extra ffmpeg input, no extra filter, no change to the graph
+    text. Three separate places have to agree on that answer (the input list,
+    the graph builder, and the studio server's own input list), and they
+    disagreeing would not raise: ffmpeg would just read the wrong input index
+    and render a wrong picture silently. Hence one function.
+    """
+    win = (cfg or {}).get("window") or {}
+    sec = (cfg or {}).get("secondary") or {}
+    return bool(win.get("enabled")) and bool(sec.get("enabled"))
+
+
+def mask_input_indices(cfg) -> dict:
+    """Which ffmpeg input index each generated still lands on.
+
+    Input 0 is the picture. Everything after it is appended in this order by
+    ffmpeg_inputs, and build_graph and graph_with_mask read the indices back
+    from here rather than counting again by hand.
+    """
+    idx = 1
+    out = {}
+    if cfg["fx"]["radial_blur"]["enabled"]:
+        out["radial"] = idx
+        idx += 1
+    if window_active(cfg):
+        out["window"] = idx
+        idx += 1
+    out["grain"] = idx
+    return out
+
+
 def esc(path) -> str:
     """ffmpeg filter args need : and \\ escaped inside the graph."""
     return str(path).replace("\\", "\\\\").replace(":", "\\:").replace(",", "\\,")
@@ -933,6 +1136,10 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
         LOG -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> SECONDARY
              -> LOOK -> FX -> GRAIN -> DETAIL -> LETTERBOX -> OUT
 
+    The power window, when it is on, wraps the SECONDARY only: the tree splits
+    just before it, runs the qualifier cube on one branch, and maskedmerges the
+    two back together through the window matte.
+
     src_label exists so a caller can feed the tree something other than the
     raw first input. The studio server prepends its own downscale and points
     the tree at that, which is the difference between a two second preview and
@@ -948,8 +1155,27 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     check_source_space(cfg, info)
     head = (f_log_stage(cfg, info, normalised=src_normalised) + f_convert_in(cfg)
             + f_primaries(cfg) + f_convert_out(cfg)
-            + f_curves(cfg) + f_secondary(cfg))
-    segs = [f"[{src_label}]{','.join(head)}[cst]"]
+            + f_curves(cfg))
+    sec = f_secondary(cfg)
+    if window_active(cfg):
+        # The window stage. Split before the qualifier cube, grade one branch,
+        # and let the matte decide per pixel which branch survives. maskedmerge
+        # returns the FIRST input where the mask is 0 and the second where it
+        # is maxval, so the ungraded branch has to be first.
+        segs = [f"[{src_label}]{','.join(head) if head else 'null'}[secin]"]
+        segs.append("[secin]split=2[wina][winb]")
+        segs.append(f"[winb]{','.join(sec)}[winb2]")
+        base = "wina"
+        if (cfg.get("secondary") or {}).get("show_mask"):
+            # In matte view the graded branch IS the qualifier matte, so
+            # compositing it over the picture would show the picture wherever
+            # the window is closed. Against black the same merge reads as
+            # qualifier times window, which is what the matte view promises.
+            segs.append("[wina]colorchannelmixer=rr=0:gg=0:bb=0[winbg]")
+            base = "winbg"
+        segs.append(f"[{base}][winb2][wmask]maskedmerge[cst]")
+    else:
+        segs = [f"[{src_label}]{','.join(head + sec)}[cst]"]
     cur = "cst"
 
     # LOOK, with a real opacity. A creative LUT at full strength is almost
@@ -979,7 +1205,7 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     # the source, and the file ends up claiming a gamut it is not in, which
     # every color-managed player then over-saturates.
     if cfg["grain"]["enabled"]:
-        idx_g = 2 if cfg["fx"]["radial_blur"]["enabled"] else 1
+        idx_g = mask_input_indices(cfg)["grain"]
         segs.append(f"[{idx_g}:v]scale={info['width']}:{info['height']}"
                     f":flags=bilinear,format=gbrp16le,setsar=1[grainplate]")
         # shortest=1 is what actually guarantees the render terminates: it ends
@@ -1016,6 +1242,8 @@ def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
         rb = cfg["fx"]["radial_blur"]
         m = radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
+    if window_active(cfg):
+        args += ["-i", str(window_mask(cfg, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += grain_input(cfg, info)
     return args
@@ -1025,8 +1253,23 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
                     src_label="0:v", head_extra=None, src_normalised=False):
     graph, needs_mask = build_graph(cfg, info, out_label, tail_extra, encode_out,
                                     src_label, src_normalised)
+    idxs = mask_input_indices(cfg)
+    if window_active(cfg):
+        # The gray16le hop is not decoration. Going straight from the 8-bit
+        # matte to gbrp16le, which is what the radial ramp does, expands by a
+        # left shift of 8, so a matte code of 255 arrives at maskedmerge as
+        # 65280 of 65535 and a fully open window applies only 99.61% of the
+        # correction. Measured: a mean residual of 0.186 of 255 on 18.6% of
+        # pixels against the un-windowed render, where it should be exactly
+        # zero. Through gray16le the expansion is a multiply by 257 instead,
+        # verified exact across all 256 codes, so 255 is the whole correction
+        # and 0 is none of it. The matte still carries 256 levels: this is the
+        # scaling, not the depth. ffmpeg's lut filter cannot do the same job
+        # here, it clips its own output at 65280 on this build.
+        graph = (f"[{idxs['window']}:v]{WINDOW_MASK_FORMAT},setsar=1[wmask];"
+                 + graph)
     if needs_mask:
-        graph = f"[1:v]format=gbrp16le,setsar=1[mask];" + graph
+        graph = f"[{idxs['radial']}:v]format=gbrp16le,setsar=1[mask];" + graph
     if head_extra:
         graph = head_extra + ";" + graph
     return graph

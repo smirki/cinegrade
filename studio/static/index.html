@@ -3,6 +3,11 @@
 <head>
 <meta charset="utf-8">
 <title>Fixxr Studio</title>
+<!-- Empty data-URI favicon: Chrome requests /favicon.ico on every load regardless of
+     whether the page links one, and the server 404ing that shows up as a console.error
+     (found by the UI harness lane, which fails its boot spec on any console.error). This
+     satisfies that request with zero bytes and no actual file, so nothing else changes. -->
+<link rel="icon" href="data:,">
 <!-- Blocking classic script, before the stylesheets: it sets data-theme on <html>
      synchronously so the very first paint (including of style.css's own rules) already
      has the right theme. Deferring this to DOMContentLoaded or app.js would show a
@@ -12,6 +17,11 @@
      so the collapsed/expanded state each sidebar was left in survives a reload
      without a flash of open-then-closed. See static/sidebars.js. -->
 <script src="/sidebars.js"></script>
+<!-- Blocking and before every script that talks to the API, because auth.js replaces
+     window.fetch: a wrapper installed after the first request has already gone out is
+     a wrapper with a hole in it. With logins off this file mounts nothing and changes
+     nothing. See static/auth.js. -->
+<script src="/auth.js"></script>
 <link rel="stylesheet" href="/vendor/gridstack.min.css">
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -23,81 +33,118 @@
      has to run fully offline with no build step (see UNSLOTH-TOKENS.md
      section 8.4's own recommended pattern for exactly this constraint), so
      an icon-font CDN or an npm icon package are both off the table.
-     Hand-drawn 24x24 outline glyphs, stroke 1.75, round caps/joins -- loosely
-     modelled on Unsloth's HugeIcons "Stroke Rounded" set (8.2) for the
-     weight and proportions, not copied path data: their MIT-licensed free
-     set ships as 10,000+ individual per-icon files, which is not worth
-     vendoring for the dozen glyphs this panel actually needs. `currentColor`
-     is what lets style.css recolour these per theme/state (.stagehead-icon,
-     .stagehead-chevron) the same way it already does for the sun/moon icons
-     in the header below. -->
+     Path data below is copied by hand from Hugeicons "core-free-icons"
+     (@hugeicons/core-free-icons, MIT licensed, Copyright 2025 Hugeicons),
+     same technique as #themeToggle's sun/moon and #icon-panel-left/right
+     above and below: the published npm package's per-icon path data pasted
+     into this file, not the package itself, so nothing here needs a build
+     step or a CDN to render. Icons used, one per symbol: icon-chevron
+     ChevronDownIcon, icon-convert RefreshCwIcon, icon-primaries
+     FilterHorizontalIcon, icon-curves EaseCurveControlPointsIcon,
+     icon-secondary ColorPickerIcon, icon-look Film01Icon, icon-fx
+     SparklesIcon, icon-grain a five-dot subset of ChartScatterIcon (its
+     sixth path, a chart axis frame, is dropped: kept only the scattered
+     dots, since Hugeicons' free set has no dedicated film-grain/noise
+     glyph and the axis frame would read as "chart" rather than "grain"),
+     icon-detail FocusIcon, icon-letterbox AspectRatioIcon, icon-output
+     Download01Icon, icon-window EllipseSelectionIcon. Each <path> below
+     keeps only its "d"; stroke, stroke-width, stroke-linecap and
+     stroke-linejoin are declared once on the <symbol> (round caps/joins,
+     1.75 weight, `currentColor`) and inherit down, the same pattern
+     icon-panel-left/right already use, so style.css keeps recolouring
+     these per theme/state (.stagehead-icon, .stagehead-chevron) from one
+     place. -->
 <svg aria-hidden="true" style="position:absolute; width:0; height:0; overflow:hidden">
   <symbol id="icon-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M6 9l6 6 6-6"/>
+    <path d="M18 9.00005C18 9.00005 13.5811 15 12 15C10.4188 15 6 9 6 9"/>
   </symbol>
-  <!-- Convert: the classic two-arc "refresh/transform" glyph -- a source
+  <!-- Convert: Hugeicons RefreshCwIcon -- two round-trip arrows, a source
        space being converted into another, not literally cinegrade's node. -->
   <symbol id="icon-convert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
-    <path d="M21 3v5h-5"/>
-    <path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
-    <path d="M3 21v-5h5"/>
+    <path d="M3.04712 13C3.01082 12.6717 2.99219 12.338 2.99219 12C2.99219 7.02944 7.02162 3 11.9922 3C14.8195 3 17.3422 4.30367 18.9922 6.34267M20.9373 11C20.9736 11.3283 20.9922 11.662 20.9922 12C20.9922 16.9706 16.9628 21 11.9922 21C9.16492 21 6.64214 19.6963 4.99219 17.6573"/>
+    <path d="M15.9922 7H16.9922C18.4064 7 19.1135 7 19.5528 6.56066C19.9922 6.12132 19.9922 5.41421 19.9922 4V3"/>
+    <path d="M7.99219 17H6.99219C5.57797 17 4.87087 17 4.43153 17.4393C3.99219 17.8787 3.99219 18.5858 3.99219 20V21"/>
   </symbol>
-  <!-- Primaries: three fader-style verticals, one per lift/gamma/gain/offset wheel. -->
+  <!-- Primaries: Hugeicons FilterHorizontalIcon -- three lift/gamma/gain
+       style sliders on their tracks. -->
   <symbol id="icon-primaries" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M4 21v-7M4 10V3"/>
-    <circle cx="4" cy="13" r="2"/>
-    <path d="M12 21v-9M12 8V3"/>
-    <circle cx="12" cy="10" r="2"/>
-    <path d="M20 21v-5M20 12V3"/>
-    <circle cx="20" cy="14" r="2"/>
+    <path d="M3 7H6"/>
+    <path d="M3 17H9"/>
+    <path d="M18 17L21 17"/>
+    <path d="M15 7L21 7"/>
+    <path d="M6 7C6 6.06812 6 5.60218 6.15224 5.23463C6.35523 4.74458 6.74458 4.35523 7.23463 4.15224C7.60218 4 8.06812 4 9 4C9.93188 4 10.3978 4 10.7654 4.15224C11.2554 4.35523 11.6448 4.74458 11.8478 5.23463C12 5.60218 12 6.06812 12 7C12 7.93188 12 8.39782 11.8478 8.76537C11.6448 9.25542 11.2554 9.64477 10.7654 9.84776C10.3978 10 9.93188 10 9 10C8.06812 10 7.60218 10 7.23463 9.84776C6.74458 9.64477 6.35523 9.25542 6.15224 8.76537C6 8.39782 6 7.93188 6 7Z"/>
+    <path d="M12 17C12 16.0681 12 15.6022 12.1522 15.2346C12.3552 14.7446 12.7446 14.3552 13.2346 14.1522C13.6022 14 14.0681 14 15 14C15.9319 14 16.3978 14 16.7654 14.1522C17.2554 14.3552 17.6448 14.7446 17.8478 15.2346C18 15.6022 18 16.0681 18 17C18 17.9319 18 18.3978 17.8478 18.7654C17.6448 19.2554 17.2554 19.6448 16.7654 19.8478C16.3978 20 15.9319 20 15 20C14.0681 20 13.6022 20 13.2346 19.8478C12.7446 19.6448 12.3552 19.2554 12.1522 18.7654C12 18.3978 12 17.9319 12 17Z"/>
   </symbol>
-  <!-- Curves: axes plus a spline, the curve editor's own shape. -->
+  <!-- Curves: Hugeicons EaseCurveControlPointsIcon -- an ease spline with
+       its two control-point handles, the curve editor's own shape. -->
   <symbol id="icon-curves" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M4 4v16h16"/>
-    <path d="M6 17c2.5-1 3.5-9 6-11s5 1 7 2.5"/>
+    <path d="M21 4C16 4 13.9792 8.0416 12 12C10.0208 15.9584 8 20 3 20"/>
+    <path d="M10 20H12M15 20L17 20M17 20C17 21.1046 17.8954 22 19 22C20.1046 22 21 21.1046 21 20C21 18.8954 20.1046 18 19 18C17.8954 18 17 18.8954 17 20Z"/>
+    <path d="M12 4H14M7 4L9 4M7 4C7 5.10457 6.10457 6 5 6C3.89543 6 3 5.10457 3 4C3 2.89543 3.89543 2 5 2C6.10457 2 7 2.89543 7 4Z"/>
   </symbol>
-  <!-- Secondary: a target, for the HSL qualifier's "a colour key, not a shape". -->
+  <!-- Secondary: Hugeicons ColorPickerIcon -- an eyedropper, for the HSL
+       qualifier's "a colour key, not a shape". -->
   <symbol id="icon-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="8.5"/>
-    <circle cx="12" cy="12" r="4.5"/>
-    <circle cx="12" cy="12" r="0.75" fill="currentColor" stroke="none"/>
+    <path d="M13.435 7L7.15915 13.2759M7.15915 13.2759L4.82728 15.6077C3.92569 16.5093 3.47489 16.9601 3.23745 17.5334C3 18.1066 3 18.7441 3 20.0192V21H3.98082C5.25586 21 5.89338 21 6.46663 20.7626C7.03988 20.5251 7.49068 20.0743 8.39227 19.1727L14.2891 13.2759M7.15915 13.2759H14.2891M14.2891 13.2759L17 10.565"/>
+    <path d="M19.2087 8.38869L20.82 10M19.2087 8.38869L20.0705 7.52682C20.363 7.23431 20.5093 7.08805 20.611 6.94529C21.1297 6.21676 21.1297 5.23953 20.611 4.511C20.5093 4.36824 20.363 4.22198 20.0705 3.92947C19.778 3.63697 19.6318 3.4907 19.489 3.38905C18.7605 2.87032 17.7832 2.87032 17.0547 3.38905C16.912 3.4907 16.7657 3.63695 16.4732 3.92947L15.6113 4.79133M19.2087 8.38869L15.6113 4.79133M14 3.18002L15.6113 4.79133"/>
   </symbol>
-  <!-- Look: a picture frame, for the creative LUT. -->
+  <!-- Look: Hugeicons Film01Icon -- a film strip with its sprocket frames,
+       for the creative LUT. -->
   <symbol id="icon-look" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="3" y="4.5" width="18" height="15" rx="2.5"/>
-    <circle cx="9" cy="10" r="1.5"/>
-    <path d="M4.5 17.5l5-5 3.5 3.5 2.5-2.5 4.5 4"/>
+    <path d="M2.5 12C2.5 7.52166 2.5 5.28249 3.89124 3.89124C5.28249 2.5 7.52166 2.5 12 2.5C16.4783 2.5 18.7175 2.5 20.1088 3.89124C21.5 5.28249 21.5 7.52166 21.5 12C21.5 16.4783 21.5 18.7175 20.1088 20.1088C18.7175 21.5 16.4783 21.5 12 21.5C7.52166 21.5 5.28249 21.5 3.89124 20.1088C2.5 18.7175 2.5 16.4783 2.5 12Z"/>
+    <path d="M2.5 7H21.5"/>
+    <path d="M2.5 17H21.5"/>
+    <path d="M12 17L12 7"/>
+    <path d="M8 7L8 3M16 7L16 3"/>
+    <path d="M8 21L8 17M16 21L16 17"/>
   </symbol>
-  <!-- FX: a four-point sparkle, for the optical effects stack. -->
+  <!-- FX: Hugeicons SparklesIcon -- two sparkles, for the optical effects
+       stack's glow. -->
   <symbol id="icon-fx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 3l1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
-    <path d="M19 15v3.5M17.25 16.75h3.5"/>
+    <path d="M15 2L15.5387 4.39157C15.9957 6.42015 17.5798 8.00431 19.6084 8.46127L22 9L19.6084 9.53873C17.5798 9.99569 15.9957 11.5798 15.5387 13.6084L15 16L14.4613 13.6084C14.0043 11.5798 12.4202 9.99569 10.3916 9.53873L8 9L10.3916 8.46127C12.4201 8.00431 14.0043 6.42015 14.4613 4.39158L15 2Z"/>
+    <path d="M7 12L7.38481 13.7083C7.71121 15.1572 8.84275 16.2888 10.2917 16.6152L12 17L10.2917 17.3848C8.84275 17.7112 7.71121 18.8427 7.38481 20.2917L7 22L6.61519 20.2917C6.28879 18.8427 5.15725 17.7112 3.70827 17.3848L2 17L3.70827 16.6152C5.15725 16.2888 6.28879 15.1573 6.61519 13.7083L7 12Z"/>
   </symbol>
-  <!-- Grain: a dot field, the plainest stand-in for photographic noise. -->
-  <symbol id="icon-grain" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-    <circle cx="7" cy="7" r="1.15"/><circle cx="12" cy="7" r="1.15"/><circle cx="17" cy="7" r="1.15"/>
-    <circle cx="7" cy="12" r="1.15"/><circle cx="12" cy="12" r="1.15"/><circle cx="17" cy="12" r="1.15"/>
-    <circle cx="7" cy="17" r="1.15"/><circle cx="12" cy="17" r="1.15"/><circle cx="17" cy="17" r="1.15"/>
+  <!-- Grain: five of Hugeicons ChartScatterIcon's six paths (see the sprite
+       comment above for why the sixth, a chart axis frame, is dropped) --
+       a scattered dot field, the plainest stand-in for photographic noise. -->
+  <symbol id="icon-grain" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12.75 10.5H12.5M13 10.5C13 10.7761 12.7761 11 12.5 11C12.2239 11 12 10.7761 12 10.5C12 10.2239 12.2239 10 12.5 10C12.7761 10 13 10.2239 13 10.5Z"/>
+    <path d="M14.75 4.5H14.5M15 4.5C15 4.77614 14.7761 5 14.5 5C14.2239 5 14 4.77614 14 4.5C14 4.22386 14.2239 4 14.5 4C14.7761 4 15 4.22386 15 4.5Z"/>
+    <path d="M18.75 11.5H18.5M19 11.5C19 11.7761 18.7761 12 18.5 12C18.2239 12 18 11.7761 18 11.5C18 11.2239 18.2239 11 18.5 11C18.7761 11 19 11.2239 19 11.5Z"/>
+    <path d="M9.75 16.5H9.5M10 16.5C10 16.7761 9.77614 17 9.5 17C9.22386 17 9 16.7761 9 16.5C9 16.2239 9.22386 16 9.5 16C9.77614 16 10 16.2239 10 16.5Z"/>
+    <path d="M7.75 8.5H7.5M8 8.5C8 8.77614 7.77614 9 7.5 9C7.22386 9 7 8.77614 7 8.5C7 8.22386 7.22386 8 7.5 8C7.77614 8 8 8.22386 8 8.5Z"/>
   </symbol>
-  <!-- Detail: camera-focus corner brackets, for soften/sharpen. -->
+  <!-- Detail: Hugeicons FocusIcon -- camera-focus corner brackets around a
+       crosshair, for soften/sharpen. -->
   <symbol id="icon-detail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
-    <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
-    <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
-    <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
-    <circle cx="12" cy="12" r="3"/>
+    <path d="M21 7.73735C20.9133 5.98847 20.654 4.89808 19.8783 4.12242C19.1026 3.34675 18.0121 3.08746 16.2632 3.00079M3 7.73656C3.08668 5.98769 3.34598 4.8973 4.1217 4.12163C4.89741 3.34596 5.98786 3.08667 7.73684 3M21 16.2627C20.9133 18.0115 20.654 19.1019 19.8783 19.8776C19.1026 20.6533 18.0121 20.9125 16.2632 20.9992M3 16.2634C3.08668 18.0123 3.34598 19.1027 4.1217 19.8784C4.89741 20.654 5.98786 20.9133 7.73684 21"/>
+    <path d="M11.9922 9V15M15 11.9941L9 11.9941"/>
   </symbol>
-  <!-- Letterbox: a frame with the top/bottom bars it adds. -->
+  <!-- Letterbox: Hugeicons AspectRatioIcon -- an outer frame with an inner
+       crop rectangle, for the top/bottom bars it adds. -->
   <symbol id="icon-letterbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="2.5" y="4.5" width="19" height="15" rx="2"/>
-    <path d="M2.5 8.5h19M2.5 15.5h19" stroke-opacity="0.55"/>
+    <path d="M2 12C2 7.75736 2 5.63604 3.17157 4.31802C4.34315 3 6.22876 3 10 3H14C17.7712 3 19.6569 3 20.8284 4.31802C22 5.63604 22 7.75736 22 12C22 16.2426 22 18.364 20.8284 19.682C19.6569 21 17.7712 21 14 21H10C6.22876 21 4.34315 21 3.17157 19.682C2 18.364 2 16.2426 2 12Z"/>
+    <path d="M2 9H10C12.8284 9 14.2426 9 15.1213 9.87868C16 10.7574 16 12.1716 16 15V21"/>
+    <path d="M10 21L10 9"/>
   </symbol>
-  <!-- Output: an arrow into a tray, the last, delivery-facing stage. -->
+  <!-- Output: Hugeicons Download01Icon -- an arrow into a tray, the last,
+       delivery-facing stage. -->
   <symbol id="icon-output" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 3v11.5"/>
-    <path d="M7.5 10l4.5 4.5 4.5-4.5"/>
-    <path d="M4 18.5h16"/>
+    <path d="M2.99969 17.0002C2.99969 17.9302 2.99969 18.3952 3.10192 18.7767C3.37932 19.8119 4.18796 20.6206 5.22324 20.898C5.60474 21.0002 6.06972 21.0002 6.99969 21.0002L16.9997 21.0002C17.9297 21.0002 18.3947 21.0002 18.7762 20.898C19.8114 20.6206 20.6201 19.8119 20.8975 18.7767C20.9997 18.3952 20.9997 17.9302 20.9997 17.0002"/>
+    <path d="M16.4998 11.5002C16.4998 11.5002 13.1856 16.0002 11.9997 16.0002C10.8139 16.0002 7.49976 11.5002 7.49976 11.5002M11.9997 15.0002V3.00016"/>
+  </symbol>
+  <!-- Window: Hugeicons EllipseSelectionIcon -- an ellipse with four
+       marching-ants corner handles, for a later wave's power-window /
+       mask stage (plan/2026-09-04-studio-next-level, contract C4: shape
+       ellipse|rect, position, rotation, softness, invert). Not referenced
+       by any panel yet; added now so that wave doesn't also need an
+       icon-sprite edit to this shared file. -->
+  <symbol id="icon-window" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13.9999 4.25195C16.8111 4.97551 19.0243 7.1887 19.7479 9.99992M9.99992 4.25195C7.1887 4.97551 4.97551 7.1887 4.25195 9.99992M4.25195 13.9999C4.97551 16.8111 7.1887 19.0243 9.99992 19.7479M13.9999 19.7479C16.8111 19.0243 19.0243 16.8111 19.7479 13.9999"/>
+    <path d="M10.2929 5.70711C10.5858 6 11.0572 6 12 6C12.9428 6 13.4142 6 13.7071 5.70711M10.2929 5.70711C10 5.41421 10 4.94281 10 4C10 3.05719 10 2.58579 10.2929 2.29289M13.7071 5.70711C14 5.41421 14 4.94281 14 4C14 3.05719 14 2.58579 13.7071 2.29289M13.7071 2.29289C13.4142 2 12.9428 2 12 2C11.0572 2 10.5858 2 10.2929 2.29289"/>
+    <path d="M10.2929 21.7071C10.5858 22 11.0572 22 12 22C12.9428 22 13.4142 22 13.7071 21.7071M10.2929 21.7071C10 21.4142 10 20.9428 10 20C10 19.0572 10 18.5858 10.2929 18.2929M13.7071 21.7071C14 21.4142 14 20.9428 14 20C14 19.0572 14 18.5858 13.7071 18.2929M13.7071 18.2929C13.4142 18 12.9428 18 12 18C11.0572 18 10.5858 18 10.2929 18.2929"/>
+    <path d="M18.2929 10.2929C18 10.5858 18 11.0572 18 12C18 12.9428 18 13.4142 18.2929 13.7071M18.2929 10.2929C18.5858 10 19.0572 10 20 10C20.9428 10 21.4142 10 21.7071 10.2929M18.2929 13.7071C18.5858 14 19.0572 14 20 14C20.9428 14 21.4142 14 21.7071 13.7071M21.7071 13.7071C22 13.4142 22 12.9428 22 12C22 11.0572 22 10.5858 21.7071 10.2929"/>
+    <path d="M2.29289 10.2929C2 10.5858 2 11.0572 2 12C2 12.9428 2 13.4142 2.29289 13.7071M2.29289 10.2929C2.58579 10 3.05719 10 4 10C4.94281 10 5.41421 10 5.70711 10.2929M2.29289 13.7071C2.58579 14 3.05719 14 4 14C4.94281 14 5.41421 14 5.70711 13.7071M5.70711 13.7071C6 13.4142 6 12.9428 6 12C6 11.0572 6 10.5858 5.70711 10.2929"/>
   </symbol>
 
   <!-- Merged Clips/Browse tab (job: file browser). Four more glyphs, same
@@ -372,6 +419,16 @@
               </select>
             </label>
             <span class="mono muted" id="modeLabel">after</span>
+            <!-- The two comparisons a colourist reaches for constantly, as
+                 buttons rather than entries buried in the View select: both
+                 are the same view modes that select already offers (before
+                 only, and wipe), promoted to one press each because "is the
+                 grade helping" is a question asked every few seconds. The
+                 select stays: it is the full list, these are the shortcuts
+                 to the two that matter. Both light up through
+                 applyViewerState, the one place that reads the view mode. -->
+            <button class="btn toggle" id="bypassBtn" title="Bypass the grade: the technical conversion only, none of the look (B)">Bypass</button>
+            <button class="btn toggle" id="wipeBtn" title="Split wipe: bypassed left of the handle, graded right. Drag the handle to move the split (W)">Wipe</button>
             <label class="check" title="Keep the exposure move in the before frame, so before-showing modes show only the creative grade">
               <input type="checkbox" id="beforeExposure"> before keeps exposure
             </label>
@@ -427,7 +484,15 @@
                    screen right now, same as it already decides between
                    frameImg and playerVideo just below. -->
               <div id="afterLayer" class="layer"><img id="frameImg" alt="graded frame" draggable="false"><canvas id="gpuCanvas"></canvas><video id="playerVideo" muted playsinline></video><b>after</b></div>
-              <div id="beforeLayer" class="layer"><img id="beforeImg" alt="ungraded frame" draggable="false"><b>before</b></div>
+              <!-- bypassCanvas is to #beforeLayer what gpuCanvas is to
+                   #afterLayer: the bypassed picture when the GPU produced
+                   it, instead of the server-rendered #beforeImg. It cannot
+                   be gpuCanvas itself because live.js presents to exactly
+                   one canvas, so app.js renders the bypass first, copies it
+                   off here, and then renders the grade over the top of the
+                   GPU canvas. #beforeLayer.gpu (style.css) is the only
+                   thing that ever swaps which of the two is visible. -->
+              <div id="beforeLayer" class="layer"><img id="beforeImg" alt="ungraded frame" draggable="false"><canvas id="bypassCanvas"></canvas><b>before</b></div>
               <div id="splitHandle"></div>
               <div id="viewerMsg"></div>
             </div>
@@ -453,6 +518,28 @@
                   <button class="btn" id="clearRefCropBtn" title="Go back to automatic content detection" disabled>Clear box</button>
                   <span class="mono muted" id="matchRefStatus"></span>
                 </div>
+                <!-- The matcher's real options (grade/tools/match_ref.py:
+                     METHODS, strength, luma_preserve), not hardcoded to
+                     reinhard and luma_preserve true. Bound and persisted to
+                     localStorage under studio.match.* in app.js
+                     (bindMatchControls), same select/checkbox classes as the
+                     viewer toolbar (label.tb, label.check in style.css). -->
+                <div id="matchRefControls" class="row wrap">
+                  <label class="tb" title="Which matcher fits the transform, see the description below">Method
+                    <select id="matchMethod">
+                      <option value="reinhard">reinhard</option>
+                      <option value="histogram">histogram</option>
+                    </select>
+                  </label>
+                  <label class="tb" title="How much of the fitted move to bake in: 0 is identity, 1 is the full fit">Strength
+                    <input type="range" id="matchStrength" min="0" max="1" step="0.05" value="1">
+                    <span class="mono muted" id="matchStrengthValue">1.00</span>
+                  </label>
+                  <label class="check" title="Leave the achromatic axis alone: match colour, not exposure">
+                    <input type="checkbox" id="matchLumaPreserve" checked> luma preserve
+                  </label>
+                </div>
+                <div class="mono muted" id="matchMethodDesc"></div>
                 <!-- Honesty requirement from the direct request: a JPEG or
                      PNG reference has no LUT in it to extract, this fits a
                      transform toward its colour statistics instead. Kept as
@@ -627,6 +714,10 @@
         <button id="jsonBtn" class="btn">JSON</button>
         <button id="limitsBtn" class="btn">Limits</button>
         <button id="helpBtn" class="btn">Keys</button>
+        <!-- Filled in and unhidden by static/auth.js only when the server is running
+             with logins on; it stays hidden for local no-login use. Clicking it opens
+             a menu (built at runtime by auth.js) with sign out and "create agent token". -->
+        <button id="userBtn" class="btn" type="button" hidden title="Account"></button>
         <!-- Icon paths: Hugeicons "core-free-icons" (Sun03Icon, Moon02Icon), MIT licensed.
              Inlined rather than an <img>/icon-font so `currentColor` can pick up --text and
              the two icons can be shown/hidden with a plain CSS attribute selector in

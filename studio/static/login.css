@@ -1,0 +1,216 @@
+/* The sign in page. Loaded after style.css, which is where every colour,
+   radius and the Space Grotesk face come from: nothing here introduces a new
+   palette. Both themes work, because every value below is a token that
+   style.css already redefines under [data-theme="light"], and theme.js runs
+   on this page too. That was cheap precisely because the tokens were already
+   there; no theme specific rule appears in this file. */
+
+body.loginpage {
+  /* style.css sets overflow: hidden on body for the app shell's fixed
+     layout. A login card wants the opposite on a short window. */
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.logincard {
+  width: 100%;
+  max-width: 340px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-4xl);
+  box-shadow: var(--card-shadow-lg);
+  padding: 28px 28px 20px;
+}
+
+.loginbrand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.loginmark {
+  width: 24px;
+  height: 24px;
+  flex: none;
+  color: var(--accent);
+}
+
+.logincard h1 {
+  margin: 0;
+  font: 600 17px/1.2 var(--ui);
+  color: var(--text-hi);
+  letter-spacing: -0.01em;
+}
+
+.loginlede {
+  margin: 0 0 20px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.logincard label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.logincard input[type=text],
+.logincard input[type=password] {
+  display: block;
+  width: 100%;
+  height: 32px;
+  margin-bottom: 14px;
+  padding: 0 12px;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius-full);
+  font: 12px var(--ui);
+}
+
+.logincard input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
+}
+
+/* Hidden until there is something to say, so the card does not reserve a
+   blank red strip that reads as a broken layout on first paint. */
+.loginerror {
+  display: none;
+  margin: -6px 0 12px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.loginerror.on { display: block; }
+
+.loginsubmit {
+  width: 100%;
+  height: 32px;
+  font-size: 12px;
+}
+
+.loginnote {
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.loginnote code {
+  font-family: var(--mono);
+  color: var(--text);
+  /* A long command in a 340px card has to be allowed to break, or it pushes
+     the card wider than its own max-width. */
+  overflow-wrap: anywhere;
+}
+
+/* ---- the user button and its menu, injected into #sidebarutil by auth.js -- */
+
+#studioUserWrap { position: relative; }
+
+#studioUserMenu {
+  position: absolute;
+  right: 0;
+  bottom: 26px;
+  z-index: 40;
+  min-width: 168px;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--card-shadow-lg);
+}
+#studioUserMenu.on { display: flex; }
+
+#studioUserMenu .who {
+  padding: 4px 8px 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+#studioUserMenu .who b { color: var(--text-hi); font-weight: 600; }
+
+#studioUserMenu button {
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  color: var(--text);
+  font: 11px var(--ui);
+  cursor: pointer;
+}
+#studioUserMenu button:hover { background: var(--raised); color: var(--text-hi); }
+
+/* ---- the show-once agent token dialog ---------------------------------- */
+
+#studioTokenOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+#studioTokenOverlay.on { display: flex; }
+
+#studioTokenOverlay .box {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-4xl);
+  box-shadow: var(--card-shadow-lg);
+  padding: 20px;
+}
+
+#studioTokenOverlay h2 {
+  margin: 0 0 8px;
+  font: 600 14px var(--ui);
+  color: var(--text-hi);
+}
+
+#studioTokenOverlay p {
+  margin: 0 0 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+#studioTokenValue {
+  display: block;
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--raised);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius-lg);
+  color: var(--text-hi);
+  font-family: var(--mono);
+  font-size: 11px;
+  /* The token is one unbroken 43 character string, so it has to be allowed
+     to wrap or the dialog grows a horizontal scrollbar. */
+  overflow-wrap: anywhere;
+  resize: none;
+}
+
+#studioTokenActions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}

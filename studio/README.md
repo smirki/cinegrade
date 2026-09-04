@@ -50,9 +50,10 @@ content/
 ```
 
 The layout follows the pipeline. Panels on the right are in node order (Convert,
-Primaries, Curves, Secondary, Look, FX, Grain, Detail, Letterbox, Output), which is
-also the order ffmpeg applies them, so reading top to bottom tells you what happened
-to the picture in what order.
+Primaries, Curves, Secondary, Window, Look, FX, Grain, Detail, Letterbox, Output),
+which is also the order ffmpeg applies them, so reading top to bottom tells you what
+happened to the picture in what order. Window sits directly under Secondary because
+it is the shape half of the same node: it gates the qualifier and nothing else.
 
 ## What the numbers mean
 
@@ -121,9 +122,9 @@ One expensive step, then everything cheap hangs off it.
 3. The JPEG you see, the scopes and the statistics are all derived from that one
    array. A frame you have already looked at comes back in about 10ms.
 
-## Two things added to the engine
+## Three things added to the engine
 
-Both are additive and both are off by default, so every existing preset renders byte
+All are additive and all are off by default, so every existing preset renders byte
 for byte the same as before.
 
 - **Curves**, wired to ffmpeg's `curves` filter with `interp=pchip`. The editor uses
@@ -133,6 +134,13 @@ for byte the same as before.
   cached by hash. That makes it a table lookup at render time rather than a per pixel
   expression, at the cost of being exact only to the resolution of that cube. The
   Matte button shows the key.
+- **Power window** (`window`), one ellipse or rectangle that gates the qualifier, so
+  a correction lands only where the colour key and the shape agree. Centre, extent,
+  rotation and feather are all fractions of the frame, which is why the same window
+  means the same shape in a 960 wide preview and in the finished render. The matte is
+  baked to an 8-bit grey PNG by a `geq` expression and merged with `maskedmerge`, the
+  same technique the radial blur ramp uses. The Matte button shows the qualifier
+  multiplied by the window, because that is what the grade actually selects.
 
 While wiring the primaries panel a real bug turned up in the engine: `lift` and
 `gain` were implemented with `colorlevels`, whose output points are capped at 1.0, so
