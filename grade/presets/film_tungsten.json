@@ -1,0 +1,70 @@
+{
+  "_comment": "Tungsten balanced negative exposed in daylight: blue-cyan shadows, magenta-leaning reds. Look mean saturation 0.23 exterior / 0.22 interior. Grain off by default, same reason as film_portrait.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.11
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.004,
+    "highlight_rolloff": 0.08
+  },
+  "look": {
+    "lut": "film_tungsten",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.64,
+      "sigma": 30,
+      "strength": 0.44,
+      "tint": [
+        1.0,
+        0.3,
+        0.12
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.74,
+      "sigma": 100,
+      "strength": 0.18,
+      "tint": [
+        0.92,
+        0.96,
+        1.0
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.22
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.4
+  },
+  "grain": {
+    "enabled": false,
+    "strength": 30,
+    "size": 3,
+    "opacity": 0.3
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

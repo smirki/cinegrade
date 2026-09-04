@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixxr Studio</title>
+<!-- Blocking classic script, before the stylesheets: it sets data-theme on <html>
+     synchronously so the very first paint (including of style.css's own rules) already
+     has the right theme. Deferring this to DOMContentLoaded or app.js would show a
+     flash of dark-then-light (or vice versa) on every load. -->
+<script src="/theme.js"></script>
+<!-- Same reasoning and technique as theme.js just above: blocking, before any CSS,
+     so the collapsed/expanded state each sidebar was left in survives a reload
+     without a flash of open-then-closed. See static/sidebars.js. -->
+<script src="/sidebars.js"></script>
+<link rel="stylesheet" href="/vendor/gridstack.min.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- Icon sprite for the PARAMETERS accordion: one <symbol> per section plus
+     the shared chevron, referenced elsewhere with <use href="#icon-name">
+     (panels.js). Defined once, here, rather than inlined per use: this tool
+     has to run fully offline with no build step (see UNSLOTH-TOKENS.md
+     section 8.4's own recommended pattern for exactly this constraint), so
+     an icon-font CDN or an npm icon package are both off the table.
+     Hand-drawn 24x24 outline glyphs, stroke 1.75, round caps/joins -- loosely
+     modelled on Unsloth's HugeIcons "Stroke Rounded" set (8.2) for the
+     weight and proportions, not copied path data: their MIT-licensed free
+     set ships as 10,000+ individual per-icon files, which is not worth
+     vendoring for the dozen glyphs this panel actually needs. `currentColor`
+     is what lets style.css recolour these per theme/state (.stagehead-icon,
+     .stagehead-chevron) the same way it already does for the sun/moon icons
+     in the header below. -->
+<svg aria-hidden="true" style="position:absolute; width:0; height:0; overflow:hidden">
+  <symbol id="icon-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 9l6 6 6-6"/>
+  </symbol>
+  <!-- Convert: the classic two-arc "refresh/transform" glyph -- a source
+       space being converted into another, not literally cinegrade's node. -->
+  <symbol id="icon-convert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
+    <path d="M21 3v5h-5"/>
+    <path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
+    <path d="M3 21v-5h5"/>
+  </symbol>
+  <!-- Primaries: three fader-style verticals, one per lift/gamma/gain/offset wheel. -->
+  <symbol id="icon-primaries" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 21v-7M4 10V3"/>
+    <circle cx="4" cy="13" r="2"/>
+    <path d="M12 21v-9M12 8V3"/>
+    <circle cx="12" cy="10" r="2"/>
+    <path d="M20 21v-5M20 12V3"/>
+    <circle cx="20" cy="14" r="2"/>
+  </symbol>
+  <!-- Curves: axes plus a spline, the curve editor's own shape. -->
+  <symbol id="icon-curves" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 4v16h16"/>
+    <path d="M6 17c2.5-1 3.5-9 6-11s5 1 7 2.5"/>
+  </symbol>
+  <!-- Secondary: a target, for the HSL qualifier's "a colour key, not a shape". -->
+  <symbol id="icon-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="8.5"/>
+    <circle cx="12" cy="12" r="4.5"/>
+    <circle cx="12" cy="12" r="0.75" fill="currentColor" stroke="none"/>
+  </symbol>
+  <!-- Look: a picture frame, for the creative LUT. -->
+  <symbol id="icon-look" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="4.5" width="18" height="15" rx="2.5"/>
+    <circle cx="9" cy="10" r="1.5"/>
+    <path d="M4.5 17.5l5-5 3.5 3.5 2.5-2.5 4.5 4"/>
+  </symbol>
+  <!-- FX: a four-point sparkle, for the optical effects stack. -->
+  <symbol id="icon-fx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3l1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7z"/>
+    <path d="M19 15v3.5M17.25 16.75h3.5"/>
+  </symbol>
+  <!-- Grain: a dot field, the plainest stand-in for photographic noise. -->
+  <symbol id="icon-grain" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+    <circle cx="7" cy="7" r="1.15"/><circle cx="12" cy="7" r="1.15"/><circle cx="17" cy="7" r="1.15"/>
+    <circle cx="7" cy="12" r="1.15"/><circle cx="12" cy="12" r="1.15"/><circle cx="17" cy="12" r="1.15"/>
+    <circle cx="7" cy="17" r="1.15"/><circle cx="12" cy="17" r="1.15"/><circle cx="17" cy="17" r="1.15"/>
+  </symbol>
+  <!-- Detail: camera-focus corner brackets, for soften/sharpen. -->
+  <symbol id="icon-detail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>
+    <path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>
+    <path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>
+    <path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>
+    <circle cx="12" cy="12" r="3"/>
+  </symbol>
+  <!-- Letterbox: a frame with the top/bottom bars it adds. -->
+  <symbol id="icon-letterbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="2.5" y="4.5" width="19" height="15" rx="2"/>
+    <path d="M2.5 8.5h19M2.5 15.5h19" stroke-opacity="0.55"/>
+  </symbol>
+  <!-- Output: an arrow into a tray, the last, delivery-facing stage. -->
+  <symbol id="icon-output" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3v11.5"/>
+    <path d="M7.5 10l4.5 4.5 4.5-4.5"/>
+    <path d="M4 18.5h16"/>
+  </symbol>
+
+  <!-- Merged Clips/Browse tab (job: file browser). Four more glyphs, same
+       hand-drawn outline family as the accordion set above, reused here for
+       folder rows, clip rows, the up-a-level action and the home/workspace
+       shortcuts rather than starting a second icon system. -->
+  <!-- Up: icon-output's arrow-into-a-tray, mirrored top to bottom, so "leave
+       this folder for its parent" reads as the opposite motion of "deliver". -->
+  <symbol id="icon-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 21V9.5"/>
+    <path d="M7.5 14l4.5-4.5 4.5 4.5"/>
+    <path d="M4 5.5h16"/>
+  </symbol>
+  <!-- Folder: a tabbed rounded rectangle, the plainest reading of "directory". -->
+  <symbol id="icon-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3.5 7.5A1.5 1.5 0 0 1 5 6H9.5L11.3 8H19A1.5 1.5 0 0 1 20.5 9.5V17A1.5 1.5 0 0 1 19 18.5H5A1.5 1.5 0 0 1 3.5 17Z"/>
+  </symbol>
+  <!-- Video: a framed play triangle, so a clip row reads as "playable"
+       without having to read its file extension. -->
+  <symbol id="icon-video" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="5" width="18" height="14" rx="2.5"/>
+    <path d="M10.5 9.3v5.4l4.7-2.7z" fill="currentColor" stroke="none"/>
+  </symbol>
+  <!-- Home: a peaked roof over a door, for the home-folder quick jump. -->
+  <symbol id="icon-home" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 11.5L12 4l8 7.5"/>
+    <path d="M6 10v8.5A1 1 0 0 0 7 19.5h10a1 1 0 0 0 1-1V10"/>
+    <path d="M10 19.5v-5.5h4v5.5"/>
+  </symbol>
+
+  <!-- Sidebar toggle pair (job: app shell restructure). Hugeicons "core-free-icons"
+       (LayoutAlignLeftIcon, LayoutAlignRightIcon), MIT licensed, Copyright 2025
+       Hugeicons -- same technique as #themeToggle's sun/moon below: path data
+       copied by hand from the published npm package, not the package itself, so
+       this file keeps needing nothing but itself to render. This is the exact
+       icon Unsloth's own SidebarTrigger uses for its collapsible sidebars
+       (research/unsloth/studio/frontend/src/components/ui/sidebar.tsx), which
+       is the reference this rebuild followed for "one collapsible sidebar each
+       side, and I want that opening/closing icon". A rounded frame plus one
+       vertical divider near whichever edge that sidebar collapses toward, so
+       the left and right toggle read as mirror images of each other rather
+       than two unrelated glyphs. That rounded frame is drawn INTO the glyph
+       itself (it is the sidebar pictogram, same as Unsloth's own icon), not a
+       button background -- the wrapping <button> around it is deliberately
+       chromeless (.sidebar-toggle in style.css: no fill, no border, no
+       border-radius at rest), matching Unsloth's own SidebarTrigger, which is
+       a `variant="ghost"` Button (components/ui/button.tsx: no background or
+       border except on hover/focus). Direct request: "for the sidebar open
+       icons i dont want a rounded thing around it". -->
+  <symbol id="icon-panel-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 3H13C16.7712 3 18.6569 3 19.8284 4.17157C21 5.34315 21 7.22876 21 11V13C21 16.7712 21 18.6569 19.8284 19.8284C18.6569 21 16.7712 21 13 21H11C7.22876 21 5.34315 21 4.17157 19.8284C3 18.6569 3 16.7712 3 13V11C3 7.22876 3 5.34315 4.17157 4.17157C5.34315 3 7.22876 3 11 3Z"/>
+    <path d="M8.00488 16.0049L8.00488 8.00488"/>
+  </symbol>
+  <symbol id="icon-panel-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 3H13C16.7712 3 18.6569 3 19.8284 4.17157C21 5.34315 21 7.22876 21 11V13C21 16.7712 21 18.6569 19.8284 19.8284C18.6569 21 16.7712 21 13 21H11C7.22876 21 5.34315 21 4.17157 19.8284C3 18.6569 3 16.7712 3 13V11C3 7.22876 3 5.34315 4.17157 4.17157C5.34315 3 7.22876 3 11 3Z"/>
+    <path d="M16 8L16 16"/>
+  </symbol>
+</svg>
+
+<div id="appshell">
+
+  <!-- Left sidebar: the old topbar's brand plus the old "sources" card,
+       demoted out of GridStack entirely (job: app shell restructure, modelled
+       on research/unsloth/studio's own AppSidebar -- see components/ui/
+       sidebar.tsx there). It used to be a GridStack widget alone in its own
+       column (gs-id="sources"), which only ever bought it the ability to be
+       dragged nowhere and resized shorter than its own column for no reason;
+       promoting it to real app-shell chrome is what makes "one main sidebar
+       (the left) and main background" literally true instead of "a widget
+       that happens to be alone in a column". #leftrail below is unchanged
+       from the inside out -- same tab strip, same four panes -- only the
+       brand at its top and #rotBtn (see the Clips pane) are new arrivals,
+       both relocated out of the deleted #topbar. Collapse/expand is driven
+       by the data-sidebar-left attribute static/sidebars.js sets on <html>
+       (see style.css); #sidebarLeftToggle below, in #maintoolbar, is the
+       button that flips it, using the same panel icon Unsloth's own
+       SidebarTrigger uses (#icon-panel-left, defined in the sprite above).
+
+       .sidebar-resize at the bottom: a drag handle on this sidebar's own
+       right edge (job: resizable sidebars, direct request "i need to be
+       able to resize each sidebar. look at the unsloth ui"), wired up in
+       initSidebarResizers (app.js) against the width state
+       static/sidebars.js owns (--sidebar-left-w on <html>, same pre-paint,
+       persists-across-reload technique as the collapse attribute just
+       above). #leftrail's own width tracks that same variable (see
+       style.css) so it stays a steady size while #sidebarLeft's outer width
+       animates to/from 0 on collapse, instead of every list and tab label
+       inside reflowing mid-transition. -->
+  <aside id="sidebarLeft">
+    <aside id="leftrail">
+      <div class="brand">FIXXR<span>STUDIO</span></div>
+
+      <div class="railtabs">
+        <button class="railtab active" data-rail="refs">Refs</button>
+        <button class="railtab" data-rail="looks">LUTs</button>
+        <button class="railtab" data-rail="jobs">Jobs</button>
+        <button class="railtab" data-rail="browse">Clips</button>
+      </div>
+
+      <section class="railpane active" data-rail="refs">
+        <div class="panelhead">Reference images</div>
+        <div class="pad">
+          <label class="check"><input type="checkbox" id="refShow"> show beside frame</label>
+        </div>
+        <div id="refList" class="reflist"></div>
+      </section>
+
+      <section class="railpane" data-rail="looks">
+        <div class="panelhead">Look LUTs</div>
+        <div class="pad row wrap">
+          <button id="importLutBtn" class="btn">Import .cube</button>
+          <button id="downloadLutBtn" class="btn">Export current</button>
+          <input type="file" id="lutFile" accept=".cube" hidden>
+        </div>
+        <div class="pad row wrap">
+          <button id="rebuildLooksBtn" class="btn">Rebuild looks</button>
+          <button id="rebuildCstBtn" class="btn">Rebuild CST</button>
+        </div>
+        <div id="lutList" class="lutlist"></div>
+        <div class="panelhead">Renders</div>
+        <div id="renderList" class="lutlist"></div>
+      </section>
+
+      <section class="railpane" data-rail="jobs">
+        <div class="panelhead">Background jobs</div>
+        <div class="pad row wrap">
+          <button id="clearCacheBtn" class="btn">Clear frame cache</button>
+        </div>
+        <div id="jobList" class="joblist"></div>
+      </section>
+
+      <!-- Clips and Browse merged into one file browser: the clip list
+           is no longer hardcoded to content/footage, it is whatever
+           folder navigation below lands on. Top half is navigation (an
+           up-a-level button, a breadcrumb of the current path, three
+           quiet quick-jump shortcuts, then the subfolders), bottom half
+           is the playable clips sitting in that folder plus the source
+           readout for whichever one is loaded, following the old Clips
+           tab's own layout. The breadcrumb's first segment is always
+           "/", so root -- and from there anywhere else on the Mac -- is
+           never more than one click away no matter where browsing
+           started; that is what replaces the old permanent row of root
+           buttons without losing reachability. data-rail stays "browse":
+           app.js's browse* functions, S.browsePath and the tab's
+           lazy-first-open check all already key off that string, so
+           keeping it avoids renaming half the file for a label change
+           alone. -->
+      <section class="railpane browsepane" data-rail="browse">
+        <div class="browsehalf browsetop">
+          <div class="browsenav">
+            <button id="browseUpBtn" class="btn iconbtn" type="button" title="Up one level" aria-label="Up one level">
+              <svg class="rowicon" aria-hidden="true"><use href="#icon-up"></use></svg>
+            </button>
+            <div id="browseCrumbs" class="crumbs"></div>
+          </div>
+          <div id="browseQuick" class="row wrap quickjumps"></div>
+          <div id="browseError" class="err"></div>
+          <div class="panelhead">Folders</div>
+          <div id="browseDirs" class="lutlist"></div>
+        </div>
+        <div class="browsehalf browsebottom">
+          <!-- #rotBtn: relocated from the deleted #topbar. It is a view
+               toggle for whichever clip is already selected (not part of
+               picking one), so it sits in this panelhead, right against the
+               list of clips it applies to, rather than back up in the
+               navigation half above. -->
+          <div class="panelhead">Clips here <span class="spacer"></span>
+            <button id="rotBtn" class="btn" title="Rotation metadata on these clips is unreliable. Flip this if the frame is sideways.">autorotate</button>
+          </div>
+          <div id="browseClips" class="lutlist"></div>
+          <div class="panelhead">Source</div>
+          <div id="clipInfo" class="kv"></div>
+        </div>
+      </section>
+    </aside>
+    <div class="sidebar-resize" data-resize-side="left" title="Drag to resize"></div>
+  </aside>
+
+  <main id="mainBg">
+    <!-- The main toolbar: everything from the old #topbar that is not the
+         brand (moved to the sidebar above) or the utilities (moved to
+         #sidebarRight below). Sits above the widgets, spans only the main
+         background's own width (not the sidebars either side of it), and is
+         not itself a widget -- there is nothing here for GridStack to know
+         about. The two icon buttons at its ends are the sidebar toggles;
+         they live here rather than inside either sidebar because a
+         collapsed sidebar cannot hold the control that reopens it. -->
+    <div id="maintoolbar">
+      <button id="sidebarLeftToggle" class="sidebar-toggle" type="button" title="Toggle the sources sidebar" aria-label="Toggle the sources sidebar" aria-expanded="true" aria-controls="sidebarLeft">
+        <svg class="rowicon" aria-hidden="true"><use href="#icon-panel-left"></use></svg>
+      </button>
+      <span class="sep"></span>
+      <label class="tb">Preset
+        <select id="presetSelect"></select>
+      </label>
+      <span id="modifiedDot" class="dot" title="live config differs from the loaded preset">modified</span>
+      <button id="loadPresetBtn" class="btn">Load</button>
+      <button id="savePresetBtn" class="btn">Overwrite</button>
+      <button id="saveAsBtn" class="btn">Save as</button>
+      <button id="deletePresetBtn" class="btn danger">Delete</button>
+
+      <span class="sep"></span>
+
+      <button id="undoBtn" class="btn" title="Undo (cmd+Z)">Undo</button>
+      <button id="redoBtn" class="btn" title="Redo (shift+cmd+Z)">Redo</button>
+      <button id="resetAllBtn" class="btn danger">Reset all</button>
+
+      <span class="spacer"></span>
+
+      <button id="sidebarRightToggle" class="sidebar-toggle" type="button" title="Toggle the parameters sidebar" aria-label="Toggle the parameters sidebar" aria-expanded="true" aria-controls="sidebarRight">
+        <svg class="rowicon" aria-hidden="true"><use href="#icon-panel-right"></use></svg>
+      </button>
+    </div>
+
+  <!-- Structured column layout beneath the toolbar (second direct request,
+       superseding the free floating widget grid this used to be; since
+       narrowed twice more -- first when "sources" left GridStack for
+       #sidebarLeft, then when "parameters" left GridStack for #sidebarRight
+       below, combined there with the utilities that used to be a plain
+       (non-resizable) chrome strip -- down to the single mid column left
+       here): #colMid IS the top level structure now, not an emergent
+       arrangement of equal widgets sharing #grid with a sibling column.
+       There is nothing left for a splitter to divide (the old .colsplit,
+       which used to trade width between this column and the params column,
+       is gone with that column); each SIDEBAR is what is now user-resizable,
+       by its own drag handle (see .sidebar-resize below and
+       initSidebarResizers in app.js), because a sidebar's width is a choice
+       about how much of the window it gets, the same job .colsplit used to
+       do, just against the sidebar instead of a second GridStack column.
+       #colMid owns exactly one nested GridStack instance (column: 1 in
+       app.js -- a single vertical lane), so a card's width is always 100% of
+       #mainBg's own width and never an independent per-card setting; only a
+       card's HEIGHT is its own, and for the two cards below the viewer that
+       height now follows their content automatically (gs-no-resize plus
+       GridStack's sizeToContent -- see initAutosizeCards in app.js and the
+       .autosize wrapper on each) rather than being a size a user drags.
+
+       gs-x/y/w/h below are #gridMid's DEFAULT layout only; app.js overwrites
+       them from localStorage on boot if a saved layout exists (see
+       GRID_DEFAULT_LAYOUT, which has to be kept in step with the numbers
+       below by hand: GridStack has no API to read "the layout this markup
+       started with" back out once it has moved something), and Reset layout
+       clears that saved copy (and the two sidebars' saved widths) together.
+       gs-id is the stable key save/load match cards by, so it must never
+       change once someone has a saved layout depending on it. -->
+  <div id="grid">
+
+  <div class="gridcol" id="colMid" data-col="mid">
+  <div class="grid-stack" id="gridMid">
+
+    <!-- viewer: the picture and its toolbar. Tallest card in the middle
+         column's default stack because it is what the grade gets judged on,
+         same reasoning the old fixed layout used, just now a default instead
+         of a floor nothing could shrink past. Shares this column's single
+         lane with scopes and timeline below, so gs-w is always 1 here too. -->
+    <div class="grid-stack-item" gs-id="viewer" gs-x="0" gs-y="0" gs-w="1" gs-h="7">
+      <div class="grid-stack-item-content">
+        <div class="widgethead">Viewer</div>
+        <section id="centre">
+          <div id="viewerbar">
+            <button class="btn" id="fitBtn">Fit</button>
+            <button class="btn" id="oneToOneBtn">100%</button>
+            <span class="mono muted" id="zoomLabel">fit</span>
+            <span class="sep"></span>
+            <label class="tb" id="viewModeLabel" title="\\ toggles after only / before only. Y cycles left/right, top/bottom, wipe, then back to after only.">View
+              <select id="viewMode" title="\\ toggles after only / before only. Y cycles left/right, top/bottom, wipe, then back to after only.">
+                <option value="after">After only</option>
+                <option value="before">Before only</option>
+                <option value="lr">Left / Right</option>
+                <option value="tb">Top / Bottom</option>
+                <option value="wipe">Wipe</option>
+              </select>
+            </label>
+            <span class="mono muted" id="modeLabel">after</span>
+            <label class="check" title="Keep the exposure move in the before frame, so before-showing modes show only the creative grade">
+              <input type="checkbox" id="beforeExposure"> before keeps exposure
+            </label>
+            <span class="sep"></span>
+            <span class="ab">
+              <button class="btn slot active" id="slotA">A</button>
+              <button class="btn slot" id="slotB">B</button>
+              <button class="btn" id="storeSlot" title="Copy the live config into the other slot">Store</button>
+            </span>
+            <span class="sep"></span>
+            <button class="btn toggle" id="maskBtn" title="Show the secondary qualifier matte">Matte</button>
+            <button class="btn toggle" id="sheetBtn" title="Same config across every marked frame (C)">Contact sheet</button>
+            <span class="spacer"></span>
+            <!-- GPU preview (job: live GPU viewer). #rendererBadge is the
+                 "which renderer am I looking at" the brief requires: it is
+                 always on screen, not a tooltip, because that is the one
+                 fact a grading decision must never be made without. Forced
+                 to the server path whenever the GPU cannot be trusted for
+                 the live config (see gpuAllowed in app.js), so the toggle
+                 itself only ever offers a choice when there is a real one. -->
+            <button class="btn toggle" id="gpuToggle" title="Grade on the GPU instead of round-tripping to the server for every knob turn">GPU preview</button>
+            <span class="mono muted" id="rendererBadge">server</span>
+            <span class="sep"></span>
+            <label class="tb">Preview
+              <select id="previewWidth">
+                <option value="640">640</option>
+                <option value="960" selected>960</option>
+                <option value="1280">1280</option>
+                <option value="1920">1920</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="viewport">
+            <div id="stage">
+              <!-- Each half is a layer container, not a bare <img>, so a
+                   later lane can drop a <canvas> in here (a WebGL renderer)
+                   without touching the view-mode CSS or any of the code
+                   that positions these two boxes; only what is inside
+                   #afterLayer / #beforeLayer changes. -->
+              <!-- playerVideo shares this layer with the still frame: Play
+                   swaps display between the two (#stage.playing in
+                   style.css), Pause swaps back. Muted because the engine
+                   never touches audio (see cinegrade.py's node tree) and
+                   because a muted <video> sidesteps every autoplay
+                   restriction outright, which matters here since play()
+                   fires after an async prepare() round trip, not
+                   synchronously inside the click handler. -->
+              <!-- gpuCanvas is the drop-in the comment above expects (job:
+                   live GPU viewer). #stage.gpu-live (style.css) is the only
+                   thing that ever shows it; app.js decides frame by frame
+                   whether the GPU or the server produced the picture on
+                   screen right now, same as it already decides between
+                   frameImg and playerVideo just below. -->
+              <div id="afterLayer" class="layer"><img id="frameImg" alt="graded frame" draggable="false"><canvas id="gpuCanvas"></canvas><video id="playerVideo" muted playsinline></video><b>after</b></div>
+              <div id="beforeLayer" class="layer"><img id="beforeImg" alt="ungraded frame" draggable="false"><b>before</b></div>
+              <div id="splitHandle"></div>
+              <div id="viewerMsg"></div>
+            </div>
+            <div id="refPane">
+              <!-- Split into an image box plus a toolbar strip below it
+                   (was a single centred <img>), so Match Reference has
+                   somewhere to put its button and result without fighting
+                   the image for the pane's centring. Only ever shown at
+                   all via #viewport.withref (style.css), the same
+                   condition that puts a reference image on screen in the
+                   first place, so this action is visible exactly when the
+                   direct request asked for and needs no separate show/hide
+                   logic of its own. -->
+              <!-- refCropBox: the match region the user drags on the
+                   reference, positioned in JS against refImg's own rendered
+                   rect (not refImgWrap's), since the flex-centred img can be
+                   letterboxed on either axis. Empty and hidden until a drag
+                   sets one (bindRefCrop in app.js). -->
+              <div id="refImgWrap"><img id="refImg" alt="reference"><div id="refCropBox"></div></div>
+              <div id="matchRef">
+                <div id="matchRefBar">
+                  <button class="btn" id="matchRefBtn">Match to reference</button>
+                  <button class="btn" id="clearRefCropBtn" title="Go back to automatic content detection" disabled>Clear box</button>
+                  <span class="mono muted" id="matchRefStatus"></span>
+                </div>
+                <!-- Honesty requirement from the direct request: a JPEG or
+                     PNG reference has no LUT in it to extract, this fits a
+                     transform toward its colour statistics instead. Kept as
+                     visible text, not just a button title, so it cannot be
+                     missed on a device with no hover. -->
+                <div class="mono muted" id="matchRefCaption">Fits a transform toward the reference's colours. Does not copy a LUT. Drag on the reference above to match only that region; otherwise the auto content detector picks it.</div>
+                <div id="matchRefResult"></div>
+              </div>
+            </div>
+            <div id="sheet"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- scopes and stats: kept as one card, per the original widget-grid
+         request's grouping -- the stat groups (#stats) and the scope images
+         (#scopes) read as one horizontal strip, one level, scrolling
+         together (see the #dockbody/#stats/#scopes comments in style.css);
+         splitting them into separate cards would break that shared strip.
+         Same column, same single lane as viewer above and timeline below, so
+         gs-x is always 0 and gs-w always 1.
+
+         gs-no-resize: dragging this card's own height no longer means
+         anything (job: widgets size to content, not to a dragged or
+         GridStack-assigned box) -- #dock's natural height is fixed by its
+         content (one row of stat groups and scope boxes, per the change
+         above), and initAutosizeCards in app.js keeps this card's actual
+         GridStack height matched to that automatically. The .autosize
+         wrapper just below is what GridStack measures to do that (see the
+         long comment on GridStack's sizeToContent in app.js): it has to be
+         #dock's own direct parent, with no other sibling inside
+         .grid-stack-item-content besides .widgethead, because GridStack's
+         sizeToContent reads literally "this wrapper's first child"'s natural
+         height, not a sum of several children. -->
+    <div class="grid-stack-item" gs-id="scopes" gs-x="0" gs-y="7" gs-w="1" gs-h="4" gs-no-resize="true">
+      <div class="grid-stack-item-content">
+        <div class="widgethead">Scopes &amp; stats</div>
+        <div class="autosize">
+        <div id="dock">
+          <div class="dockhead">
+            <span class="panelhead inline">Scopes</span>
+            <button class="btn toggle active" data-scope="waveform">Waveform</button>
+            <button class="btn toggle active" data-scope="parade">Parade</button>
+            <button class="btn toggle active" data-scope="vectorscope">Vector</button>
+            <button class="btn toggle" data-scope="histogram">Histogram</button>
+            <span class="spacer"></span>
+            <button class="btn" id="scopesRefresh">Refresh</button>
+            <button class="btn toggle active" id="scopesAuto">Auto</button>
+          </div>
+          <div id="dockbody">
+            <div id="stats"></div>
+            <div id="scopes"></div>
+          </div>
+          <div class="mono muted" id="statsNote"></div>
+        </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- timeline: its own card, last in the middle column's stack, so it
+         cannot end up squeezed out by everything else the way the original
+         bug report had it -- and a narrower window narrows #colMid's own
+         cards together instead of leaving any one of them stranded at a
+         leftover width. gs-no-resize plus the .autosize wrapper: same
+         content-follows-size treatment as scopes above, same reason (see
+         that card's own comment, and initAutosizeCards in app.js) -- #marks
+         in particular can grow to more than one row as marks pile up, and
+         that should grow this card, not scroll inside it. -->
+    <div class="grid-stack-item" gs-id="timeline" gs-x="0" gs-y="11" gs-w="1" gs-h="3" gs-no-resize="true">
+      <div class="grid-stack-item-content">
+        <div class="widgethead">Timeline</div>
+        <div class="autosize">
+        <div id="timeline">
+          <div class="tlbar">
+            <button class="btn" id="playHead">|&lt;</button>
+            <button class="btn" id="stepBack" title="one frame back (,)">&lt;</button>
+            <button class="btn" id="stepFwd" title="one frame forward (.)">&gt;</button>
+            <span class="sep"></span>
+            <button class="btn toggle" id="playBtn" title="Play from the current playhead with the current grade (P)">Play</button>
+            <label class="tb" title="Length of clip rendered per press of Play">secs <input type="text" id="playDur" class="mono num" size="3" value="5"></label>
+            <span class="mono muted" id="playStatus"></span>
+            <span class="sep"></span>
+            <input type="range" id="scrub" min="0" max="1000" value="0">
+            <span class="mono" id="timeLabel">0.00s</span>
+            <button class="btn" id="markBtn" title="Mark this frame (M)">Mark</button>
+            <button class="btn" id="clearMarksBtn">Clear marks</button>
+            <span class="spacer"></span>
+            <label class="tb">Render
+              <input type="text" id="renderName" class="mono" size="14" placeholder="name">
+            </label>
+            <label class="tb">start <input type="text" id="renderStart" class="mono num" size="5" value="0"></label>
+            <label class="tb">secs <input type="text" id="renderDur" class="mono num" size="5" value="3"></label>
+            <label class="tb">width
+              <select id="renderScale">
+                <option value="">source</option>
+                <option value="1920">1920</option>
+                <option value="1280">1280</option>
+              </select>
+            </label>
+            <button class="btn accent" id="renderBtn">Render</button>
+          </div>
+          <!-- Live loop (job: live GPU viewer, mode 2). Its own row, its own
+               button, deliberately not sharing playBtn above: Play streams a
+               server-encoded segment once through; Loop decodes a range once
+               and then re-grades every frame on the GPU as it repeats, and
+               every knob stays live while it does. The two are mutually
+               exclusive (app.js stops one before starting the other) but are
+               not the same feature wearing two names. -->
+          <div class="tlbar" id="loopBar">
+            <button class="btn toggle" id="loopBtn" title="Loop this range on the GPU, grading every frame as it plays">Loop</button>
+            <label class="tb" title="Loop range start, in seconds">from <input type="text" id="loopStart" class="mono num" size="4" value="0"></label>
+            <label class="tb" title="Loop range end, in seconds">to <input type="text" id="loopEnd" class="mono num" size="4" value="2"></label>
+            <button class="btn" id="loopMarkBtn" title="Set the loop range from the playhead and the next mark">Use marks</button>
+            <span class="mono muted" id="loopStatus"></span>
+            <span class="spacer"></span>
+            <span class="mono muted small" id="loopBudget"></span>
+          </div>
+          <div id="thumbs"></div>
+          <div id="marks"></div>
+        </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+  </div>
+
+  </div>
+  </main>
+
+  <!-- Right sidebar (job: combine parameters + utilities into one resizable
+       sidebar; direct request "the utilities and the parameter should be
+       combined and thats the sidebar that opens and closes"). Two stacked
+       pieces inside #paramsdock, same shape as
+       research/unsloth/studio/frontend's own SidebarHeader/SidebarContent/
+       SidebarFooter (components/ui/sidebar.tsx): a header, a scrollable
+       content area that is the actual work surface, and a footer strip of
+       secondary actions that never scrolls away from it.
+
+       - #params (was its own GridStack widget, gs-id="params", alone in a
+         second GridStack column -- see the removed .colsplit/#colRight this
+         replaces) is now this sidebar's scrollable "control panel": the
+         whole grade accordion, unchanged from the inside out, just moved
+         out of GridStack entirely the same way #leftrail was for the left
+         sidebar. flex: 1 1 auto in style.css is what makes it the piece
+         that actually grows/shrinks with the sidebar and scrolls its own
+         overflow, so the header and utility strip around it never do.
+       - #sidebarutil is the former #sidebarRight body verbatim --
+         #renderTime, Reset layout, JSON, Limits, Keys, the theme toggle --
+         relocated out of the deleted #topbar in the first app-shell pass and
+         now the "utility strip" beneath the control panel instead of being
+         the sidebar's only content. A wrapping horizontal row (not the old
+         vertical stack of full-width buttons): these are secondary actions
+         that do not need to compete with #params for vertical room, the
+         actual scarce resource once parameters lives here too.
+
+       Collapse/expand is driven by data-sidebar-right on <html>
+       (static/sidebars.js, style.css), toggled from #sidebarRightToggle in
+       #maintoolbar using #icon-panel-right, and this sidebar's own drag
+       handle (.sidebar-resize below, initSidebarResizers in app.js) resizes
+       it the same way #sidebarLeft's does -- see that sidebar's own comment
+       for why #paramsdock is a fixed-width inner wrapper rather than the
+       collapsing element itself. -->
+  <aside id="sidebarRight">
+    <div id="paramsdock">
+      <div class="panelhead">Parameters</div>
+      <aside id="params"></aside>
+      <div id="sidebarutil">
+        <span class="mono muted" id="renderTime">idle</span>
+        <button id="resetLayoutBtn" class="btn" title="Put every panel back to its default size and position">Reset layout</button>
+        <button id="jsonBtn" class="btn">JSON</button>
+        <button id="limitsBtn" class="btn">Limits</button>
+        <button id="helpBtn" class="btn">Keys</button>
+        <!-- Icon paths: Hugeicons "core-free-icons" (Sun03Icon, Moon02Icon), MIT licensed.
+             Inlined rather than an <img>/icon-font so `currentColor` can pick up --text and
+             the two icons can be shown/hidden with a plain CSS attribute selector in
+             style.css instead of swapping src on click. -->
+        <button id="themeToggle" class="btn" title="Toggle light/dark theme">
+          <svg class="sun" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M17 12C17 14.7614 14.7614 17 12 17C9.23858 17 7 14.7614 7 12C7 9.23858 9.23858 7 12 7C14.7614 7 17 9.23858 17 12Z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M12 2V3.5M12 20.5V22M19.0708 19.0713L18.0101 18.0106M5.98926 5.98926L4.9286 4.9286M22 12H20.5M3.5 12H2M19.0713 4.92871L18.0106 5.98937M5.98975 18.0107L4.92909 19.0714" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/>
+          </svg>
+          <svg class="moon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M21.5 14.0784C20.3003 14.7189 18.9301 15.0821 17.4751 15.0821C12.7491 15.0821 8.91792 11.2509 8.91792 6.52485C8.91792 5.06986 9.28105 3.69968 9.92163 2.5C5.66765 3.49698 2.5 7.31513 2.5 11.8731C2.5 17.1899 6.8101 21.5 12.1269 21.5C16.6849 21.5 20.503 18.3324 21.5 14.0784Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="sidebar-resize" data-resize-side="right" title="Drag to resize"></div>
+  </aside>
+
+</div>
+
+<!-- overlays ------------------------------------------------------------ -->
+<div id="jsonOverlay" class="overlay">
+  <div class="sheetbox">
+    <div class="panelhead">Raw config <span class="spacer"></span>
+      <button class="btn" id="jsonApply">Apply</button>
+      <button class="btn" id="jsonCopy">Copy</button>
+      <button class="btn" id="jsonClose">Close</button>
+    </div>
+    <div id="jsonError" class="err"></div>
+    <textarea id="jsonText" spellcheck="false"></textarea>
+    <div class="panelhead">Preset file that would be written (defaults stripped)</div>
+    <pre id="jsonDiff" class="mono small"></pre>
+  </div>
+</div>
+
+<div id="limitsOverlay" class="overlay">
+  <div class="sheetbox">
+    <div class="panelhead">What this tool can and cannot do <span class="spacer"></span>
+      <button class="btn" id="limitsClose">Close</button>
+    </div>
+    <div id="limitsBody" class="prose"></div>
+  </div>
+</div>
+
+<div id="helpOverlay" class="overlay">
+  <div class="sheetbox">
+    <div class="panelhead">Keyboard <span class="spacer"></span>
+      <button class="btn" id="helpClose">Close</button>
+    </div>
+    <div id="helpBody" class="prose"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/vendor/gridstack-all.js"></script>
+<script src="/controls.js"></script>
+<script src="/schema.js"></script>
+<script src="/panels.js"></script>
+<script src="/limits.js"></script>
+<script src="/session.js"></script>
+<script src="/gpu.js"></script>
+<script src="/live.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

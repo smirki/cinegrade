@@ -1,0 +1,63 @@
+{
+  "_comment": "Reference-matched: warm, restrained, olive greens, deep detailed shadows. The default for real exterior footage.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.07
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.05,
+    "saturation": 1.0,
+    "vibrance": 0.1,
+    "black_lift": 0.006,
+    "highlight_rolloff": 0.05
+  },
+  "look": {
+    "lut": "natural",
+    "mix": 0.8
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.72,
+      "sigma": 22,
+      "strength": 0.3,
+      "tint": [
+        1.0,
+        0.36,
+        0.16
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.8,
+      "sigma": 90,
+      "strength": 0.14,
+      "tint": [
+        1.0,
+        0.96,
+        0.9
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.2
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.4
+  },
+  "grain": {
+    "enabled": false
+  }
+}

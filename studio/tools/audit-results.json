@@ -1,0 +1,2364 @@
+{
+  "generated_at": "2026-09-01T23:56:29-0400",
+  "python": "3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 21.0.0 (clang-2100.0.123.102)]",
+  "clips": {
+    "main": "A001_09011832_C003.MOV",
+    "second": "A001_09011336_C002.MOV"
+  },
+  "frame_selection": {
+    "candidates": [
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 0.3,
+        "p95_luma": 166.39780000000002,
+        "p5_luma": 23.795399999999994,
+        "mean_luma": 89.4705076919486,
+        "mean_sat": 0.1774010685958792
+      },
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 1.0,
+        "p95_luma": 170.18919999999997,
+        "p5_luma": 22.7914,
+        "mean_luma": 92.57334244700131,
+        "mean_sat": 0.18215105169225418
+      },
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 2.0,
+        "p95_luma": 168.72940000000003,
+        "p5_luma": 24.859599999999997,
+        "mean_luma": 96.36462416465288,
+        "mean_sat": 0.184284926545724
+      },
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 3.0,
+        "p95_luma": 163.7536,
+        "p5_luma": 26.0722,
+        "mean_luma": 96.45518535121924,
+        "mean_sat": 0.17749056099197766
+      },
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 4.0,
+        "p95_luma": 163.36630999999983,
+        "p5_luma": 24.072199999999995,
+        "mean_luma": 96.08615815987477,
+        "mean_sat": 0.18176801230104442
+      },
+      {
+        "clip": "A001_09011336_C002.MOV",
+        "t": 4.7,
+        "p95_luma": 166.61900000000003,
+        "p5_luma": 22.872799999999994,
+        "mean_luma": 94.65917696067662,
+        "mean_sat": 0.18249365332799627
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 1,
+        "p95_luma": 228.3702,
+        "p5_luma": 26.2098,
+        "mean_luma": 94.17002420172452,
+        "mean_sat": 0.2734510101307248
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 4,
+        "p95_luma": 217.5238,
+        "p5_luma": 34.712399999999995,
+        "mean_luma": 106.93435218585238,
+        "mean_sat": 0.28427009609911663
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 8,
+        "p95_luma": 227.82919999999996,
+        "p5_luma": 55.363,
+        "mean_luma": 107.54575341031413,
+        "mean_sat": 0.2724376207028801
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 12,
+        "p95_luma": 165.49729999999985,
+        "p5_luma": 17.7782,
+        "mean_luma": 63.267568822770215,
+        "mean_sat": 0.2941153613795445
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 16,
+        "p95_luma": 184.20860000000002,
+        "p5_luma": 39.37819999999999,
+        "mean_luma": 93.33357833452328,
+        "mean_sat": 0.25547692109953346
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 20,
+        "p95_luma": 160.6919599999998,
+        "p5_luma": 31.9972,
+        "mean_luma": 83.54433227317662,
+        "mean_sat": 0.2580316723815356
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 24,
+        "p95_luma": 210.3966,
+        "p5_luma": 17.0538,
+        "mean_luma": 74.11270574912126,
+        "mean_sat": 0.3162347179726364
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 28,
+        "p95_luma": 208.01319999999998,
+        "p5_luma": 5.933,
+        "mean_luma": 61.22280930250439,
+        "mean_sat": 0.23471723286902152
+      },
+      {
+        "clip": "A001_09011832_C003.MOV",
+        "t": 31,
+        "p95_luma": 206.8006,
+        "p5_luma": 11.430399999999999,
+        "mean_luma": 91.17883028449033,
+        "mean_sat": 0.27881860853975843
+      }
+    ],
+    "chosen": {
+      "clip": "A001_09011832_C003.MOV",
+      "t": 1.0,
+      "reason": "highest p95 luma (genuine highlights: sky) among candidates with decent mean saturation (car paint, foliage, sky); see candidates list for the full sweep"
+    },
+    "second_clip": {
+      "clip": "A001_09011336_C002.MOV",
+      "t": 2.0,
+      "reason": "used only where a test needs a second scene (golden-hour driveway, lower dynamic range, different hue mix)"
+    }
+  },
+  "render_count": 157,
+  "elapsed_seconds": 93.55924201011658,
+  "section_failures": [],
+  "results": [
+    {
+      "parameter": "convert.working_space",
+      "verdict": "works",
+      "summary": "dwg and direct are two different CST LUT chains (not byte identical: max diff 14 of 255), so this is a genuinely different code path, not a dead switch, though at this preset's default encode/tonemap the two chains now land close enough that the mean difference is only 0.06 code values, likely imperceptible on most of the frame; the max=14 shows they still diverge on some pixels (see convert.encode for why direct's calibration moved closer to dwg's mid-audit).",
+      "direction": "claim: dwg and direct should differ; measured mean_abs_diff=0.06, max_abs_diff=14",
+      "measurements": {
+        "dwg_vs_direct": {
+          "mean_abs_diff": 0.06313479422964265,
+          "max_abs_diff": 14.0,
+          "mean_signed": {
+            "r": 0.04866954086115993,
+            "g": 0.019185248242530754,
+            "b": 0.044012247363796136
+          },
+          "pct_pixels_changed": 16.8777460456942
+        }
+      }
+    },
+    {
+      "parameter": "convert.tonemap",
+      "verdict": "works",
+      "summary": "aces, filmic and none are three different LUT chains: on working_space=direct (the only space with a none LUT) none clips 13.67% of pixels to code 255 vs 0.00% for aces and 0.00% for filmic. aces vs filmic under working_space=dwg differ by mean 20.52 code values. tonemap=none with working_space=dwg currently renders without error (a DWG_to_Rec709_none_*.cube now exists on disk).",
+      "direction": "claim: none clips more pixels to 255 than aces/filmic; measured {\"aces\": 0.0, \"filmic\": 0.0, \"none\": 13.66995276801406}",
+      "measurements": {
+        "clipped_white_pct": {
+          "aces": 0.0,
+          "filmic": 0.0,
+          "none": 13.66995276801406
+        },
+        "pairwise_diffs_direct": {
+          "aces_vs_filmic": {
+            "mean_abs_diff": 20.510020320738136,
+            "max_abs_diff": 60.0,
+            "mean_signed": {
+              "r": 12.751191783831283,
+              "g": 13.489223143673112,
+              "b": 16.531210182337436
+            },
+            "pct_pixels_changed": 99.99052614235501
+          },
+          "aces_vs_none": {
+            "mean_abs_diff": 27.466323868629175,
+            "max_abs_diff": 62.0,
+            "mean_signed": {
+              "r": 28.118935358084357,
+              "g": 27.058217541739893,
+              "b": 27.221818706063267
+            },
+            "pct_pixels_changed": 100.0
+          },
+          "filmic_vs_none": {
+            "mean_abs_diff": 13.209115498681898,
+            "max_abs_diff": 68.0,
+            "mean_signed": {
+              "r": 15.367743574253076,
+              "g": 13.568994398066783,
+              "b": 10.690608523725835
+            },
+            "pct_pixels_changed": 100.0
+          }
+        },
+        "dwg_aces_vs_filmic": {
+          "mean_abs_diff": 20.518364180579965,
+          "max_abs_diff": 60.0,
+          "mean_signed": {
+            "r": 12.749136368629173,
+            "g": 13.481309039982426,
+            "b": 16.545344079525485
+          },
+          "pct_pixels_changed": 99.99052614235501
+        },
+        "dwg_plus_none_error": null
+      }
+    },
+    {
+      "parameter": "convert.encode",
+      "verdict": "works",
+      "summary": "On working_space=dwg, rec709a vs gamma24 select different output LUTs and differ by mean 6.41 code values (max 9): the control case genuinely works. On working_space=direct the two renders are NOT identical (max diff 9), because an AppleLog_to_Rec709_<tonemap>_<encode>.cube now exists on disk and f_convert_out picks it over the unsuffixed fallback, so cfg.encode now genuinely changes the direct path's output too.",
+      "direction": "claim: differs on dwg (control), inert on direct; measured dwg mean_abs_diff=6.41, direct max_abs_diff=9, direct_ignores_encode=False",
+      "measurements": {
+        "dwg_control": {
+          "mean_abs_diff": 6.4072330843585235,
+          "max_abs_diff": 9.0,
+          "mean_signed": {
+            "r": 6.512905041739894,
+            "g": 6.540211720123023,
+            "b": 6.1685824912126535
+          },
+          "pct_pixels_changed": 100.0
+        },
+        "direct_suspect": {
+          "mean_abs_diff": 6.416434625805507,
+          "max_abs_diff": 9.0,
+          "mean_signed": {
+            "r": 6.52815795254833,
+            "g": 6.544523011862918,
+            "b": 6.176622913005272
+          },
+          "pct_pixels_changed": 100.0
+        },
+        "direct_ignores_encode": false
+      }
+    },
+    {
+      "parameter": "convert.exposure",
+      "verdict": "works",
+      "summary": "Mean luma rises monotonically with exposure: 64.5 code values at -1 stop, 94.2 at 0, 130.0 at +1 stop.",
+      "direction": "claim: monotonic rise; measured monotonic=True",
+      "measurements": {
+        "mean_luma_by_stop": {
+          "-1": 64.46304734182777,
+          "0": 94.17002420172452,
+          "+1": 129.983274122913
+        }
+      }
+    },
+    {
+      "parameter": "primaries.contrast",
+      "verdict": "works",
+      "summary": "Luma standard deviation rises from 63.8 to 84.2 at contrast 1.8 (frame mean moves from 94.2 to 92.0, a smaller shift than the spread increase, because the pivot near mid grey keeps the average roughly anchored while the spread widens).",
+      "direction": "claim: std rises with contrast; measured 63.8 -> 84.2",
+      "measurements": {
+        "std_off": 63.76527066958209,
+        "std_on": 84.22902857960923,
+        "mean_off": 94.17002420172452,
+        "mean_on": 92.03213928108522
+      }
+    },
+    {
+      "parameter": "primaries.pivot",
+      "verdict": "works",
+      "summary": "With contrast held at 1.4, the fixed point of the contrast transform (read from a calibrated ramp through the real f_primaries filter string) moves with pivot: default (mid grey) crosses at code 85 (expected 85.7), pivot 0.2 crosses at 50 (expected 51.0), pivot 0.6 crosses at 153 (expected 153.0).",
+      "direction": "claim: crossover follows pivot; measured rows=[{'pivot_cfg': None, 'expected_code': 85.68, 'measured_crossover_code': 85.0}, {'pivot_cfg': 0.2, 'expected_code': 51.0, 'measured_crossover_code': 50.0}, {'pivot_cfg': 0.6, 'expected_code': 153.0, 'measured_crossover_code': 153.0}]",
+      "measurements": {
+        "pivot_rows": [
+          {
+            "pivot_cfg": null,
+            "expected_code": 85.68,
+            "measured_crossover_code": 85.0
+          },
+          {
+            "pivot_cfg": 0.2,
+            "expected_code": 51.0,
+            "measured_crossover_code": 50.0
+          },
+          {
+            "pivot_cfg": 0.6,
+            "expected_code": 153.0,
+            "measured_crossover_code": 153.0
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "primaries.saturation",
+      "verdict": "works",
+      "summary": "Mean (max-min)/max rises with saturation: 0.2735 at 1.0, 0.3957 at 1.5, 0.4945 at 2.0. At saturation 0 the frame is monochrome: mean cross-channel gap is only 0.01 code values (rounding noise from the matrix coefficients, not colour). No crash found anywhere in the 2.0-2.5 range including the schema max of 2.5: _saturation_chain now splits saturation above SAT_MAX_PER_PASS into several composed colorchannelmixer passes (s ** (1/N) each, exactly equivalent by the matrix's own idempotent-luma-projection algebra) specifically to stay inside ffmpeg's [-2, 2] coefficient range, so the whole schema range now renders without error.",
+      "direction": "claim: sat rises with saturation, sat=0 is monochrome; measured monotonic=True, mono_gap=0.01, crashes_anywhere_in_0_to_2.5=False",
+      "measurements": {
+        "mean_sat_by_saturation": {
+          "0.0": 0.2734510101307248,
+          "1.5": 0.3956853282515058,
+          "2.0": 0.49451051317582906
+        },
+        "mono_cross_channel_gap": 0.012333177724077328,
+        "crash_boundary_saturation": null,
+        "crash_at_2_5_error": null,
+        "crashes_anywhere_tested": false
+      }
+    },
+    {
+      "parameter": "primaries.vibrance",
+      "verdict": "partially works",
+      "summary": "Vibrance 0.7 raises mean saturation to 0.4433. A flat saturation multiply matched to the same overall strength is saturation 1.719 (mean 0.4422), so the two can be compared fairly. Vibrance puts 11.5% of its gain on the flat pixels (baseline sat < 0.15, 239009 px, +0.0457) versus the already saturated ones (baseline sat > 0.45, 139959 px, +0.3528); the matched flat multiply puts 11.7% there (+0.0461 versus +0.3475). Vibrance does not favour flat colour any more than a plain multiply does, so the tooltip's claim of protecting already saturated colour is not what the engine delivers.",
+      "direction": "claim: vibrance favours flat colour more than a matched flat multiply; measured 11.5% vs 11.7%",
+      "measurements": {
+        "vibrance": {
+          "low": 0.045702516199234315,
+          "high": 0.35278948617542405,
+          "mean": 0.44331420063513627,
+          "flat_share": 0.11468866608837296
+        },
+        "matched_saturation": {
+          "value": 1.71875,
+          "low": 0.04611492030517318,
+          "high": 0.34745131427358344,
+          "mean": 0.44216842970704634,
+          "flat_share": 0.11717194274689517
+        }
+      }
+    },
+    {
+      "parameter": "primaries.temperature",
+      "verdict": "works",
+      "summary": "At temperature +0.3, mean r rises 95.5 -> 112.2 and mean b falls 83.0 -> 72.0 (mean g 94.9 -> 93.5), matching the tooltip's 'positive is warmer'.",
+      "direction": "claim: +temp raises r, lowers b; measured r 95.5->112.2, b 83.0->72.0",
+      "measurements": {
+        "off": {
+          "r": 95.54837983304043,
+          "g": 94.88330678822496,
+          "b": 83.04567360500879
+        },
+        "pushed": {
+          "r": 112.24835374560632,
+          "g": 93.49937664762741,
+          "b": 71.98332189147628
+        }
+      }
+    },
+    {
+      "parameter": "primaries.tint",
+      "verdict": "works",
+      "summary": "At tint +0.3, mean g rises 94.9 -> 106.4 (r 95.5 -> 88.3, b 83.0 -> 81.2), matching 'positive is greener'.",
+      "direction": "claim: +tint raises g; measured 94.9->106.4",
+      "measurements": {
+        "off": {
+          "r": 95.54837983304043,
+          "g": 94.88330678822496,
+          "b": 83.04567360500879
+        },
+        "pushed": {
+          "r": 88.2564133897188,
+          "g": 106.35907018892794,
+          "b": 81.20229569420034
+        }
+      }
+    },
+    {
+      "parameter": "primaries.brightness",
+      "verdict": "partially works",
+      "summary": "At brightness +0.15, p5 moves +56.2, p50 moves +96.9, p95 moves +22.6 code values. They differ by up to 74.3 code values, less flat than the label implies, because brightness is added before the tonemap/CST-out LUT and that LUT compresses highlights more than shadows, so an equal push pre-tonemap lands unequally post-tonemap.",
+      "direction": "claim: all percentiles move roughly equally; measured deltas={'p5': 56.224590000000006, 'p50': 96.8845, 'p95': 22.56159999999997}",
+      "measurements": {
+        "off_pct": {
+          "p5": 26.2098,
+          "p50": 71.3895,
+          "p95": 228.3702
+        },
+        "pushed_pct": {
+          "p5": 82.43439000000001,
+          "p50": 168.274,
+          "p95": 250.93179999999998
+        },
+        "deltas": {
+          "p5": 56.224590000000006,
+          "p50": 96.8845,
+          "p95": 22.56159999999997
+        }
+      }
+    },
+    {
+      "parameter": "primaries.lift",
+      "verdict": "works",
+      "summary": "At lift +0.12, p5 moves +31.2 vs p95 +11.3: shadows move more than highlights, matching 'lift moves shadows'.",
+      "direction": "claim: shadows move more than highlights; measured {'p5': 31.225799999999992, 'p50': 51.4577, 'p95': 11.2808}",
+      "measurements": {
+        "deltas": {
+          "p5": 31.225799999999992,
+          "p50": 51.4577,
+          "p95": 11.2808
+        }
+      }
+    },
+    {
+      "parameter": "primaries.gain",
+      "verdict": "works",
+      "summary": "At gain 1.35, p95 moves +25.5 vs p5 +16.1: highlights move more than shadows, matching 'gain moves highlights'.",
+      "direction": "claim: highlights move more than shadows; measured {'p5': 16.088199999999993, 'p50': 65.6095, 'p95': 25.48939999999999}",
+      "measurements": {
+        "deltas": {
+          "p5": 16.088199999999993,
+          "p50": 65.6095,
+          "p95": 25.48939999999999
+        }
+      }
+    },
+    {
+      "parameter": "primaries.gamma",
+      "verdict": "works",
+      "summary": "At gamma 1.7, p50 moves +122.6 vs p5 +76.0 and p95 +22.5: midtones move the most of the three, matching 'gamma moves midtones'.",
+      "direction": "claim: midtones move most; measured {'p5': 76.0312, 'p50': 122.5969, 'p95': 22.48939999999999}",
+      "measurements": {
+        "deltas": {
+          "p5": 76.0312,
+          "p50": 122.5969,
+          "p95": 22.48939999999999
+        }
+      }
+    },
+    {
+      "parameter": "primaries.lift (triple)",
+      "verdict": "works",
+      "summary": "lift triple [0.06, 0.0, -0.06]: channel means move by r+33.38 g+0.27 b-33.33 code values relative to the scalar-default render, ordered as configured (r pushed most positive/least negative through to b), so channels move independently.",
+      "direction": "claim: channels move independently; measured {'r': 33.377630711775026, 'g': 0.2739180579964824, 'b': -33.33069941783831}",
+      "measurements": {
+        "triple": [
+          0.06,
+          0.0,
+          -0.06
+        ],
+        "channel_deltas": {
+          "r": 33.377630711775026,
+          "g": 0.2739180579964824,
+          "b": -33.33069941783831
+        }
+      }
+    },
+    {
+      "parameter": "primaries.gamma (triple)",
+      "verdict": "works",
+      "summary": "gamma triple [1.5, 1.0, 0.65]: channel means move by r+107.59 g-17.58 b-83.05 code values relative to the scalar-default render, ordered as configured (r pushed most positive/least negative through to b), so channels move independently.",
+      "direction": "claim: channels move independently; measured {'r': 107.58665833699473, 'g': -17.58242256151142, 'b': -83.04567360500879}",
+      "measurements": {
+        "triple": [
+          1.5,
+          1.0,
+          0.65
+        ],
+        "channel_deltas": {
+          "r": 107.58665833699473,
+          "g": -17.58242256151142,
+          "b": -83.04567360500879
+        }
+      }
+    },
+    {
+      "parameter": "primaries.gain (triple)",
+      "verdict": "works",
+      "summary": "gain triple [1.3, 1.0, 0.7]: channel means move by r+68.22 g-3.33 b-82.64 code values relative to the scalar-default render, ordered as configured (r pushed most positive/least negative through to b), so channels move independently.",
+      "direction": "claim: channels move independently; measured {'r': 68.22489290421791, 'g': -3.326977152899829, 'b': -82.63867942662566}",
+      "measurements": {
+        "triple": [
+          1.3,
+          1.0,
+          0.7
+        ],
+        "channel_deltas": {
+          "r": 68.22489290421791,
+          "g": -3.326977152899829,
+          "b": -82.63867942662566
+        }
+      }
+    },
+    {
+      "parameter": "primaries.brightness (triple)",
+      "verdict": "works",
+      "summary": "brightness triple [0.12, 0.0, -0.12]: channel means move by r+91.49 g-9.39 b-80.60 code values relative to the scalar-default render, ordered as configured (r pushed most positive/least negative through to b), so channels move independently.",
+      "direction": "claim: channels move independently; measured {'r': 91.486170913884, 'g': -9.38556541080844, 'b': -80.60134007029878}",
+      "measurements": {
+        "triple": [
+          0.12,
+          0.0,
+          -0.12
+        ],
+        "channel_deltas": {
+          "r": 91.486170913884,
+          "g": -9.38556541080844,
+          "b": -80.60134007029878
+        }
+      }
+    },
+    {
+      "parameter": "primaries.black_lift",
+      "verdict": "works",
+      "summary": "At black_lift +0.15, tracking the same pixels: the darkest 5% rise +9.91 code values, pixels sitting at mid grey move +0.29, and the brightest 5% move -0.00. Each end stays under half a code value, which is below one 8 bit step and so cannot be seen: the control lifts shadows and genuinely leaves mid tones and highlights alone. For context the whole-frame percentiles moved p5 +8.5, p50 +1.0, p95 -0.0; the p95 figure shifts because lifting the shadows reshapes the histogram, not because bright pixels changed.",
+      "direction": "claim: shadows rise, mid tones and highlights stay put; measured {'dark': 9.911615536699893, 'grey': 0.2927980182926831, 'bright': -0.0007742936379363712}",
+      "measurements": {
+        "tracked_pixel_moves": {
+          "dark": 9.911615536699893,
+          "grey": 0.2927980182926831,
+          "bright": -0.0007742936379363712
+        },
+        "percentile_deltas": {
+          "p5": 8.510599999999997,
+          "p50": 0.9856000000000051,
+          "p95": -0.004000000000047521
+        }
+      }
+    },
+    {
+      "parameter": "primaries.highlight_rolloff",
+      "verdict": "works",
+      "summary": "At highlight_rolloff 0.2, tracking the same pixels: the brightest 5% move -6.20 code values, pixels sitting at mid grey move +0.10, and the darkest 5% move -0.00. Each end stays under half a code value, which is below one 8 bit step and so cannot be seen: the control rolls off highlights and genuinely leaves mid tones and shadows alone. For context the whole-frame percentiles moved p5 +0.0, p50 +0.1, p95 -6.3.",
+      "direction": "claim: highlights fall, mid tones and shadows stay put; measured {'dark': -0.00022949172089958142, 'grey': 0.09552055386178844, 'bright': -6.1972682885307195}",
+      "measurements": {
+        "tracked_pixel_moves": {
+          "dark": -0.00022949172089958142,
+          "grey": 0.09552055386178844,
+          "bright": -6.1972682885307195
+        },
+        "percentile_deltas": {
+          "p5": 0.002799999999997027,
+          "p50": 0.08870000000000289,
+          "p95": -6.280800000000028
+        }
+      }
+    },
+    {
+      "parameter": "curves.master",
+      "verdict": "works",
+      "summary": "Master midpoint pushed to (0.5, 0.65) raises mean luma from 94.2 to 120.8.",
+      "direction": "claim: mean luma rises; measured 94.2 -> 120.8",
+      "measurements": {
+        "off_mean": 94.17002420172452,
+        "pushed_mean": 120.8261040377856
+      }
+    },
+    {
+      "parameter": "curves.r",
+      "verdict": "works",
+      "summary": "Pushing only the r curve's midpoint moves mean r by +27.0 while the other two channels move by at most 0.0, so the push is isolated to that channel.",
+      "direction": "claim: only r moves materially; measured {'r': 26.964061126977143, 'g': 0.001033886203870793, 'b': -0.013510544815460435}",
+      "measurements": {
+        "deltas": {
+          "r": 26.964061126977143,
+          "g": 0.001033886203870793,
+          "b": -0.013510544815460435
+        }
+      }
+    },
+    {
+      "parameter": "curves.g",
+      "verdict": "works",
+      "summary": "Pushing only the g curve's midpoint moves mean g by +26.9 while the other two channels move by at most 0.0, so the push is isolated to that channel.",
+      "direction": "claim: only g moves materially; measured {'r': -0.012170474516707941, 'g': 26.893604459578214, 'b': 0.012331118189806034}",
+      "measurements": {
+        "deltas": {
+          "r": -0.012170474516707941,
+          "g": 26.893604459578214,
+          "b": 0.012331118189806034
+        }
+      }
+    },
+    {
+      "parameter": "curves.b",
+      "verdict": "works",
+      "summary": "Pushing only the b curve's midpoint moves mean b by +23.4 while the other two channels move by at most 0.0, so the push is isolated to that channel.",
+      "direction": "claim: only b moves materially; measured {'r': 0.008923275483297743, 'g': -0.0060509116871685364, 'b': 23.42195738137083}",
+      "measurements": {
+        "deltas": {
+          "r": 0.008923275483297743,
+          "g": -0.0060509116871685364,
+          "b": 23.42195738137083
+        }
+      }
+    },
+    {
+      "parameter": "curves.interp",
+      "verdict": "works",
+      "summary": "On the same widely spaced points [[0.0, 0.0], [0.05, 0.55], [0.5, 0.5], [1.0, 1.0]], pchip stays monotone (largest input-to-input dip 1.00 code values, monotone) while natural cubic overshoots (largest dip 7.00 code values, non-monotone). The two interp modes produce a max response difference of 125.0 code values along the ramp, so the choice is not inert.",
+      "direction": "claim: pchip vs natural differ on widely spaced points; measured max_abs_diff=125.0, pchip_monotonic=True, natural_monotonic=False",
+      "measurements": {
+        "points": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.05,
+            0.55
+          ],
+          [
+            0.5,
+            0.5
+          ],
+          [
+            1.0,
+            1.0
+          ]
+        ],
+        "pchip_monotonic": true,
+        "natural_monotonic": false,
+        "max_dip_pchip": 1.0,
+        "max_dip_natural": 7.0,
+        "ramp_diff": {
+          "mean_abs_diff": 53.4453125,
+          "max_abs_diff": 125.0
+        }
+      }
+    },
+    {
+      "parameter": "secondary (key isolation)",
+      "verdict": "works",
+      "summary": "hue_center 52 deg with hue_shift +60 and sat_gain 1.8: pixels inside the key (266109 px) move by a mean 30.39 code values while pixels clearly outside the key (400764 px) move by only 0.25, so the correction stays inside the qualifier.",
+      "direction": "claim: inside moves, outside does not; measured inside=30.39 outside=0.25",
+      "measurements": {
+        "hue_histogram": [
+          {
+            "lo": 0,
+            "hi": 15,
+            "count": 10686
+          },
+          {
+            "lo": 15,
+            "hi": 30,
+            "count": 19127
+          },
+          {
+            "lo": 30,
+            "hi": 45,
+            "count": 63310
+          },
+          {
+            "lo": 45,
+            "hi": 60,
+            "count": 111613
+          },
+          {
+            "lo": 60,
+            "hi": 75,
+            "count": 64410
+          },
+          {
+            "lo": 75,
+            "hi": 90,
+            "count": 49937
+          },
+          {
+            "lo": 90,
+            "hi": 105,
+            "count": 35626
+          },
+          {
+            "lo": 105,
+            "hi": 120,
+            "count": 10756
+          },
+          {
+            "lo": 120,
+            "hi": 135,
+            "count": 10050
+          },
+          {
+            "lo": 135,
+            "hi": 150,
+            "count": 8588
+          },
+          {
+            "lo": 150,
+            "hi": 165,
+            "count": 11010
+          },
+          {
+            "lo": 165,
+            "hi": 180,
+            "count": 7784
+          },
+          {
+            "lo": 180,
+            "hi": 195,
+            "count": 9580
+          },
+          {
+            "lo": 195,
+            "hi": 210,
+            "count": 16840
+          },
+          {
+            "lo": 210,
+            "hi": 225,
+            "count": 37648
+          },
+          {
+            "lo": 225,
+            "hi": 240,
+            "count": 8005
+          },
+          {
+            "lo": 240,
+            "hi": 255,
+            "count": 7754
+          },
+          {
+            "lo": 255,
+            "hi": 270,
+            "count": 7546
+          },
+          {
+            "lo": 270,
+            "hi": 285,
+            "count": 5892
+          },
+          {
+            "lo": 285,
+            "hi": 300,
+            "count": 4433
+          },
+          {
+            "lo": 300,
+            "hi": 315,
+            "count": 5675
+          },
+          {
+            "lo": 315,
+            "hi": 330,
+            "count": 6264
+          },
+          {
+            "lo": 330,
+            "hi": 345,
+            "count": 9863
+          },
+          {
+            "lo": 345,
+            "hi": 360,
+            "count": 9857
+          }
+        ],
+        "hue_center": 52.5,
+        "pop_diff": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 30.38968618122649,
+          "outside_mean_abs_diff": 0.25472347815672064
+        }
+      }
+    },
+    {
+      "parameter": "secondary.invert",
+      "verdict": "works",
+      "summary": "With the default key, 35.84% of pixels read keyed (matte >= 128); with invert on, 64.24% do, and the two sum to 100.08% (should land near 100%).",
+      "direction": "claim: invert flips the key; measured 35.84% + 64.24% = 100.08%",
+      "measurements": {
+        "pct_default": 35.83699472759227,
+        "pct_inverted": 64.24236599297012
+      }
+    },
+    {
+      "parameter": "secondary.show_mask",
+      "verdict": "works",
+      "summary": "show_mask renders a greyscale matte (r/g/b cross-channel gap 0.01) instead of the corrected image; toggling it off with the same key returns the colour-corrected frame (mean abs diff from the matte render is 122.5, confirming the two are genuinely different outputs).",
+      "direction": "claim: show_mask displays a matte, not the graded image; confirmed by cross-channel gap and diff from corrected render",
+      "measurements": {
+        "matte_cross_channel_gap": 0.012313268892794375
+      }
+    },
+    {
+      "parameter": "secondary.strength",
+      "verdict": "works",
+      "summary": "Inside the key, strength 0.5 moves pixels by a mean 15.19 code values vs 30.39 at strength 1.0, a ratio of 0.50 (0.5 would be an exact half).",
+      "direction": "claim: 0.5 is about half the move of 1.0; measured ratio=0.50",
+      "measurements": {
+        "half": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 15.194227428109034,
+          "outside_mean_abs_diff": 0.1285411530643138
+        },
+        "full": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 30.38968618122649,
+          "outside_mean_abs_diff": 0.25472347815672064
+        },
+        "ratio": 0.49997974107068627
+      }
+    },
+    {
+      "parameter": "secondary.hue_width",
+      "verdict": "works",
+      "summary": "Pushing hue_width to 120.0 moves the keyed pixel count from 35.84% to 53.61% of the frame (wider hue window should key MORE pixels).",
+      "direction": "claim: wider hue window should key MORE pixels; measured 35.84% -> 53.61%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 53.60693101933216,
+        "pushed_value": 120.0
+      }
+    },
+    {
+      "parameter": "secondary.hue_soft",
+      "verdict": "works",
+      "summary": "Pushing hue_soft to 60.0 moves the keyed pixel count from 35.84% to 47.49% of the frame (softer hue edge should key MORE pixels (softness grows the selection outward)).",
+      "direction": "claim: softer hue edge should key MORE pixels (softness grows the selection outward); measured 35.84% -> 47.49%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 47.48750549209139,
+        "pushed_value": 60.0
+      }
+    },
+    {
+      "parameter": "secondary.sat_low",
+      "verdict": "works",
+      "summary": "Pushing sat_low to 0.4 moves the keyed pixel count from 35.84% to 22.78% of the frame (raising the saturation floor should key FEWER pixels).",
+      "direction": "claim: raising the saturation floor should key FEWER pixels; measured 35.84% -> 22.78%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 22.783391915641477,
+        "pushed_value": 0.4
+      }
+    },
+    {
+      "parameter": "secondary.sat_high",
+      "verdict": "works",
+      "summary": "Pushing sat_high to 0.5 moves the keyed pixel count from 35.84% to 26.65% of the frame (lowering the saturation ceiling should key FEWER pixels).",
+      "direction": "claim: lowering the saturation ceiling should key FEWER pixels; measured 35.84% -> 26.65%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 26.653531414762742,
+        "pushed_value": 0.5
+      }
+    },
+    {
+      "parameter": "secondary.sat_soft",
+      "verdict": "works",
+      "summary": "Pushing sat_soft to 0.4 moves the keyed pixel count from 35.84% to 36.45% of the frame (softer saturation edge should key MORE pixels).",
+      "direction": "claim: softer saturation edge should key MORE pixels; measured 35.84% -> 36.45%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 36.454443101933215,
+        "pushed_value": 0.4
+      }
+    },
+    {
+      "parameter": "secondary.lum_low",
+      "verdict": "works",
+      "summary": "Pushing lum_low to 0.3 moves the keyed pixel count from 35.84% to 22.65% of the frame (raising the luma floor should key FEWER pixels).",
+      "direction": "claim: raising the luma floor should key FEWER pixels; measured 35.84% -> 22.65%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 22.647188049209138,
+        "pushed_value": 0.3
+      }
+    },
+    {
+      "parameter": "secondary.lum_high",
+      "verdict": "works",
+      "summary": "Pushing lum_high to 0.7 moves the keyed pixel count from 35.84% to 35.27% of the frame (lowering the luma ceiling should key FEWER pixels).",
+      "direction": "claim: lowering the luma ceiling should key FEWER pixels; measured 35.84% -> 35.27%",
+      "measurements": {
+        "default_pct_keyed": 35.83699472759227,
+        "pushed_pct_keyed": 35.27350615114236,
+        "pushed_value": 0.7
+      }
+    },
+    {
+      "parameter": "secondary.hue_center",
+      "verdict": "works",
+      "summary": "Shifting hue_center by +90 deg (from 52 to 142) with hue_width/soft unchanged moves the keyed pct from 35.84% to 3.42%, and the two keyed sets overlap (intersection over union) by only 0.000: the window follows hue_center to a different part of the hue wheel rather than just resizing in place.",
+      "direction": "claim: hue_center selects which hue is keyed; measured IoU=0.000 (low IoU means the selection genuinely relocated)",
+      "measurements": {
+        "default_hue_center": 52.5,
+        "moved_hue_center": 142.5,
+        "default_pct_keyed": 35.83699472759227,
+        "moved_pct_keyed": 3.415943541300527,
+        "iou": 0.0
+      }
+    },
+    {
+      "parameter": "secondary.lum_soft",
+      "verdict": "partially works",
+      "summary": "At the default lum_low=0/lum_high=1 window (the schema default), pushing lum_soft to 0.4 keeps the keyed count at 35.84% (was 35.84%): there is no boundary to soften because luma cannot exist outside 0..1. With the window narrowed to lum_low=0.2/lum_high=0.8, the same push moves it from 32.32% to 35.11%, so the parameter itself works, it is just structurally a no-op at the schema's own default window.",
+      "direction": "claim: softer luma edge keys more pixels; measured no movement at default window (35.84% -> 35.84%), real movement once the window has an edge (32.32% -> 35.11%)",
+      "measurements": {
+        "default_window_pct": {
+          "before": 35.83699472759227,
+          "after": 35.83699472759227
+        },
+        "narrow_window_pct": {
+          "before": 32.32397847100176,
+          "after": 35.1097045254833
+        }
+      }
+    },
+    {
+      "parameter": "secondary.hue_shift",
+      "verdict": "works",
+      "summary": "hue_shift pushed alone: inside-key pixels move a mean 20.68 code values vs 0.16 outside the key.",
+      "direction": "claim: hue_shift corrects only keyed pixels; measured inside=20.68 outside=0.16",
+      "measurements": {
+        "pop_diff": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 20.67538239343026,
+          "outside_mean_abs_diff": 0.15923253252953523
+        }
+      }
+    },
+    {
+      "parameter": "secondary.sat_gain",
+      "verdict": "works",
+      "summary": "sat_gain pushed alone: inside-key pixels move a mean 13.89 code values vs 0.16 outside the key.",
+      "direction": "claim: sat_gain corrects only keyed pixels; measured inside=13.89 outside=0.16",
+      "measurements": {
+        "pop_diff": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 13.888100991197842,
+          "outside_mean_abs_diff": 0.15991456318431796
+        }
+      }
+    },
+    {
+      "parameter": "secondary.lum_gain",
+      "verdict": "works",
+      "summary": "lum_gain pushed alone: inside-key pixels move a mean 53.65 code values vs 1.07 outside the key.",
+      "direction": "claim: lum_gain corrects only keyed pixels; measured inside=53.65 outside=1.07",
+      "measurements": {
+        "pop_diff": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 53.648865690375,
+          "outside_mean_abs_diff": 1.070359779487845
+        }
+      }
+    },
+    {
+      "parameter": "secondary.tint",
+      "verdict": "works",
+      "summary": "tint pushed alone: inside-key pixels move a mean 42.13 code values vs 1.21 outside the key.",
+      "direction": "claim: tint corrects only keyed pixels; measured inside=42.13 outside=1.21",
+      "measurements": {
+        "pop_diff": {
+          "inside_pixels": 266109,
+          "outside_pixels": 400764,
+          "inside_mean_abs_diff": 42.12627532326979,
+          "outside_mean_abs_diff": 1.2104896314705578
+        }
+      }
+    },
+    {
+      "parameter": "look.lut",
+      "verdict": "works",
+      "summary": "Applying the 'kodak2383' look LUT (of 24 available: bleach, blockbuster, blockbuster_max, blue_hour, commercial, demo_2567, film_portrait, film_tungsten, forest, golden_haze, interior, kodak2383, match_dfd97c95112bc05043458835383b6715f3bec4a5_a001_09011832_c003_reinhard_lp, match_img_2562_a001_09011336_c002_reinhard_lp, match_img_2567_a001_09011336_c002_reinhard_lp, natural, neutral, nordic, premium, punch, reels, silverblue, teal_orange, warm_film) at mix 1.0 changes the frame by a mean 6.63 code values (max 32).",
+      "direction": "claim: applying a look changes the frame; measured mean_abs_diff=6.63",
+      "measurements": {
+        "available_looks": [
+          "bleach",
+          "blockbuster",
+          "blockbuster_max",
+          "blue_hour",
+          "commercial",
+          "demo_2567",
+          "film_portrait",
+          "film_tungsten",
+          "forest",
+          "golden_haze",
+          "interior",
+          "kodak2383",
+          "match_dfd97c95112bc05043458835383b6715f3bec4a5_a001_09011832_c003_reinhard_lp",
+          "match_img_2562_a001_09011336_c002_reinhard_lp",
+          "match_img_2567_a001_09011336_c002_reinhard_lp",
+          "natural",
+          "neutral",
+          "nordic",
+          "premium",
+          "punch",
+          "reels",
+          "silverblue",
+          "teal_orange",
+          "warm_film"
+        ],
+        "chosen": "kodak2383",
+        "full_vs_off": {
+          "mean_abs_diff": 6.631007432630345,
+          "max_abs_diff": 32.0,
+          "mean_signed": {
+            "r": 3.990145815026362,
+            "g": 3.111851933216169,
+            "b": 4.04614592486819
+          },
+          "pct_pixels_changed": 99.9850340509666
+        }
+      }
+    },
+    {
+      "parameter": "look.mix",
+      "verdict": "works",
+      "summary": "mix 0.0 vs no-look at all: mean abs diff 0.000 (exactly zero, pixel identical as claimed). mix 1.0 vs the full-look render: mean abs diff 0.000 (pixel identical). Distance from no-look rises monotonically across 0, 0.25, 0.5, 0.75, 1.0: 0.00, 1.66, 3.32, 4.97, 6.63.",
+      "direction": "claim: mix 0 == no-look, mix 1 == full look, monotonic between; measured mix0_identical=True, mix1_identical=True, monotonic=True",
+      "measurements": {
+        "rows": [
+          {
+            "mix": 0.0,
+            "mean_abs_diff_from_no_look": 0.0,
+            "mean_abs_diff_from_full_look": 6.631007432630345
+          },
+          {
+            "mix": 0.25,
+            "mean_abs_diff_from_no_look": 1.6591525702987697,
+            "mean_abs_diff_from_full_look": 4.971864931165788
+          },
+          {
+            "mix": 0.5,
+            "mean_abs_diff_from_no_look": 3.3162854239894552,
+            "mean_abs_diff_from_full_look": 3.3147357388693615
+          },
+          {
+            "mix": 0.75,
+            "mean_abs_diff_from_no_look": 4.971226933216169,
+            "mean_abs_diff_from_full_look": 1.6597896528998242
+          },
+          {
+            "mix": 1.0,
+            "mean_abs_diff_from_no_look": 6.631007432630345,
+            "mean_abs_diff_from_full_look": 0.0
+          }
+        ],
+        "mix0_identical": true,
+        "mix1_identical": true,
+        "monotonic": true
+      }
+    },
+    {
+      "parameter": "fx.halation.strength",
+      "verdict": "works",
+      "summary": "Mean luma at strength 0, 0.3, 0.55, 1 is 94.17, 95.06, 95.80, 97.14 (off = 94.17); rising strength raises mean luma, a screen blend adding light.",
+      "direction": "claim: strength up raises mean luma; measured [{'strength': 0.0, 'mean_luma': 94.17002420172452}, {'strength': 0.3, 'mean_luma': 95.05936803190905}, {'strength': 0.55, 'mean_luma': 95.80071064586996}, {'strength': 1.0, 'mean_luma': 97.13760612725176}]",
+      "measurements": {
+        "off_mean_luma": 94.17002420172452,
+        "rows": [
+          {
+            "strength": 0.0,
+            "mean_luma": 94.17002420172452
+          },
+          {
+            "strength": 0.3,
+            "mean_luma": 95.05936803190905
+          },
+          {
+            "strength": 0.55,
+            "mean_luma": 95.80071064586996
+          },
+          {
+            "strength": 1.0,
+            "mean_luma": 97.13760612725176
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.halation.threshold",
+      "verdict": "works",
+      "summary": "Diff from halation-off at threshold 0.4 / 0.62 / 0.85 is 3.44, 1.79, 0.38 mean code values: raising threshold shrinks the effect, fewer source pixels qualify.",
+      "direction": "claim: higher threshold shrinks the diff; measured [{'threshold': 0.4, 'mean_abs_diff_vs_off': 3.436413023579379}, {'threshold': 0.62, 'mean_abs_diff_vs_off': 1.7895837910076158}, {'threshold': 0.85, 'mean_abs_diff_vs_off': 0.38300655389572347}]",
+      "measurements": {
+        "rows": [
+          {
+            "threshold": 0.4,
+            "mean_abs_diff_vs_off": 3.436413023579379
+          },
+          {
+            "threshold": 0.62,
+            "mean_abs_diff_vs_off": 1.7895837910076158
+          },
+          {
+            "threshold": 0.85,
+            "mean_abs_diff_vs_off": 0.38300655389572347
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.halation.sigma",
+      "verdict": "works",
+      "summary": "Glow-width metric (diff image normalised by its own mean, then mean abs diff against a 61px box blur of itself; falls as the glow widens, see glow_width_metric() for why the raw unnormalised version was rejected) at sigma 7.8 / 26 / 78.0 is 0.325, 0.306, 0.263, falling as sigma rises: the glow gets wider as claimed.",
+      "direction": "claim: higher sigma widens the glow (metric falls); measured [{'sigma': 7.8, 'glow_width_metric': 0.3246875454274716}, {'sigma': 26.0, 'glow_width_metric': 0.30614592826909287}, {'sigma': 78.0, 'glow_width_metric': 0.26328760861105693}]",
+      "measurements": {
+        "rows": [
+          {
+            "sigma": 7.8,
+            "glow_width_metric": 0.3246875454274716
+          },
+          {
+            "sigma": 26.0,
+            "glow_width_metric": 0.30614592826909287
+          },
+          {
+            "sigma": 78.0,
+            "glow_width_metric": 0.26328760861105693
+          }
+        ],
+        "metric": "mean_abs_diff(diff/mean(diff), box_blur61(diff/mean(diff)))"
+      }
+    },
+    {
+      "parameter": "fx.halation.tint",
+      "verdict": "works",
+      "summary": "Tint [1.0, 0.34, 0.16] gains most in channel 'r' (+3.71); tint [0.16, 0.34, 1.0] gains most in channel 'b' (+3.32); per channel deltas are {'r': 3.71070545913884, 'g': 1.1231326889279438, 'b': 0.5336006151142355} vs {'r': 0.5943198044815465, 'g': 1.1224118519332162, 'b': 3.319587543936731}. (Note: halation's own shipped default tint is [1.0, 0.34, 0.16], tested separately above under fx.halation.strength etc; this tint test uses an explicit warm/cool pair instead of the default so the swap is unambiguous.)",
+      "direction": "claim: swapping tint swaps the dominant channel; measured r vs b",
+      "measurements": {
+        "tint_a": [
+          1.0,
+          0.34,
+          0.16
+        ],
+        "delta_a": {
+          "r": 3.71070545913884,
+          "g": 1.1231326889279438,
+          "b": 0.5336006151142355
+        },
+        "tint_b": [
+          0.16,
+          0.34,
+          1.0
+        ],
+        "delta_b": {
+          "r": 0.5943198044815465,
+          "g": 1.1224118519332162,
+          "b": 3.319587543936731
+        },
+        "shipped_default_tint": [
+          1.0,
+          0.34,
+          0.16
+        ]
+      }
+    },
+    {
+      "parameter": "fx.halation.strength_range",
+      "verdict": "works",
+      "summary": "Driven across the range schema.js declares (0 to 6), past the 1.0 that used to be the ceiling: glow keeps growing all the way to the top of the slider (strength 1.5: +1.61 mean code values vs strength 1.0, strength 2: +3.00 mean code values vs strength 1.0, strength 6: +11.55 mean code values vs strength 1.0), so the whole declared 0 to 6 range is live travel. Row by row: strength=1.5 ran=True mean_abs_diff_vs_1.0=1.61; strength=2 ran=True mean_abs_diff_vs_1.0=3.00; strength=6 ran=True mean_abs_diff_vs_1.0=11.55; strength=9 (past the slider max) ran=True mean_abs_diff_vs_1.0=16.29. Above 1.0 the engine drives the glow layer's amplitude instead of the blend opacity, which is what ffmpeg genuinely caps at 1.0 (see glow_drive in cinegrade.py).",
+      "direction": "claim: the slider's full 0 to 6 range does something; measured errored=False, clamped=False, monotonic=True",
+      "measurements": {
+        "declared_max": 6.0,
+        "rows": [
+          {
+            "strength": 1.5,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 1.6140766879027533,
+              "max_abs_diff": 44.0,
+              "mean_signed": {
+                "r": 3.3448662675746923,
+                "g": 1.0195655755711774,
+                "b": 0.4765734841827768
+              },
+              "pct_pixels_changed": 65.32458260105449
+            }
+          },
+          {
+            "strength": 2.0,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 3.003812426772115,
+              "max_abs_diff": 88.0,
+              "mean_signed": {
+                "r": 6.014911028119508,
+                "g": 2.0401224736379615,
+                "b": 0.9552971221441124
+              },
+              "pct_pixels_changed": 70.81626208260106
+            }
+          },
+          {
+            "strength": 6.0,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 11.552156561218512,
+              "max_abs_diff": 188.0,
+              "mean_signed": {
+                "r": 20.681337873462216,
+                "g": 9.15546875,
+                "b": 4.8185756260984185
+              },
+              "pct_pixels_changed": 79.85226274165203
+            }
+          },
+          {
+            "strength": 9.0,
+            "within_declared_range": false,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 16.287570024165202,
+              "max_abs_diff": 203.0,
+              "mean_signed": {
+                "r": 28.38761396089631,
+                "g": 12.980645869947276,
+                "b": 7.493255711775044
+              },
+              "pct_pixels_changed": 81.97770210896309
+            }
+          }
+        ],
+        "any_errored": false,
+        "any_clamped": false,
+        "grows_monotonically": true
+      }
+    },
+    {
+      "parameter": "fx.bloom.strength",
+      "verdict": "works",
+      "summary": "Mean luma at strength 0, 0.28, 0.3, 1 is 94.17, 95.86, 95.98, 100.20 (off = 94.17); rising strength raises mean luma, a screen blend adding light.",
+      "direction": "claim: strength up raises mean luma; measured [{'strength': 0.0, 'mean_luma': 94.17002420172452}, {'strength': 0.28, 'mean_luma': 95.85798880903998}, {'strength': 0.3, 'mean_luma': 95.9780029566674}, {'strength': 1.0, 'mean_luma': 100.20212101768453}]",
+      "measurements": {
+        "off_mean_luma": 94.17002420172452,
+        "rows": [
+          {
+            "strength": 0.0,
+            "mean_luma": 94.17002420172452
+          },
+          {
+            "strength": 0.28,
+            "mean_luma": 95.85798880903998
+          },
+          {
+            "strength": 0.3,
+            "mean_luma": 95.9780029566674
+          },
+          {
+            "strength": 1.0,
+            "mean_luma": 100.20212101768453
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.bloom.threshold",
+      "verdict": "works",
+      "summary": "Diff from bloom-off at threshold 0.4 / 0.72 / 0.85 is 3.81, 1.73, 0.75 mean code values: raising threshold shrinks the effect, fewer source pixels qualify.",
+      "direction": "claim: higher threshold shrinks the diff; measured [{'threshold': 0.4, 'mean_abs_diff_vs_off': 3.8097498352372585}, {'threshold': 0.72, 'mean_abs_diff_vs_off': 1.733411595635618}, {'threshold': 0.85, 'mean_abs_diff_vs_off': 0.747537712360867}]",
+      "measurements": {
+        "rows": [
+          {
+            "threshold": 0.4,
+            "mean_abs_diff_vs_off": 3.8097498352372585
+          },
+          {
+            "threshold": 0.72,
+            "mean_abs_diff_vs_off": 1.733411595635618
+          },
+          {
+            "threshold": 0.85,
+            "mean_abs_diff_vs_off": 0.747537712360867
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.bloom.sigma",
+      "verdict": "works",
+      "summary": "Glow-width metric (diff image normalised by its own mean, then mean abs diff against a 61px box blur of itself; falls as the glow widens, see glow_width_metric() for why the raw unnormalised version was rejected) at sigma 21.0 / 70 / 210.0 is 0.356, 0.297, 0.213, falling as sigma rises: the glow gets wider as claimed.",
+      "direction": "claim: higher sigma widens the glow (metric falls); measured [{'sigma': 21.0, 'glow_width_metric': 0.35566505495825557}, {'sigma': 70.0, 'glow_width_metric': 0.29706956746117136}, {'sigma': 210.0, 'glow_width_metric': 0.2132242599916471}]",
+      "measurements": {
+        "rows": [
+          {
+            "sigma": 21.0,
+            "glow_width_metric": 0.35566505495825557
+          },
+          {
+            "sigma": 70.0,
+            "glow_width_metric": 0.29706956746117136
+          },
+          {
+            "sigma": 210.0,
+            "glow_width_metric": 0.2132242599916471
+          }
+        ],
+        "metric": "mean_abs_diff(diff/mean(diff), box_blur61(diff/mean(diff)))"
+      }
+    },
+    {
+      "parameter": "fx.bloom.tint",
+      "verdict": "works",
+      "summary": "Tint [1.0, 0.34, 0.16] gains most in channel 'r' (+1.66); tint [0.16, 0.34, 1.0] gains most in channel 'b' (+2.03); per channel deltas are {'r': 1.6562445079086117, 'g': 0.5892876757469244, 'b': 0.3251935962214411} vs {'r': 0.26098692882249563, 'g': 0.5888757688927944, 'b': 2.028578097539543}. (Note: bloom's own shipped default tint is [1.0, 0.97, 0.92], tested separately above under fx.bloom.strength etc; this tint test uses an explicit warm/cool pair instead of the default so the swap is unambiguous.)",
+      "direction": "claim: swapping tint swaps the dominant channel; measured r vs b",
+      "measurements": {
+        "tint_a": [
+          1.0,
+          0.34,
+          0.16
+        ],
+        "delta_a": {
+          "r": 1.6562445079086117,
+          "g": 0.5892876757469244,
+          "b": 0.3251935962214411
+        },
+        "tint_b": [
+          0.16,
+          0.34,
+          1.0
+        ],
+        "delta_b": {
+          "r": 0.26098692882249563,
+          "g": 0.5888757688927944,
+          "b": 2.028578097539543
+        },
+        "shipped_default_tint": [
+          1.0,
+          0.97,
+          0.92
+        ]
+      }
+    },
+    {
+      "parameter": "fx.bloom.strength_range",
+      "verdict": "works",
+      "summary": "Driven across the range schema.js declares (0 to 4), past the 1.0 that used to be the ceiling: glow keeps growing all the way to the top of the slider (strength 1.5: +3.10 mean code values vs strength 1.0, strength 2: +6.12 mean code values vs strength 1.0, strength 4: +16.12 mean code values vs strength 1.0), so the whole declared 0 to 4 range is live travel. Row by row: strength=1.5 ran=True mean_abs_diff_vs_1.0=3.10; strength=2 ran=True mean_abs_diff_vs_1.0=6.12; strength=4 ran=True mean_abs_diff_vs_1.0=16.12; strength=6 (past the slider max) ran=True mean_abs_diff_vs_1.0=23.74. Above 1.0 the engine drives the glow layer's amplitude instead of the blend opacity, which is what ffmpeg genuinely caps at 1.0 (see glow_drive in cinegrade.py).",
+      "direction": "claim: the slider's full 0 to 4 range does something; measured errored=False, clamped=False, monotonic=True",
+      "measurements": {
+        "declared_max": 4.0,
+        "rows": [
+          {
+            "strength": 1.5,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 3.0981688451962506,
+              "max_abs_diff": 54.0,
+              "mean_signed": {
+                "r": 2.9621938159050965,
+                "g": 2.9974983523725833,
+                "b": 3.334759446397188
+              },
+              "pct_pixels_changed": 74.77358853251317
+            }
+          },
+          {
+            "strength": 2.0,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 6.124133164909197,
+              "max_abs_diff": 107.0,
+              "mean_signed": {
+                "r": 5.928825241652021,
+                "g": 5.922701559753954,
+                "b": 6.520853471001757
+              },
+              "pct_pixels_changed": 80.98871375219684
+            }
+          },
+          {
+            "strength": 4.0,
+            "within_declared_range": true,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 16.116799392208552,
+              "max_abs_diff": 190.0,
+              "mean_signed": {
+                "r": 15.72618903778559,
+                "g": 15.368312005711775,
+                "b": 17.255894387082602
+              },
+              "pct_pixels_changed": 89.31705843585237
+            }
+          },
+          {
+            "strength": 6.0,
+            "within_declared_range": false,
+            "ran": true,
+            "error": null,
+            "identical_to_strength_1": false,
+            "diff_vs_strength_1": {
+              "mean_abs_diff": 23.740360921939075,
+              "max_abs_diff": 211.0,
+              "mean_signed": {
+                "r": 23.26503734622144,
+                "g": 22.56923193101933,
+                "b": 25.38680799648506
+              },
+              "pct_pixels_changed": 92.38974626537785
+            }
+          }
+        ],
+        "any_errored": false,
+        "any_clamped": false,
+        "grows_monotonically": true
+      }
+    },
+    {
+      "parameter": "fx.rgb_split.amount",
+      "verdict": "works",
+      "summary": "Rendered at [0.0, 0.4, 0.6, 1.0, 1.4, 1.6, 2.4, 2.6]: byte-identical groups are [[0.0, 0.4], [0.6, 1.0, 1.4], [1.6, 2.4], [2.6]] (amount is rounded to whole pixels by int(round(amount)) before building rgbashift, so members of a group share the same rounded pixel count: [0, 1, 2, 3]). Amounts that round to 0 ([0.0, 0.4]) are byte identical to rgb_split disabled entirely, because amt=0 skips the rgbashift filter.",
+      "direction": "claim: rounds to whole pixels; measured groups=[[0.0, 0.4], [0.6, 1.0, 1.4], [1.6, 2.4], [2.6]]",
+      "measurements": {
+        "groups": [
+          [
+            0.0,
+            0.4
+          ],
+          [
+            0.6,
+            1.0,
+            1.4
+          ],
+          [
+            1.6,
+            2.4
+          ],
+          [
+            2.6
+          ]
+        ],
+        "rounded_amounts": {
+          "0.0": 0,
+          "0.4": 0,
+          "0.6": 1,
+          "1.0": 1,
+          "1.4": 1,
+          "1.6": 2,
+          "2.4": 2,
+          "2.6": 3
+        },
+        "identical_to_disabled": [
+          0.0,
+          0.4
+        ]
+      }
+    },
+    {
+      "parameter": "fx.radial_blur.sigma",
+      "verdict": "works",
+      "summary": "Mean abs laplacian in the outer ring (radius > 0.9 of the ellipse-normalised frame radius, off = 0.05) at sigma 2.0 / 9 / 25.0 is 0.01, 0.00, 0.00: high-frequency edge energy falls as sigma rises.",
+      "direction": "claim: higher sigma softens the edges (laplacian falls); measured [{'sigma': 2.0, 'outer_ring_mean_abs_laplacian': 0.010054568623529573}, {'sigma': 9.0, 'outer_ring_mean_abs_laplacian': 0.003770323010639366}, {'sigma': 25.0, 'outer_ring_mean_abs_laplacian': 0.0035508891181061596}]",
+      "measurements": {
+        "off_outer_ring_laplacian": 0.04771745023976436,
+        "rows": [
+          {
+            "sigma": 2.0,
+            "outer_ring_mean_abs_laplacian": 0.010054568623529573
+          },
+          {
+            "sigma": 9.0,
+            "outer_ring_mean_abs_laplacian": 0.003770323010639366
+          },
+          {
+            "sigma": 25.0,
+            "outer_ring_mean_abs_laplacian": 0.0035508891181061596
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.radial_blur.start",
+      "verdict": "works",
+      "summary": "With end fixed at 1.0, the radius where on/off laplacian energy first drops under 0.6x (the sharp-to-soft crossover) is start=0.2 -> r=0.53125, start=0.55 -> r=0.78125, start=0.9 -> r=0.96875.",
+      "direction": "claim: start moves the crossover; measured [0.53125, 0.78125, 0.96875]",
+      "measurements": {
+        "rows": [
+          {
+            "start": 0.2,
+            "end": 1.0,
+            "crossover_radius": 0.53125,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.957,
+              0.866,
+              0.775,
+              0.687,
+              0.598,
+              0.511,
+              0.42,
+              0.33,
+              0.242,
+              0.156,
+              0.075,
+              0.042,
+              0.049,
+              0.063,
+              0.113,
+              0.118,
+              0.136,
+              0.127,
+              0.076,
+              NaN
+            ]
+          },
+          {
+            "start": 0.55,
+            "end": 1.0,
+            "crossover_radius": 0.78125,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.959,
+              0.803,
+              0.642,
+              0.483,
+              0.328,
+              0.173,
+              0.054,
+              0.049,
+              0.063,
+              0.113,
+              0.118,
+              0.136,
+              0.127,
+              0.076,
+              NaN
+            ]
+          },
+          {
+            "start": 0.9,
+            "end": 1.0,
+            "crossover_radius": 0.96875,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.912,
+              0.304,
+              0.049,
+              0.063,
+              0.113,
+              0.118,
+              0.136,
+              0.127,
+              0.076,
+              NaN
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.radial_blur.end",
+      "verdict": "works",
+      "summary": "With start fixed at 0.55, the crossover radius at end=0.7 / 1.0 / 1.4 is 0.65625 / 0.78125 / 0.90625.",
+      "direction": "claim: end moves the crossover; measured [0.65625, 0.78125, 0.90625]",
+      "measurements": {
+        "rows": [
+          {
+            "start": 0.55,
+            "end": 0.7,
+            "crossover_radius": 0.65625,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.744,
+              0.264,
+              0.039,
+              0.037,
+              0.037,
+              0.04,
+              0.042,
+              0.049,
+              0.063,
+              0.113,
+              0.118,
+              0.136,
+              0.127,
+              0.076,
+              NaN
+            ]
+          },
+          {
+            "start": 0.55,
+            "end": 1.0,
+            "crossover_radius": 0.78125,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.959,
+              0.803,
+              0.642,
+              0.483,
+              0.328,
+              0.173,
+              0.054,
+              0.049,
+              0.063,
+              0.113,
+              0.118,
+              0.136,
+              0.127,
+              0.076,
+              NaN
+            ]
+          },
+          {
+            "start": 0.55,
+            "end": 1.4,
+            "crossover_radius": 0.90625,
+            "ratio_by_radius": [
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              1.0,
+              0.996,
+              0.931,
+              0.846,
+              0.761,
+              0.679,
+              0.596,
+              0.513,
+              0.436,
+              0.365,
+              0.308,
+              0.231,
+              0.184,
+              0.13,
+              0.076,
+              NaN
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.vignette.amount",
+      "verdict": "works",
+      "summary": "corner/centre luma ratio at amount 0.0 / 0.45 / 1.0 is 1.323, 0.588, 0.027: corners darken relative to centre as amount rises.",
+      "direction": "claim: corners darken relative to centre; measured [{'amount': 0.0, 'corner_luma': 84.3032739265928, 'center_luma': 63.73848476454294, 'corner_over_center': 1.322643207443956}, {'amount': 0.45, 'corner_luma': 37.4142958968144, 'center_luma': 63.60170481301939, 'corner_over_center': 0.5882593242871004}, {'amount': 1.0, 'corner_luma': 1.7251393092105265, 'center_luma': 63.218691170360096, 'corner_over_center': 0.027288437600861835}]",
+      "measurements": {
+        "rows": [
+          {
+            "amount": 0.0,
+            "corner_luma": 84.3032739265928,
+            "center_luma": 63.73848476454294,
+            "corner_over_center": 1.322643207443956
+          },
+          {
+            "amount": 0.45,
+            "corner_luma": 37.4142958968144,
+            "center_luma": 63.60170481301939,
+            "corner_over_center": 0.5882593242871004
+          },
+          {
+            "amount": 1.0,
+            "corner_luma": 1.7251393092105265,
+            "center_luma": 63.218691170360096,
+            "corner_over_center": 0.027288437600861835
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "fx.vignette.radius",
+      "verdict": "works",
+      "summary": "With amount fixed at 0.45, radius 0.2 vs 0.85 vs 1.6 are NOT identical: max_abs_diff 0.2v0.85=143.0, 0.2v1.6=204.0, 0.85v1.6=96.0.",
+      "direction": "claim (UI tooltip): radius is inert; measured all_identical=False",
+      "measurements": {
+        "0.2_vs_0.85": {
+          "mean_abs_diff": 41.75225450351494,
+          "max_abs_diff": 143.0,
+          "mean_signed": {
+            "r": 43.06080568980668,
+            "g": 43.10389251977153,
+            "b": 39.09206530096661
+          },
+          "pct_pixels_changed": 99.74461775043937
+        },
+        "0.2_vs_1.6": {
+          "mean_abs_diff": 58.860000640744,
+          "max_abs_diff": 204.0,
+          "mean_signed": {
+            "r": 60.53592926186292,
+            "g": 60.61407760325132,
+            "b": 55.42999505711775
+          },
+          "pct_pixels_changed": 99.77962983304042
+        },
+        "0.85_vs_1.6": {
+          "mean_abs_diff": 17.107746137229057,
+          "max_abs_diff": 96.0,
+          "mean_signed": {
+            "r": 17.47512357205624,
+            "g": 17.51018508347979,
+            "b": 16.33792975615114
+          },
+          "pct_pixels_changed": 98.75878734622144
+        }
+      }
+    },
+    {
+      "parameter": "grain.strength",
+      "verdict": "works",
+      "summary": "Local variance (variance of the on-minus-off difference image, minus a 3x3 box blur of that difference; isolates the added noise from scene content) is 0.10 at strength 10 and 2.12 at strength 90, rising with strength. Two independent ffmpeg invocations of the SAME grain config, at the same clip and timecode, produced byte-identical frames for every config tested here (run-to-run spread 0 in all cases). That contradicts this audit brief's own assumption that grain is random per ffmpeg run: for a single still frame the noise plate is grabbed from frame 0 of a freshly started lavfi noise source every time, so a still-frame render of a given config is fully reproducible; a real video render over many frames would show a different noise realisation per output frame instead.",
+      "direction": "claim: strength up raises local variance; measured 0.10 -> 2.12",
+      "measurements": {
+        "configs": {
+          "default": {
+            "config": {
+              "strength": 40,
+              "size": 3,
+              "opacity": 0.5
+            },
+            "run1": {
+              "local_variance": 0.48416523894115504,
+              "autocorr": {
+                "1": 0.3642518034794202,
+                "2": 0.10221365270736729,
+                "3": -0.14735969506163707,
+                "4": -0.0736845818262685,
+                "5": -0.007685042268530378,
+                "6": 0.045151758935417154,
+                "7": 0.018655564399599624,
+                "8": 0.0050389103802703375
+              },
+              "mono_corr": {
+                "rg": 0.7321867400526672,
+                "rb": 0.6008070691303786,
+                "gb": 0.6393494810723427
+              }
+            },
+            "run2": {
+              "local_variance": 0.48416523894115504,
+              "autocorr": {
+                "1": 0.3642518034794202,
+                "2": 0.10221365270736729,
+                "3": -0.14735969506163707,
+                "4": -0.0736845818262685,
+                "5": -0.007685042268530378,
+                "6": 0.045151758935417154,
+                "7": 0.018655564399599624,
+                "8": 0.0050389103802703375
+              },
+              "mono_corr": {
+                "rg": 0.7321867400526672,
+                "rb": 0.6008070691303786,
+                "gb": 0.6393494810723427
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "strength_low": {
+            "config": {
+              "strength": 10,
+              "size": 3,
+              "opacity": 0.5
+            },
+            "run1": {
+              "local_variance": 0.10194234254774157,
+              "autocorr": {
+                "1": 0.0004715093320714998,
+                "2": 0.057840986852713404,
+                "3": -0.04297235896061788,
+                "4": -0.02227483939665189,
+                "5": -0.0013870548134264078,
+                "6": 0.014877071162681492,
+                "7": 0.005833595553913614,
+                "8": 0.003181773709875493
+              },
+              "mono_corr": {
+                "rg": 0.18593881095994383,
+                "rb": 0.12560971385758143,
+                "gb": 0.13060021411718803
+              }
+            },
+            "run2": {
+              "local_variance": 0.10194234254774157,
+              "autocorr": {
+                "1": 0.0004715093320714998,
+                "2": 0.057840986852713404,
+                "3": -0.04297235896061788,
+                "4": -0.02227483939665189,
+                "5": -0.0013870548134264078,
+                "6": 0.014877071162681492,
+                "7": 0.005833595553913614,
+                "8": 0.003181773709875493
+              },
+              "mono_corr": {
+                "rg": 0.18593881095994383,
+                "rb": 0.12560971385758143,
+                "gb": 0.13060021411718803
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "strength_high": {
+            "config": {
+              "strength": 90,
+              "size": 3,
+              "opacity": 0.5
+            },
+            "run1": {
+              "local_variance": 2.1220764386349997,
+              "autocorr": {
+                "1": 0.4451438721269288,
+                "2": 0.11140002163957825,
+                "3": -0.16990142841655848,
+                "4": -0.08426403348262798,
+                "5": -0.008707102984187086,
+                "6": 0.051924021230524704,
+                "7": 0.02111659210164404,
+                "8": 0.005422729506099899
+              },
+              "mono_corr": {
+                "rg": 0.9083119186743557,
+                "rb": 0.7695706892145969,
+                "gb": 0.8208401975022235
+              }
+            },
+            "run2": {
+              "local_variance": 2.1220764386349997,
+              "autocorr": {
+                "1": 0.4451438721269288,
+                "2": 0.11140002163957825,
+                "3": -0.16990142841655848,
+                "4": -0.08426403348262798,
+                "5": -0.008707102984187086,
+                "6": 0.051924021230524704,
+                "7": 0.02111659210164404,
+                "8": 0.005422729506099899
+              },
+              "mono_corr": {
+                "rg": 0.9083119186743557,
+                "rb": 0.7695706892145969,
+                "gb": 0.8208401975022235
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "size_small": {
+            "config": {
+              "strength": 40,
+              "size": 1,
+              "opacity": 0.5
+            },
+            "run1": {
+              "local_variance": 11.207238826853953,
+              "autocorr": {
+                "1": -0.17740489093428563,
+                "2": 0.0540268256027326,
+                "3": 0.006863637823987738,
+                "4": 0.004556129032554866,
+                "5": -0.005780975516399465,
+                "6": -0.009239624070525712,
+                "7": 0.017092296410653733,
+                "8": -0.027682727939752804
+              },
+              "mono_corr": {
+                "rg": 0.9759430363840977,
+                "rb": 0.9119986284451008,
+                "gb": 0.929301467695742
+              }
+            },
+            "run2": {
+              "local_variance": 11.207238826853953,
+              "autocorr": {
+                "1": -0.17740489093428563,
+                "2": 0.0540268256027326,
+                "3": 0.006863637823987738,
+                "4": 0.004556129032554866,
+                "5": -0.005780975516399465,
+                "6": -0.009239624070525712,
+                "7": 0.017092296410653733,
+                "8": -0.027682727939752804
+              },
+              "mono_corr": {
+                "rg": 0.9759430363840977,
+                "rb": 0.9119986284451008,
+                "gb": 0.929301467695742
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "size_large": {
+            "config": {
+              "strength": 40,
+              "size": 8,
+              "opacity": 0.5
+            },
+            "run1": {
+              "local_variance": 0.18503644814533923,
+              "autocorr": {
+                "1": 0.04056730570798198,
+                "2": 0.04116164387328726,
+                "3": 0.043436577589824554,
+                "4": 0.033684801337319055,
+                "5": 0.021381448852737534,
+                "6": 0.014862067832227866,
+                "7": 0.0025392791731494273,
+                "8": -0.015998315098614553
+              },
+              "mono_corr": {
+                "rg": 0.42801510271639615,
+                "rb": 0.2631235702394033,
+                "gb": 0.32390050080703575
+              }
+            },
+            "run2": {
+              "local_variance": 0.18503644814533923,
+              "autocorr": {
+                "1": 0.04056730570798198,
+                "2": 0.04116164387328726,
+                "3": 0.043436577589824554,
+                "4": 0.033684801337319055,
+                "5": 0.021381448852737534,
+                "6": 0.014862067832227866,
+                "7": 0.0025392791731494273,
+                "8": -0.015998315098614553
+              },
+              "mono_corr": {
+                "rg": 0.42801510271639615,
+                "rb": 0.2631235702394033,
+                "gb": 0.32390050080703575
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "opacity_low": {
+            "config": {
+              "strength": 40,
+              "size": 3,
+              "opacity": 0.15
+            },
+            "run1": {
+              "local_variance": 0.11373499401086792,
+              "autocorr": {
+                "1": 0.04526506087009555,
+                "2": 0.06412483673353414,
+                "3": -0.05584171773869706,
+                "4": -0.028585226476746106,
+                "5": -0.002448389756019279,
+                "6": 0.017956496820801783,
+                "7": 0.008095114193975893,
+                "8": 0.0028016916019015696
+              },
+              "mono_corr": {
+                "rg": 0.23491656583114898,
+                "rb": 0.16494851667322843,
+                "gb": 0.17381772057714404
+              }
+            },
+            "run2": {
+              "local_variance": 0.11373499401086792,
+              "autocorr": {
+                "1": 0.04526506087009555,
+                "2": 0.06412483673353414,
+                "3": -0.05584171773869706,
+                "4": -0.028585226476746106,
+                "5": -0.002448389756019279,
+                "6": 0.017956496820801783,
+                "7": 0.008095114193975893,
+                "8": 0.0028016916019015696
+              },
+              "mono_corr": {
+                "rg": 0.23491656583114898,
+                "rb": 0.16494851667322843,
+                "gb": 0.17381772057714404
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          },
+          "opacity_high": {
+            "config": {
+              "strength": 40,
+              "size": 3,
+              "opacity": 0.95
+            },
+            "run1": {
+              "local_variance": 1.5401219898203728,
+              "autocorr": {
+                "1": 0.43562756722753493,
+                "2": 0.10994809110192337,
+                "3": -0.1676005425024441,
+                "4": -0.08363467870079241,
+                "5": -0.008603959944020178,
+                "6": 0.05070204697215176,
+                "7": 0.020933509066010457,
+                "8": 0.005308116947822862
+              },
+              "mono_corr": {
+                "rg": 0.8872398992294828,
+                "rb": 0.7482047277162465,
+                "gb": 0.79874492900896
+              }
+            },
+            "run2": {
+              "local_variance": 1.5401219898203728,
+              "autocorr": {
+                "1": 0.43562756722753493,
+                "2": 0.10994809110192337,
+                "3": -0.1676005425024441,
+                "4": -0.08363467870079241,
+                "5": -0.008603959944020178,
+                "6": 0.05070204697215176,
+                "7": 0.020933509066010457,
+                "8": 0.005308116947822862
+              },
+              "mono_corr": {
+                "rg": 0.8872398992294828,
+                "rb": 0.7482047277162465,
+                "gb": 0.79874492900896
+              }
+            },
+            "runs_byte_identical": true,
+            "local_variance_spread": 0.0
+          }
+        },
+        "noise_floor_zero_everywhere": true
+      }
+    },
+    {
+      "parameter": "grain.size",
+      "verdict": "works",
+      "summary": "Autocorrelation of the noise plate itself (not the composited frame) first drops below 0.3 at lag 1 for size 1, lag 2 for size 3, lag 2 for size 8 (by-lag values: {1: {1: -0.1780066472940442, 2: 0.0547956622277142, 3: 0.006211363057816691, 4: 0.004416294703572306, 5: -0.007025166671511645, 6: -0.009530362052952279, 7: 0.01922227301412551, 8: -0.03061817646196228}, 3: {1: 0.5597831910220687, 2: 0.16842821636733812, 3: -0.23145651560861308, 4: -0.11171829818989232, 5: -0.014135530246684777, 6: 0.06948838503067808, 7: 0.02684596976308199, 8: 0.00537626664797851}, 8: {1: 0.32969885864968507, 2: 0.2993436751820352, 3: 0.2426929098271598, 4: 0.19918263757181448, 5: 0.1537203867173298, 6: 0.1075011009089391, 7: 0.008897871109590002, 8: -0.12886626323315117}}), so a larger plate downscale correlates over a longer pixel distance once measured on the plate directly, matching 'size is the plate downscale factor'.",
+      "direction": "claim: larger size keeps autocorrelation high to a longer lag; measured half-life lags {1: 1, 3: 2, 8: 2}",
+      "measurements": {
+        "plate_autocorr_by_size": {
+          "1": {
+            "1": -0.1780066472940442,
+            "2": 0.0547956622277142,
+            "3": 0.006211363057816691,
+            "4": 0.004416294703572306,
+            "5": -0.007025166671511645,
+            "6": -0.009530362052952279,
+            "7": 0.01922227301412551,
+            "8": -0.03061817646196228
+          },
+          "3": {
+            "1": 0.5597831910220687,
+            "2": 0.16842821636733812,
+            "3": -0.23145651560861308,
+            "4": -0.11171829818989232,
+            "5": -0.014135530246684777,
+            "6": 0.06948838503067808,
+            "7": 0.02684596976308199,
+            "8": 0.00537626664797851
+          },
+          "8": {
+            "1": 0.32969885864968507,
+            "2": 0.2993436751820352,
+            "3": 0.2426929098271598,
+            "4": 0.19918263757181448,
+            "5": 0.1537203867173298,
+            "6": 0.1075011009089391,
+            "7": 0.008897871109590002,
+            "8": -0.12886626323315117
+          }
+        },
+        "half_life_lag": {
+          "1": 1,
+          "3": 2,
+          "8": 2
+        }
+      }
+    },
+    {
+      "parameter": "grain.opacity",
+      "verdict": "works",
+      "summary": "Local variance is 0.11 at opacity 0.15 and 1.54 at opacity 0.95, rising with opacity.",
+      "direction": "claim: opacity up raises local variance; measured 0.11 -> 1.54",
+      "measurements": {
+        "opacity_low_variance": 0.11373499401086792,
+        "opacity_high_variance": 1.5401219898203728
+      }
+    },
+    {
+      "parameter": "grain (monochrome)",
+      "verdict": "works",
+      "summary": "The noise plate itself is r==g==b at every pixel (True: confirmed by direct array comparison, not inferred), so the source noise is exactly monochrome as the code comment claims. Once blended onto the real, coloured, textured frame via overlay blend, the visible result is NOT perfectly monochrome: cross-channel correlation of the on-minus-off residual is r-g=0.7322, r-b=0.6008, g-b=0.6393. This is expected, not a bug: overlay blend is a function of each channel's own base value, so the same luma-only perturbation lands as a different absolute delta per channel wherever the base image itself has colour.",
+      "direction": "claim: grain is monochrome; measured plate_exactly_monochrome=True, composited correlation={'rg': 0.7321867400526672, 'rb': 0.6008070691303786, 'gb': 0.6393494810723427}",
+      "measurements": {
+        "plate_exactly_monochrome": true,
+        "composited_cross_channel_corr": {
+          "rg": 0.7321867400526672,
+          "rb": 0.6008070691303786,
+          "gb": 0.6393494810723427
+        },
+        "composited_reads_monochrome": false
+      }
+    },
+    {
+      "parameter": "detail.soften",
+      "verdict": "works",
+      "summary": "Mean abs laplacian at soften 0 / 1 / 3 is 0.07982, 0.03204, 0.00735: falls as soften rises, less edge energy. At the schema max (soften=12), mean_abs_diff vs off is 17.23 code values (96.8% of pixels moved), a strong, clearly visible blur.",
+      "direction": "claim: soften up lowers edge energy; measured [{'soften': 0.0, 'mean_abs_laplacian': 0.07981888126098417}, {'soften': 1.0, 'mean_abs_laplacian': 0.03204487400496227}, {'soften': 3.0, 'mean_abs_laplacian': 0.0073465978862986316}], max mean_abs_diff=17.23",
+      "measurements": {
+        "laplacian_rows": [
+          {
+            "soften": 0.0,
+            "mean_abs_laplacian": 0.07981888126098417
+          },
+          {
+            "soften": 1.0,
+            "mean_abs_laplacian": 0.03204487400496227
+          },
+          {
+            "soften": 3.0,
+            "mean_abs_laplacian": 0.0073465978862986316
+          }
+        ],
+        "off_vs_max_diff": {
+          "mean_abs_diff": 17.234623974809608,
+          "max_abs_diff": 189.0,
+          "mean_signed": {
+            "r": -0.007164433216168717,
+            "g": -0.009521913444639719,
+            "b": -0.010686236818980668
+          },
+          "pct_pixels_changed": 96.78904876977153
+        }
+      }
+    },
+    {
+      "parameter": "detail.sharpen",
+      "verdict": "works",
+      "summary": "Mean abs laplacian at sharpen 0 / 0.5 / 1.5 is 0.07982, 0.08028, 0.08053: rises as sharpen rises, more edge energy. At the schema max (sharpen=3), mean_abs_diff vs off is only 0.35 code values (max_abs_diff 2 of 255, 59.1% of pixels touched): the direction is correct and every pixel it touches moves the same way, but the unsharp pass is a genuinely subtle edge-contrast lift on this footage, not a strong sharpen, matching the code's own comment that it is meant to read cleaner than harsh in-camera sharpening.",
+      "direction": "claim: sharpen up raises edge energy; measured [{'sharpen': 0.0, 'mean_abs_laplacian': 0.07981888126098417}, {'sharpen': 0.5, 'mean_abs_laplacian': 0.0802761708923464}, {'sharpen': 1.5, 'mean_abs_laplacian': 0.08053399171017264}], max mean_abs_diff=0.35, max_abs_diff=2",
+      "measurements": {
+        "laplacian_rows": [
+          {
+            "sharpen": 0.0,
+            "mean_abs_laplacian": 0.07981888126098417
+          },
+          {
+            "sharpen": 0.5,
+            "mean_abs_laplacian": 0.0802761708923464
+          },
+          {
+            "sharpen": 1.5,
+            "mean_abs_laplacian": 0.08053399171017264
+          }
+        ],
+        "off_vs_max_diff": {
+          "mean_abs_diff": 0.35414927504393673,
+          "max_abs_diff": 2.0,
+          "mean_signed": {
+            "r": 0.36539021309314584,
+            "g": 0.36054618848857645,
+            "b": 0.3169705623901582
+          },
+          "pct_pixels_changed": 59.074170694200355
+        },
+        "weak_at_schema_max": true
+      }
+    },
+    {
+      "parameter": "letterbox.aspect",
+      "verdict": "works",
+      "summary": "On a 640x360 frame, measured black bars (top, bottom) vs f_letterbox's own arithmetic (round(W/aspect), rounded to even, centred) at aspect 1.85 / 2.39 / 2.76: aspect 1.85: measured (7, 7) vs expected 7, visible height 346 vs expected 346; aspect 2.39: measured (46, 46) vs expected 46, visible height 268 vs expected 268; aspect 2.76: measured (64, 64) vs expected 64, visible height 232 vs expected 232. All match exactly.",
+      "direction": "claim: bars match round(W/aspect) arithmetic; measured matches=True",
+      "measurements": {
+        "rows": [
+          {
+            "aspect": 1.85,
+            "measured_top_bar": 7,
+            "measured_bottom_bar": 7,
+            "expected_bar": 7,
+            "measured_visible_height": 346,
+            "expected_visible_height": 346
+          },
+          {
+            "aspect": 2.39,
+            "measured_top_bar": 46,
+            "measured_bottom_bar": 46,
+            "expected_bar": 46,
+            "measured_visible_height": 268,
+            "expected_visible_height": 268
+          },
+          {
+            "aspect": 2.76,
+            "measured_top_bar": 64,
+            "measured_bottom_bar": 64,
+            "expected_bar": 64,
+            "measured_visible_height": 232,
+            "expected_visible_height": 232
+          }
+        ],
+        "source_wxh": [
+          640,
+          360
+        ]
+      }
+    },
+    {
+      "parameter": "letterbox.aspect (early return below source aspect)",
+      "verdict": "works",
+      "summary": "Source aspect is 1.778; at aspect 1.067 (below source aspect, target height would exceed the frame), the letterboxed render is byte identical to letterbox disabled, confirming f_letterbox's `if target >= H: return []` early-return path.",
+      "direction": "claim: aspect below source aspect is a no-op; measured identical=True",
+      "measurements": {
+        "low_aspect": 1.067,
+        "identical_to_disabled": true
+      }
+    },
+    {
+      "parameter": "output.codec",
+      "verdict": "works",
+      "summary": "ffprobe on a short real encode of each codec setting reports prores_ks -> prores/yuv422p10le, libx264 -> h264/yuvj420p, libx265 -> hevc/yuvj420p: every request lands on the matching encoder.",
+      "direction": "claim: codec selects the ffprobe-reported encoder; measured [{'requested': 'prores_ks', 'ffprobe_codec_name': 'prores', 'pix_fmt': 'yuv422p10le', 'size_bytes': 4415156}, {'requested': 'libx264', 'ffprobe_codec_name': 'h264', 'pix_fmt': 'yuvj420p', 'size_bytes': 1027151}, {'requested': 'libx265', 'ffprobe_codec_name': 'hevc', 'pix_fmt': 'yuvj420p', 'size_bytes': 1146295}]",
+      "measurements": {
+        "rows": [
+          {
+            "requested": "prores_ks",
+            "ffprobe_codec_name": "prores",
+            "pix_fmt": "yuv422p10le",
+            "size_bytes": 4415156
+          },
+          {
+            "requested": "libx264",
+            "ffprobe_codec_name": "h264",
+            "pix_fmt": "yuvj420p",
+            "size_bytes": 1027151
+          },
+          {
+            "requested": "libx265",
+            "ffprobe_codec_name": "hevc",
+            "pix_fmt": "yuvj420p",
+            "size_bytes": 1146295
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "output.profile",
+      "verdict": "works",
+      "summary": "ffprobe reports prores profile name 0 -> Proxy, 3 -> HQ, 5 -> XQ; file size in bytes for a 0.5s clip is 933010, 4415156, 9638115, rising with profile as expected for a heavier codec.",
+      "direction": "claim: profile picks a real prores profile; measured names_match=False, size_rises=True",
+      "measurements": {
+        "rows": [
+          {
+            "requested_profile": 0,
+            "ffprobe_profile": "Proxy",
+            "size_bytes": 933010
+          },
+          {
+            "requested_profile": 3,
+            "ffprobe_profile": "HQ",
+            "size_bytes": 4415156
+          },
+          {
+            "requested_profile": 5,
+            "ffprobe_profile": "XQ",
+            "size_bytes": 9638115
+          }
+        ],
+        "profile_name_match": false,
+        "size_rises": true
+      }
+    },
+    {
+      "parameter": "output.crf",
+      "verdict": "works",
+      "summary": "File size in bytes for a 0.5s libx264 clip at crf 0 (lossless-ish) / 16 / 51 (worst) is 4934772, 1027151, 14998: falls monotonically as crf rises, matching crf as a quality/size knob.",
+      "direction": "claim: crf trades size for quality; measured sizes [{'crf': 0, 'size_bytes': 4934772}, {'crf': 16, 'size_bytes': 1027151}, {'crf': 51, 'size_bytes': 14998}]",
+      "measurements": {
+        "rows": [
+          {
+            "crf": 0,
+            "size_bytes": 4934772
+          },
+          {
+            "crf": 16,
+            "size_bytes": 1027151
+          },
+          {
+            "crf": 51,
+            "size_bytes": 14998
+          }
+        ]
+      }
+    },
+    {
+      "parameter": "output.preset",
+      "verdict": "works",
+      "summary": "On a 0.5s clip, ultrafast took 0.87s (1792551 bytes) and veryslow took 1.63s (986858 bytes): veryslow spends more time encoding, as an x264 preset should.",
+      "direction": "claim: preset trades encode time for compression efficiency; measured [{'preset': 'ultrafast', 'size_bytes': 1792551, 'encode_seconds': 0.8671391010284424}, {'preset': 'veryslow', 'size_bytes': 986858, 'encode_seconds': 1.634105920791626}]",
+      "measurements": {
+        "rows": [
+          {
+            "preset": "ultrafast",
+            "size_bytes": 1792551,
+            "encode_seconds": 0.8671391010284424
+          },
+          {
+            "preset": "veryslow",
+            "size_bytes": 986858,
+            "encode_seconds": 1.634105920791626
+          }
+        ]
+      }
+    }
+  ]
+}

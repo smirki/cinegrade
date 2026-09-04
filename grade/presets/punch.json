@@ -1,0 +1,51 @@
+{
+  "_comment": "High contrast, high saturation, hue faithful. For product and car footage where the client knows what colour their logo is. No halation and no bloom: both cost the sharpness this look is selling. Measured mean saturation 0.45 exterior / 0.32 interior.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.06
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.0,
+    "highlight_rolloff": 0.05
+  },
+  "look": {
+    "lut": "punch",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": false
+    },
+    "bloom": {
+      "enabled": false
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.14
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.9
+  },
+  "grain": {
+    "enabled": false
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

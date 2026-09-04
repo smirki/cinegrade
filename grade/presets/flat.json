@@ -1,0 +1,4 @@
+{
+  "_comment": "CST only. The honest starting point: correct Rec.709, no creative move.",
+  "convert": {"tonemap": "aces", "exposure": 0.0}
+}

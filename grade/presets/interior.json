@@ -1,0 +1,67 @@
+{
+  "_comment": "Warm interior under practical light: warm mids and highlights, shadows held faintly cool. Rich, not hazy. Measured mean saturation 0.35 exterior / 0.23 interior.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.07
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.02,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.0,
+    "highlight_rolloff": 0.06
+  },
+  "look": {
+    "lut": "interior",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.66,
+      "sigma": 28,
+      "strength": 0.4,
+      "tint": [
+        1.0,
+        0.38,
+        0.18
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.72,
+      "sigma": 100,
+      "strength": 0.2,
+      "tint": [
+        1.0,
+        0.95,
+        0.86
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.24
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.5
+  },
+  "grain": {
+    "enabled": false
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

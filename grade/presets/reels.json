@@ -1,0 +1,74 @@
+{
+  "_comment": "Calibrated to the reference frames: mean saturation ~0.33, muted greens, warm-forward, blacks to zero, soft highlights. No letterbox.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 1.09
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.0,
+    "highlight_rolloff": 0.1
+  },
+  "look": {
+    "lut": "reels",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.6,
+      "sigma": 40,
+      "strength": 0.42,
+      "tint": [
+        1.0,
+        0.34,
+        0.14
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.66,
+      "sigma": 120,
+      "strength": 0.26,
+      "tint": [
+        1.0,
+        0.95,
+        0.88
+      ]
+    },
+    "rgb_split": {
+      "enabled": false,
+      "amount": 2
+    },
+    "radial_blur": {
+      "enabled": false,
+      "sigma": 10,
+      "start": 0.55,
+      "end": 1.05
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.26
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.6
+  },
+  "grain": {
+    "enabled": true,
+    "strength": 34,
+    "size": 3,
+    "opacity": 0.34
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

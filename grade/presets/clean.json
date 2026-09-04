@@ -1,0 +1,54 @@
+{
+  "_comment": "Restraint. For soft or noisy sources where every optical effect costs more apparent quality than it adds. Sharpens instead of softening; no radial blur, no vignette, no grain.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.05
+  },
+  "primaries": {
+    "temperature": 0.015,
+    "tint": 0.0,
+    "contrast": 1.08,
+    "saturation": 1.0,
+    "vibrance": 0.22,
+    "black_lift": 0.004,
+    "highlight_rolloff": 0.035
+  },
+  "look": {
+    "lut": "kodak2383",
+    "mix": 0.35
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.74,
+      "sigma": 18,
+      "strength": 0.22,
+      "tint": [
+        1.0,
+        0.36,
+        0.16
+      ]
+    },
+    "bloom": {
+      "enabled": false
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": false
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 1.1
+  },
+  "grain": {
+    "enabled": false
+  }
+}

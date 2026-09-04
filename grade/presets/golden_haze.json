@@ -1,0 +1,61 @@
+{
+  "_comment": "Warm hazy reference: milky lifted blacks, golden mids, soft everything.",
+  "convert": {
+    "tonemap": "filmic",
+    "exposure": 0.15,
+    "working_space": "dwg",
+    "encode": "rec709a"
+  },
+  "primaries": {
+    "contrast": 0.98,
+    "saturation": 1.0,
+    "temperature": 0.06,
+    "vibrance": 0.1
+  },
+  "look": {
+    "lut": "golden_haze",
+    "mix": 0.85
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.55,
+      "sigma": 40,
+      "strength": 0.62,
+      "tint": [
+        1.0,
+        0.45,
+        0.22
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.62,
+      "sigma": 100,
+      "strength": 0.34,
+      "tint": [
+        1.0,
+        0.95,
+        0.86
+      ]
+    },
+    "rgb_split": {
+      "enabled": false,
+      "amount": 1
+    },
+    "radial_blur": {
+      "enabled": true,
+      "sigma": 7,
+      "start": 0.6,
+      "end": 1.05
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.3
+    }
+  },
+  "grain": {
+    "enabled": true,
+    "strength": 5
+  }
+}

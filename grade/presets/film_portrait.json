@@ -1,0 +1,70 @@
+{
+  "_comment": "Daylight colour negative, portrait stock. Flatter than the source, warm, skin first. Look mean saturation 0.25 exterior / 0.18 interior. Grain is off by default and the stock wants it: turn it on when the source measures above 0.5 detail energy (see AGENTS.md), because on a soft source it adds noise instead of texture, and it also lifts measured saturation by about 0.04 through the overlay blend.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.07
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.0,
+    "highlight_rolloff": 0.06
+  },
+  "look": {
+    "lut": "film_portrait",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.72,
+      "sigma": 22,
+      "strength": 0.28,
+      "tint": [
+        1.0,
+        0.38,
+        0.18
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.8,
+      "sigma": 90,
+      "strength": 0.14,
+      "tint": [
+        1.0,
+        0.96,
+        0.9
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.16
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.4
+  },
+  "grain": {
+    "enabled": false,
+    "strength": 26,
+    "size": 3,
+    "opacity": 0.26
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "_comment": "Full node tree with every optical stage on. The house look.",
+  "convert": {
+    "tonemap": "aces",
+    "exposure": 0.0,
+    "working_space": "dwg",
+    "encode": "rec709a"
+  },
+  "primaries": {
+    "contrast": 1.02,
+    "saturation": 1.02,
+    "temperature": 0.03,
+    "vibrance": 0.1
+  },
+  "look": {
+    "lut": "warm_film",
+    "mix": 0.8
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.62,
+      "sigma": 26,
+      "strength": 0.5,
+      "tint": [
+        1.0,
+        0.34,
+        0.16
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.75,
+      "sigma": 70,
+      "strength": 0.22,
+      "tint": [
+        1.0,
+        0.97,
+        0.92
+      ]
+    },
+    "rgb_split": {
+      "enabled": true,
+      "amount": 2
+    },
+    "radial_blur": {
+      "enabled": true,
+      "sigma": 8,
+      "start": 0.62,
+      "end": 1.05
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.38
+    }
+  },
+  "grain": {
+    "enabled": true,
+    "strength": 5
+  }
+}

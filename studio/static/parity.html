@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixxr Studio: GPU vs ffmpeg parity</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c2027; --line: #2c323c; --fg: #e6e9ee;
+    --muted: #8b94a3; --ok: #4cc38a; --warn: #e8b64c; --bad: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header {
+    position: sticky; top: 0; z-index: 2; background: var(--panel);
+    border-bottom: 1px solid var(--line); padding: 12px 18px;
+  }
+  h1 { font-size: 15px; margin: 0 0 6px; }
+  h2 { font-size: 14px; margin: 28px 0 8px; color: var(--fg); }
+  main { padding: 18px; }
+  button {
+    background: #2f6feb; color: #fff; border: 0; border-radius: 5px;
+    padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+  th, td {
+    border-bottom: 1px solid var(--line); padding: 3px 8px;
+    text-align: right; white-space: nowrap;
+  }
+  th { color: var(--muted); font-weight: 600; text-align: right; }
+  td:first-child, th:first-child, td:last-child, th:last-child { text-align: left; }
+  tr:hover td { background: #1a1e25; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  pre { color: var(--muted); margin: 6px 0 0; white-space: pre-wrap; }
+  #cv { display: none; }
+  p { max-width: 90ch; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GPU vs ffmpeg parity</h1>
+  <div id="head" class="muted">loading</div>
+  <p class="muted" style="margin:6px 0">
+    Every configuration is rendered twice, once by gpu.js on the card and once by
+    ffmpeg on the server, and the two 8 bit pictures are differenced pixel by
+    pixel. Grain is off everywhere on purpose: ffmpeg's noise filter is seeded
+    from the clock, so it does not even match itself between runs.
+  </p>
+  <button id="go">Run the sweep</button>
+  <span id="prog" class="muted"></span>
+  <pre id="log"></pre>
+</header>
+<main>
+  <canvas id="cv"></canvas>
+  <div id="out"></div>
+</main>
+<script src="/gpu.js"></script>
+<script src="/parity.js"></script>
+<script>
+  document.getElementById("go").addEventListener("click", function () {
+    this.disabled = true;
+    Parity.run().catch(function () {}).then(function () {
+      document.getElementById("go").disabled = false;
+    });
+  });
+</script>
+</body>
+</html>

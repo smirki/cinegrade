@@ -1,0 +1,63 @@
+{
+  "_comment": "Loud, deliberate teal and orange. Meant to read as graded at a glance.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.08
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.04,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.004,
+    "highlight_rolloff": 0.06
+  },
+  "look": {
+    "lut": "blockbuster",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.68,
+      "sigma": 26,
+      "strength": 0.42,
+      "tint": [
+        1.0,
+        0.34,
+        0.14
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.78,
+      "sigma": 80,
+      "strength": 0.18,
+      "tint": [
+        1.0,
+        0.95,
+        0.88
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.38
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.5
+  },
+  "grain": {
+    "enabled": false
+  }
+}

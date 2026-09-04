@@ -1,0 +1,15 @@
+# large or regenerable or user-owned data; the repo tracks code, presets, tests, docs
+footage/
+refs/
+grade/out/
+grade/luts/
+grade/tests/_work/
+studio/cache/
+studio/data/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+studio/shots/
+grade/stills/

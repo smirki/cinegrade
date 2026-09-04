@@ -1,0 +1,74 @@
+{
+  "_comment": "Loud teal/orange. Everything on: halation, bloom, anamorphic edge blur, RGB split, vignette, grain.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 1.2
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.02,
+    "saturation": 1.0,
+    "vibrance": 0.1,
+    "black_lift": 0.014,
+    "highlight_rolloff": 0.09
+  },
+  "look": {
+    "lut": "blockbuster",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.52,
+      "sigma": 46,
+      "strength": 0.7,
+      "tint": [
+        1.0,
+        0.3,
+        0.12
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.58,
+      "sigma": 140,
+      "strength": 0.4,
+      "tint": [
+        1.0,
+        0.94,
+        0.86
+      ]
+    },
+    "rgb_split": {
+      "enabled": true,
+      "amount": 3
+    },
+    "radial_blur": {
+      "enabled": true,
+      "sigma": 6,
+      "start": 0.66,
+      "end": 1.05
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.38
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.8
+  },
+  "grain": {
+    "enabled": true,
+    "strength": 55,
+    "size": 3,
+    "opacity": 0.52
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}

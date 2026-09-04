@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixxr Studio: GPU preview</title>
+<!--
+  A standalone viewer for the WebGL2 grading path in gpu.js, next to the
+  ffmpeg render of the same config so the two can be compared by eye and by
+  number. It deliberately does not touch the main app: gpu.js knows nothing
+  about the studio's DOM and this page owns every element it uses.
+-->
+<style>
+  :root {
+    --bg: #101216; --panel: #171a20; --line: #262b34;
+    --text: #d8dde5; --dim: #8b94a3; --accent: #4ea3ff;
+    --bad: #ff6b6b; --ok: #55c98a; --warn: #e8b64c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header {
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header a { color: var(--accent); }
+  .wrap { display: flex; gap: 14px; padding: 14px; align-items: flex-start; }
+  .side { width: 320px; flex: none; }
+  .main { flex: 1; min-width: 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 12px;
+  }
+  .card h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 8px;
+  }
+  label { display: block; margin: 6px 0; color: var(--dim); }
+  label span.v { color: var(--text); float: right; }
+  select, input[type=range], input[type=number] { width: 100%; }
+  select, input[type=number] {
+    background: #0c0e12; color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 4px 6px; font: inherit;
+  }
+  button {
+    background: #1e242e; color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #07101c; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .views { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .view { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+  .view h3 { font-size: 11px; margin: 0 0 6px; color: var(--dim); font-weight: 600; }
+  .view canvas, .view img { width: 100%; display: block; background: #000; image-rendering: pixelated; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; }
+  .st-exact { color: var(--ok); }
+  .st-close { color: #e8b64c; }
+  .st-unsupported { color: var(--bad); }
+  .st-off { color: #4d5563; }
+  .note { color: var(--dim); font-size: 11px; }
+  .warn { color: #e8b64c; }
+  pre { white-space: pre-wrap; color: var(--dim); font-size: 11px; margin: 6px 0 0; }
+  #err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>GPU preview</h1>
+  <span class="note">gpu.js against the ffmpeg render of the same config</span>
+  <a href="/parity.html">parity harness</a>
+  <a href="/">studio</a>
+  <span id="err"></span>
+</header>
+
+<div class="wrap">
+  <div class="side">
+    <div class="card">
+      <h2>Source</h2>
+      <label>Clip <select id="clip"></select></label>
+      <label>Time <span class="v" id="timeV">0.00 s</span>
+        <input type="range" id="time" min="0" max="10" step="0.04" value="0"></label>
+      <label>Preview width <select id="width">
+        <option>320</option><option>640</option>
+        <option selected>960</option><option>1280</option></select></label>
+      <label>Preset <select id="preset"></select></label>
+    </div>
+
+    <div class="card">
+      <h2>Controls</h2>
+      <div id="sliders"></div>
+      <label>Look <select id="look"></select></label>
+      <div class="row">
+        <label style="flex:1"><input type="checkbox" id="fx_halation"> halation</label>
+        <label style="flex:1"><input type="checkbox" id="fx_bloom"> bloom</label>
+      </div>
+      <div class="row">
+        <label style="flex:1"><input type="checkbox" id="fx_radial_blur"> radial</label>
+        <label style="flex:1"><input type="checkbox" id="fx_rgb_split"> rgb split</label>
+      </div>
+      <div class="row">
+        <label style="flex:1"><input type="checkbox" id="fx_vignette"> vignette</label>
+        <label style="flex:1"><input type="checkbox" id="letterbox"> letterbox</label>
+      </div>
+      <div class="row">
+        <label style="flex:1"><input type="checkbox" id="grain"> grain</label>
+        <span class="note" style="flex:1">grain is not on the GPU path</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Render</h2>
+      <div class="row">
+        <button class="primary" id="go">Render both</button>
+        <button id="gpuOnly">GPU only</button>
+      </div>
+      <label>Difference gain <span class="v" id="gainV">8x</span>
+        <input type="range" id="gain" min="1" max="64" step="1" value="8"></label>
+      <pre id="timing"></pre>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="views">
+      <div class="view"><h3>GPU</h3><canvas id="gpu"></canvas></div>
+      <div class="view"><h3>ffmpeg</h3><canvas id="ff"></canvas></div>
+      <div class="view"><h3>difference</h3><canvas id="diff"></canvas></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h2>Difference</h2>
+      <div id="stats" class="note">Not measured yet.</div>
+    </div>
+    <div class="card">
+      <h2>Stage report</h2>
+      <table id="stages"><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script src="/gpu.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var S = {
+    state: null, gpu: null, cfg: {}, clipInfo: null,
+    src: null, ff: null, gpuPix: null, size: [0, 0], busy: false
+  };
+
+  // Exposed on purpose: this page is a diagnostic tool, and being able to
+  // poke at the last source frame and the last two pixel buffers from the
+  // console is the whole point of having it.
+  window.gpuPreview = S;
+
+  var $ = function (id) { return document.getElementById(id); };
+  function err(msg) { $("err").textContent = msg || ""; }
+
+  // The handful of parameters worth a slider here. The full set lives in the
+  // real app; this page exists to compare pixels, not to replace the panels.
+  var SLIDERS = [
+    ["convert.exposure", "exposure", -3, 3, 0.01],
+    ["primaries.contrast", "contrast", 0.5, 2, 0.01],
+    ["primaries.saturation", "saturation", 0, 2, 0.01],
+    ["primaries.vibrance", "vibrance", -1, 1, 0.01],
+    ["primaries.temperature", "temperature", -1, 1, 0.01],
+    ["primaries.tint", "tint", -1, 1, 0.01],
+    ["primaries.brightness", "brightness", -0.3, 0.3, 0.005],
+    ["primaries.gamma", "gamma", 0.4, 2.5, 0.01],
+    ["primaries.black_lift", "black lift", 0, 0.2, 0.002],
+    ["primaries.highlight_rolloff", "highlight rolloff", 0, 0.4, 0.002],
+    ["look.mix", "look mix", 0, 1, 0.01],
+    ["detail.soften", "soften", 0, 4, 0.05],
+    ["detail.sharpen", "sharpen", 0, 3, 0.05]
+  ];
+
+  function get(o, path) {
+    return path.split(".").reduce(function (a, k) { return a && a[k]; }, o);
+  }
+  function set(o, path, v) {
+    var ks = path.split("."), last = ks.pop();
+    var t = ks.reduce(function (a, k) { return (a[k] = a[k] || {}); }, o);
+    t[last] = v;
+  }
+
+  function buildSliders() {
+    var host = $("sliders");
+    SLIDERS.forEach(function (s) {
+      var l = document.createElement("label");
+      l.innerHTML = s[1] + ' <span class="v"></span>';
+      var i = document.createElement("input");
+      i.type = "range"; i.min = s[2]; i.max = s[3]; i.step = s[4];
+      i.value = get(S.cfg, s[0]);
+      i.addEventListener("input", function () {
+        set(S.cfg, s[0], parseFloat(i.value));
+        l.querySelector(".v").textContent = i.value;
+        refreshStages();
+      });
+      l.appendChild(i);
+      l.querySelector(".v").textContent = i.value;
+      host.appendChild(l);
+      s.el = i; s.label = l;
+    });
+  }
+
+  function syncSliders() {
+    SLIDERS.forEach(function (s) {
+      var v = get(S.cfg, s[0]);
+      s.el.value = v;
+      s.label.querySelector(".v").textContent = v;
+    });
+    ["halation", "bloom", "radial_blur", "rgb_split", "vignette"].forEach(function (k) {
+      $("fx_" + k).checked = !!S.cfg.fx[k].enabled;
+    });
+    $("letterbox").checked = !!S.cfg.letterbox.enabled;
+    $("grain").checked = !!S.cfg.grain.enabled;
+    $("look").value = S.cfg.look.lut || "";
+  }
+
+  function wireChecks() {
+    ["halation", "bloom", "radial_blur", "rgb_split", "vignette"].forEach(function (k) {
+      $("fx_" + k).addEventListener("change", function (e) {
+        S.cfg.fx[k].enabled = e.target.checked; refreshStages();
+      });
+    });
+    $("letterbox").addEventListener("change", function (e) {
+      S.cfg.letterbox.enabled = e.target.checked; refreshStages();
+    });
+    // Grain gets its own switch because leaving it on makes every comparison
+    // look broken: ffmpeg draws noise the GPU path does not draw at all.
+    $("grain").addEventListener("change", function (e) {
+      S.cfg.grain.enabled = e.target.checked; refreshStages();
+    });
+    $("look").addEventListener("change", function (e) {
+      S.cfg.look.lut = e.target.value || null; refreshStages();
+    });
+    $("gain").addEventListener("input", function () {
+      $("gainV").textContent = $("gain").value + "x";
+      if (S.gpuPix && S.ff) drawDiff();
+    });
+    $("time").addEventListener("input", function () {
+      $("timeV").textContent = (+$("time").value).toFixed(2) + " s";
+    });
+    $("clip").addEventListener("change", pickClip);
+    $("preset").addEventListener("change", loadPreset);
+    $("go").addEventListener("click", function () { run(true); });
+    $("gpuOnly").addEventListener("click", function () { run(false); });
+  }
+
+  function refreshStages() {
+    var rep = StudioGPU.stageReport(S.cfg);
+    var body = $("stages").querySelector("tbody");
+    body.innerHTML = "";
+    var head = document.createElement("tr");
+    head.innerHTML = "<th>stage</th><th>status</th><th>what it means</th>";
+    body.appendChild(head);
+    rep.stages.forEach(function (st) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + st.name + "</td>"
+        + '<td class="st-' + st.status + '">' + st.status + "</td>"
+        + '<td class="note">' + (st.active ? st.note : "not enabled") + "</td>";
+      body.appendChild(tr);
+    });
+    return rep;
+  }
+
+  function pickClip() {
+    var name = $("clip").value;
+    S.clipInfo = S.state.clips.filter(function (c) { return c.name === name; })[0];
+    if (S.clipInfo) {
+      $("time").max = Math.max(0.04, (S.clipInfo.duration || 1) - 0.04);
+    }
+    S.src = null;
+  }
+
+  // The clips list reports both the raw dimensions and the upright ones, and
+  // the preview always renders upright, so the scale factor has to come from
+  // the upright width or every pixel denominated parameter is scaled wrong.
+  function sourceWidth() {
+    var c = S.clipInfo;
+    if (!c) return 0;
+    return (c.autorotate && c.autorotate.width) || (c.raw && c.raw.width) || c.width || 0;
+  }
+
+  function loadPreset() {
+    var name = $("preset").value;
+    if (!name) { S.cfg = StudioGPU.fullConfig({}); syncSliders(); refreshStages(); return; }
+    fetch("/api/preset?name=" + encodeURIComponent(name))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        S.cfg = StudioGPU.fullConfig(j.config || j);
+        syncSliders(); refreshStages();
+      })
+      .catch(function (e) { err(String(e)); });
+  }
+
+  function fetchSource() {
+    var body = {
+      clip: $("clip").value, time: parseFloat($("time").value),
+      width: parseInt($("width").value, 10), autorotate: true
+    };
+    var key = JSON.stringify(body);
+    if (S.src && S.srcKey === key) return Promise.resolve(S.src);
+    return fetch("/api/source", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+      var size = (r.headers.get("X-Frame-Size") || "0x0").split("x").map(Number);
+      return r.arrayBuffer().then(function (buf) {
+        S.size = size; S.srcKey = key;
+        S.src = { data: new Uint16Array(buf), w: size[0], h: size[1] };
+        return S.src;
+      });
+    });
+  }
+
+  function fetchFfmpeg() {
+    var body = {
+      clip: $("clip").value, time: parseFloat($("time").value),
+      width: parseInt($("width").value, 10), autorotate: true,
+      format: "raw", config: S.cfg
+    };
+    var t0 = performance.now();
+    return fetch("/api/frame", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+      return r.arrayBuffer().then(function (buf) {
+        return { pix: new Uint8Array(buf), ms: performance.now() - t0 };
+      });
+    });
+  }
+
+  function drawRgb(canvas, pix, w, h) {
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext("2d");
+    var img = ctx.createImageData(w, h);
+    for (var i = 0, j = 0; i < w * h; i++, j += 3) {
+      img.data[i * 4] = pix[j];
+      img.data[i * 4 + 1] = pix[j + 1];
+      img.data[i * 4 + 2] = pix[j + 2];
+      img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function drawDiff() {
+    var w = S.size[0], h = S.size[1], gain = +$("gain").value;
+    var c = $("diff"); c.width = w; c.height = h;
+    var ctx = c.getContext("2d"), img = ctx.createImageData(w, h);
+    for (var i = 0, j = 0; i < w * h; i++, j += 3) {
+      for (var k = 0; k < 3; k++) {
+        img.data[i * 4 + k] = Math.min(255, Math.abs(S.gpuPix[j + k] - S.ff[j + k]) * gain);
+      }
+      img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function stats() {
+    var n = S.size[0] * S.size[1], names = ["R", "G", "B"];
+    var out = [], over1 = 0, over4 = 0;
+    for (var k = 0; k < 3; k++) {
+      var max = 0, sum = 0;
+      for (var i = 0; i < n; i++) {
+        var d = Math.abs(S.gpuPix[i * 3 + k] - S.ff[i * 3 + k]);
+        if (d > max) max = d;
+        sum += d;
+      }
+      out.push(names[k] + ": max " + max + ", mean " + (sum / n).toFixed(4));
+    }
+    for (var p = 0; p < n * 3; p++) {
+      var dd = Math.abs(S.gpuPix[p] - S.ff[p]);
+      if (dd > 1) over1++;
+      if (dd > 4) over4++;
+    }
+    out.push("channels off by more than 1: " + (100 * over1 / (n * 3)).toFixed(3) + "%");
+    out.push("channels off by more than 4: " + (100 * over4 / (n * 3)).toFixed(3) + "%");
+    if (S.cfg.grain.enabled) {
+      out.push('<b class="warn">Grain is on, and grain is not ported. '
+             + "Nearly all of the difference above is ffmpeg's noise, which is "
+             + "seeded from the clock and does not repeat between two ffmpeg "
+             + "runs either. Turn grain off to compare the grade.</b>");
+    }
+    $("stats").innerHTML = out.join("<br>");
+  }
+
+  function run(withFfmpeg) {
+    if (S.busy) return;
+    S.busy = true; err("");
+    var factor = 1;
+    fetchSource().then(function (src) {
+      factor = src.w / (sourceWidth() || src.w);
+      S.gpu.setSource(src.data, src.w, src.h);
+      return S.gpu.ready(S.cfg, { pixelScale: factor });
+    }).then(function () {
+      // render() already presents to the canvas it was created with, so this
+      // canvas is a WebGL surface and must not also be asked for a 2D context.
+      var r = S.gpu.render(S.cfg, { pixelScale: factor });
+      S.gpuPix = S.gpu.readPixels();
+      S.size = [r.width, r.height];
+      var line = "GPU " + r.ms.toFixed(1) + " ms over " + r.passes + " passes"
+        + " at " + r.width + "x" + r.height;
+      // Re-render with the source already uploaded: this is the number that
+      // matters for dragging a slider.
+      var t0 = performance.now();
+      S.gpu.render(S.cfg, { pixelScale: factor });
+      line += "\nGPU re-render (source already on the card) "
+        + (performance.now() - t0).toFixed(1) + " ms";
+      $("timing").textContent = line;
+      refreshStages();
+      if (!withFfmpeg) { S.busy = false; return null; }
+      return fetchFfmpeg().then(function (f) {
+        S.ff = f.pix;
+        drawRgb($("ff"), f.pix, S.size[0], S.size[1]);
+        $("timing").textContent = line + "\nffmpeg " + f.ms.toFixed(1) + " ms";
+        drawDiff(); stats();
+        S.busy = false;
+      });
+    }).catch(function (e) {
+      err(String(e && e.message || e)); S.busy = false;
+    });
+  }
+
+  fetch("/api/state").then(function (r) { return r.json(); }).then(function (st) {
+    S.state = st;
+    StudioGPU.setDefaults(st.defaults);
+    S.cfg = StudioGPU.fullConfig({});
+    $("clip").innerHTML = st.clips.map(function (c) {
+      return '<option value="' + c.name + '">' + c.name + "</option>";
+    }).join("");
+    $("preset").innerHTML = '<option value="">(engine defaults)</option>'
+      + st.presets.map(function (p) {
+        var n = p.name || p;
+        return '<option value="' + n + '">' + n + "</option>";
+      }).join("");
+    $("look").innerHTML = '<option value="">(none)</option>'
+      + st.looks.map(function (l) {
+        var n = l.name || l;
+        return '<option value="' + n + '">' + n + "</option>";
+      }).join("");
+    S.gpu = StudioGPU.create($("gpu"), { apiBase: "" });
+    if (!S.gpu) { err("No GPU path: " + StudioGPU.lastError); return; }
+    buildSliders(); wireChecks(); pickClip(); refreshStages();
+  }).catch(function (e) { err(String(e)); });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+{
+  "_comment": "Cold night. Ambient goes blue, bulbs stay warm. Measured mean saturation 0.26 exterior / 0.28 interior. Grain off: night footage carries its own noise.",
+  "convert": {
+    "working_space": "dwg",
+    "tonemap": "aces",
+    "encode": "rec709a",
+    "exposure": 0.11
+  },
+  "primaries": {
+    "temperature": 0.0,
+    "tint": 0.0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "vibrance": 0.0,
+    "black_lift": 0.006,
+    "highlight_rolloff": 0.08
+  },
+  "look": {
+    "lut": "blue_hour",
+    "mix": 1.0
+  },
+  "fx": {
+    "halation": {
+      "enabled": true,
+      "threshold": 0.62,
+      "sigma": 34,
+      "strength": 0.38,
+      "tint": [
+        1.0,
+        0.36,
+        0.14
+      ]
+    },
+    "bloom": {
+      "enabled": true,
+      "threshold": 0.68,
+      "sigma": 110,
+      "strength": 0.24,
+      "tint": [
+        0.9,
+        0.95,
+        1.0
+      ]
+    },
+    "rgb_split": {
+      "enabled": false
+    },
+    "radial_blur": {
+      "enabled": false
+    },
+    "vignette": {
+      "enabled": true,
+      "amount": 0.28
+    }
+  },
+  "detail": {
+    "soften": 0.0,
+    "sharpen": 0.4
+  },
+  "grain": {
+    "enabled": false
+  },
+  "letterbox": {
+    "enabled": false,
+    "aspect": 2.39
+  }
+}
