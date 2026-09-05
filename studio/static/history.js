@@ -98,14 +98,59 @@
     return isAgent(author) ? (265 + (h % 55)) : (155 + (h % 60));
   }
 
-  function buildChip(author) {
+  /* ---- lane colour ---------------------------------------------------
+     One stable hue per branch (a "lane"), the way GitKraken's own graph
+     does it: main is lane 0, each fork the next lane, oldest branch first
+     (log.branches is already created-ascending). Eight hues, 40 degrees
+     apart, chosen to read on both themes and to stay clear of --warn (about
+     30) and --danger (about 358) so a coloured lane is never mistaken for a
+     warning; lane 0 lands close to the app's own --accent hue (about 210),
+     so the trunk branch quietly matches the rest of the UI's own colour. A
+     ninth or later live lane cycles back to hue 0, which two branches
+     sharing a colour is an acceptable rare collision rather than an
+     unbounded palette. */
+  var LANE_HUES = [215, 255, 295, 335, 55, 95, 135, 175];
+
+  function laneIndexForBranch(branchName) {
+    var branches = (state.log && state.log.branches) || [];
+    for (var i = 0; i < branches.length; i++) { if (branches[i].name === branchName) return i; }
+    return 0;
+  }
+
+  function laneHue(branchName) {
+    return LANE_HUES[laneIndexForBranch(branchName) % LANE_HUES.length];
+  }
+
+  /* ---- author avatar ---------------------------------------------------
+     A small circle takes the place of the old full name chip: initials for
+     a person, a bot glyph for an agent or cli, same hue family and "you"
+     ring buildChip already used (isAgent/isYou/hueFor below), so the row
+     stays legible at a compact GitKraken style row height. The full name is
+     still one hover away (title), same as the message and the time. */
+  function initials(author) {
+    var a = String(author || "").replace(/^agent:/i, "").trim();
+    if (!a) return "?";
+    var parts = a.split(/[\s_.\-]+/).filter(Boolean);
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return (parts[0].charAt(0) + parts[1].charAt(0)).toUpperCase();
+  }
+
+  function buildAvatar(author) {
     var span = document.createElement("span");
     var agent = isAgent(author);
     var you = isYou(author);
-    span.className = "hchip" + (agent ? " hchip-agent" : " hchip-person") + (you ? " hchip-you" : "");
+    span.className = "havatar" + (agent ? " havatar-agent" : " havatar-person") + (you ? " havatar-you" : "");
     span.style.setProperty("--hue", String(hueFor(author)));
-    span.textContent = author || "unknown";
-    span.title = you ? "you" : (agent ? "agent" : "person");
+    span.title = author || "unknown";
+    if (agent) {
+      if (global.StudioIcons && typeof global.StudioIcons.render === "function") {
+        span.appendChild(global.StudioIcons.render("Robot01Icon", "havatar-icon"));
+      } else {
+        span.textContent = "AI"; // StudioIcons not loaded: still readable, never blank
+      }
+    } else {
+      span.textContent = initials(author);
+    }
     return span;
   }
 
@@ -260,38 +305,43 @@
     row.dataset.commit = c.id;
     row.tabIndex = 0;
 
-    // Two lines, not one: a commit's message is the answer to "what changed"
-    // (the founder's own framing: "like if i move the hsl slider it should be
-    // like hsl slider moved"), so it gets a line of its own with nothing
-    // competing for width, prominent text, one line, ellipsis when long. The
-    // id/chip/tag/time/actions are all flex:none (actions stay layout space
-    // even hidden, for the hover fade) and on a narrow sidebar their combined
-    // width alone can exceed it, so sharing a line with the message starved
-    // it to zero width; a metadata line above the message never competes
-    // with it for space at all.
-    var meta = document.createElement("div");
-    meta.className = "historyrow-meta";
+    // One compact GitKraken style line: avatar, then the message (the
+    // answer to "what changed", the founder's own framing: "like if i move
+    // the hsl slider it should be like hsl slider moved") gets whatever
+    // space is left and is the only flexible thing on the row, so branch
+    // pill / id / time land right aligned for free without a margin-left
+    // hack. The action buttons are display:none until hover/focus/expanded
+    // (not merely visibility:hidden), so on every ordinary row they cost the
+    // message NOTHING: an earlier version of this row reserved their layout
+    // width all the time and that alone could starve the message to zero
+    // width on a narrow sidebar.
+    row.appendChild(buildAvatar(c.author));
 
-    var id = document.createElement("span");
-    id.className = "hid mono";
-    id.textContent = c.short;
-    meta.appendChild(id);
-
-    meta.appendChild(buildChip(c.author));
+    var msg = document.createElement("span");
+    msg.className = "hmsg";
+    msg.textContent = c.message || "";
+    msg.title = c.message || ""; // the full text on hover even before expanding
+    row.appendChild(msg);
 
     if (c.is_tip) {
       var tag = document.createElement("span");
       tag.className = "htag";
+      tag.style.setProperty("--lane-hue", String(laneHue(c.branch)));
       tag.textContent = c.branch;
       tag.title = c.branch + " (tip)";
-      meta.appendChild(tag);
+      row.appendChild(tag);
     }
+
+    var id = document.createElement("span");
+    id.className = "hid mono";
+    id.textContent = c.short;
+    row.appendChild(id);
 
     var time = document.createElement("span");
     time.className = "htime mono";
     time.textContent = relativeTime(c.ts);
     time.title = absoluteTime(c.ts);
-    meta.appendChild(time);
+    row.appendChild(time);
 
     var actions = document.createElement("span");
     actions.className = "historyrow-actions";
@@ -303,18 +353,13 @@
     forkBtn.addEventListener("click", function (ev) { ev.stopPropagation(); doFork(c.id); });
     actions.appendChild(gotoBtn);
     actions.appendChild(forkBtn);
-    meta.appendChild(actions);
+    row.appendChild(actions);
 
-    row.appendChild(meta);
-
-    var msgLine = document.createElement("div");
-    msgLine.className = "historyrow-msgline";
-    var msg = document.createElement("span");
-    msg.className = "hmsg";
-    msg.textContent = c.message || "";
-    msg.title = c.message || ""; // the full text on hover even before expanding
-    msgLine.appendChild(msg);
-    row.appendChild(msgLine);
+    // GitKraken's own hover behaviour: rest a pointer on a commit and its
+    // whole line of ancestors lights up in the graph while everything else
+    // dims, so lineage reads at a glance in a busy tree.
+    row.addEventListener("mouseenter", function () { highlightAncestry(c.id); });
+    row.addEventListener("mouseleave", clearHighlight);
 
     var changes = document.createElement("div");
     changes.className = "historyrow-changes";
@@ -413,7 +458,15 @@
 
     function laneX(branchName) { return laneIndex(branches, branchName) * LANE_W + (LANE_W / 2) + 4; }
 
-    var c, edge, x1, y1, x2, y2, parent, pj, midY;
+    // Edges are drawn first, nodes after, in the same DOM order as before:
+    // an edge is always painted underneath every node, so a curve sweeping
+    // across another lane visually passes behind that lane's dot rather
+    // than over its face. A same branch parent is a straight line in that
+    // one lane's colour; a fork leaves the parent's lane on a bezier and is
+    // coloured for the CHILD's lane (the branch being forked INTO), so a
+    // branch pill, its commits' dots and the curve that started it all read
+    // as one colour at a glance, the way GitKraken's own graph does it.
+    var c, edge, x1, y1, x2, y2, parent, pj, midY, hue;
     for (i = 0; i < n; i++) {
       c = log.commits[i];
       if (!c.parent) continue;
@@ -422,6 +475,7 @@
       parent = byId[c.parent];
       x1 = laneX(c.branch); y1 = centres[i];
       x2 = laneX(parent.branch); y2 = centres[pj];
+      hue = laneHue(c.branch);
       if (parent.branch === c.branch) {
         edge = document.createElementNS(NS, "line");
         edge.setAttribute("x1", x1); edge.setAttribute("y1", y1);
@@ -433,16 +487,85 @@
         edge.setAttribute("d", "M " + x1 + " " + y1 + " C " + x1 + " " + midY + ", " + x2 + " " + midY + ", " + x2 + " " + y2);
         edge.setAttribute("class", "hedge fork");
       }
+      edge.style.setProperty("--lane-hue", String(hue));
+      edge.setAttribute("data-commit", c.id); // the edge belongs to its child row, for ancestry hover
       svg.appendChild(edge);
     }
     for (i = 0; i < n; i++) {
       c = log.commits[i];
-      var dot = document.createElementNS(NS, "circle");
-      dot.setAttribute("cx", String(laneX(c.branch)));
-      dot.setAttribute("cy", String(centres[i]));
-      dot.setAttribute("r", c.is_head ? "5" : "4");
-      dot.setAttribute("class", "hnode" + (c.is_head ? " head" : ""));
-      svg.appendChild(dot);
+      hue = laneHue(c.branch);
+      var cx = laneX(c.branch), cy = centres[i];
+      var r = c.is_tip ? 5 : 4;
+      if (c.is_head) {
+        // HEAD is not just another dot: a ring in the lane's own colour
+        // (still legible as "which branch"), with a small filled centre in
+        // the app's own accent colour so "you are here" reads instantly
+        // regardless of which lane it lands in.
+        var ring = document.createElementNS(NS, "circle");
+        ring.setAttribute("cx", String(cx)); ring.setAttribute("cy", String(cy));
+        ring.setAttribute("r", String(r + 2.5));
+        ring.setAttribute("class", "hnode hnode-ring" + (c.is_tip ? " tip" : ""));
+        ring.style.setProperty("--lane-hue", String(hue));
+        ring.setAttribute("data-commit", c.id);
+        svg.appendChild(ring);
+        var center = document.createElementNS(NS, "circle");
+        center.setAttribute("cx", String(cx)); center.setAttribute("cy", String(cy));
+        center.setAttribute("r", String(Math.max(2, r - 1.5)));
+        center.setAttribute("class", "hnode hnode-head-center");
+        center.setAttribute("data-commit", c.id);
+        svg.appendChild(center);
+      } else {
+        var dot = document.createElementNS(NS, "circle");
+        dot.setAttribute("cx", String(cx));
+        dot.setAttribute("cy", String(cy));
+        dot.setAttribute("r", String(r));
+        dot.setAttribute("class", "hnode" + (c.is_tip ? " tip" : ""));
+        dot.style.setProperty("--lane-hue", String(hue));
+        dot.setAttribute("data-commit", c.id);
+        svg.appendChild(dot);
+      }
+    }
+  }
+
+  /* ---- hover ancestry -----------------------------------------------------
+     GitKraken dims everything except a hovered commit's own lineage; walking
+     .parent from the hovered id (via a fresh id -> commit map, cheap even at
+     a few hundred commits and never stale since it is built from state.log
+     at hover time, not cached) gives exactly that chain, self included. Every
+     node and edge in the graph already carries data-commit (an edge's is its
+     CHILD commit's id), so membership in that set is a single class flip. */
+  function ancestrySet(id) {
+    var set = {};
+    var log = state.log;
+    if (!log || !log.commits || !id) return set;
+    var byId = {};
+    for (var i = 0; i < log.commits.length; i++) byId[log.commits[i].id] = log.commits[i];
+    var cur = id, guard = 0, max = log.commits.length + 1;
+    while (cur && byId[cur] && guard < max) {
+      set[cur] = true;
+      cur = byId[cur].parent;
+      guard++;
+    }
+    return set;
+  }
+
+  function highlightAncestry(id) {
+    if (!els.graph) return;
+    var set = ancestrySet(id);
+    var els_ = els.graph.querySelectorAll("[data-commit]");
+    for (var i = 0; i < els_.length; i++) {
+      var lit = !!set[els_[i].getAttribute("data-commit")];
+      els_[i].classList.toggle("hgraph-lit", lit);
+      els_[i].classList.toggle("hgraph-dim", !lit);
+    }
+  }
+
+  function clearHighlight() {
+    if (!els.graph) return;
+    var els_ = els.graph.querySelectorAll(".hgraph-dim, .hgraph-lit");
+    for (var i = 0; i < els_.length; i++) {
+      els_[i].classList.remove("hgraph-dim");
+      els_[i].classList.remove("hgraph-lit");
     }
   }
 

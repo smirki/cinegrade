@@ -444,19 +444,21 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 #historyGraph { flex: none; display: block; }
 .historyrows { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 
+/* One compact GitKraken style line, about 28px: avatar, the message taking
+   whatever space is left (the only flexible thing on the row), branch pill
+   / id / time riding right aligned for free. The action buttons are
+   display:none until hover/focus/expanded (never visibility:hidden, which
+   still reserves their width) -- an earlier two-line layout existed only
+   because a visibility:hidden actions span plus a full name chip together
+   could starve the message to zero width on a narrow sidebar; a hidden
+   flex:none child taking zero layout space removes that trap entirely. */
 .historyrow {
-  position: relative; padding: 4px 8px 4px 4px; border-bottom: 1px solid var(--line);
-  cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+  position: relative; padding: 0 8px 0 4px; min-height: 28px; border-bottom: 1px solid var(--line);
+  cursor: pointer; display: flex; align-items: center; gap: 6px;
 }
 .historyrow:hover { background: var(--panel2); }
 .historyrow.head { background: var(--accent-wash); }
-/* Meta line (id, author chip, branch tag, time, the hover actions) above the
-   message: kept off the message's own line so nothing flex:none ever eats
-   its width, on any sidebar width. Wraps rather than clips when the
-   metadata alone cannot fit. */
-.historyrow-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
 .historyrow .hid { flex: none; color: var(--text-dim); }
-.historyrow-msgline { display: flex; min-width: 0; margin-top: 1px; }
 .historyrow .hmsg {
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; color: var(--text-hi); font-weight: 500;
@@ -464,26 +466,44 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 /* Expanded: the full message, not just what fit on one line, alongside the
    already expanded change list below it. */
 .historyrow.expanded .hmsg { white-space: normal; overflow: visible; text-overflow: clip; }
+/* Branch pill: filled in the tip's own lane colour (--lane-hue, set inline
+   in history.js), the same colour as that lane's nodes and edges in the
+   graph column, so a glance ties a row to its place in the tree. */
 .historyrow .htag {
   flex: none; font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
-  color: var(--text-dim); border: 1px solid var(--line2); border-radius: var(--radius-sm);
-  padding: 0 4px;
+  font-weight: 600; border-radius: var(--radius-sm); padding: 0 4px;
+  background: hsl(var(--lane-hue, 210) 55% 26%); color: #fff;
 }
+[data-theme="light"] .historyrow .htag { background: hsl(var(--lane-hue, 210) 70% 88%); color: hsl(var(--lane-hue, 210) 55% 24%); }
 .historyrow .htime { flex: none; color: var(--text-dim); font-size: 10px; }
-.historyrow-actions { flex: none; display: flex; gap: 4px; visibility: hidden; }
+.historyrow-actions { flex: none; display: none; gap: 4px; }
 .historyrow:hover .historyrow-actions, .historyrow:focus-within .historyrow-actions,
-.historyrow.expanded .historyrow-actions { visibility: visible; }
+.historyrow.expanded .historyrow-actions { display: flex; }
 .historyrow-actions .btn { height: 18px; padding: 0 8px; font-size: 10px; }
 .historyrow-changes { padding: 2px 4px 4px 26px; display: none; }
 .historyrow.expanded .historyrow-changes { display: block; }
 .historyrow-changes div { font-size: 10px; color: var(--text-dim); padding: 1px 0; }
 .historyrow-changes div span.hchange-label { color: var(--text); }
 
-/* Author chip: shape carries person/agent (round pill vs a tag's smaller
-   radius), a stable per-author hue carries "which one", and an accent ring
-   marks the chip that is you regardless of hue -- three independent signals
-   so "you" versus "another person" versus "an agent" all read at a glance,
-   per the legend below. --hue is set inline per chip (history.js). */
+/* Author avatar: a small circle in place of the old full name chip --
+   initials for a person, a bot glyph for an agent/cli -- same stable
+   per-author hue and "you" ring the chip used, shape still carries
+   person versus agent (round versus a tag's smaller radius), the full
+   name is one hover away via title. --hue is set inline per avatar
+   (history.js), same convention the legend chips below use. */
+.havatar {
+  flex: none; width: 18px; height: 18px; border-radius: var(--radius-full);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 8px; font-weight: 700; letter-spacing: 0.2px; line-height: 1;
+  background: hsl(var(--hue, 210) 55% 26%); color: #fff;
+}
+[data-theme="light"] .havatar { background: hsl(var(--hue, 210) 70% 88%); color: hsl(var(--hue, 210) 55% 24%); }
+.havatar-agent { border-radius: var(--radius-sm); }
+.havatar-you { box-shadow: 0 0 0 1px var(--accent) inset; }
+.havatar-icon { width: 11px; height: 11px; stroke-width: 2.5; }
+
+/* Legend chip: unchanged shape/colour language, still used only by
+   historylegend below (the row itself now uses .havatar). */
 .hchip {
   display: inline-flex; align-items: center; flex: none;
   padding: 1px 7px; border-radius: var(--radius-full);
@@ -494,10 +514,27 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 .hchip-agent { border-radius: var(--radius-sm); }
 .hchip-you { box-shadow: 0 0 0 1px var(--accent) inset; }
 
-.hnode { fill: var(--text-dim); stroke: var(--panel2); stroke-width: 2; }
-.hnode.head { fill: var(--accent); stroke: var(--accent-wash); stroke-width: 3; }
-.hedge { stroke: var(--line2); stroke-width: 1.5; fill: none; }
-.hedge.fork { stroke: var(--accent); }
+/* Graph column: every dot, ring and line carries --lane-hue inline (set per
+   element in history.js from the same eight hue palette laneHue() draws
+   from), so a lane's colour is identical across its nodes, its edges and
+   its branch pill. A filled dot is an ordinary commit; HEAD is a ring in
+   its lane's colour around a small centre filled in the app's own accent,
+   so "you are here" reads regardless of which lane HEAD happens to be in;
+   a branch tip's dot (or ring) is drawn a touch larger. hgraph-dim/lit are
+   toggled on hover (history.js's highlightAncestry) to show one commit's
+   lineage and fade the rest, the way GitKraken does it. */
+.hnode { fill: hsl(var(--lane-hue, 210) 62% 58%); stroke: var(--panel2); stroke-width: 1.5; transition: opacity 120ms ease; }
+.hnode.tip { stroke-width: 2; }
+[data-theme="light"] .hnode { fill: hsl(var(--lane-hue, 210) 55% 42%); }
+.hnode-ring { fill: none; stroke: hsl(var(--lane-hue, 210) 62% 58%); stroke-width: 2; transition: opacity 120ms ease; }
+.hnode-ring.tip { stroke-width: 2.5; }
+[data-theme="light"] .hnode-ring { stroke: hsl(var(--lane-hue, 210) 55% 42%); }
+.hnode-head-center { fill: var(--accent); transition: opacity 120ms ease; }
+.hedge { stroke: hsl(var(--lane-hue, 210) 62% 58%); stroke-width: 1.5; fill: none; transition: opacity 120ms ease; }
+.hedge.fork { stroke-width: 1.75; }
+[data-theme="light"] .hedge { stroke: hsl(var(--lane-hue, 210) 55% 42%); }
+.hgraph-dim { opacity: 0.22; }
+.hgraph-lit { opacity: 1; }
 
 .historylegend {
   flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

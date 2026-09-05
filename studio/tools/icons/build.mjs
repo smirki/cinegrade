@@ -48,7 +48,8 @@ const ICON_NAMES = [
   "Add01Icon",
   "Copy01Icon",
   "ArrowDown01Icon",
-  "Delete01Icon"
+  "Delete01Icon",
+  "Robot01Icon"
 ];
 
 const pkgJsonPath = require.resolve("@hugeicons/core-free-icons/package.json");

@@ -86,9 +86,13 @@ export default async function run(ctx) {
     return page.evaluate(() => {
       var rows = document.querySelectorAll("#historyRows .historyrow");
       return Array.prototype.map.call(rows, function (r) {
+        // The GitKraken style redesign swapped the full name chip for a
+        // compact avatar circle (initials, or a bot glyph for an agent);
+        // the full author string moved to its title attribute, still one
+        // read away, same as it was one hover away for a human before.
         return {
           id: r.querySelector(".hid") ? r.querySelector(".hid").textContent : "",
-          author: r.querySelector(".hchip") ? r.querySelector(".hchip").textContent : "",
+          author: r.querySelector(".havatar") ? r.querySelector(".havatar").title : "",
           msg: r.querySelector(".hmsg") ? r.querySelector(".hmsg").textContent : "",
           head: r.classList.contains("head"),
         };
@@ -289,6 +293,59 @@ export default async function run(ctx) {
     return fail("the graph only has " + graphChildren + " SVG child element(s) after a fork, expected at least a dot for each visible commit plus a fork edge");
   }
   notes.push("editing from root auto forked: branch select grew from " + branchesBeforeFork.length + " to " + branchesAfterFork.length + " option(s), graph has " + graphChildren + " element(s)");
+
+  // --- 6b. GitKraken style graph: lane colours, curved fork edges, HEAD ring -
+  const graphInfo = await page.evaluate(() => {
+    var svg = document.getElementById("historyGraph");
+    var forkEdges = Array.prototype.slice.call(svg.querySelectorAll(".hedge.fork"));
+    var straightEdges = Array.prototype.slice.call(svg.querySelectorAll("line.hedge"));
+    function stroke(el) { return getComputedStyle(el).stroke; }
+    return {
+      forkTags: forkEdges.map(function (e) { return e.tagName.toLowerCase(); }),
+      forkStrokes: forkEdges.map(stroke),
+      straightStrokes: straightEdges.map(stroke),
+      ringCount: svg.querySelectorAll(".hnode-ring").length,
+      headCenterCount: svg.querySelectorAll(".hnode-head-center").length,
+    };
+  });
+  if (!graphInfo.forkTags.length) {
+    return fail("no .hedge.fork element in the graph after an auto fork, expected at least one (the parent's lane leaving on a curve into the child's lane)");
+  }
+  const notPath = graphInfo.forkTags.find((t) => t !== "path");
+  if (notPath) {
+    return fail("a .hedge.fork element is a <" + notPath + ">, expected every fork edge to be a <path> (a bezier curve), not a straight <line>");
+  }
+  // Two branches, two lane colours: the fork edge's own stroke (the new
+  // branch's lane) has to actually differ from an existing straight edge's
+  // stroke (an older lane, e.g. main) -- read as real computed SVG paint,
+  // not by trusting a class name alone.
+  const distinctStrokes = new Set(graphInfo.forkStrokes.concat(graphInfo.straightStrokes));
+  if (distinctStrokes.size < 2) {
+    return fail("fork edge stroke(s) " + JSON.stringify(graphInfo.forkStrokes) + " and straight edge stroke(s) " + JSON.stringify(graphInfo.straightStrokes) + " are not distinguishable, expected two different branches to render in two different lane colours");
+  }
+  if (graphInfo.ringCount < 1 || graphInfo.headCenterCount < 1) {
+    return fail("expected HEAD to render as a ring (.hnode-ring) with a filled centre (.hnode-head-center), found ring=" + graphInfo.ringCount + " centre=" + graphInfo.headCenterCount);
+  }
+  notes.push("graph has " + distinctStrokes.size + " distinct lane stroke colour(s) across a straight and a fork edge, the fork edge is a <path> curve, HEAD renders as a ring plus a filled centre");
+
+  // --- 6c. hovering a row highlights its ancestry, dims the rest -------------
+  const hoverRowHandle = (await page.$$("#historyRows .historyrow"))[0];
+  await hoverRowHandle.hover();
+  await sleep(150);
+  const hoverInfo = await page.evaluate(() => {
+    var svg = document.getElementById("historyGraph");
+    return { lit: svg.querySelectorAll(".hgraph-lit").length, dim: svg.querySelectorAll(".hgraph-dim").length };
+  });
+  if (!hoverInfo.lit) return fail("hovering the top history row applied no .hgraph-lit element in the graph, expected its ancestry path to light up (GitKraken's own lineage highlight)");
+  if (!hoverInfo.dim) return fail("hovering the top history row applied no .hgraph-dim element in the graph, expected the rest of the tree to dim");
+  await page.mouse.move(0, 0);
+  await sleep(150);
+  const afterLeave = await page.evaluate(() => document.getElementById("historyGraph").querySelectorAll(".hgraph-lit, .hgraph-dim").length);
+  if (afterLeave !== 0) {
+    return fail("moving the mouse off the row left " + afterLeave + " .hgraph-lit/.hgraph-dim element(s) behind, expected the highlight to clear on mouseleave");
+  }
+  notes.push("hovering the top row lit " + hoverInfo.lit + " ancestry element(s) and dimmed " + hoverInfo.dim + ", both cleared on mouseleave");
+
   const forkHeadId = await head();
 
   // --- 7. explicit Fork from here, answering the prompt() -------------------
