@@ -37,9 +37,10 @@ import cases_output           # noqa: E402
 import cases_range            # noqa: E402
 import cases_cli              # noqa: E402
 import cases_window           # noqa: E402
+import cases_radial           # noqa: E402
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
-           cases_range, cases_output, cases_window, cases_cli]
+           cases_range, cases_output, cases_window, cases_radial, cases_cli]
 
 
 def main():

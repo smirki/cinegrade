@@ -353,10 +353,11 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 #sidebarutil #renderTime { padding: 0 2px; }
 
 /* Theme toggle: a plain .btn (pill, themed like every other button here)
-   holding two inline HugeIcons glyphs (MIT, Copyright 2025 Hugeicons; path
-   data copied by hand per UNSLOTH-TOKENS.md 8.4's own recommended technique,
-   not the npm package) swapped by the `data-theme` attribute static/theme.js
-   sets on <html> -- CSS only, no JS beyond the attribute flip. Lives in
+   holding two HugeIcons glyphs (Sun03Icon, Moon02Icon; MIT, Copyright 2025
+   Hugeicons), rendered from the vendored package by StudioIcons (see
+   studio/static/icons.js) rather than typed by hand, swapped by the
+   `data-theme` attribute static/theme.js sets on <html> -- CSS only, no JS
+   beyond the attribute flip. Lives in
    #sidebarutil now (direct request: "themeToggle goes on the new right
    sidebar with the other utilities"), sized like its siblings there via the
    `#sidebarutil .btn` rule above, but still needs its own flex centering so
@@ -693,14 +694,13 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    plain .btn uses. Disabled at the filesystem root, where there is no
    parent left to go up to. */
 .iconbtn { width: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex: none; }
-/* Explicit size, not left to the SVG's own intrinsic box: an <svg> with no
-   width/height/viewBox on itself (every icon here puts its viewBox on the
-   <symbol> it <use>s, not on this wrapping element) has no sizing
-   information of its own, so it falls back to the UA default replaced-
-   element box (300x150) and gets squashed into whatever this flex button
-   allows -- 22px on the constrained axis, whatever content-based height
-   flexbox hands it on the other, which reads as a barely-visible sliver
-   rather than a glyph. */
+/* Explicit size, not left to content: .rowicon here is a data-icon
+   placeholder (StudioIcons.mount fills it with a rendered <svg>, see
+   studio/static/icons.js) that starts out an empty, zero-size <span>. Giving
+   it a real box up front is what the mounted svg (set to width/height: 100%
+   of its own box, not this class) then fills; without this, an unfilled or
+   still-loading placeholder would collapse to nothing in this flex button
+   instead of reserving its own 14px glyph space. */
 .iconbtn .rowicon { width: 14px; height: 14px; color: inherit; }
 
 /* Sidebar toggles (#sidebarLeftToggle, #sidebarRightToggle in #maintoolbar):
@@ -955,6 +955,66 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 }
 #splitHandle.dragging::after { height: 44px; margin-top: -22px; }
 
+/* The power window's shape editor (window-editor.js): an SVG laid over the
+   whole stage, drawing the shape in the picture's own coordinates. It sits
+   above #splitHandle (z-index 2) so a grip is never stolen by the wipe, and
+   the SVG root is pointer-events: none so everything it does NOT draw a grip
+   on stays as clickable as it was before the overlay existed. Only the grips
+   and the invisible feather ring take the pointer back.
+   Accent, thin, no fill: the same restraint the rest of the viewer chrome
+   keeps next to a picture being judged. The one filled area is the wash, and
+   only while the centre grip is under the pointer. */
+#windowOverlay {
+  position: absolute; inset: 0; display: none; z-index: 3;
+  pointer-events: none; touch-action: none; outline: none;
+}
+#windowOverlay.on { display: block; }
+#windowOverlay .win-outline {
+  fill: none; stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke;
+}
+/* Invert means the correction lands OUTSIDE this shape. The dashed outline
+   is the only thing that says so on the picture; the shape drawn is the same
+   shape either way, because that is what the parameters describe. */
+#windowOverlay.inverted .win-outline { stroke-dasharray: 6 4; }
+#windowOverlay .win-feather {
+  fill: none; stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 5;
+  opacity: 0.7; vector-effect: non-scaling-stroke;
+}
+/* The grab target for the feather, invisible and wider than the line it sits
+   on. pointer-events: stroke is what makes an unpainted stroke hittable, and
+   fill: none is what keeps the whole interior from swallowing clicks. */
+#windowOverlay .win-hit {
+  fill: none; stroke: transparent; stroke-width: 14;
+  pointer-events: stroke; cursor: crosshair;
+}
+/* The wash is the one filled area, and it only appears while the centre grip
+   is under the pointer: a permanent tint over the picture would be colour
+   the eye has to subtract from every judgement made through it.
+   --accent-wash at 60% rather than neat, because at full strength it reads
+   as a colour cast on the frame instead of a hint about a shape. */
+#windowOverlay .win-wash { fill: none; stroke: none; opacity: 0.6; }
+#windowOverlay.hot .win-wash { fill: var(--accent-wash); }
+#windowOverlay .win-stem, #windowOverlay .win-cross {
+  stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke;
+}
+#windowOverlay .win-cross { opacity: 0.8; }
+/* The grips borrow the panel's own surface and border rather than a colour
+   of their own, the same recipe .btn uses, so they read as chrome sitting on
+   the picture instead of as something in the picture. */
+#windowOverlay .win-grip {
+  fill: var(--panel); stroke: var(--accent); stroke-width: 2;
+  pointer-events: all; vector-effect: non-scaling-stroke;
+}
+#windowOverlay .win-grip:hover { fill: var(--accent); }
+#windowOverlay .win-centre { cursor: move; }
+#windowOverlay .win-extent { cursor: pointer; }
+#windowOverlay .win-rot { cursor: grab; }
+#windowOverlay.dragging .win-rot { cursor: grabbing; }
+/* Focused (arrow keys nudge the centre from here), shown on the shape rather
+   than as a ring round the whole stage, which is what a default focus ring
+   on a full-stage SVG would draw. */
+#windowOverlay:focus-visible .win-outline { stroke-width: 2; }
+
 /* Column now (image on top, the Match Reference toolbar below it), not the
    single centred child this used to be: the toolbar needs its own row
    rather than sharing #refPane's old align-items: center with the image. */
@@ -1009,15 +1069,17 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 
 /* ---- dock (scopes + stats) --------------------------------------------- */
 
-/* Scopes and numbers share one horizontally scrolling strip, and it is now
-   a single row: #stats and #scopes sit at the same level as siblings inside
-   #dockbody, both flex-wrap: nowrap, so the luma/rgb percentile numbers and
-   the waveform/parade/vectorscope/histogram images scroll together as one
-   strip rather than the numbers staying pinned on the left while only the
-   scope images scrolled or wrapped underneath them (direct request: "in the
-   scopes and stats widget luma percentiles ... these should be the same
-   level as the graphs so they all scroll horizontally 1 row"). See #scopes
-   and #stats below for what this replaced and why.
+/* Scopes and numbers share one horizontally scrolling strip, and it is a
+   single row: #stats and #scopes sit at the same level as siblings inside
+   #dockbody, both flex-wrap: nowrap, rather than the numbers staying on
+   the left while only the scope images scrolled or wrapped underneath them
+   (direct request: "in the scopes and stats widget luma percentiles ...
+   these should be the same level as the graphs so they all scroll
+   horizontally 1 row"). #stats is also pinned in place with position:
+   sticky while #scopes scrolls past it underneath, so the strip is one row
+   that scrolls together AND the luma/rgb percentile numbers stay legible
+   the whole time, rather than scrolling out of view with the images they
+   describe. See #scopes and #stats below for what this replaced and why.
 
    #dock's own height is no longer something this file manages by shrinking
    a flex column under pressure: the card is gs-no-resize in the HTML and
@@ -1043,9 +1105,9 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    box side by side, the trailing ones (often the vectorscope) dropped onto
    a second row instead of running off the edge, which read as tidy but put
    #stats and #scopes at two different levels in practice -- #stats stayed
-   one row pinned to the left (see the sticky pin #stats used to have,
-   below) while #scopes alone grew to two rows underneath it. That is the
-   opposite of "the same level ... scroll horizontally 1 row".
+   one row pinned to the left (see the sticky pin on #stats below) while
+   #scopes alone grew to two rows underneath it. That is the opposite of
+   "the same level ... scroll horizontally 1 row".
 
    The fix: flex-wrap: nowrap, same as #stats, so #scopes is always exactly
    one row and the two containers read as peers in #dockbody's single
@@ -1080,30 +1142,33 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
               color: var(--text-dim); background: rgba(0,0,0,0.65); padding: 0 4px; letter-spacing: 0.5px;
               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; box-sizing: border-box; }
 
-/* Stats used to come first and stay put: position: sticky; left: 0 pinned
-   the numbers to the start of #dockbody's strip so they stayed visible
-   (like a table's frozen first column) while a wide #scopes scrolled or
-   wrapped past them. That pin is removed now, on a direct instruction to
-   reconsider it: with #scopes also flex-wrap: nowrap above, #stats and
-   #scopes are being asked to read as "the same level" in ONE row that
-   "scroll[s] horizontally 1 row" together, and a sticky-pinned #stats is
-   the opposite relationship -- stats holding still while scopes are the
-   only thing that moves under them, not two peers moving together. flex:
-   none is kept (#stats still never shrinks or wraps, always its own full
-   width) but the pin, its background/z-index (needed only so the pinned
-   copy could paint over scope content passing underneath it) and its
-   border-right (the seam between the pinned and unpinned parts of the
-   strip) all go with it, because none of them mean anything once nothing is
-   pinned.
+/* Stats stays pinned to the start of #dockbody's strip: position: sticky;
+   left: 0, like a table's frozen first column, so the luma/rgb percentile
+   numbers stay on screen while #scopes scrolls past underneath. background:
+   var(--panel) (matching #dock's own background, so the pinned copy reads
+   as part of the same card, not a patch) plus z-index: 1 (same pattern as
+   #sidebarRightToggle above) keep a scope image passing underneath from
+   showing through; border-right is the seam between the pinned and
+   scrolling parts of the strip.
 
-   The trade-off, stated plainly: on a strip wide enough to actually need
-   #dockbody's horizontal scroll, the luma/rgb percentile numbers can now
-   scroll out of view past the left edge along with the scope images, where
-   they used to stay put no matter how far right you scrolled. That is
-   being accepted on purpose here, in exchange for stats and scopes actually
-   behaving like one scrolling row of equal peers instead of a frozen header
-   over a scrolling body -- which is what was asked for. */
-#stats { display: flex; flex-wrap: nowrap; gap: 4px; flex: none; }
+   This pin was tried before and removed once, on a direct instruction to
+   reconsider it: with #scopes also flex-wrap: nowrap, #stats and #scopes
+   were being asked to read as "the same level" in ONE row that "scroll[s]
+   horizontally 1 row" together, and a sticky #stats looked like the
+   opposite -- stats holding still while scopes alone moved underneath it,
+   a frozen header over a scrolling body rather than two peers moving
+   together. That objection was about the visual read, not the row
+   structure, and the row structure has not changed: #stats and #scopes are
+   still one row, same #dockbody, same flex-wrap: nowrap, same top (checked
+   in 07-scopes-row.mjs). What changed is a later, more specific direct
+   instruction: after seeing the un-pinned single row in practice, the
+   numbers scrolling out of view with the images they describe was called
+   out as the actual problem, ahead of the two of them tracking
+   pixel-for-pixel. Pinning #stats again is what answers that, without
+   undoing the one-row layout the earlier instruction asked for. */
+#stats { display: flex; flex-wrap: nowrap; gap: 4px; flex: none;
+         position: sticky; left: 0; z-index: 1; background: var(--panel);
+         border-right: 1px solid var(--line); }
 .statgroup { border: 1px solid var(--line); min-width: 132px; flex: none;
              white-space: nowrap; }
 .statgroup > b { display: block; background: var(--panel2); border-bottom: 1px solid var(--line);
@@ -1205,10 +1270,10 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
   background: transparent; cursor: pointer; user-select: none;
 }
 /* Icons are UNSLOTH-TOKENS.md 8.3's hard-coded 15px floor, rounded up to
-   the whole 16px the direct request specified. Hand-drawn outline glyphs
-   (see the <symbol> sprite in index.html), not vendored HugeIcons path
-   data: the free set is MIT and copyable, but 10k+ per-icon files is not
-   worth pulling in for a dozen glyphs this tool actually uses. */
+   the whole 16px the direct request specified. Rendered from vendored
+   HugeIcons definitions by StudioIcons (studio/static/icons.js,
+   studio/static/vendor/hugeicons.js), built by panels.js -- no path data
+   lives in this stylesheet or anywhere hand-typed. */
 .stagehead-icon { width: 16px; height: 16px; flex: none; color: var(--text-dim); }
 .stagehead-name {
   font-size: 12px; font-weight: 500; color: var(--text-hi);
@@ -1506,3 +1571,56 @@ input[type="checkbox"].ctl-switch:focus-visible { outline: 2px solid var(--accen
   border-radius: var(--radius-full);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ---- power window shape editor (static/window-editor.js) -----------------
+   An SVG laid over #stage, but positioned against the PICTURE's rendered
+   rect rather than the stage's own box (window-editor.js computes the
+   offset): in wipe mode #afterLayer is stretched to the whole stage and
+   only the element inside it has the rect the window's fractions refer to.
+   Nothing in here fills: an opaque shape over a picture being judged for
+   colour is the one thing this overlay must never do, so the only fill is
+   the accent wash while the pointer is on the centre grip, which is a
+   deliberate momentary "this is what is inside" answer. */
+#windowOverlay {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  display: none; z-index: 3; overflow: visible; outline: none;
+  pointer-events: none; touch-action: none;
+}
+#windowOverlay.on { display: block; }
+/* Reads the state app.js already writes, adds no writer of its own. In both
+   of these the graded layer is not the picture on screen, so neither is a
+   shape drawn on it: same rule #splitHandle follows for the same reason. */
+#stage.playing #windowOverlay,
+#stage.mode-before #windowOverlay { display: none; }
+
+#windowOverlay .win-outline { fill: none; stroke: var(--accent); stroke-width: 1.25; }
+#windowOverlay.hot .win-outline { fill: var(--accent-wash); }
+/* The feather ring is the matte's OUTER edge (d = 1 + softness), dashed
+   because it is a ramp boundary rather than the shape itself. */
+#windowOverlay .win-feather {
+  fill: none; stroke: var(--accent); stroke-width: 1;
+  stroke-dasharray: 5 4; opacity: 0.6;
+}
+/* A wide transparent stroke over the same path: a 1px ring is not a grab
+   target, and widening the visible stroke to make it one would draw a fat
+   ring over the picture instead. */
+#windowOverlay .win-hit {
+  fill: none; stroke: transparent; stroke-width: 14;
+  pointer-events: stroke; cursor: crosshair;
+}
+#windowOverlay .win-stem { stroke: var(--accent); stroke-width: 1; opacity: 0.7; }
+#windowOverlay .win-cross {
+  stroke: var(--accent); stroke-width: 1; opacity: 0.5; pointer-events: none;
+}
+#windowOverlay .win-grip {
+  fill: var(--panel); stroke: var(--accent); stroke-width: 1.25; pointer-events: all;
+}
+#windowOverlay .win-grip:hover { fill: var(--accent); }
+#windowOverlay .win-centre { cursor: move; }
+#windowOverlay .win-extent { cursor: crosshair; }
+#windowOverlay .win-rot { cursor: grab; }
+#windowOverlay.dragging .win-grip { cursor: grabbing; }
+/* Inverted windows grade everything OUTSIDE the shape, so the outline reads
+   as the hole it has become rather than as the graded region. */
+#windowOverlay.inverted .win-outline { stroke-dasharray: 2 3; }
+#windowOverlay:focus-visible .win-centre { stroke-width: 2.5; }

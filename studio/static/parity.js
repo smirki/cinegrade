@@ -124,6 +124,39 @@
       secondary: { enabled: true, invert: true, hue_center: 30, hue_width: 50,
                    lum_gain: 0.85 } });
 
+    /* The power window. It gates the secondary and nothing else, so every one
+     * of these carries the same deliberately loud qualifier correction: a
+     * matte that is right but a correction that barely moves the picture
+     * would measure exact while proving nothing. The three shapes cover the
+     * feathered ellipse (the default), a rotated rectangle with a hard edge
+     * (softness 0, where the matte is two levels and the only question is
+     * which side of the boundary a pixel lands on) and a wide feather that is
+     * also inverted (the correction lives outside the shape). */
+    var winSec = { enabled: true, hue_center: 30, hue_width: 50, hue_soft: 20,
+                   hue_shift: -25, sat_gain: 1.45, lum_gain: 1.12,
+                   tint: [0.05, -0.02, -0.04] };
+    add("window_ellipse", "window", {
+      secondary: winSec, window: { enabled: true } });
+    add("window_rect_rot", "window", {
+      secondary: winSec,
+      window: { enabled: true, shape: "rect", rotation: 37.0, softness: 0.0 } });
+    add("window_soft", "window", {
+      secondary: winSec,
+      window: { enabled: true, softness: 0.5, invert: true } });
+    /* The matte on its own, with nothing else in the way. show_mask makes the
+     * graded branch the qualifier matte and the un-graded branch black, and a
+     * qualifier this wide selects every pixel at exactly 1.0, so the graded
+     * branch is white and the finished picture IS the window matte in all
+     * three channels. Any disagreement in this row is a matte code, not a
+     * correction that happened to land on a rounding boundary, which is what
+     * makes it the row to read when the shader's arithmetic is in question. */
+    add("window_matte_only", "window", {
+      secondary: { enabled: true, show_mask: true, hue_center: 0,
+                   hue_width: 360, hue_soft: 1, sat_low: 0, sat_high: 1,
+                   sat_soft: 0, lum_low: 0, lum_high: 1, lum_soft: 0 },
+      window: { enabled: true, cx: 0.46, cy: 0.53, w: 0.55, h: 0.4,
+                rotation: 21.0, softness: 0.22 } });
+
     add("look_natural_full", "look", { look: { lut: "natural", mix: 1.0 } });
     add("look_natural_half", "look", { look: { lut: "natural", mix: 0.5 } });
     add("look_silverblue", "look", { look: { lut: "silverblue", mix: 1.0 } });

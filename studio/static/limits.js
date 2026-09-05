@@ -39,11 +39,16 @@
      "can decode it, through VideoToolbox, so this is a Chrome limit rather " +
      "than a hardware or codec limit in general. Short of using Safari, the " +
      "only way to get a playable source into Chrome is a server made proxy " +
-     "in a format Chrome can decode, and that proxy would have to be 10 bit " +
-     "(HEVC): Apple Log packs its range into a narrow code window, and an 8 " +
-     "bit H.264 proxy would band it visibly. Streaming the already graded " +
-     "result instead sidesteps all of this, because a finished Rec.709 " +
-     "image is exactly what 8 bit H.264 is for."],
+     "in a format Chrome can decode, and that is now what Play does: see " +
+     "the playback entry under Fixed. This entry used to go on to say that " +
+     "such a proxy would have to be 10 bit HEVC, because Apple Log packs its " +
+     "range into a narrow code window and an 8 bit H.264 proxy would band it " +
+     "visibly. That was a prediction, not a measurement, and the 8 bit proxy " +
+     "was built and measured instead: the numbers are in the next entry. The " +
+     "worry is not disproved (the log curve is still undone by the grade " +
+     "AFTER the 8 bit step, and nothing here tested a large smooth gradient " +
+     "for banding specifically), but it is no longer a reason not to have " +
+     "playback."],
     ["Not a calibrated reference.",
      "The grade is computed in 16 bit, but you are judging an 8 bit JPEG that " +
      "your browser then colour manages to your display profile. No amount of " +
@@ -51,6 +56,28 @@
     ["Scopes measure the preview, not the render.",
      "They run on the 640 wide 8 bit preview frame, not the full resolution 10 " +
      "bit output. Read them for shape and balance, not as a broadcast QC pass."],
+    ["Playback is judged on an 8 bit proxy, stills are not.",
+     "Pressing Play does not run the 16 bit path faster. It decodes a 960 wide " +
+     "8 bit 4:2:0 H.264 proxy in a hidden &lt;video&gt; and grades each frame " +
+     "on the GPU, while a still comes from the 16 bit /api/source path as " +
+     "before, so the picture you judge while playing is not quite the picture " +
+     "you judge when you stop. Measured by studio/tests/proxy-fidelity.mjs, " +
+     "which grades the same frame of the same clip with the same config twice, " +
+     "once from each path, at three frames of a 24 fps clip: with the panels at " +
+     "their defaults the mean absolute difference per channel was " +
+     "3.195/1.806/2.777, 3.012/1.799/2.599 and 3.292/1.742/2.767 of 255, and " +
+     "with a grade on (which stretches whatever the codec did) 4.29/2.487/4.417, " +
+     "3.899/2.427/4.106 and 4.169/2.289/4.225. The worst single channel across " +
+     "those six comparisons was 53 of 255. The share of pixels off by more than " +
+     "2 of 255 is 72.488 to 76.255 percent at defaults and 85.128 to 87.369 " +
+     "percent graded, so this is everywhere in the frame rather than in one " +
+     "corner. What it is not is a shift: whole picture mean luma moved by only " +
+     "0.10 to 0.32 of 255, so exposure and balance read the same and the " +
+     "difference is fine grain from chroma subsampling and DCT. Decoding the " +
+     "same proxy file with ffmpeg rather than Chrome gives 1.023/0.700/1.222, " +
+     "so about a third of the difference is the encode and the rest is Chrome's " +
+     "own YUV to RGB conversion and chroma upsampling on the way into the " +
+     "texture, which no server side setting here can reach."],
   ];
 
   var POSSIBLE = [
@@ -67,13 +94,16 @@
      "centre, extent, rotation, feather and invert, gating the secondary " +
      "through a geq baked matte and maskedmerge, which is the same technique " +
      "the radial blur ramp already used. It has sliders in the Window panel " +
-     "and it renders. What is still missing is the drawing part: there is no " +
-     "way to drag the shape on the picture, no handles for the extent or the " +
-     "rotation, and no softness ring, so a window is positioned by numbers " +
-     "rather than by eye. The GPU shader port is missing with it, which is " +
-     "why an enabled window drops the viewer back to the server render. Both " +
-     "are the next wave of work. See the three window entries below for what " +
-     "the shipped half does and does not do."],
+     "and it renders. The drawing part has landed too: the shape is dragged " +
+     "on the picture itself, with a centre grip, four extent handles on the " +
+     "rotated axes, a rotation grip on a stem and a draggable feather ring, " +
+     "so a window no longer has to be positioned by numbers alone. The GPU " +
+     "shader port has landed with it, so an enabled window no longer drops " +
+     "the viewer back to the server render; see the fixed entries for the " +
+     "measured parity and for what the drawing half does not show. What is " +
+     "still missing from the phrase 'drawn power windows' as a colourist " +
+     "means it is everything the window entries below list: one shape, no " +
+     "tracking, and the gate only reaches the secondary."],
     ["Several secondaries, or several look slots.",
      "Straightforward. A secondary is baked to a 33 cube and inserted as one " +
      "lut3d node, so a second one is a second node. The only real cost is that " +
@@ -145,6 +175,14 @@
      "cube. It does not extract the reference's LUT, because a JPEG does not " +
      "contain one; it moves the source's colour statistics toward the " +
      "reference's, and it reports how far it got and where it is unreliable."],
+    ["Grade versions, and a reference still per clip.",
+     "The storage half is already there and is the easy half: per clip grades " +
+     "sit in grades(user_id, clip_key, clip_name, config_json, updated_at) " +
+     "with a primary key on (user_id, clip_key), so exactly one row per clip " +
+     "per account. Versions mean dropping that uniqueness and adding a label " +
+     "and a created_at; a still means writing one JPEG beside the row. The " +
+     "actual work is the interface: a version list, a way to compare two of " +
+     "them, and a rule for which version a clip loads on select."],
   ];
 
   var BROKEN = [
@@ -338,20 +376,169 @@
      "(max difference 0 of 255 across ten shape and size combinations at " +
      "1920x1080 and 320x568). The scaling into the 16 bit merge is exact too, " +
      "but only because the matte is routed through gray16le on the way in. " +
-     "Straight to 16 bit planar RGB, which is what the radial ramp does, " +
-     "ffmpeg expands 8 bits with a left shift, so matte code 255 arrives as " +
-     "65280 of 65535 and a fully open window applies 99.61% of the " +
-     "correction: measured at a mean 0.186 of 255 on 18.6% of pixels before " +
-     "that hop was added, and exactly 0 after it."],
-    ["A power window switches the GPU preview off.",
-     "known preview limit, until the shader port lands",
-     "The window is in the ffmpeg engine only. gpu.js has no window stage at " +
-     "all, so it would not even report it as unsupported: it would grade the " +
-     "whole frame and show a picture that quietly ignores the shape you just " +
-     "drew, which is the worst kind of preview error. The viewer therefore " +
-     "treats an enabled window as blocking and falls back to the server " +
-     "render for as long as it is on. Everything still works, it is just the " +
-     "slower path. The shader port is the next wave of work."],
+     "Straight to 16 bit planar RGB ffmpeg expands 8 bits with a left shift, " +
+     "so matte code 255 arrives as 65280 of 65535 and a fully open window " +
+     "applies 99.61% of the correction: measured at a mean 0.186 of 255 on " +
+     "18.6% of pixels before that hop was added, and exactly 0 after it. The " +
+     "radial blur ramp shipped on the bare shift until 2026-09-04 and now " +
+     "takes the same hop; see the fixed list below for what that moved."],
+    ["The agent grading loop only tunes five primaries controls.",
+     "works, and only there",
+     "studio/tools/agent_grade.py drives a real grade through the same HTTP " +
+     "API the browser uses (state, session, stats, match, grade or preset), " +
+     "but the loop that decides what to change is five deterministic rules " +
+     "over PRIMARIES ONLY: exposure through primaries.brightness (a proxy, " +
+     "not convert.exposure, because that field lives outside the primaries " +
+     "node this loop is scoped to, which the CLI guide's own advice to grade " +
+     "exposure in stops on the log signal does not apply here), contrast " +
+     "through primaries.contrast, saturation through primaries.saturation, " +
+     "and white balance through primaries.temperature and primaries.tint, " +
+     "each moved by a damped share of the measured gap and clamped to that " +
+     "control's own range from schema.js. It never touches curves, the " +
+     "secondary, the window, grain, detail, fx, or which look is loaded, " +
+     "except the one look a --ref run fits and applies through /api/match " +
+     "before the primaries loop even starts. Measured on a real clip " +
+     "(A001_09011832_C003.MOV) against two different targets: toward the " +
+     "cinematic preset's own measured stats from a flat start, the loop cut " +
+     "total tracked error from 0.4499 to 0.0379 (91.6%) over 12 steps " +
+     "without fully converging, because cinematic's difference from flat " +
+     "also comes from convert.exposure 1.2, the blockbuster look LUT, and " +
+     "halation, bloom, rgb_split and vignette, none of which primaries can " +
+     "reach, so saturation was still climbing toward its own range ceiling " +
+     "(reached 1.8957 of 0 to 2.5) rather than closing the last few percent " +
+     "of gap. Toward a reference image (IMG_2570.PNG), after /api/match fit " +
+     "and applied a look (distance 0.0993 to 0.0737), the primaries loop " +
+     "converged fully in 6 steps, total error 0.7232 to 0.0438, every " +
+     "tracked metric inside tolerance, with contrast pushed to 2.3413 of " +
+     "its 2.5 ceiling: a real convergence, but on a reference whose " +
+     "remaining gap after the look fit happened to be one primaries push " +
+     "could close, which will not be true of every reference or every " +
+     "preset."],
+    ["A saved grade is the current config and nothing else.",
+     "works, but it is not a version history",
+     "PUT /api/grade replaces the whole config for that clip, so there is one " +
+     "grade per clip per account and no way back to what it looked like an " +
+     "hour ago. No named versions, no reference stills, no per clip notes. " +
+     "The undo stack is per clip but lives in browser memory only: measured, " +
+     "the grade comes back after a reload and the undo button is disabled, " +
+     "because the history of how you got there was never sent anywhere."],
+    ["The clip key is content based, so a re-encode is a new clip.",
+     "by design, with a real cost",
+     "A clip is identified by the first 32 hex characters of sha256(byte " +
+     "length, first 1 MiB, last 1 MiB), not by its name or its path. " +
+     "Measured: a byte identical copy of a 114 MB clip, saved in the same " +
+     "folder under a different name, resolved to the same key " +
+     "05fe6fe1e893172ddf254f196a9a121d, so renaming or moving footage keeps " +
+     "its grade. The other half of that deal is that a transcode, a trim or " +
+     "a re-wrap is a different file and gets a different key, so it arrives " +
+     "ungraded and nothing on screen explains why. Copy grade here is the " +
+     "manual way across."],
+    ["Only the active A/B slot follows the clip.",
+     "partially works",
+     "Selecting a clip loads its grade into whichever slot is active and " +
+     "leaves the other slot untouched, so the inactive slot still holds the " +
+     "previous clip's look. Comparing A against B straight after a clip " +
+     "switch is therefore comparing this clip's grade against the last " +
+     "clip's, which is a reasonable thing to want and is not what the two " +
+     "buttons appear to promise. Only the active slot is ever saved."],
+    ["With logins off, everything belongs to one account.",
+     "works as intended, said out loud",
+     "Grades and saved presets are keyed by user id, and with no logins every " +
+     "request resolves to user id 0. Two people sharing one machine therefore " +
+     "share one set of grades, and turning --auth on later does not migrate " +
+     "what user 0 saved into the new accounts: it stays under id 0 and " +
+     "becomes invisible. Measured with two accounts on one server: the " +
+     "second account's GET /api/grade for a clip the first had graded " +
+     "returned exists false, and its GET /api/grades returned an empty list."],
+    ["Uploaded clips are not scanned.",
+     "no content or malware scanning",
+     "POST /api/upload checks the file extension against the same allow " +
+     "list every other route uses, then runs a bounded, headers only " +
+     "ffprobe to confirm the container actually has a video stream. Neither " +
+     "check looks at what is in the picture or whether the bytes contain " +
+     "anything else riding along with them. This is a personal grading tool " +
+     "on a machine its account already has a login for, not a public " +
+     "upload surface, and no scanning of any kind was built for it."],
+    ["The upload quota only ever looks at one folder.",
+     "measured, by design",
+     "The default 8589934592 byte (8 GiB) per file cap and 53687091200 " +
+     "byte (50 GiB) per account total are both checked against the single " +
+     "destination folder an upload lands in (FOOTAGE with logins off, this " +
+     "account's own footage folder with them on), summing only the files " +
+     "sitting directly inside it. Nothing here looks at the rest of the " +
+     "disk, at studio/cache (which this same wave measured at over 2.6 GB " +
+     "just from the frame cache during testing), or at other accounts' " +
+     "folders, so an account can still fill the disk by staying under its " +
+     "own 50 GiB and letting the shared caches grow unbounded around it. " +
+     "The quota check itself also has a gap: two uploads to the same " +
+     "account starting at the same moment both read the folder's current " +
+     "size before either has written a byte, so both can pass a check that " +
+     "only one of them should have, and the folder ends up over the cap by " +
+     "roughly the smaller of the two uploads. Measured by reading the code " +
+     "path, not by triggering it: _dir_total_bytes() and the write that " +
+     "follows it are not under one lock."],
+    ["An upload is one request with no resume.",
+     "no resume, no chunking",
+     "The whole file is one HTTP POST body, written to a temp file and " +
+     "renamed into place only once every declared byte has arrived. A " +
+     "connection that drops midway (closed laptop lid, wifi drop, a " +
+     "reverse proxy timeout) deletes the partial temp file and reports an " +
+     "error; there is no byte range, no chunk id and nothing saved to " +
+     "resume from, so trying again means uploading the whole clip from the " +
+     "first byte. For an 8 GiB cap on an ordinary upload connection that is " +
+     "a real cost, not a rare inconvenience."],
+    ["ffprobe validating an upload checks the container, not the whole pipeline.",
+     "partially works",
+     "A file that keeps its declared extension and reports a stream with " +
+     "codec_type video in its own headers is accepted; cinegrade's own " +
+     "decode is never attempted before the file is kept. An exotic or " +
+     "corrupt codec that ffprobe's header parse recognises as \"video\" but " +
+     "that the render graph cannot actually decode would still be accepted " +
+     "here and only fail later, the first time someone tries to view or " +
+     "grade it."],
+    ["POST /api/look (importing a .cube LUT) has no body size cap.",
+     "found while auditing this, not fixed here",
+     "Every JSON route now refuses a body over 8 MB before reading it (see " +
+     "_body() in server.py), and POST /api/upload has its own 8 GiB cap " +
+     "checked the same way. The one other route that reads a raw request " +
+     "body, POST /api/look, calls _raw_body() instead, which was out of " +
+     "this wave's scope and still reads whatever Content-Length claims " +
+     "with no ceiling at all."],
+    ["The window drawn on the picture is the geometry, not the matte.",
+     "an outline and a ring, not a preview of the falloff",
+     "The shape editor draws exactly what the seven numbers say and nothing " +
+     "more: a solid outline at the shape's own edge (d = 1) and a dashed " +
+     "ring at (1 + softness) times that radius, which is where the matte " +
+     "reaches zero. Between those two lines it draws nothing at all, so the " +
+     "linear ramp the engine actually computes per pixel is not on screen. " +
+     "The accent wash that appears while the centre grip is under the " +
+     "pointer is a flat fill of the inside, the same colour at d = 0.2 as at " +
+     "d = 0.99, and it stays on the inside when invert is on, where the " +
+     "correction lands OUTSIDE the shape (the dashed outline is the only " +
+     "thing that says so). To see the real matte, turn the Matte view on: " +
+     "that renders the qualifier matte multiplied by the window matte from " +
+     "the engine itself. What IS measured is the mapping, not the falloff: " +
+     "in studio/tests spec 13 a real 120px drag of the centre grip across a " +
+     "468.2px wide fitted picture moved window.cx by 0.25632 against an " +
+     "expected 0.25632, an error of 0.00000. At that fitted size one screen " +
+     "pixel is 1/468th of the frame, which is also the finest the arrow key " +
+     "nudge can go by eye; the sliders still go finer."],
+    ["The grain stage's icon reads as a chart, not as film grain.",
+     "closest available glyph, not the intended shape",
+     "Every icon in this tool is now rendered from @hugeicons/core-free-icons " +
+     "verbatim (studio/tools/icons/build.mjs vendors whole icon definitions, " +
+     "studio/static/icons.js turns them into real svg nodes; no path data is " +
+     "typed or edited by hand anywhere). A prior version of this icon hand " +
+     "picked 5 of ChartScatterIcon's 6 paths, dropping its axis-frame line so " +
+     "only the scattered dots remained. That per-path edit is exactly the " +
+     "human-touches-path-data pattern this rework removes, so the grain stage " +
+     "now shows the whole icon, axis frame included: 6 shapes, confirmed by " +
+     "studio/tests/verify-icons-l8c.mjs reading the live DOM. Hugeicons' free " +
+     "4,500-icon set (checked by name: grain, noise, texture, scatter, dotted) " +
+     "has no dedicated film-grain glyph; ChartScatterIcon's dot field is the " +
+     "closest shape available, and it now reads more like a scatter chart " +
+     "because of that frame line. The engine's own grain effect is unaffected; " +
+     "this is a labelling glyph only."],
   ];
 
   var FIXED = [
@@ -443,6 +630,154 @@
      "wrong in a second way: ffmpeg extrapolates that straight line past both " +
      "ends and the editor drew it flat. Both are fixed, and the drawn line now " +
      "matches ffmpeg within 1 of 65535 on all five curves tested."],
+    ["A power window", "switched the GPU preview off, now it renders on the GPU",
+     "The window was in the ffmpeg engine only, so live.js forced an enabled " +
+     "window into its blocking list and the viewer fell back to the server " +
+     "render for as long as one was on. gpu.js now evaluates the same matte " +
+     "formula per pixel in the colour shader, with the same floor(m*255+0.5) " +
+     "rounding and the same multiply by 257 into the 16 bit merge, and " +
+     "maskedmerges the secondary branch over the un-graded one exactly where " +
+     "build_graph splits the tree. The override is gone. Measured on this " +
+     "machine (Apple M5, ANGLE Metal) against ffmpeg 8.1.1 at 640x1138 and " +
+     "1280x2276: four window configs, eight runs, all EXACT, worst channel 1 " +
+     "code of 255 and 0.00 percent of channels off by more than 1. The sweep " +
+     "went from 152 EXACT, 32 CLOSE, 0 FAILED of 184 runs to 160 EXACT, 32 " +
+     "CLOSE, 0 FAILED of 192, with all 184 earlier runs unchanged in verdict, " +
+     "worst channel and mean. The shader works in 32 bit float where the " +
+     "engine's numpy and geq references work in 64 bit, so a pixel sitting on " +
+     "a matte step can round the other way: the window_matte_only case, which " +
+     "renders the bare matte with nothing else in the chain, differs from " +
+     "ffmpeg's baked matte on 5 of 728320 pixels at 640 wide and 11 of " +
+     "2913280 at 1280 wide, by one code of 255 each. That is 0.0007 and " +
+     "0.0004 percent. One matte code is 1/255th of the correction, so at the " +
+     "loudest qualifier in the sweep (which moves the picture by at most 59 " +
+     "of 255) it cannot reach half an 8 bit code, and none of those pixels " +
+     "shows up as an output difference. A correction stronger than about 127 " +
+     "of 255 could make one visible, and it would be one code."],
+    ["A power window could only be positioned by typing numbers.",
+     "was seven sliders, now it is dragged on the picture",
+     "The window had centre, extent, rotation, softness and invert as " +
+     "sliders in the Window panel and nothing on the picture, so placing a " +
+     "shape over a face meant guessing a fraction, releasing, looking, and " +
+     "guessing again. The shape is now drawn over the graded layer as an SVG " +
+     "overlay with a centre grip, four extent handles sitting on the " +
+     "ROTATED axes, a rotation grip on a stem and a draggable feather ring, " +
+     "and arrow keys nudge the centre by one screen pixel (ten with shift). " +
+     "It maps to the picture element's own rendered rect, not the stage, so " +
+     "it stays correct in the letterboxed and split view modes, and it reads " +
+     "the same autorotated axes the engine bakes the matte in. Every drag " +
+     "writes through the same Panels.emit the sliders write through, which " +
+     "is why a drag auto-enables the stage, is one undo step, and moves the " +
+     "sliders as it goes. Measured in studio/tests spec 13 against a real " +
+     "browser and real pointer input: a 120px drag of the centre grip on a " +
+     "468.2px wide picture moved cx from 0.5 to 0.75632 where 0.75632 was " +
+     "expected (error 0.00000), window.enabled went false to true on that " +
+     "same drag, one undo press put cx back to 0.5, and a drag on the " +
+     "rotation grip moved rotation from 0 to 20.7 degrees."],
+    ["Playing a clip", "was a server render per segment, now the whole clip " +
+     "plays graded on the GPU",
+     "Play used to ask the server to render a short segment and stream the " +
+     "result back, so what you could watch was whatever had been rendered and " +
+     "every scrub was a round trip. One bounded ffmpeg pass per clip and width " +
+     "now writes a proxy (POST /api/proxy/prepare, cached under " +
+     "studio/cache/proxy against a 1.5 GB budget, served with byte ranges so a " +
+     "&lt;video&gt; can seek in it), a hidden video element decodes it, and " +
+     "requestVideoFrameCallback hands every presented frame to the same gpu.js " +
+     "chain the stills go through. Measured on this machine by " +
+     "studio/tests/proxy-fidelity.mjs: 5 seconds of a 24 fps clip graded 119 " +
+     "frames in 4949 ms, which is 23.84 fps against a ceiling of 24.00 (a video " +
+     "element plays at 1x, so the clip's own rate is the limit), with 0 frames " +
+     "skipped by the renderer and 0 dropped by the decoder, and the GPU chain " +
+     "itself costing 0.04 ms per frame (worst 0.2 ms). A knob moved mid " +
+     "playback lands on the very next frame: mean luma went 99.58 to 161.84 " +
+     "with no frame in between. Nothing accumulates per frame: the JS heap over " +
+     "those 119 frames went from 72.2 MB to 20.7 MB. The cost is the one " +
+     "prepare pass, which is not free and is not hidden: at 640 wide a 5.00 s " +
+     "clip took 2.0 s for 1.52 MB and a 32.25 s clip took 11.9 s for 19.87 MB, " +
+     "both about 2.5x realtime from 2160x3840 source, and at 960 wide the same " +
+     "5 s clip is 3.60 MB. Asking again for a proxy already on disk answers in " +
+     "1 ms. The proxy is tagged full range rather than limited because both " +
+     "were built and compared: limited scored a slightly lower per pixel mean " +
+     "(3.139/1.919/2.799 against 3.643/2.092/3.482) but moved whole picture " +
+     "mean luma by 1.21 to 1.50 of 255 where full moved it by 0.10 to 0.32, and " +
+     "a bias you can see beats grain you cannot."],
+    ["Seeking in the proxy", "expected to snap to a keyframe, measured frame " +
+     "exact",
+     "The proxy is encoded with a 12 frame GOP (-g 12 -keyint_min 12 " +
+     "-sc_threshold 0) on the assumption that a seek would land on a keyframe " +
+     "and a short GOP would keep that error under half a second. That " +
+     "assumption is wrong, and measuring it is what showed it: 12 random seeks " +
+     "in a 5 s 24 fps clip each landed on exactly the frame asked for (frames " +
+     "8, 29, 31, 36, 49, 51, 68, 88, 92, 93, 97 and 99, none of them a multiple " +
+     "of 12), and stepping one frame forward and back returned to the frame it " +
+     "started on. The decoder decodes forward from the keyframe rather than " +
+     "showing it, so a short GOP buys latency, not accuracy. The latency it " +
+     "buys, measured: 11 ms at best, 126 ms median, 372 ms worst, where the " +
+     "cluster at about 126 ms is this code's own 120 ms wait for a frame that a " +
+     "paused element may never present again, not decode time. End to end, " +
+     "dragging the timeline to a new time and seeing a different picture " +
+     "measured 24.8, 27.7, 141.5 and 201.2 ms."],
+    ["Which frame is the frame at 1.5 seconds", "the still and the video " +
+     "disagreed by one, now they are mapped",
+     "ffmpeg's -ss T returns the first frame whose timestamp is at or after T. " +
+     "A video element asked for currentTime = T shows the frame whose display " +
+     "interval contains T. Those are different frames whenever T does not sit " +
+     "exactly on a frame boundary, and the gap is a whole frame of motion: an " +
+     "early version of the fidelity tool compared frame 11 against frame 12 " +
+     "and reported a mean difference of 3.9 of 255 that was the shot moving, " +
+     "not the codec. live.js now maps clip time to proxy time and back so both " +
+     "paths name the same frame, and the tool asks for the middle of a frame so " +
+     "no rounding at either end can tip it into the neighbour. The frame rate " +
+     "that arithmetic uses comes from ffprobe's r_frame_rate, not " +
+     "avg_frame_rate: on the test clip avg reads 23.067 against a real 24.000, " +
+     "which drifts a whole frame within half a second and measured as a mean " +
+     "difference of 26 of 255 before it was fixed. Two encoder knobs that " +
+     "sound like they would help do nothing here and were dropped rather than " +
+     "left in as decoration: sws dithering and accurate rounding on the 16 bit " +
+     "to 8 bit step produced byte identical files (cmp, not eyeballing), and " +
+     "CRF 12 instead of 18 changed the decoded result by 0.09 of 255 while " +
+     "tripling the file."],
+    ["The radial blur ramp", "was wrong twice over on the way into the merge, " +
+     "now exact",
+     "The ramp is an 8 bit grey PNG baked by a geq expression, and between the " +
+     "number that expression asked for and the weight maskedmerge applied sat " +
+     "two silent conversions, both wrong. First, the geq ran on the luma plane " +
+     "of a limited range YUV source and the frame was converted to grey " +
+     "afterwards, which stretched every code by round((v-16)*255/219): on a " +
+     "256 wide identity ramp 248 of 256 codes moved, by up to 20 code values, " +
+     "and only 220 distinct codes survived, so everything at or below 16 " +
+     "flattened to 0 and everything at or above 235 flattened to 255. Second, " +
+     "the 8 bit matte was widened to 16 bit with a bare format=gbrp16le, which " +
+     "is a left shift: code 0 arrived as 0, 128 as 32768, 235 as 60160 and 255 " +
+     "as 65280 of 65535, so a fully open ramp applied 99.61% of the blur and " +
+     "never all of it. Both now go the way the window matte already went: " +
+     "format=gray before the geq (measured: 0 of 256 codes moved, max error 0) " +
+     "and format=gray16le,format=gbrp16le into the merge (measured: max " +
+     "|arrived - 257n| = 0 over all 256 codes, 255 arriving as 65535, and the " +
+     "same 0 end to end through maskedmerge itself). What it moved, measured " +
+     "on A001_09011336_C002.MOV at 2.0 s rendered 1920x3412, radial blur on at " +
+     "the defaults (sigma 9, start 0.55, end 1.0): max 4 of 255, mean 0.0944, " +
+     "9.35% of pixels changed, and it lands where it should. Inside the ramp " +
+     "start radius, where the matte is closed, exactly 0 pixels moved. In the " +
+     "ramp itself, max 4 and mean 0.1649 over 16.33% of pixels. Outside the " +
+     "ramp, where the matte is fully open, max 1 and mean 0.0190 over 1.90% of " +
+     "pixels, which is the 65280 to 65535 correction arriving. With start " +
+     "pulled to 0.2 the same picture: max 4, mean 0.1309, 12.90% of pixels, " +
+     "still 0 inside the closed radius. For scale, turning the radial blur on " +
+     "at all moves that frame by up to 51 of 255, so this was up to about 8% " +
+     "of the effect it was supposed to be applying. One golden moved and only " +
+     "one (clipA_cinekit, the only golden preset with a radial blur: g_p95 " +
+     "0.58039 to 0.58431 and b_p99 0.63922 to 0.64314, both one 8 bit code); " +
+     "the other five re-blessed byte identical. The GPU port emulated both " +
+     "defects on purpose so that parity would pass, and now emulates neither. " +
+     "It still quantises the ramp with floor(255*ramp), because the matte " +
+     "really is an 8 bit PNG and ffmpeg's geq really does truncate (measured " +
+     "on a 640x360 ramp: floor matches on all 230400 pixels, round-half-up " +
+     "misses 86776 of them and rint misses 86770). Parity is unchanged either " +
+     "side of the fix, 160 EXACT, 32 CLOSE, 0 FAILED of 192 before and after, " +
+     "with both radial stage rows EXACT at max 1 of 255 and 0% of pixels off " +
+     "by more than 1. Four regression tests now pin it (grade/tests/" +
+     "cases_radial.py) so it cannot come back quietly."],
   ];
 
   function rows(items) {

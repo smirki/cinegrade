@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixxr Studio: GPU render worker</title>
+<!-- The page a headless Chrome loads for a GPU final render. It is not part
+     of the studio UI: render_gpu.py opens it through tools/render_worker.mjs,
+     it pulls source frames from the server, grades them with the same gpu.js
+     the viewer uses, and posts the graded 16 bit frames back. Opening it by
+     hand shows the status text and nothing else, because every route it uses
+     needs a running render's own token. -->
+<style>
+  html, body { margin: 0; background: #101114; color: #d8dae0;
+               font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #status { padding: 16px; white-space: pre-wrap; }
+  canvas { position: fixed; left: -10000px; top: 0; width: 8px; height: 8px; }
+</style>
+</head>
+<body>
+<div id="status">starting</div>
+<canvas id="gl" width="8" height="8"></canvas>
+<script src="gpu.js"></script>
+<script src="render.js"></script>
+</body>
+</html>

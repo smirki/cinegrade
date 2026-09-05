@@ -31,6 +31,25 @@
   var MID_GREY_CODE = { dwg: 0.3360, direct: 0.4883 };
   var VIGNETTE_RADIUS_NEUTRAL = 0.85;
 
+  /* The power window block, mirrored from cinegrade.DEFAULTS["window"].
+   *
+   * It is a named constant as well as a member of DEFAULTS below because
+   * setDefaults() can replace DEFAULTS with a copy that came from an older
+   * server, and a window block with missing fields would resolve to NaN in
+   * the matte rather than to the engine's own numbers. This constant is the
+   * merge base, so every field always has a value.
+   *
+   * Every geometric value is a FRACTION of the frame, which is what lets a
+   * 640 wide preview and a 3840 wide render describe the same shape without
+   * scaleForPreview having a case for any of it. cx/cy are the centre, w/h
+   * the FULL extent (not the half axis), rotation is degrees clockwise on
+   * screen, softness is the feather width as a fraction of the shape radius. */
+  var WINDOW_DEFAULTS = {
+    enabled: false, shape: "ellipse",
+    cx: 0.5, cy: 0.5, w: 0.6, h: 0.6,
+    rotation: 0.0, softness: 0.15, invert: false
+  };
+
   // A local copy of cinegrade.DEFAULTS. It is a mirror, not the source of
   // truth: setDefaults() lets a caller hand over the copy the server sent so
   // an engine change cannot silently leave this file behind.
@@ -66,6 +85,7 @@
       hue_shift: 0.0, sat_gain: 1.0, lum_gain: 1.0,
       tint: [0.0, 0.0, 0.0], strength: 1.0
     },
+    window: WINDOW_DEFAULTS,
     output: { codec: "prores_ks", profile: 3, crf: 16, preset: "slow" }
   };
 
@@ -454,6 +474,59 @@
     return plan;
   }
 
+  /* The power window: the shape half of a secondary, ported from
+   * cinegrade.py's window_matte / _window_geometry / window_active.
+   *
+   * The window gates the SECONDARY and only the secondary. With the qualifier
+   * off there is nothing for a shape to gate, and the engine drops the stage
+   * out of the graph entirely rather than leaving an inert filter in it, so
+   * this preview has to make the same call from the same rule or it shows a
+   * shape the render does not have. */
+  function windowActive(cfg) {
+    var win = (cfg && cfg.window) || {};
+    var sec = (cfg && cfg.secondary) || {};
+    return !!win.enabled && !!sec.enabled;
+  }
+
+  function windowBlock(cfg) {
+    return deepMerge(WINDOW_DEFAULTS, (cfg && cfg.window) || {});
+  }
+
+  /* Python's float(f"{x:.Nf}"), which is how cinegrade rounds the geometry.
+   *
+   * The engine passes every window constant through a decimal round trip so
+   * that the double numpy evaluates is bit for bit the double ffmpeg parses
+   * back out of the geq string. Doing the same round trip here means the
+   * shader starts from the same constants both references start from instead
+   * of from full precision numbers that could round a boundary pixel the
+   * other way. toFixed and Python's format differ only on an exact decimal
+   * tie, which needs a dyadic input landing exactly on a half at the tenth
+   * decimal place; none of the shipped shapes can produce one. */
+  function qdec(x, places) { return parseFloat((+x).toFixed(places)); }
+
+  /* Fractions in, pixels out, rounded once. Mirrors _window_geometry. */
+  function windowGeometry(win, width, height) {
+    var soft = Math.max(0, +win.softness);
+    var r = (+win.rotation) * Math.PI / 180;
+    var g = {
+      rect: String(win.shape) === "rect",
+      invert: !!win.invert,
+      soft: soft,
+      cr: qdec(Math.cos(r), 12),
+      sr: qdec(Math.sin(r), 12),
+      cxp: qdec(+win.cx * width, 10),
+      cyp: qdec(+win.cy * height, 10),
+      // A half axis is clamped to one pixel, so a zero width window is a one
+      // pixel line rather than a divide by zero.
+      ax: qdec(Math.max(+win.w * width / 2, 1), 10),
+      ay: qdec(Math.max(+win.h * height / 2, 1), 10)
+    };
+    // The feather edges, precomputed for the same reason: one rounding, shared.
+    g.hi = qdec(1 + soft, 10);
+    g.den = soft > 0 ? qdec(2 * soft, 10) : 0;
+    return g;
+  }
+
   var STAGE_NOTES = {
     log: "Exposure and white balance as a log domain offset, one clamped add "
        + "per channel. Pure arithmetic, no resampling, no quantisation.",
@@ -471,6 +544,12 @@
           + "then master).",
     secondary: "The server bakes the qualifier to a 33 cube and the GPU applies "
              + "it tetrahedrally, so this is the same table ffmpeg reads.",
+    window: "The engine's own matte formula evaluated per pixel in the "
+          + "shader rather than baked to a PNG, quantised the same way with "
+          + "floor(m*255+0.5) and scaled into the 16 bit merge by 257, then "
+          + "maskedmerge against the un-graded branch. The window gates the "
+          + "secondary and nothing else, which is what build_graph's split "
+          + "does. The matte is 8 bit in both paths.",
     look: "3D LUT, tetrahedral, then blend=normal, which is dst = lut*mix + "
         + "pre_lut*(1-mix).",
     halation: "Highlight pass, swscale bilinear downscale to a quarter, gblur, "
@@ -479,7 +558,10 @@
     bloom: "Same structure as halation at an eighth resolution.",
     radial_blur: "gblur plus maskedmerge against a radial ramp. The ramp is "
                + "generated by ffmpeg as an 8 bit PNG, so it is an 8 bit matte "
-               + "in the real path too.",
+               + "in the real path too, quantised here with floor(255*ramp) to "
+               + "match. It scales into the 16 bit merge by 257, the same hop "
+               + "the window matte takes, so a fully open ramp applies the "
+               + "whole blur.",
     rgb_split: "Whole pixel channel shift with edge smear. The engine rounds "
              + "the amount to an integer, so this is exact by construction.",
     vignette: "cos^4 falloff with ffmpeg's LCG dither. This is where the chain "
@@ -544,6 +626,7 @@
           + "within 1/65535 of the filter on a 65536 entry ramp."
           : "");
     add("secondary", "Secondary", !!(cfg.secondary && cfg.secondary.enabled), "exact");
+    add("window", "Power window", windowActive(cfg), "exact");
     add("look", "Look", !!cfg.look.lut, "exact");
 
     /* These three were expected to be approximations because they involve
@@ -732,6 +815,14 @@
     "uniform int uHasSat;",
     "uniform float uVib;",
     "uniform int uHasVib;",
+    "uniform int uWinOn;",
+    "uniform int uWinRect;",
+    "uniform int uWinInvert;",
+    "uniform int uWinBlack;",
+    "uniform vec2 uWinCentre;",     // cx*W, cy*H in pixels
+    "uniform vec2 uWinAxis;",       // the two half axes in pixels
+    "uniform vec2 uWinRot;",        // (cos, sin) of the rotation
+    "uniform vec2 uWinFeather;",    // (1+softness, 2*softness); y 0 is a hard edge
     "out vec4 oCol;"
   ].concat(LIB_LUT3D).concat([
     "const float CODE = 65535.0;",
@@ -753,6 +844,35 @@
     "float mixrow(vec3 code, vec3 k) {",
     "  vec3 t = roundEven(code * k);",
     "  return t.r + t.g + t.b;",
+    "}",
+    /* The power window matte, C4's formula on integer pixel indices with no
+     * half pixel offset, which is what geq's X and Y are. The rounding is
+     * floor(x + 0.5) and not roundEven: numpy's rint and ffmpeg's expression
+     * language disagree on halves, so the engine pinned both of its
+     * references to floor(x + 0.5) and this is the third one. */
+    "float winMatte(ivec2 q) {",
+    "  float dx = float(q.x) - uWinCentre.x;",
+    "  float dy = float(q.y) - uWinCentre.y;",
+    "  float ux = dx * uWinRot.x + dy * uWinRot.y;",
+    "  float uy = dy * uWinRot.x - dx * uWinRot.y;",
+    "  float a = ux / uWinAxis.x;",
+    "  float b = uy / uWinAxis.y;",
+    "  float d = uWinRect == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
+    "  float m = uWinFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
+    "          : clamp((uWinFeather.x - d) / uWinFeather.y, 0.0, 1.0);",
+    "  if (uWinInvert == 1) m = 1.0 - m;",
+    "  return floor(m * 255.0 + 0.5);",
+    "}",
+    /* maskedmerge on gbrp16le. The 8 bit matte is scaled by 257, not by a
+     * left shift of 8: the engine routes it through format=gray16le for
+     * exactly this reason, because a shift tops the matte out at 65280 and a
+     * fully open window would then apply 99.61% of the correction. */
+    "vec3 winMerge(vec3 base, vec3 over, float m8) {",
+    "  uint m = uint(m8) * 257u;",
+    "  uvec3 bs = uvec3(floor(base * CODE + 0.5));",
+    "  uvec3 os = uvec3(floor(over * CODE + 0.5));",
+    "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
+    "  return vec3(r) / CODE;",
     "}",
     "void main() {",
     "  ivec2 p = ivec2(gl_FragCoord.xy);",
@@ -784,7 +904,20 @@
     "  if (uHasBlc == 1) c = vec3(blcAt(c.r), blcAt(c.g), blcAt(c.b));",
     "  if (uSizes.y > 0) c = q16(tetra(uCstOut, uSizes.y, c));",
     "  if (uHasCurve == 1) c = vec3(curve1(c, 0), curve1(c, 1), curve1(c, 2));",
-    "  if (uSizes.z > 0) c = q16(tetra(uSec, uSizes.z, c));",
+    "  if (uSizes.z > 0) {",
+    "    vec3 pre = c;",
+    "    c = q16(tetra(uSec, uSizes.z, c));",
+    /* The window gates the secondary: build_graph splits the tree just before
+     * the qualifier cube, grades one branch and merges the two back through
+     * the matte, with the UN-graded branch first because maskedmerge returns
+     * its first input where the mask is 0. In matte view the graded branch IS
+     * the qualifier matte, so the base branch goes black and the merge reads
+     * as qualifier times window rather than as picture outside the shape. */
+    "    if (uWinOn == 1) {",
+    "      vec3 wbase = uWinBlack == 1 ? vec3(0.0) : pre;",
+    "      c = winMerge(wbase, c, winMatte(p));",
+    "    }",
+    "  }",
     "  if (uSizes.w > 0) {",
     "    vec3 lk = q16(tetra(uLook, uSizes.w, c));",
     // blend=normal is dst = top*opacity + bottom*(1-opacity) in float,
@@ -958,14 +1091,21 @@
 
   /* maskedmerge against the radial ramp.
    *
-   * The ramp is not a clean 0 to 1 gradient and modelling it as one is wrong
-   * by up to 19 code values. cinegrade bakes it with geq on a limited range
-   * YUV surface and then converts to gray, so the real chain is: truncate
-   * 255*ramp to a code, expand limited to full with round((v-16)*255/219),
-   * then widen 8 bit to 16 bit by a shift of 8 (NOT by 257, so the matte tops
-   * out at 65280 and the blur never fully replaces the sharp layer). All
-   * three steps were measured against a mask ffmpeg generated; with them the
-   * matte matches exactly, without them it does not. */
+   * The ramp is still quantised, because cinegrade bakes it to an 8 bit PNG:
+   * geq truncates 255*ramp to a code, so the shader does floor(255*ramp) too.
+   * That is the only emulation left here.
+   *
+   * Until 2026-09-04 two more steps were needed, and both were engine defects
+   * rather than facts about the format. radial_mask ran its geq on a limited
+   * range YUV surface and converted to gray afterwards, which expanded every
+   * code by round((v-16)*255/219) (248 of 256 codes moved, up to 20 code
+   * values, only 220 distinct codes surviving), and graph_with_mask widened
+   * the 8 bit matte to 16 bit with a shift of 8, so the matte topped out at
+   * 65280 and a fully open ramp applied 99.61% of the blur instead of all of
+   * it. The engine now bakes through format=gray first and merges through
+   * WINDOW_MASK_FORMAT (format=gray16le,format=gbrp16le), which is a multiply
+   * by exactly 257, verified at max |v - 257n| = 0 across all 256 codes. So
+   * the shader multiplies by 257 and emulates nothing else. */
   var FS_MASKEDMERGE = src([
     "#version 300 es",
     "precision highp float;",
@@ -983,8 +1123,7 @@
     "  float dy = (float(p.y) - uCentre.y) / uHalf.y;",
     "  float ramp = clamp((length(vec2(dx, dy)) - uStart) / uSpan, 0.0, 1.0);",
     "  float v8 = clamp(floor(255.0 * ramp), 0.0, 255.0);",
-    "  float m8 = clamp(floor((v8 - 16.0) * (255.0 / 219.0) + 0.5), 0.0, 255.0);",
-    "  uint m = uint(m8) * 256u;",
+    "  uint m = uint(v8) * 257u;",
     "  uvec3 bs = uvec3(floor(texelFetch(uBase, p, 0).rgb * 65535.0 + 0.5));",
     "  uvec3 os = uvec3(floor(texelFetch(uOver, p, 0).rgb * 65535.0 + 0.5));",
     "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
@@ -2018,6 +2157,20 @@
     gl.uniform1i(G.loc(prog, "uHasVib"), Math.abs(+p.vibrance) > 1e-6 ? 1 : 0);
     gl.uniform1f(G.loc(prog, "uVib"), fmt(+p.vibrance, 4));
 
+    /* The power window. Every parameter is a fraction of the frame, so the
+     * geometry is resolved against the size this render is actually running
+     * at and no preview scaling is needed. */
+    var wg = windowGeometry(windowBlock(cfg), W, H);
+    gl.uniform1i(G.loc(prog, "uWinOn"), windowActive(cfg) ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uWinRect"), wg.rect ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uWinInvert"), wg.invert ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uWinBlack"),
+                 (cfg.secondary && cfg.secondary.show_mask) ? 1 : 0);
+    gl.uniform2f(G.loc(prog, "uWinCentre"), wg.cxp, wg.cyp);
+    gl.uniform2f(G.loc(prog, "uWinAxis"), wg.ax, wg.ay);
+    gl.uniform2f(G.loc(prog, "uWinRot"), wg.cr, wg.sr);
+    gl.uniform2f(G.loc(prog, "uWinFeather"), wg.hi, wg.den);
+
     var bl = +p.black_lift, hr = +p.highlight_rolloff;
     var hasBlc = Math.abs(bl) > 1e-6 || Math.abs(hr) > 1e-6;
     // Built first, bound second, because building one binds it somewhere.
@@ -2267,6 +2420,12 @@
     gl.uniform1i(G.loc(prog, "uDirect"), codeMax === 255 ? 1 : 0);
     gl.uniform2i(G.loc(prog, "uSize"), W, H);
     G.draw(this.out);
+    // opts.want16 keeps the 16 bit picture as well as the 8 bit one. `cur` is
+    // the float target holding the value ffmpeg's own graph would hand the
+    // encoder, BEFORE the closing format=rgb24 table above, which is the only
+    // place a final render can read without banding. See keep16 below; the
+    // pass is skipped entirely for every existing caller.
+    if (opts.want16) this.keep16(cur, W, H);
     G.release(cur);
     this.passCount++;
 
@@ -2306,6 +2465,132 @@
       rgb[j + 2] = rgba[i * 4 + 2];
     }
     return rgb;
+  };
+
+  // --- 16 bit output, for the GPU final render ----------------------
+
+  /* Pack the finished float picture into one R16UI target laid out exactly
+   * like ffmpeg's gbrp16le: the G plane first, then B, then R, each W by H,
+   * stacked into a W by 3H texture.
+   *
+   * Planar rather than packed is a measured requirement, not tidiness.
+   * swscale reaches yuv422p10le from a PACKED 16 bit RGB input by a different
+   * path than from a planar one: feeding the encoder rgb48le differs from the
+   * single process ffmpeg render by up to 17.4 of 255 on 3.7 percent of
+   * channels, and feeding it gbrp16le reproduces that render exactly (max
+   * 0.000). Doing the interleave here in a shader also means the CPU never
+   * touches the pixels: no per pixel JavaScript on an 8 megapixel frame.
+   *
+   * The quantisation is floor(v * 65535 + 0.5), the same rounding FS_TAIL8
+   * applies before its 8 bit table, so the 16 bit output and the 8 bit
+   * preview agree about what code a value is. */
+  var FS_PACK16 = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uTex;",
+    "uniform int uHeight;",
+    "out uvec4 oCol;",
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  int plane = p.y / uHeight;",
+    "  vec3 c = texelFetch(uTex, ivec2(p.x, p.y - plane * uHeight), 0).rgb;",
+    // gbrp: plane 0 is green, plane 1 is blue, plane 2 is red.
+    "  float v = plane == 0 ? c.g : (plane == 1 ? c.b : c.r);",
+    "  oCol = uvec4(uint(clamp(floor(v * 65535.0 + 0.5), 0.0, 65535.0)), 0u, 0u, 0u);",
+    "}"
+  ]);
+
+  Instance.prototype.keep16 = function (cur, W, H) {
+    var gl = this.gl, G = this.G;
+    var need = 3 * H;
+    var max = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    if (need > max) {
+      throw new Error("StudioGPU: a " + W + "x" + H + " frame needs a "
+        + need + " tall readback target and this GPU stops at " + max);
+    }
+    if (!this.out16 || this.out16.w !== W || this.out16.h !== need) {
+      if (this.out16) {
+        gl.deleteTexture(this.out16.tex);
+        gl.deleteFramebuffer(this.out16.fbo);
+      }
+      G.scratch();
+      var tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, W, need, 0,
+                    gl.RED_INTEGER, gl.UNSIGNED_SHORT, null);
+      nearest(gl, gl.TEXTURE_2D);
+      var fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                              gl.TEXTURE_2D, tex, 0);
+      var st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (st !== gl.FRAMEBUFFER_COMPLETE) {
+        throw new Error("StudioGPU: no R16UI render target (status " + st + ")");
+      }
+      this.out16 = { tex: tex, fbo: fbo, w: W, h: need, frameH: H };
+    }
+    var prog = G.program("pack16", FS_PACK16);
+    gl.useProgram(prog);
+    G.bindTex(prog, "uTex", 0, cur.tex);
+    gl.uniform1i(G.loc(prog, "uHeight"), H);
+    G.draw(this.out16);
+    this.passCount++;
+    return this.out16;
+  };
+
+  /* The last render's picture as gbrp16le bytes, ready to hand to ffmpeg.
+   *
+   * Only valid after render(config, {want16: true}); readPixels() above stays
+   * exactly as it was, 8 bit, for the preview and the parity harness. */
+  Instance.prototype.readPlanar16 = function () {
+    if (!this.out16) {
+      throw new Error("StudioGPU: render with {want16: true} before readPlanar16");
+    }
+    var gl = this.gl, t = this.out16;
+    var buf = new Uint16Array(t.w * t.h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+    // 16 bit rows: the default 4 byte pack alignment is right for an even
+    // width and wrong for an odd one, and this is the only place the buffer
+    // layout has to be exact.
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 2);
+    gl.readPixels(0, 0, t.w, t.h, gl.RED_INTEGER, gl.UNSIGNED_SHORT, buf);
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
+    return buf;
+  };
+
+  /* Upload an rgb48le source frame without touching it on the CPU.
+   *
+   * setSource above expands the frame into a Float32Array in JavaScript,
+   * which is fine for one still and is 33 million writes per frame at 4K.
+   * EXT_texture_norm16 lets the same bytes go straight to the GPU as a
+   * normalised RGB16 texture, sampled as value/65535: the identical numbers
+   * the float path produces. Falls back to setSource when the extension is
+   * missing, so this is a speed path and never a fidelity one. */
+  Instance.prototype.setSource16 = function (u16, w, h) {
+    var gl = this.gl;
+    if (this.norm16 === undefined) {
+      this.norm16 = gl.getExtension("EXT_texture_norm16");
+    }
+    if (!this.norm16) return this.setSource(u16, w, h);
+    this.G.scratch();
+    if (!this.src || this.src.w !== w || this.src.h !== h || !this.src.norm16) {
+      if (this.src) gl.deleteTexture(this.src.tex);
+      var tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+      gl.texImage2D(gl.TEXTURE_2D, 0, this.norm16.RGB16_EXT, w, h, 0,
+                    gl.RGB, gl.UNSIGNED_SHORT, u16);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      nearest(gl, gl.TEXTURE_2D);
+      this.src = { tex: tex, w: w, h: h, norm16: true };
+      return this.src;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.src.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGB, gl.UNSIGNED_SHORT, u16);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    return this.src;
   };
 
   function now() {

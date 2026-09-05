@@ -36,6 +36,9 @@ const SPEC_FILES = [
   "09-undo.mjs",
   "10-theme.mjs",
   "11-reload-clean.mjs",
+  "12-per-clip-grades.mjs",
+  "13-window-editor.mjs",
+  "14-proxy-playback.mjs",
 ];
 
 /* The one place every spec waits for "the app finished its first boot":
@@ -75,6 +78,61 @@ function pushLog(buf, chunk) {
   if (buf.length > 1000) buf.shift();
 }
 
+/* Per clip grades (contract C3) are real, persistent, per account data in
+ * studio/data/studio.db, and this harness drives the real server, so it is
+ * writing into whatever the person running it has actually graded.
+ *
+ * That cuts both ways and both of them matter. A spec that changes the config
+ * now SAVES it, so the next run boots with the previous run's leftovers and a
+ * spec that asserts a starting value fails for a reason that is nowhere in its
+ * own code (measured: window.enabled left true by an earlier run made the
+ * window-editor spec fail on its first assertion). And a run that simply
+ * scribbles over somebody's grades is not an acceptable price for a test.
+ *
+ * So the run takes the grades away before the first page load and puts them
+ * back at the end: every spec starts from "no clip has a grade", and the
+ * account's own work is exactly where it was. Addressing by clip_key rather
+ * than by name on the way back is deliberate: a grade can exist for a clip
+ * that is not in the current footage folder, and the key is what identifies
+ * it either way. */
+async function takeGradesAside(baseUrl) {
+  const saved = [];
+  let rows = [];
+  try {
+    const list = await fetch(baseUrl + "/api/grades").then((r) => r.json());
+    rows = (list && list.grades) || [];
+  } catch (err) {
+    return saved;                       // no grade API: nothing to protect
+  }
+  for (const row of rows) {
+    const q = "?clip=" + encodeURIComponent(row.clip_key);
+    try {
+      const one = await fetch(baseUrl + "/api/grade" + q).then((r) => r.json());
+      if (one && one.exists) {
+        saved.push({ key: row.clip_key, name: row.clip_name, config: one.config });
+      }
+      await fetch(baseUrl + "/api/grade" + q, { method: "DELETE" });
+    } catch (err) { /* leave that one alone rather than half clearing it */ }
+  }
+  return saved;
+}
+
+async function putGradesBack(baseUrl, saved) {
+  // Clear first: the run itself will have saved grades of its own (a spec
+  // that clicks a control now writes one), and leaving those behind would
+  // mean "restored" quietly meant "restored, plus whatever the tests did".
+  await takeGradesAside(baseUrl);
+  for (const g of saved) {
+    try {
+      await fetch(baseUrl + "/api/grade", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clip: g.key, clip_name: g.name, config: g.config }),
+      });
+    } catch (err) { /* best effort: the server may already be gone */ }
+  }
+}
+
 async function main() {
   const port = await findFreePort(PORT_MIN, PORT_MAX, 40);
   const baseUrl = "http://127.0.0.1:" + port;
@@ -92,11 +150,15 @@ async function main() {
   let browser = null;
   const rows = [];
   let hardFailure = null;
+  let savedGrades = [];
 
   try {
     console.log("[run] waiting for " + baseUrl + "/api/state ...");
     await waitForHttp200(baseUrl + "/api/state", 20000, 250);
     console.log("[run] server is up");
+
+    savedGrades = await takeGradesAside(baseUrl);
+    console.log("[run] set aside " + savedGrades.length + " saved grade(s) for the duration of this run");
 
     browser = await puppeteer.launch({
       executablePath: CHROME_PATH,
@@ -156,9 +218,14 @@ async function main() {
   } catch (err) {
     hardFailure = err;
   } finally {
+    // Order matters: close the browser FIRST. grades.js flushes a pending
+    // autosave from a beforeunload handler with fetch keepalive, so a tab
+    // torn down after the restore could put a test's grade back on top of the
+    // real one. Then restore, while the server is still alive to PUT to.
     if (browser) {
       try { await browser.close(); } catch (e) { /* best effort */ }
     }
+    await putGradesBack(baseUrl, savedGrades);
     if (server && server.exitCode === null && !server.killed) {
       server.kill("SIGTERM");
       await sleep(500);

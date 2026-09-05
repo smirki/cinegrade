@@ -753,7 +753,10 @@ def f_secondary(cfg) -> list[str]:
 
 LUT_MASKS = ROOT / "luts" / "masks"
 
-# How the 8-bit matte gets into the 16-bit merge. See graph_with_mask.
+# How an 8-bit matte gets into the 16-bit merge: a multiply by exactly 257, so
+# code 255 arrives as 65535 and applies the whole correction. Both mattes use
+# it, the window's and the radial blur ramp's. Named for the window because the
+# window stage measured it first. See graph_with_mask.
 WINDOW_MASK_FORMAT = "format=gray16le,format=gbrp16le"
 
 
@@ -1066,7 +1069,18 @@ def build_fx(cfg, info, base_label: str, idx: int) -> tuple[list[str], str, int]
 
 
 def radial_mask(w, h, start, end):
-    """A cached greyscale radial ramp used as the radial-blur matte."""
+    """A cached greyscale radial ramp used as the radial-blur matte.
+
+    `format=gray` runs BEFORE the geq for the same reason it does in
+    window_mask. The lavfi colour source is yuv, so writing 0-255 into its luma
+    plane and converting to gray afterwards costs a tv-to-full expansion: the
+    code the expression asked for comes back as round((v-16)*255/219) clipped
+    to 0-255. Measured on a 256 wide identity ramp: 248 of 256 codes moved, up
+    to 20 code values, and only 220 distinct codes survived, so everything at
+    or below 16 flattened to 0 and everything at or above 235 flattened to 255.
+    Writing straight into a gray plane costs nothing and lands the exact code.
+    The matte is still an 8-bit PNG; this is the scaling, not the depth.
+    """
     d = ROOT / "luts" / "masks"
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"radial_{w}x{h}_{start:.2f}_{end:.2f}.png"
@@ -1076,7 +1090,7 @@ def radial_mask(w, h, start, end):
         subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
              "-i", f"color=c=black:s={w}x{h}:d=1",
-             "-vf", f"geq=lum='{expr}':cb=128:cr=128,format=gray",
+             "-vf", f"format=gray,geq=lum='{expr}'",
              "-frames:v", "1", str(p)], check=True)
     return p
 
@@ -1254,22 +1268,27 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
     graph, needs_mask = build_graph(cfg, info, out_label, tail_extra, encode_out,
                                     src_label, src_normalised)
     idxs = mask_input_indices(cfg)
+    # Both mattes take the same hop into the 16-bit merge, and the hop is not
+    # decoration. Going straight from the 8-bit matte to gbrp16le expands by a
+    # left shift of 8, so a matte code of 255 arrives at maskedmerge as 65280
+    # of 65535 and a fully open matte applies only 99.61% of the correction.
+    # Measured on the window: a mean residual of 0.186 of 255 on 18.6% of
+    # pixels against the un-windowed render, where it should be exactly zero.
+    # Through gray16le the expansion is a multiply by 257 instead, verified
+    # exact across all 256 codes (max |v - 257n| = 0), so 255 is the whole
+    # correction and 0 is none of it. The matte still carries 256 levels: this
+    # is the scaling, not the depth. ffmpeg's lut filter cannot do the same job
+    # here, it clips its own output at 65280 on this build.
+    #
+    # The radial ramp shipped on the shift until 2026-09-04 and now shares the
+    # window's hop. That moved approved renders (max 20 of 255 on the ramp
+    # region, from the tv-to-full expansion radial_mask also carried), so it
+    # was a founder call, taken and approved.
     if window_active(cfg):
-        # The gray16le hop is not decoration. Going straight from the 8-bit
-        # matte to gbrp16le, which is what the radial ramp does, expands by a
-        # left shift of 8, so a matte code of 255 arrives at maskedmerge as
-        # 65280 of 65535 and a fully open window applies only 99.61% of the
-        # correction. Measured: a mean residual of 0.186 of 255 on 18.6% of
-        # pixels against the un-windowed render, where it should be exactly
-        # zero. Through gray16le the expansion is a multiply by 257 instead,
-        # verified exact across all 256 codes, so 255 is the whole correction
-        # and 0 is none of it. The matte still carries 256 levels: this is the
-        # scaling, not the depth. ffmpeg's lut filter cannot do the same job
-        # here, it clips its own output at 65280 on this build.
         graph = (f"[{idxs['window']}:v]{WINDOW_MASK_FORMAT},setsar=1[wmask];"
                  + graph)
     if needs_mask:
-        graph = f"[{idxs['radial']}:v]format=gbrp16le,setsar=1[mask];" + graph
+        graph = f"[{idxs['radial']}:v]{WINDOW_MASK_FORMAT},setsar=1[mask];" + graph
     if head_extra:
         graph = head_extra + ";" + graph
     return graph

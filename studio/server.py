@@ -69,6 +69,17 @@ import cinegrade as CG  # noqa: E402  (path has to be set first)
 sys.path.insert(0, str(STUDIO))
 import auth as AUTH  # noqa: E402  (same reason)
 import db as DB      # noqa: E402  (same reason)
+import grades as GRADES  # noqa: E402  (same reason)
+import render_gpu as RG  # noqa: E402  (same reason)
+
+# render_gpu drives ffmpeg and the browser worker through this module's own
+# helpers (clip_info, scale_for_preview, Job). Handing it the module object is
+# how it gets them: this file runs as __main__, so an "import server" inside
+# render_gpu would load a SECOND copy with its own JOBS dict and its own
+# caches. Binding early is safe because it only stores the object; the
+# attributes it reads are looked up when a render starts, long after this file
+# has finished executing.
+RG.bind(sys.modules[__name__])
 
 # Every cached frame is the output of this exact engine file, so its hash
 # belongs in the cache key. Without it, editing cinegrade.py leaves the studio
@@ -102,6 +113,29 @@ CACHE_MAX_FILES = 600
 SRC_MEM_MAX = 48
 CACHE_SRC_MAX_FILES = 300
 
+# Upload caps, both overridable from the command line (see main()). 8 GiB
+# covers a single 4K ProRes clip several minutes long; 50 GiB is a generous
+# per-account total before an account has to clear something out before
+# adding more. Neither is enforced anywhere except this server: an account
+# with shell access to the machine can always put a bigger file straight
+# into a footage folder.
+UPLOAD_MAX_BYTES = 8 * 1024 ** 3
+UPLOAD_QUOTA_BYTES = 50 * 1024 ** 3
+
+# A JSON request body over this is refused before it is even read (see
+# _body() below). 8MB is far more than any config patch this app sends; the
+# one route that legitimately moves more bytes than that is /api/upload,
+# which reads the raw socket itself and never calls _body().
+BODY_MAX_BYTES = 8 * 1024 * 1024
+
+# A LUT (.cube) body over this is refused before it is read, same rule as
+# BODY_MAX_BYTES above but for the one route that reads the raw socket with
+# _raw_body() instead: POST /api/look, which imports a .cube file as plain
+# text and never calls _body(). A 129 point cube (129**3 lines of "r g b"
+# floats) is about 35MB as text, so 64MB comfortably covers the largest LUT
+# anyone imports while still refusing an unbounded body.
+LOOK_MAX_BYTES = 64 * 1024 * 1024
+
 _probe_cache: dict[tuple[str, bool], dict] = {}
 _probe_lock = threading.Lock()
 
@@ -122,6 +156,19 @@ _gen_lock = threading.Lock()
 
 class StudioError(Exception):
     """A bad request the user can fix. Answered with 400, not a stack trace."""
+
+
+class HttpError(Exception):
+    """A request problem that is not a plain 400: a size cap (413), a missing
+    header (400 too, but raised from a place that is not asking for a
+    StudioError's fixed code). Kept separate from AUTH.AuthError only
+    because that one belongs to the auth module, not to plumbing that has
+    nothing to do with who is signed in.
+    """
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +238,48 @@ def register_external_clip(raw: str) -> str:
     return name
 
 
+def _dir_total_bytes(d: Path) -> int:
+    """Sum of file sizes directly inside a folder, for the upload quota check.
+
+    Not recursive: a footage folder here is flat, and this server never
+    writes a subfolder into one on its own.
+    """
+    total = 0
+    if d.exists():
+        for p in d.iterdir():
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def probe_is_video(path: Path) -> bool:
+    """A bounded, headers-only check that a freshly uploaded file actually
+    decodes as a video, not just a file with a video-looking extension.
+
+    -show_entries limited to codec_type means ffprobe reads container/stream
+    headers and stops; it does not decode a single frame. The timeout is the
+    real bound: a corrupt or hostile file that makes ffprobe hang instead of
+    exiting quickly must not be able to tie up the request thread forever.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        streams = json.loads(proc.stdout or "{}").get("streams") or []
+    except json.JSONDecodeError:
+        return False
+    return any(s.get("codec_type") == "video" for s in streams)
+
+
 # Somewhere useful to start browsing from, rather than dropping the user at /
 # and making them click down through five levels of system folders.
 def browse_roots(user: dict | None = None) -> list[dict]:
@@ -251,8 +340,15 @@ def browse_dir(raw: str | None, user: dict | None = None) -> dict:
                 if entry.is_dir():
                     dirs.append({"name": entry.name, "path": str(entry)})
                 elif entry.suffix.lower() in VIDEO_EXT:
+                    # key is the content identity a grade is stored under
+                    # (contract C3). grades.py caches it by (realpath, size,
+                    # mtime) in memory and in SQLite, so only the first
+                    # listing of a folder pays the 2 MiB read per file, and
+                    # safe_key gives "" for a file it cannot read rather than
+                    # failing the whole listing.
                     files.append({"name": entry.name, "path": str(entry),
-                                  "bytes": entry.stat().st_size})
+                                  "bytes": entry.stat().st_size,
+                                  "key": GRADES.safe_key(entry)})
             except OSError:
                 continue                       # a broken symlink is not an error
     except PermissionError:
@@ -270,15 +366,42 @@ def ensure_dirs() -> None:
     # accounts database and each account's own footage folder live there, and
     # the whole folder is gitignored because it is user owned data.
     for d in (CACHE / "frames", CACHE / "img", CACHE / "thumbs", CACHE / "refs",
-              CACHE / "src", CACHE / "segments", STUDIO_TOOLS, OUT, PRESETS, LOOKS,
+              CACHE / "src", CACHE / "segments", CACHE / "proxy", STUDIO_TOOLS,
+              OUT, PRESETS, LOOKS,
               DB.DATA, AUTH.USERS_DIR):
         d.mkdir(parents=True, exist_ok=True)
+    # Per clip grades keep their own tables in the same SQLite file the
+    # accounts use. Created here rather than lazily on the first request, so a
+    # data folder that cannot be written fails at boot with a clear traceback
+    # instead of inside a request somebody is waiting on.
+    GRADES.init_schema()
+    # User 0 is the local no-login account. Its preset folder exists from boot
+    # so a "save as" with logins off has somewhere of its own to land instead
+    # of writing into the shipped, checked in library.
+    GRADES.user_presets_dir(0)
     # A ".tmp" left in segments/ is a playback render a previous server
     # process was still streaming (and writing to disk for the cache) when
     # it stopped; nothing will ever finish it, so unlike everything else in
     # that folder it is not a cache entry, just leftover.
     for p in (CACHE / "segments").glob("*.tmp"):
         p.unlink(missing_ok=True)
+    # Same story one folder over, with one hard-won difference. A ".partial"
+    # in proxy/ is a proxy encode (see the proxy section below) that was
+    # still being written when a process stopped, but this cache is SHARED
+    # with any other studio process on the machine, and several run at once
+    # during development. Deleting one unconditionally at boot kills an
+    # encode another process is writing right now: ffmpeg then fails at the
+    # faststart step with "unable to re-open output file for shifting data",
+    # which is exactly how this was found (two 85 second encodes, both lost
+    # at the last second to an unrelated server starting up). So age is the
+    # test, not existence: an in-flight encode's file is being appended to
+    # continuously, so its mtime is always recent.
+    for p in (CACHE / "proxy").glob("*.partial"):
+        try:
+            if time.time() - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -430,9 +553,22 @@ def _cache_path(kind: str, key: str, ext: str) -> Path:
 
 
 def _prune_cache(kind: str, max_files: int = CACHE_MAX_FILES) -> None:
+    """Oldest-mtime eviction. Tolerant of a file disappearing mid-listing:
+    a second server pointed at this same studio/cache, or a concurrent
+    request in this one, can unlink an entry between glob() and stat() here
+    (or between this prune and a reader elsewhere reading the same file), so
+    a file stat() can no longer see is treated as already gone rather than
+    raising and failing the request that happened to trigger this prune.
+    """
     d = CACHE / kind
-    files = sorted(d.glob("*"), key=lambda p: p.stat().st_mtime)
-    for p in files[:-max_files]:
+    dated = []
+    for p in d.glob("*"):
+        try:
+            dated.append((p.stat().st_mtime, p))
+        except FileNotFoundError:
+            continue
+    dated.sort(key=lambda t: t[0])
+    for _, p in dated[:-max_files]:
         try:
             p.unlink()
         except OSError:
@@ -493,10 +629,17 @@ def source_frame(clip: str, time_s: float, width: int,
             "source_width": info["width"], "source_height": info["height"]}
     want = width * height * 3 * 2  # 3 channels, 2 bytes (uint16) each
 
+    data = None
     if disk_path.exists():
-        os.utime(disk_path, None)
-        data = disk_path.read_bytes()
-    else:
+        try:
+            os.utime(disk_path, None)
+            data = disk_path.read_bytes()
+        except FileNotFoundError:
+            # A prune (this process or another one sharing studio/cache)
+            # deleted it between exists() and the read above; treat that
+            # exactly like a cache miss instead of failing the request.
+            data = None
+    if data is None:
         vf = (f"scale={width}:{height}:flags=bilinear,setsar=1,"
               f"scale=in_color_matrix={matrix}:in_range={info['color_range']}"
               f":out_range=full,format=gbrp16le")
@@ -578,9 +721,12 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
     meta = {"key": key, "width": width, "height": height,
             "source_width": info["width"], "source_height": info["height"]}
     if raw_path.exists():
-        os.utime(raw_path, None)
-        return np.frombuffer(raw_path.read_bytes(), np.uint8).reshape(
-            height, width, 3), meta
+        try:
+            os.utime(raw_path, None)
+            return np.frombuffer(raw_path.read_bytes(), np.uint8).reshape(
+                height, width, 3), meta
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; fall through and re-render
 
     src, _smeta = source_frame(clip, time_s, width, autorotate)
 
@@ -647,8 +793,11 @@ def encode_jpeg(rgb: np.ndarray, key: str, quality: int = 2) -> bytes:
     """
     path = _cache_path("img", f"{key}_q{quality}", "jpg")
     if path.exists():
-        os.utime(path, None)
-        return path.read_bytes()
+        try:
+            os.utime(path, None)
+            return path.read_bytes()
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; re-encode instead of failing
     h, w = rgb.shape[:2]
     args = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{w}x{h}", "-i", "-", "-frames:v", "1",
@@ -849,17 +998,28 @@ def _register_pending(params: dict) -> None:
 
 def _prune_cache_bytes(kind: str, max_bytes: int, pattern: str = "*.mp4") -> None:
     """Byte-capped LRU eviction, the segment cache's counterpart to the
-    file-count _prune_cache above. Oldest mtime first, same as that one.
+    file-count _prune_cache above. Oldest mtime first, same as that one, and
+    tolerant of the same race: a file another process (or another thread in
+    this one) already deleted by the time stat() runs here is treated as
+    already evicted rather than raising out of this walk.
     """
     d = CACHE / kind
-    files = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime)
-    total = sum(p.stat().st_size for p in files)
-    i = 0
-    while total > max_bytes and i < len(files):
-        p = files[i]
+    dated = []
+    for p in d.glob(pattern):
         try:
-            total -= p.stat().st_size
+            dated.append((p.stat().st_mtime, p.stat().st_size, p))
+        except FileNotFoundError:
+            continue
+    dated.sort(key=lambda t: t[0])
+    total = sum(size for _, size, _ in dated)
+    i = 0
+    while total > max_bytes and i < len(dated):
+        _, size, p = dated[i]
+        try:
             p.unlink()
+            total -= size
+        except FileNotFoundError:
+            total -= size          # already gone, someone else's prune got it first
         except OSError:
             pass
         i += 1
@@ -1009,8 +1169,11 @@ def render_scope(rgb: np.ndarray, key: str, kind: str, size: int) -> bytes:
         raise StudioError(f"unknown scope: {kind}")
     path = _cache_path("img", f"{key}_{kind}_{size}", "jpg")
     if path.exists():
-        os.utime(path, None)
-        return path.read_bytes()
+        try:
+            os.utime(path, None)
+            return path.read_bytes()
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; re-render instead of failing
     h, w = rgb.shape[:2]
     out_h = max(2, int(size * SCOPE_ASPECT[kind]) // 2 * 2)
     vf = SCOPE_GRAPHS[kind] + f",scale={size}:{out_h}"
@@ -1112,27 +1275,59 @@ def frame_stats(rgb: np.ndarray) -> dict:
 # presets
 # --------------------------------------------------------------------------
 
-def list_presets() -> list[dict]:
-    items = []
-    for p in sorted(PRESETS.glob("*.json")):
-        try:
-            raw = json.loads(p.read_text())
-        except json.JSONDecodeError as exc:
-            items.append({"name": p.stem, "error": str(exc)})
-            continue
-        items.append({"name": p.stem, "comment": raw.get("_comment", ""),
-                      "look": (raw.get("look") or {}).get("lut")})
+def _preset_entry(p: Path, library: bool) -> dict:
+    try:
+        raw = json.loads(p.read_text())
+    except json.JSONDecodeError as exc:
+        return {"name": p.stem, "error": str(exc), "library": library}
+    return {"name": p.stem, "comment": raw.get("_comment", ""),
+            "look": (raw.get("look") or {}).get("lut"), "library": library}
+
+
+def list_presets(user_id: int = 0) -> list[dict]:
+    """The shipped library plus this account's own presets, library first.
+
+    grade/presets/ is checked into the repository and shared by every account,
+    so it is read only here: `library: true` says so, and delete refuses those
+    with a 403. Anything the user saves lands in
+    studio/data/users/<id>/presets/ and comes back with `library: false`. With
+    logins off that is user 0, so the founder's own saves still get a folder of
+    their own instead of editing tracked files.
+
+    A user preset with the same name as a library one shadows it, and only the
+    user's copy is listed: two identically named entries in one dropdown would
+    be a picker where the right answer is unknowable.
+    """
+    items = [_preset_entry(p, True) for p in sorted(PRESETS.glob("*.json"))]
+    mine = sorted(GRADES.user_presets_dir(user_id).glob("*.json"))
+    names = {p.stem for p in mine}
+    items = [it for it in items if it["name"] not in names]
+    items.extend(_preset_entry(p, False) for p in mine)
     return items
 
 
-def read_preset(name: str) -> dict:
-    p = PRESETS / f"{safe_name(name)}.json"
+def preset_path(name: str, user_id: int = 0) -> tuple[Path, bool]:
+    """Where one preset actually is, and whether it is a library file.
+
+    The user's own folder is looked at first so a saved preset shadows a
+    shipped one of the same name, matching what list_presets shows.
+    """
+    name = safe_name(name)
+    mine = GRADES.user_presets_dir(user_id) / f"{name}.json"
+    if mine.exists():
+        return mine, False
+    return PRESETS / f"{name}.json", True
+
+
+def read_preset(name: str, user_id: int = 0) -> dict:
+    p, _library = preset_path(name, user_id)
     if not p.exists():
         raise StudioError(f"preset not found: {name}")
     return CG.deep_merge(CG.DEFAULTS, json.loads(p.read_text()))
 
 
-def write_preset(name: str, cfg: dict, comment: str = "") -> Path:
+def write_preset(name: str, cfg: dict, comment: str = "",
+                 user_id: int = 0) -> Path:
     name = safe_name(name)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise StudioError("preset names may use letters, digits, dot, dash and "
@@ -1145,7 +1340,12 @@ def write_preset(name: str, cfg: dict, comment: str = "") -> Path:
     comment = comment or existing
     if comment:
         body = {"_comment": comment, **body}
-    p = PRESETS / f"{name}.json"
+    # Always the account's own folder, never the shipped library: same file
+    # format, same indent, same trailing newline as before, just somewhere the
+    # user owns. "Overwrite" on a library preset therefore writes a user copy
+    # that shadows it, which is the only sane meaning of overwrite on a file
+    # every other account is also reading.
+    p = GRADES.user_presets_dir(user_id) / f"{name}.json"
     p.write_text(json.dumps(body, indent=2) + "\n")
     return p
 
@@ -1300,6 +1500,12 @@ def _register(job: Job) -> Job:
 
 
 def start_render(payload: dict) -> Job:
+    # Engine "gpu" is the same render through a headless Chrome running
+    # gpu.js instead of ffmpeg's filter graph (studio/render_gpu.py). Every
+    # other option in this payload means the same thing to both engines, and
+    # ffmpeg stays the default and the reference.
+    if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
+        return RG.start_gpu_render(payload)
     clip = payload["clip"]
     cfg = full_config(payload.get("config"))
     autorotate = bool(payload.get("autorotate", True))
@@ -1384,6 +1590,303 @@ def start_render(payload: dict) -> Job:
 
 
 # --------------------------------------------------------------------------
+# playback proxy (the GPU playback path, live.js Mode 3)
+#
+# The segment stream above renders the whole grade chain on the CPU and
+# streams the RESULT, which measured about 2 fps on a 4K chain and cannot be
+# re-graded once it is encoded. This is the other half of the answer: one
+# bounded ffmpeg pass per clip writes an UNGRADED proxy, the browser plays it
+# in a hidden <video>, and every frame goes through gpu.js. The grade then
+# costs nothing per frame that a still render did not already cost, and a
+# knob turn shows up on the next presented frame instead of restarting an
+# encode.
+#
+# The one thing this has to get right is the pixel domain. source_frame()
+# above hands the GPU full range RGB, produced by
+# scale=in_color_matrix=<clip matrix>:in_range=<clip range>:out_range=full.
+# The proxy runs that exact same normalisation and then converts to Y'CbCr
+# with a bt709 matrix that is TAGGED on the file, so the browser's own
+# decoder undoes precisely that conversion and the shader sees the same
+# numbers. Getting this wrong is silent: the picture still looks like a
+# picture, it is just graded from different source values than the still.
+# --------------------------------------------------------------------------
+
+PROXY = CACHE / "proxy"
+
+# One proxy per (clip, width, range tag). Bigger than the segment budget
+# because a proxy is per clip rather than per press of Play, so the same
+# handful of files stay useful for a whole session instead of turning over
+# on every grade change. Measured on the 5s 4K test clip: 960 wide, CRF 18,
+# 1.1MB. A cache of this size therefore holds hours of proxy.
+PROXY_CACHE_MAX_BYTES = 1_500_000_000
+PROXY_DEFAULT_WIDTH = 960
+
+# CRF 18 rather than something visually lossless: measured against the 16-bit
+# still path, CRF 12 costs 3.1x the bytes and buys a mean improvement of
+# about 0.09 of 255, because the error is dominated by the 8-bit 4:2:0 round
+# trip and not by the compression (a LOSSLESS 4:4:4 encode of the same frame
+# still differs by mean 0.85/0.48/1.15 R/G/B). Spending bytes on that floor
+# would be spending them on nothing.
+PROXY_CRF = 18
+
+# ~0.5s between keyframes at 24fps. Short on purpose: a seek has to decode
+# from the previous keyframe, so this is what makes scrubbing cheap. It costs
+# bitrate, which is the trade this file is happy to make.
+PROXY_GOP = 12
+
+# Chrome is the client, and how it converts Y'CbCr back to RGB is decided by
+# the tags on the file, so this is a measured choice, not a preference. See
+# the honesty entry in limits.js for the two numbers it was chosen on.
+PROXY_RANGE = "full"
+
+# In the cache key, so changing any of the encode decisions above cannot
+# leave a stale proxy on disk that no longer matches what this code makes.
+PROXY_VERSION = "1"
+
+# proxy key -> job id, so a second prepare for a clip that is already
+# encoding joins the running job instead of starting a duplicate ffmpeg.
+_proxy_jobs: dict[str, str] = {}
+_proxy_lock = threading.Lock()
+
+
+def _proxy_path(key: str) -> Path:
+    return PROXY / f"{key}.mp4"
+
+
+# clip name -> the frame rate its FRAMES are spaced at, cached.
+_proxy_fps_cache: dict[str, float] = {}
+
+
+def _proxy_fps(clip: str, info: dict) -> float:
+    """The rate the frames of this clip actually sit at, which is not always
+    the rate clip_info reports.
+
+    clip_info's fps comes from ffprobe's avg_frame_rate, which is frames
+    divided by CONTAINER duration. Measured on this project's own footage:
+    A001_09011832_C003.MOV has 744 frames spaced exactly 1/24s apart, but its
+    container runs 32.254s, so avg_frame_rate reports 23.067. Frame index
+    arithmetic on 23.067 drifts a whole frame within half a second, and a
+    whole frame is what makes a scrub show a different picture on the proxy
+    than on the still path (measured: mean difference 26 of 255 on a
+    mismatched frame against 4.2 on a matched one).
+
+    r_frame_rate is ffprobe's answer to "what is the smallest frame interval
+    here", which is the number this arithmetic needs. It is nonsense on
+    genuinely variable frame rate material (a screen recording tags 600), so
+    it is only trusted when it is close to the average.
+    """
+    hit = _proxy_fps_cache.get(clip)
+    if hit is not None:
+        return hit
+    avg = float(info.get("fps") or 24.0)
+    fps = avg
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
+             str(clip_path(clip))], capture_output=True, text=True, timeout=20).stdout
+        # ffprobe's csv writer puts a trailing comma on this one-field
+        # query ("24/1,"), so the fraction is picked out rather than split on.
+        m = re.search(r"(\d+)\s*/\s*(\d+)", out)
+        r = (float(m.group(1)) / float(m.group(2))) if m and float(m.group(2)) else 0.0
+        if r > 0 and avg > 0 and r / avg <= 1.5:
+            fps = r
+    except Exception:                                         # noqa: BLE001
+        pass
+    _proxy_fps_cache[clip] = fps
+    return fps
+
+
+def _proxy_params(payload: dict) -> dict:
+    """Resolve a proxy request into dimensions, duration and a cache key.
+
+    No grade config anywhere in here on purpose: the proxy is the source, not
+    the picture. That is what makes it one file per clip instead of one per
+    grade, and what lets a knob turn during playback cost nothing.
+    """
+    clip = payload["clip"]
+    autorotate = bool(payload.get("autorotate", True))
+    info = clip_info(clip, autorotate)
+    rng = "limited" if str(payload.get("range") or PROXY_RANGE) == "limited" else "full"
+
+    # Rounded to even BEFORE _preview_dims so the proxy asks that function the
+    # same question the still path asks it: 4:2:0 needs even dimensions, and
+    # sneaking the rounding in afterwards would hand the GPU a proxy one pixel
+    # narrower than the still it is being compared against.
+    width = max(160, int(payload.get("width") or PROXY_DEFAULT_WIDTH)) // 2 * 2
+    pwidth, pheight = _preview_dims(info, width)
+    if pwidth % 2:
+        # Only reachable on a source whose own width is odd, where the clamp
+        # inside _preview_dims wins. The still path would use pwidth+1 there.
+        pwidth -= 1
+
+    fps = _proxy_fps(clip, info)
+    # Bounded even when the probe says nothing: an unbounded ffmpeg wrote
+    # 2.6GB in this project once, and "the clip has no duration" is exactly
+    # the case where that happens.
+    duration = float(info.get("duration") or 0.0)
+    if not duration > 0:
+        duration = 60.0
+    want = payload.get("duration")
+    if want not in (None, "", 0):
+        duration = max(1.0 / fps, min(duration, float(want)))
+
+    matrix = CG.source_matrix(info)
+    key = hashlib.sha1(json.dumps({
+        "clip": clip, "w": pwidth, "h": pheight, "rot": autorotate,
+        "dur": round(duration, 3), "range": rng, "matrix": matrix,
+        "src_range": info["color_range"], "crf": PROXY_CRF, "gop": PROXY_GOP,
+        "v": PROXY_VERSION,
+    }, sort_keys=True).encode()).hexdigest()
+
+    return {"key": key, "clip": clip, "autorotate": autorotate, "range": rng,
+            "width": pwidth, "height": pheight, "duration": duration,
+            "fps": fps, "matrix": matrix, "info": info}
+
+
+def _proxy_ffmpeg_args(params: dict, out_path: Path) -> list[str]:
+    """The single bounded pass that writes one proxy.
+
+    The filter chain is three deliberate steps:
+      1. scale to the preview size with the same flags source_frame uses,
+      2. the identical normalisation source_frame runs (clip matrix and clip
+         range in, FULL range RGB out) so the pixels are in the GPU's domain,
+      3. back to Y'CbCr with a bt709 matrix, which the -colorspace and
+         -color_range tags below then tell the browser to undo.
+    Step 3 is a lossy hop (8-bit, and 4:2:0 for the chroma) and it is the only
+    place the proxy path differs from the still path. Its size is measured,
+    not assumed: see the honesty entry.
+    """
+    info = params["info"]
+    out_range = "full" if params["range"] == "full" else "limited"
+    vf = (f"scale={params['width']}:{params['height']}:flags=bilinear,setsar=1,"
+          f"scale=in_color_matrix={params['matrix']}"
+          f":in_range={info['color_range']}:out_range=full,format=gbrp16le,"
+          f"scale=out_color_matrix=bt709:out_range={out_range},format=yuv420p")
+
+    args = ["ffmpeg", "-v", "error", "-y"]
+    if not params["autorotate"]:
+        args += ["-noautorotate"]
+    args += ["-i", str(clip_path(params["clip"]))]
+    # An output option, after every -i, so it bounds the ENCODE and not just
+    # the seek: the house rule for every ffmpeg call in this file.
+    args += ["-t", str(params["duration"])]
+    args += ["-vf", vf, "-an", "-sn", "-dn"]
+    args += [
+        "-c:v", "libx264", "-crf", str(PROXY_CRF), "-preset", "veryfast",
+        # sc_threshold 0 with a fixed -g means the keyframes land on an exact
+        # grid, so "how far back does a seek have to decode from" has one
+        # answer (at most PROXY_GOP frames) instead of depending on the cut.
+        "-g", str(PROXY_GOP), "-keyint_min", str(PROXY_GOP), "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+        "-color_range", "pc" if params["range"] == "full" else "tv",
+        # The moov atom up front: without it the browser has to fetch the end
+        # of the file before it can play or seek at all.
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
+        # Explicit, because the file is written to a ".partial" name (renamed
+        # on success) and ffmpeg refuses to guess a muxer from that extension.
+        "-f", "mp4", str(out_path),
+    ]
+    return args
+
+
+def start_proxy(params: dict) -> Job:
+    """Encode one proxy in the background, through the ordinary Job machinery
+    so the jobs panel shows it and a stuck encode is visible rather than a
+    Play button that silently never lights up.
+    """
+    key = params["key"]
+    with _proxy_lock:
+        existing = _proxy_jobs.get(key)
+        if existing:
+            job = JOBS.get(existing)
+            if job is not None and job.status == "running":
+                return job
+    cache_path = _proxy_path(key)
+    tmp_path = PROXY / f"{key}.{uuid.uuid4().hex[:8]}.partial"
+    args = _proxy_ffmpeg_args(params, tmp_path)
+    label = f"proxy {params['clip']} {params['width']}px"
+    job = _register(Job("proxy", label))
+    job.output = str(cache_path)
+    total = max(0.1, params["duration"])
+    with _proxy_lock:
+        _proxy_jobs[key] = job.id
+
+    def worker():
+        try:
+            with FFMPEG_SLOTS:
+                job.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True)
+                for line in job.proc.stdout:
+                    line = line.strip()
+                    if line.startswith("out_time_us="):
+                        try:
+                            secs = int(line.split("=", 1)[1]) / 1e6
+                            job.progress = min(1.0, secs / total)
+                            job.message = f"{secs:.1f}s of {total:.1f}s"
+                        except ValueError:
+                            pass
+                job.proc.wait()
+                err = job.proc.stderr.read()
+            ok = job.proc.returncode == 0 and tmp_path.exists() \
+                and tmp_path.stat().st_size > 0
+            if job.status == "cancelled" or not ok:
+                tmp_path.unlink(missing_ok=True)
+                if job.status != "cancelled":
+                    job.status = "failed"
+                    job.message = (err or "ffmpeg failed").strip()[-600:]
+            else:
+                # Rename last: a reader either sees no file or sees a complete
+                # one, never a half written mp4 the browser would fail on.
+                tmp_path.replace(cache_path)
+                _prune_cache_bytes("proxy", PROXY_CACHE_MAX_BYTES)
+                job.status = "done"
+                job.progress = 1.0
+                size = cache_path.stat().st_size if cache_path.exists() else 0
+                job.message = f"{size / 1e6:.1f} MB"
+        except Exception as exc:                              # noqa: BLE001
+            tmp_path.unlink(missing_ok=True)
+            job.status = "failed"
+            job.message = f"{exc}"
+        finally:
+            job.finished = time.time()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job
+
+
+def proxy_state(params: dict) -> dict:
+    """What /api/proxy/prepare answers: where the file is, and whether it is
+    there yet. Starting the encode is this function's side effect, on purpose:
+    the client asks one question ("can I play this clip") and gets either a
+    URL it can use now or a job id it can watch.
+    """
+    key = params["key"]
+    path = _proxy_path(key)
+    ready = path.exists() and path.stat().st_size > 0
+    job = None
+    if ready:
+        os.utime(path, None)
+    else:
+        job = start_proxy(params)
+    out = {
+        "key": key, "ready": ready,
+        "url": f"/api/proxy/{key}.mp4",
+        "width": params["width"], "height": params["height"],
+        "duration": params["duration"], "fps": params["fps"],
+        "range": params["range"], "crf": PROXY_CRF, "gop": PROXY_GOP,
+        "source_width": params["info"]["width"],
+        "source_height": params["info"]["height"],
+        "bytes": path.stat().st_size if ready else 0,
+    }
+    if job is not None:
+        out["job"] = job.as_dict()
+    return out
+
+
+# --------------------------------------------------------------------------
 # live session
 #
 # The config the user is looking at lived only in browser memory, so nothing
@@ -1393,39 +1896,59 @@ def start_render(payload: dict) -> Job:
 # browser still owns the config and republishes on every change.
 # --------------------------------------------------------------------------
 
-LIVE = {"rev": 0, "config": None, "clip": None, "time": 0.0, "by": "server"}
+# One live session PER USER, keyed by user id, each with exactly the shape the
+# single global LIVE dict used to have. With logins off every request resolves
+# to user 0, so there is one entry and the behaviour is what it always was.
+# With logins on, two people grading at once would otherwise share one mirror:
+# one browser's publish would land in the other's long poll and overwrite the
+# picture they were working on.
+LIVE: dict[int, dict] = {}
 _live_lock = threading.Lock()
 # Woken on every change so a waiting long poll returns immediately instead of
 # the browser having to poll on a timer and lag behind by up to that interval.
+# One condition for every user rather than one each: a wake is cheap, each
+# waiter rechecks its own revision, and a per user condition would have to be
+# created under a lock anyway.
 _live_changed = threading.Condition(_live_lock)
 
 
-def live_get() -> dict:
+def _live_state(user_id: int) -> dict:
+    """This user's live state, created on first touch. Call with the lock held."""
+    st = LIVE.get(int(user_id))
+    if st is None:
+        st = {"rev": 0, "config": None, "clip": None, "time": 0.0,
+              "by": "server"}
+        LIVE[int(user_id)] = st
+    return st
+
+
+def live_get(user_id: int = 0) -> dict:
     with _live_lock:
-        return deepcopy(LIVE)
+        return deepcopy(_live_state(user_id))
 
 
-def live_set(payload: dict) -> dict:
+def live_set(payload: dict, user_id: int = 0) -> dict:
     """Merge a patch into the live config and wake anything waiting on it."""
     with _live_lock:
+        state = _live_state(user_id)
         patch = payload.get("config")
         if patch is not None:
-            if payload.get("replace") or LIVE["config"] is None:
-                LIVE["config"] = full_config(patch)
+            if payload.get("replace") or state["config"] is None:
+                state["config"] = full_config(patch)
             else:
                 # Deep merged so a caller can send just the one knob it cares
                 # about, which is the whole point of the CLI surface.
-                LIVE["config"] = CG.deep_merge(LIVE["config"], patch)
+                state["config"] = CG.deep_merge(state["config"], patch)
         for key in ("clip", "time"):
             if payload.get(key) is not None:
-                LIVE[key] = payload[key]
-        LIVE["by"] = str(payload.get("by") or "cli")
-        LIVE["rev"] += 1
+                state[key] = payload[key]
+        state["by"] = str(payload.get("by") or "cli")
+        state["rev"] += 1
         _live_changed.notify_all()
-        return deepcopy(LIVE)
+        return deepcopy(state)
 
 
-def live_wait(since: int, timeout: float = 25.0) -> dict:
+def live_wait(since: int, timeout: float = 25.0, user_id: int = 0) -> dict:
     """Block until the live config has moved past `since`, or time out.
 
     A long poll rather than a timer in the browser: the tab picks up an outside
@@ -1434,12 +1957,13 @@ def live_wait(since: int, timeout: float = 25.0) -> dict:
     """
     deadline = time.time() + timeout
     with _live_lock:
-        while LIVE["rev"] <= since:
+        state = _live_state(user_id)
+        while state["rev"] <= since:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             _live_changed.wait(remaining)
-        return deepcopy(LIVE)
+        return deepcopy(state)
 
 
 def match_reference_job(payload: dict) -> dict:
@@ -1622,8 +2146,11 @@ def thumbnail(clip: str, time_s: float, width: int, autorotate: bool) -> bytes:
     key = hashlib.sha1(f"{clip}|{time_s:.3f}|{width}|{autorotate}".encode()).hexdigest()
     path = _cache_path("thumbs", key, "jpg")
     if path.exists():
-        os.utime(path, None)
-        return path.read_bytes()
+        try:
+            os.utime(path, None)
+            return path.read_bytes()
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; re-render instead of failing
     info = clip_info(clip, autorotate)
     height = max(2, int(round(info["height"] * width / info["width"] / 2)) * 2)
     # Thumbnails run the conversion only. They are a "where am I in the clip"
@@ -1663,8 +2190,11 @@ def ref_image(name: str, width: int) -> bytes:
     key = hashlib.sha1(f"{name}|{width}|{src.stat().st_mtime_ns}".encode()).hexdigest()
     path = _cache_path("refs", key, "jpg")
     if path.exists():
-        os.utime(path, None)
-        return path.read_bytes()
+        try:
+            os.utime(path, None)
+            return path.read_bytes()
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; re-render instead of failing
     args = ["ffmpeg", "-v", "error", "-y", "-i", str(src),
             "-vf", f"scale={width}:-2:flags=bicubic", "-frames:v", "1",
             "-q:v", "3", "-pix_fmt", "yuvj444p", "-f", "mjpeg", "-"]
@@ -1776,14 +2306,31 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             return {}
+        # Checked against the declared length before a single byte is read,
+        # so an oversized JSON body is refused instead of the server sitting
+        # there waiting for bytes that may never come. The one route that
+        # legitimately sends more than this (uploading a clip) reads the raw
+        # socket itself in _handle_upload and never reaches this method.
+        if n > BODY_MAX_BYTES:
+            raise HttpError(413, f"request body is {n} bytes, over the "
+                                 f"{BODY_MAX_BYTES} byte cap for this endpoint")
         raw = self.rfile.read(n)
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise StudioError(f"bad JSON body: {exc}")
 
-    def _raw_body(self) -> bytes:
-        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+    def _raw_body(self, max_bytes: int | None = None) -> bytes:
+        n = int(self.headers.get("Content-Length") or 0)
+        # Same cap check as _body() above, before a byte is read, so a client
+        # sending an oversized body over its declared Content-Length gets a
+        # 413 instead of the server reading the whole thing first. max_bytes
+        # is optional (default: no cap) so callers that already validate size
+        # a different way, like the upload handler, are unaffected.
+        if max_bytes is not None and n > max_bytes:
+            raise HttpError(413, f"request body is {n} bytes, over the "
+                                 f"{max_bytes} byte cap for this endpoint")
+        return self.rfile.read(n)
 
     def _query(self) -> dict:
         q = urllib.parse.urlparse(self.path).query
@@ -1875,13 +2422,101 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, data, "video/mp4", {"Accept-Ranges": "bytes"})
 
+    def _serve_proxy(self, name: str) -> None:
+        """GET /api/proxy/<key>.mp4, with byte ranges.
+
+        A <video> element cannot seek without them: Chrome asks for the tail
+        of the file to read the index, then for the byte range around the
+        keyframe it wants, and a server that answers every one of those with
+        200 and the whole file makes scrubbing quadratic in file size (and,
+        on some builds, makes currentTime= silently do nothing). The stdlib
+        server this file is built on has no Range support of its own, so this
+        is it.
+        """
+        key = name[:-4] if name.endswith(".mp4") else name
+        if not re.fullmatch(r"[0-9a-f]{8,64}", key):
+            raise StudioError("that is not a proxy key")
+        path = _proxy_path(key)
+        # Gone is a 404 with a one line reason, never a traceback, and that
+        # covers two different ways of being gone: never built, and pruned
+        # between this check and the read below by _prune_cache_bytes in
+        # another request or another server sharing studio/cache. The client
+        # answer to both is the same, so they get the same message: prepare
+        # it again. Every read here goes through this one handler, so the
+        # race cannot escape as a 500 from some other line.
+        gone = HttpError(404, "that proxy has not been built yet, or has been "
+                              "evicted from the cache; ask for it again with "
+                              "POST /api/proxy/prepare")
+        try:
+            total = path.stat().st_size
+            os.utime(path, None)
+        except FileNotFoundError:
+            raise gone
+        rng = (self.headers.get("Range") or "").strip()
+        if not rng.lower().startswith("bytes="):
+            try:
+                whole = path.read_bytes()
+            except FileNotFoundError:
+                raise gone
+            self._send(200, whole, "video/mp4", {"Accept-Ranges": "bytes"})
+            return
+        spec = rng[6:].strip()
+        # A multi range request gets the FIRST range, which RFC 9110 allows
+        # (a server may answer with a single part). Building a
+        # multipart/byteranges body would be more code for a case no browser
+        # media element actually sends.
+        if "," in spec:
+            spec = spec.split(",")[0].strip()
+        lo, _, hi = spec.partition("-")
+        try:
+            if lo == "":
+                # "bytes=-N": the last N bytes, which is how a player reads
+                # an index at the end of a file.
+                start = max(0, total - int(hi))
+                end = total - 1
+            else:
+                start = int(lo)
+                end = int(hi) if hi else total - 1
+        except ValueError:
+            self._send(416, b"", "video/mp4",
+                       {"Content-Range": f"bytes */{total}",
+                        "Accept-Ranges": "bytes"})
+            return
+        end = min(end, total - 1)
+        if start > end or start >= total:
+            self._send(416, b"", "video/mp4",
+                       {"Content-Range": f"bytes */{total}",
+                        "Accept-Ranges": "bytes"})
+            return
+        # Seek and read only what was asked for: a proxy is one file for a
+        # whole clip, so reading all of it to answer a 64KB range would be
+        # the thing that makes seeking expensive.
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(end - start + 1)
+        except FileNotFoundError:
+            raise gone
+        self._send(206, data, "video/mp4", {
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Accept-Ranges": "bytes",
+        })
+
     def _play_stream(self, key: str) -> None:
         if not key:
             raise StudioError("no playback key given")
         cache_path = _segment_path(key)
         if cache_path.exists():
-            self._serve_segment_file(cache_path)
-            return
+            try:
+                self._serve_segment_file(cache_path)
+                return
+            except FileNotFoundError:
+                # A prune (this process or another one sharing studio/cache)
+                # deleted the segment between exists() and the read inside
+                # _serve_segment_file, before any response header went out.
+                # Fall through exactly like a cache miss: re-render if the
+                # params to do that are still remembered below.
+                pass
 
         with _play_pending_lock:
             params = _play_pending.get(key)
@@ -1934,11 +2569,113 @@ class Handler(BaseHTTPRequestHandler):
             tmp_path.unlink(missing_ok=True)
         self._stream_end()
 
+    # --- upload -------------------------------------------------------------
+
+    def _handle_upload(self) -> None:
+        """POST /api/upload: the raw file body streamed straight to disk.
+
+        No multipart parser: the client sends the whole file as the request
+        body, with the display name in X-File-Name (percent-encoded, since a
+        header value has to stay on one line and plain ASCII) and always
+        application/octet-stream for Content-Type. That keeps this stdlib
+        only and lets the size cap below answer before a single byte of the
+        body is read, which a multipart body (the boundary parser has to
+        start consuming the stream before it knows anything) cannot do.
+
+        Auth, the login-required 401 and the CSRF check already ran in
+        _api() before this route was reached, exactly like every other POST,
+        so logins-on with no session or a cross site post never gets this
+        far. Which folder this writes into is decided the same way `open`
+        decides what a browse path is allowed to resolve to: this account's
+        own footage folder with logins on, the shared FOOTAGE folder without.
+        """
+        raw_name = self.headers.get("X-File-Name", "")
+        name = safe_name(urllib.parse.unquote(raw_name))
+        ext = Path(name).suffix.lower()
+        if ext not in VIDEO_EXT:
+            raise StudioError(f"not a video extension this tool reads: {name}")
+
+        length_hdr = self.headers.get("Content-Length")
+        if not length_hdr or not length_hdr.isdigit():
+            raise HttpError(400, "Content-Length is required for an upload")
+        length = int(length_hdr)
+        if length <= 0:
+            raise HttpError(400, "empty upload")
+        if length > UPLOAD_MAX_BYTES:
+            # Checked against the header alone, before a byte of the body is
+            # read: an oversized upload is refused instantly rather than
+            # after however long it takes to stream gigabytes nobody wants.
+            raise HttpError(413, f"upload is {length} bytes, over the "
+                                 f"{UPLOAD_MAX_BYTES} byte cap")
+
+        dest_dir = AUTH.user_footage(self.user["id"]) if AUTH.enabled() else FOOTAGE
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        existing = _dir_total_bytes(dest_dir)
+        if existing + length > UPLOAD_QUOTA_BYTES:
+            raise HttpError(413, "this upload would put the footage folder "
+                                 f"over its {UPLOAD_QUOTA_BYTES} byte total; "
+                                 "delete something first")
+
+        final_name = name
+        if (dest_dir / final_name).exists():
+            # Do not silently overwrite an existing clip of the same name;
+            # give the new file its own identity instead, the same call
+            # register_external_clip makes for a colliding external file.
+            stem, suffix = Path(name).stem, Path(name).suffix
+            final_name = f"{stem}_{uuid.uuid4().hex[:6]}{suffix}"
+        final_path = dest_dir / final_name
+        tmp_path = dest_dir / f".upload-{uuid.uuid4().hex[:8]}.tmp"
+
+        written = 0
+        try:
+            with open(tmp_path, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break                    # the connection dropped early
+                    f.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                    # Belt and braces: written can only reach `length`, which
+                    # was already checked above, but the cap is enforced here
+                    # too rather than trusted to the header alone, in case a
+                    # future caller of this method ever changes that.
+                    if written > UPLOAD_MAX_BYTES:
+                        raise HttpError(413, "upload exceeded the size cap "
+                                             "while it was being received")
+            if written != length:
+                raise StudioError("the upload connection dropped before the "
+                                  "declared size arrived; try again")
+            tmp_path.replace(final_path)
+        except Exception:                                      # noqa: BLE001
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        if not probe_is_video(final_path):
+            final_path.unlink(missing_ok=True)
+            raise StudioError(f"{name} is not a video ffprobe can read; "
+                              "nothing was kept")
+
+        # Answered the same shape as POST /api/open: a clip entry the client
+        # can select immediately, plus the refreshed clip list it belongs in.
+        clip_name = register_external_clip(str(final_path))
+        self._json({"name": clip_name,
+                    "clip": self._clip_entry(clip_path(clip_name), clip_name),
+                    "clips": self._clips()})
+
     def do_GET(self):                                          # noqa: N802
         self._dispatch("GET")
 
     def do_POST(self):                                         # noqa: N802
         self._dispatch("POST")
+
+    def do_PUT(self):                                          # noqa: N802
+        # PUT exists for one route, PUT /api/grade: saving a clip's grade is
+        # an idempotent write of the whole thing at a known address, which is
+        # exactly what PUT means. Without this method BaseHTTPRequestHandler
+        # answers 501 and the autosave fails silently in the page.
+        self._dispatch("PUT")
 
     def do_DELETE(self):                                       # noqa: N802
         self._dispatch("DELETE")
@@ -1959,6 +2696,16 @@ class Handler(BaseHTTPRequestHandler):
         except AUTH.AuthError as exc:
             # 401, 403 and 429 mean three different things to a client, so
             # they cannot all collapse into StudioError's 400 below.
+            self._json({"error": str(exc)}, exc.code)
+        except HttpError as exc:
+            if exc.code == 413:
+                # Answered without reading the declared body, so whatever the
+                # client was about to send is still sitting unread on the
+                # socket. Keeping the connection alive would feed those
+                # leftover bytes to the parser as the start of the next
+                # request; closing instead is what actually avoids the wait
+                # this check exists to avoid.
+                self.close_connection = True
             self._json({"error": str(exc)}, exc.code)
         except StudioError as exc:
             self._json({"error": str(exc)}, 400)
@@ -2022,6 +2769,16 @@ class Handler(BaseHTTPRequestHandler):
         return (AUTH.behind_https_proxy()
                 or self.headers.get("X-Forwarded-Proto", "").strip().lower()
                 == "https")
+
+    def _uid(self) -> int:
+        """The account this request belongs to.
+
+        With logins off _dispatch leaves self.user as None and everything is
+        the local user, id 0. Every per user store (grades, presets, the live
+        session) keys off this one number, so "auth off changes nothing" holds
+        without a single "is auth on" branch inside those stores.
+        """
+        return int(self.user["id"]) if self.user else 0
 
     def _require_admin(self) -> None:
         if not AUTH.enabled():
@@ -2131,7 +2888,7 @@ class Handler(BaseHTTPRequestHandler):
         # a browser attaches automatically to somebody else's form post, and
         # an Authorization header is not. Sign in itself carries no cookie
         # yet, so it passes through here untouched.
-        if (AUTH.enabled() and method in ("POST", "DELETE")
+        if (AUTH.enabled() and method in ("POST", "PUT", "DELETE")
                 and self.auth_method == "cookie"
                 and not AUTH.csrf_ok(self.headers.get("Sec-Fetch-Site", ""),
                                      self.headers.get("Origin", ""),
@@ -2145,20 +2902,37 @@ class Handler(BaseHTTPRequestHandler):
             self._auth_api(method, route, q)
             return
 
-        if AUTH.enabled() and self.user is None:
-            raise AUTH.AuthError(401, "sign in to use the studio")
+        # A GPU render's browser worker is not a person and has no session.
+        # It carries the random token minted for that one render, it is a
+        # child of this process so it is always on loopback, and the token
+        # opens four routes and nothing else (render_gpu.WORKER_ROUTES). Every
+        # other caller still meets the login gate below.
+        if not RG.worker_authorised(self, route, method):
+            if AUTH.enabled() and self.user is None:
+                raise AUTH.AuthError(401, "sign in to use the studio")
+
+        if route.startswith("render/gpu/") and RG.handle(self, method, route, q):
+            return
 
         if route == "state" and method == "GET":
             self._json({
                 "defaults": CG.DEFAULTS,
                 "clips": self._clips(),
-                "presets": list_presets(),
+                "presets": list_presets(self._uid()),
                 "looks": list_looks(),
                 "refs": list_refs(),
                 "renders": list_renders(),
                 "paths": {
                     "content": str(CONTENT), "presets": str(PRESETS),
                     "looks": str(LOOKS), "out": str(OUT), "refs": str(REFS),
+                    # "presets" above is always the shared, read only library
+                    # (grade/presets/). A signed in user's own saved presets
+                    # live in a separate per account folder (see
+                    # GRADES.user_presets_dir); this tells an agent where
+                    # that is, and is null with logins off since there is no
+                    # account to key it by.
+                    "user_presets": str(GRADES.user_presets_dir(self._uid()))
+                                     if self.user else None,
                 },
                 "stat_definitions": {
                     "sat_floor": SAT_FLOOR,
@@ -2186,6 +2960,10 @@ class Handler(BaseHTTPRequestHandler):
             name = register_external_clip(raw_open)
             self._json({"name": name, "clip": self._clip_entry(clip_path(name), name),
                         "clips": self._clips()})
+            return
+
+        if route == "upload" and method == "POST":
+            self._handle_upload()
             return
 
         if route == "frame" and method == "POST":
@@ -2274,19 +3052,92 @@ class Handler(BaseHTTPRequestHandler):
                        {"X-Lut-Size": str(size)})
             return
 
+        # The live session is per account (wave 2). The wire shape is
+        # unchanged, including the `by` field session.js filters its own
+        # echoes on: only the state it reads and writes is now this user's.
         if route == "session" and method == "GET":
-            self._json(live_get())
+            self._json(live_get(self._uid()))
             return
 
         if route == "session" and method == "POST":
-            self._json(live_set(self._body()))
+            self._json(live_set(self._body(), self._uid()))
             return
 
         if route == "session/wait" and method == "GET":
             # Held open until something changes, so the browser sees an outside
             # edit immediately instead of on its next poll tick.
             self._json(live_wait(int(q.get("since", 0)),
-                                 float(q.get("timeout", 25))))
+                                 float(q.get("timeout", 25)), self._uid()))
+            return
+
+        # --- per clip grades, contract C3 -------------------------------
+        #
+        # A grade belongs to (this account, this clip's content key). The
+        # client talks in clip NAMES because that is what every other route
+        # here takes; the key is resolved server side so a rename cannot
+        # separate a clip from its grade.
+        if route == "grade" and method == "GET":
+            key = self._grade_key(q.get("clip", ""))
+            row = GRADES.get_grade(self._uid(), key)
+            if row is None:
+                self._json({"exists": False, "key": key, "config": None,
+                            "updated_at": None})
+                return
+            self._json({"exists": True, "key": key, "config": row["config"],
+                        "updated_at": row["updated_at"]})
+            return
+
+        if route == "grade" and method == "PUT":
+            payload = self._body()
+            name = str(payload.get("clip", "") or "")
+            key = self._grade_key(name)
+            # A caller that addressed the clip by key (a backup being put
+            # back, an agent working from GET /api/grades) can still say what
+            # the clip was called, so the picker does not end up listing raw
+            # hex. Addressing by name is the normal case and needs none of it.
+            if GRADES.is_key(name):
+                prev = GRADES.get_grade(self._uid(), key)
+                name = (str(payload.get("clip_name") or "")
+                        or (prev["clip_name"] if prev else ""))
+            # full_config so a partial patch is stored whole: a later read
+            # then loads into the UI without depending on whatever the engine
+            # defaults happened to be on the day it was saved.
+            cfg = full_config(payload.get("config"))
+            updated = GRADES.put_grade(self._uid(), key, name, cfg)
+            self._json({"key": key, "updated_at": updated})
+            return
+
+        if route == "grades" and method == "GET":
+            self._json({"grades": GRADES.list_grades(self._uid())})
+            return
+
+        if route == "grade" and method == "DELETE":
+            key = self._grade_key(q.get("clip", ""))
+            self._json({"deleted": GRADES.delete_grade(self._uid(), key),
+                        "key": key})
+            return
+
+        if route == "grade/copy" and method == "POST":
+            payload = self._body()
+            src = self._grade_key(str(payload.get("from", "") or ""))
+            dst_name = str(payload.get("to", "") or "")
+            dst = self._grade_key(dst_name)
+            if GRADES.is_key(dst_name):
+                # The caller addressed the destination by key, so there is no
+                # display name in the request. Keep whatever name that clip
+                # was last saved under rather than writing the key into the
+                # name column and making the picker unreadable.
+                prev = GRADES.get_grade(self._uid(), dst)
+                dst_name = prev["clip_name"] if prev else ""
+            row = GRADES.get_grade(self._uid(), src)
+            if row is None:
+                raise StudioError("that clip has no saved grade to copy")
+            if src == dst:
+                raise StudioError("source and destination are the same clip")
+            updated = GRADES.put_grade(self._uid(), dst, dst_name,
+                                       full_config(row["config"]))
+            self._json({"key": dst, "from": src, "config": row["config"],
+                        "updated_at": updated})
             return
 
         if route == "match" and method == "POST":
@@ -2341,27 +3192,39 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "presets" and method == "GET":
-            self._json({"presets": list_presets()})
+            self._json({"presets": list_presets(self._uid())})
             return
 
         if route == "preset" and method == "GET":
-            self._json({"name": q["name"], "config": read_preset(q["name"])})
+            self._json({"name": q["name"],
+                        "config": read_preset(q["name"], self._uid())})
             return
 
         if route == "preset" and method == "POST":
             payload = self._body()
             p = write_preset(payload["name"], payload.get("config"),
-                             payload.get("comment", ""))
+                             payload.get("comment", ""), self._uid())
             self._json({"saved": p.name, "path": str(p),
-                        "presets": list_presets()})
+                        "presets": list_presets(self._uid())})
             return
 
         if route == "preset" and method == "DELETE":
-            p = PRESETS / f"{safe_name(q['name'])}.json"
+            p, library = preset_path(q["name"], self._uid())
             if not p.exists():
                 raise StudioError(f"preset not found: {q['name']}")
+            if library:
+                # 403, not 400: the request is well formed and the file is
+                # right there, the caller is simply not allowed to remove it.
+                # grade/presets/ is checked into the repository and shared by
+                # every account, so deleting one here would be one user
+                # deleting a tracked file out from under everybody else.
+                raise AUTH.AuthError(
+                    403, f"{q['name']} is a shipped library preset and is read "
+                         "only. Save your own copy under the same name to "
+                         "shadow it, and delete that instead")
             p.unlink()
-            self._json({"deleted": q["name"], "presets": list_presets()})
+            self._json({"deleted": q["name"],
+                        "presets": list_presets(self._uid())})
             return
 
         if route == "looks" and method == "GET":
@@ -2383,7 +3246,7 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
                 raise StudioError("LUT names may use letters, digits, dot, "
                                   "dash and underscore only")
-            text = self._raw_body().decode("utf-8", "replace")
+            text = self._raw_body(LOOK_MAX_BYTES).decode("utf-8", "replace")
             size = validate_cube(text)
             (LOOKS / f"{name}.cube").write_text(text)
             self._json({"imported": name, "size": size, "looks": list_looks()})
@@ -2408,7 +3271,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "render" and method == "POST":
-            job = start_render(self._body())
+            body = self._body()
+            # The GPU engine spawns a browser that has to fetch frames back
+            # from this server, and only the request knows which port that is
+            # (the studio takes --port, and the tests run it on a random one).
+            body.setdefault("port", self.server.server_address[1])
+            job = start_render(body)
             self._json({"job": job.as_dict()})
             return
 
@@ -2447,7 +3315,12 @@ class Handler(BaseHTTPRequestHandler):
                                           "computer")
             target = Path(self._body().get("path", ""))
             allowed = [OUT.resolve(), PRESETS.resolve(), LOOKS.resolve(),
-                       REFS.resolve()]
+                       REFS.resolve(),
+                       # This account's own preset folder. A preset saved
+                       # since wave 2 lands there rather than in the shipped
+                       # library, so without this entry "reveal" on a preset
+                       # the user just saved would refuse to show it.
+                       GRADES.user_presets_dir(self._uid()).resolve()]
             if not any(str(target.resolve()).startswith(str(a)) for a in allowed):
                 raise StudioError("that path is outside the studio folders")
             subprocess.Popen(["open", "-R", str(target)])
@@ -2483,11 +3356,44 @@ class Handler(BaseHTTPRequestHandler):
             self._play_stream(q.get("key", ""))
             return
 
+        # Playback proxy (live.js Mode 3). prepare is the only POST: it
+        # answers with a URL when the file is already on disk and with a job
+        # to watch when it is not, so the client has one call to make either
+        # way. The mp4 itself is a plain GET so a <video src> can point at it.
+        if route == "proxy/prepare" and method == "POST":
+            self._json(proxy_state(_proxy_params(self._body())))
+            return
+
+        if route.startswith("proxy/") and method == "GET":
+            self._serve_proxy(route[len("proxy/"):])
+            return
+
         raise StudioError(f"no route for {method} {path}")
+
+    def _grade_key(self, value: str) -> str:
+        """Turn whatever the client sent into a clip key.
+
+        A clip NAME is the normal case and is resolved to a path and hashed.
+        A bare 32 hex key is also accepted, because the copy picker is built
+        from GET /api/grades, whose rows are keys: a clip that has a saved
+        grade but is not currently in the clip list (a drive that is not
+        mounted, a file moved somewhere the browser has not visited) has no
+        name this server can resolve, and refusing to copy from it would make
+        the picker offer entries it then rejects.
+        """
+        value = (value or "").strip()
+        if not value:
+            raise StudioError("no clip given")
+        if GRADES.is_key(value):
+            return value.lower()
+        return GRADES.clip_key(clip_path(value))
 
     def _clip_entry(self, p: Path, name: str) -> dict:
         entry = {"name": name, "bytes": p.stat().st_size, "path": str(p),
-                 "external": name in EXTERNAL_CLIPS}
+                 "external": name in EXTERNAL_CLIPS,
+                 # Content key (contract C3): the identity this clip's saved
+                 # grade is filed under, stable across a rename or a move.
+                 "key": GRADES.safe_key(p)}
         for rot in (True, False):
             try:
                 info = clip_info(name, rot)
@@ -2590,7 +3496,7 @@ def _user_cli(args) -> bool:
 
 
 def main() -> None:
-    global VERBOSE
+    global VERBOSE, UPLOAD_MAX_BYTES, UPLOAD_QUOTA_BYTES
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=7431)
@@ -2614,8 +3520,17 @@ def main() -> None:
                     help="list accounts and exit")
     ap.add_argument("--delete-user", metavar="NAME",
                     help="delete an account and exit")
+    ap.add_argument("--upload-max-bytes", type=int, default=UPLOAD_MAX_BYTES,
+                    help="reject a single POST /api/upload larger than this "
+                         "many bytes (default 8 GiB)")
+    ap.add_argument("--upload-quota-bytes", type=int, default=UPLOAD_QUOTA_BYTES,
+                    help="reject an upload that would put one account's "
+                         "footage folder over this many bytes total "
+                         "(default 50 GiB)")
     args = ap.parse_args()
     VERBOSE = args.verbose
+    UPLOAD_MAX_BYTES = args.upload_max_bytes
+    UPLOAD_QUOTA_BYTES = args.upload_quota_bytes
 
     if _user_cli(args):
         return

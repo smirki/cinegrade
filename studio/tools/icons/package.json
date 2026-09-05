@@ -1,0 +1,13 @@
+{
+  "name": "studio-icons-build",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Build step that vendors HugeIcons definitions into studio/static/vendor/hugeicons.js. Not shipped, not loaded by the studio itself.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@hugeicons/core-free-icons": "4.3.0"
+  }
+}

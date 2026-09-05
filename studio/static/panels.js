@@ -47,26 +47,20 @@
   // patch), so this is never stale when a real edit reaches emit().
   var lastCfg = null;
 
-  // One outline glyph per pipeline stage (index.html defines the <symbol>
-  // sprite these <use> elements reference). Keyed by stage.id, not stage
-  // order, so reordering SCHEMA can never silently swap two icons.
+  // One outline glyph per pipeline stage, keyed by stage.id (not stage
+  // order, so reordering SCHEMA can never silently swap two icons). Values
+  // are @hugeicons/core-free-icons export names, resolved by StudioIcons
+  // (studio/static/icons.js) against window.HUGEICONS
+  // (studio/static/vendor/hugeicons.js, vendored by studio/tools/icons/
+  // build.mjs) -- no path data lives in this file.
   var STAGE_ICON = {
-    convert: "icon-convert", primaries: "icon-primaries", curves: "icon-curves",
-    secondary: "icon-secondary", look: "icon-look", fx: "icon-fx",
-    grain: "icon-grain", detail: "icon-detail", letterbox: "icon-letterbox",
-    output: "icon-output"
+    convert: "RefreshCwIcon", primaries: "FilterHorizontalIcon", curves: "EaseCurveControlPointsIcon",
+    secondary: "ColorPickerIcon", window: "EllipseSelectionIcon", look: "Film01Icon", fx: "SparklesIcon",
+    grain: "ChartScatterIcon", detail: "FocusIcon", letterbox: "AspectRatioIcon",
+    output: "Download01Icon"
   };
-  var SVGNS = "http://www.w3.org/2000/svg";
-  var XLINKNS = "http://www.w3.org/1999/xlink";
   function useIcon(name, cls) {
-    var svg = document.createElementNS(SVGNS, "svg");
-    svg.setAttribute("class", cls);
-    svg.setAttribute("aria-hidden", "true");
-    var use = document.createElementNS(SVGNS, "use");
-    use.setAttribute("href", "#" + name);
-    use.setAttributeNS(XLINKNS, "xlink:href", "#" + name); // older Safari
-    svg.appendChild(use);
-    return svg;
+    return global.StudioIcons.render(name, cls);
   }
 
   function subhead(text) {
@@ -103,11 +97,11 @@
 
       var head = document.createElement("div");
       head.className = "stagehead";
-      head.appendChild(useIcon(STAGE_ICON[stage.id] || "icon-convert", "stagehead-icon"));
+      head.appendChild(useIcon(STAGE_ICON[stage.id] || "RefreshCwIcon", "stagehead-icon"));
       var nm = document.createElement("span"); nm.className = "stagehead-name"; nm.textContent = stage.name;
       var sp = document.createElement("span"); sp.className = "spacer";
       head.appendChild(nm); head.appendChild(sp);
-      head.appendChild(useIcon("icon-chevron", "stagehead-chevron"));
+      head.appendChild(useIcon("ChevronDownIcon", "stagehead-chevron"));
       head.addEventListener("click", function () { box.classList.toggle("collapsed"); });
 
       var body = document.createElement("div");
@@ -494,7 +488,12 @@
   }
 
   global.Panels = {
-    build: build, refresh: refresh, setLooks: setLooks,
+    // emit is exported for one caller: the on-picture shape editor
+    // (window-editor.js), which is a control for the same config the panel
+    // shows and therefore has to take the same route into it, auto-enable
+    // included. Anything else that edits the config should go through
+    // app.js's onParamChange directly.
+    build: build, refresh: refresh, setLooks: setLooks, emit: emit,
     getPath: getPath, setPath: setPath, same: same,
     resizeCurves: resizeCurves, collapseAll: collapseAll
   };

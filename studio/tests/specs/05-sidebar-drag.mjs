@@ -5,6 +5,28 @@
  * (sidebars.js paints it from localStorage before first paint). This is
  * one of the two behaviours the plan calls out as unverified on this
  * machine, answered here with a real drag, not a value assignment. */
+
+/* Polls an element's rendered width every 50ms until two consecutive
+ * readings agree (or the ceiling passes), rather than sleeping a fixed
+ * duration: #sidebarRight's 160ms width transition (style.css) means any
+ * fixed sleep at or near that duration reads a mid-transition width and
+ * flakes under load. */
+async function waitForStableWidth(page, elementId, ceilingMs) {
+  const read = (id) => {
+    var el = document.getElementById(id);
+    return el ? el.getBoundingClientRect().width : null;
+  };
+  const start = Date.now();
+  let prev = await page.evaluate(read, elementId);
+  while (Date.now() - start < ceilingMs) {
+    await new Promise((r) => setTimeout(r, 50));
+    const cur = await page.evaluate(read, elementId);
+    if (cur === prev) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+
 export default async function run(ctx) {
   const page = ctx.page;
 
@@ -20,12 +42,13 @@ export default async function run(ctx) {
   const collapsed = await page.evaluate(() => document.documentElement.hasAttribute("data-sidebar-right"));
   if (collapsed) {
     await page.click("#sidebarRightToggle");
-    await new Promise((r) => setTimeout(r, 250));
+    await waitForStableWidth(page, "sidebarRight", 2000);
   }
   // #sidebarRight animates width over 160ms (style.css): settle here too, in
   // case an earlier spec left a collapse/expand transition still finishing,
-  // so "before" is the resting width, not a mid-transition one.
-  await new Promise((r) => setTimeout(r, 200));
+  // so "before" is the resting width, not a mid-transition one. Polled, not
+  // slept, so this holds under load instead of racing the transition.
+  await waitForStableWidth(page, "sidebarRight", 2000);
 
   const before = await page.evaluate(() => {
     var el = document.getElementById("sidebarRight");
@@ -50,7 +73,9 @@ export default async function run(ctx) {
   await page.mouse.move(before.handleX + dragBy / 2, before.handleY, { steps: 5 });
   await page.mouse.move(before.handleX + dragBy, before.handleY, { steps: 5 });
   await page.mouse.up();
-  await new Promise((r) => setTimeout(r, 150));
+  // Poll instead of a fixed sleep: a 150ms sleep raced #sidebarRight's own
+  // 160ms width transition and flaked under load.
+  await waitForStableWidth(page, "sidebarRight", 2000);
 
   const after = await page.evaluate(() => ({
     width: document.getElementById("sidebarRight").getBoundingClientRect().width,
@@ -84,7 +109,7 @@ export default async function run(ctx) {
   await page.evaluate((w) => {
     if (window.fixxrSidebars) window.fixxrSidebars.setWidth("right", w);
   }, before.width);
-  await new Promise((r) => setTimeout(r, 250));
+  await waitForStableWidth(page, "sidebarRight", 2000);
 
   return {
     status: "PASS",

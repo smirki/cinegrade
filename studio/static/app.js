@@ -89,7 +89,23 @@
     gpu: false,
     gpuOk: false,
     looping: false,
-    loopPreparing: false
+    loopPreparing: false,
+    // Proxy playback (job: live GPU viewer, mode 3). gpuPlaying is the third
+    // "is something moving on screen" flag, deliberately NOT S.playing:
+    // playing means a server encoded <video> is the picture, and mode 3's
+    // picture is the GPU canvas, so setStageLayer has to land on "gpu" for
+    // it. proxyPreparing covers the one ffmpeg pass per clip that has to
+    // finish before anything can play; proxyClip/proxyReady say which clip
+    // the prepared proxy belongs to, so selecting another clip (or changing
+    // the preview width) cannot leave Play pointing at the previous one's
+    // frames. proxyWarming is the background encode started on clip select
+    // and is deliberately NOT part of "is playback active": pressing Play
+    // while it runs joins that same job rather than being read as a stop.
+    gpuPlaying: false,
+    proxyPreparing: false,
+    proxyWarming: false,
+    proxyDesc: null,
+    proxyReady: false
   };
 
   // The five before/after view modes (job 3). Kept as constants rather than
@@ -233,6 +249,10 @@
     // publishing is a no-op with nothing loaded (see session.js), so this
     // costs nothing when no outside agent is attached.
     if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
+    // Same hook, same definition of "committed", for the per clip autosave
+    // (grades.js). It debounces, so a slider release and a checkbox and a
+    // reset all cost one PUT between them if they happen inside 600 ms.
+    if (window.StudioGrades) window.StudioGrades.commit(S.clip, cfg());
   }
 
   function restore(snap) {
@@ -244,6 +264,11 @@
     updateModified();
     scheduleRender();
     updateUndoButtons();
+    // An undo or a redo moves the grade as much as a slider does, so it
+    // autosaves too. Without this the screen would show the undone grade
+    // while the server still held the one before it, which is exactly the
+    // silent disagreement per clip grades exist to remove.
+    if (window.StudioGrades) window.StudioGrades.commit(S.clip, cfg());
   }
 
   function undo() {
@@ -313,6 +338,13 @@
   var inflight = 0;
 
   function scheduleRender(delay) {
+    // The power window's on-picture shape editor (window-editor.js) draws
+    // straight from cfg().window, so it has to redraw wherever the config
+    // moved. This is that one place: every edit, undo, preset load, clip
+    // switch and outside session patch already funnels through here, so
+    // hooking it is what keeps the overlay and the Window panel's sliders
+    // showing the same shape without either one polling the other.
+    if (window.WindowEditor) window.WindowEditor.sync();
     // Every codepath that changes the config or the playhead (a slider
     // drag, a preset load, undo/redo, an outside session patch, setTime)
     // already funnels through here before asking the server for a fresh
@@ -333,7 +365,11 @@
     // unneeded here, it would be wrong: it targets frameImg, which is
     // hidden and not what is on screen while #stage.gpu-live is showing
     // gpuCanvas instead.
-    if (S.looping) return;
+    // Mode 3 (proxy playback) is the same exception for the same reason: it
+    // re-reads cfg() on every presented frame, so a knob change is already
+    // on screen by the next frame and a still-frame fetch aimed at the
+    // hidden #frameImg would be both wasted and wrong.
+    if (S.looping || S.gpuPlaying) return;
     clearTimeout(renderTimer);
     renderTimer = setTimeout(doRender, delay === undefined ? 110 : delay);
   }
@@ -388,6 +424,11 @@
     if (mode === "graded" && S.gpu && StudioLive.available()) {
       inflight++;
       gpuBypassStep(gpuBefore).then(function () {
+        // A scrub started a proxy seek (see proxyPreview): let it land
+        // first, so the accurate 16-bit still render is the LAST thing to
+        // present rather than racing the 8-bit preview for the canvas.
+        return whenProxySettled();
+      }).then(function () {
         return StudioLive.renderStill({
           clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
           config: cfg(), sourceWidth: clipSourceWidth()
@@ -754,10 +795,18 @@
     // on its very next animation frame, so an explicit jump has to stop it
     // first or the scrub would silently snap back a few milliseconds later.
     if (S.looping || S.loopPreparing) stopLoopInternal();
+    // Mode 3 owns S.time while it plays for the same reason the loop does,
+    // so an explicit jump stops it rather than being overwritten a frame later.
+    if (S.gpuPlaying) stopGpuPlayback(true);
     S.time = Math.max(0, Math.min(t, Math.max(0, S.duration - 1 / S.fps)));
     $("timeLabel").textContent = S.time.toFixed(2) + "s";
     $("scrub").value = String(Math.round(S.duration ? (S.time / S.duration) * 1000 : 0));
     highlightThumb();
+    // The proxy answers a scrub in the time of a seek instead of a decode,
+    // which is what makes dragging the timeline feel like a player rather
+    // than a series of stills. It is a PREVIEW: scheduleRender below still
+    // asks for the exact 16-bit frame and overwrites it (see whenProxySettled).
+    proxyPreview(S.time);
     scheduleRender();
   }
 
@@ -907,7 +956,7 @@
     // (before-only) or splits the viewer in a way a single played video
     // was never built to share, so switching modes stops it rather than
     // leaving a video playing invisibly behind a mode change.
-    if (S.playing || S.playPreparing) stopPlayback();
+    stopAnyPlayback();
     // Same reasoning, same layer, for the GPU loop (#stage.gpu-live).
     if (S.looping || S.loopPreparing) stopLoop();
     S.viewMode = mode;
@@ -1019,13 +1068,27 @@
     var sel = $("presetSelect");
     var keep = sel.value;
     sel.innerHTML = "";
-    list.forEach(function (p) {
-      var o = document.createElement("option");
-      o.value = p.name;
-      o.textContent = p.name + (p.look ? "  [" + p.look + "]" : "");
-      o.title = p.comment || "";
-      sel.appendChild(o);
-    });
+    // Two groups, because they behave differently and a flat list would hide
+    // that: the shipped library in grade/presets is shared and read only (the
+    // server answers 403 on delete), and "mine" is this account's own folder,
+    // which is where every save lands. `library` comes from the server, so a
+    // build where that flag is missing degrades to one "mine" group rather
+    // than to a wrong claim about what is deletable.
+    function group(label, rows) {
+      if (!rows.length) return;
+      var g = document.createElement("optgroup");
+      g.label = label;
+      rows.forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p.name;
+        o.textContent = p.name + (p.look ? "  [" + p.look + "]" : "");
+        o.title = p.comment || "";
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    }
+    group("library (read only)", list.filter(function (p) { return p.library; }));
+    group("mine", list.filter(function (p) { return !p.library; }));
     if (keep && list.some(function (p) { return p.name === keep; })) sel.value = keep;
   }
 
@@ -1044,6 +1107,12 @@
       // needs its own publish: an outside agent watching the session should
       // see a preset load too, not just the edits made on top of it.
       if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
+      // And for the same reason it needs its own autosave. Putting a preset
+      // on a clip is a change to that clip's grade, and a user who loads a
+      // look and then touches nothing else still expects it to be there when
+      // they come back. grades.js ignores this while it is itself loading a
+      // grade, so the boot sequence cannot save the starting preset over one.
+      if (window.StudioGrades) window.StudioGrades.commit(S.clip, cfg());
       // A fresh preset load is the one point where overwriting the render
       // name field is always correct (it is, by definition, unmodified at
       // this instant) and where a hand-typed name stops being protected:
@@ -1072,6 +1141,39 @@
     Panels.refresh(cfg(), S.defaults);
     markStageState(); updateModified(); scheduleRender(0);
     toast("config updated externally" + (state && state.by ? " (" + state.by + ")" : ""));
+  };
+
+  // The grades.js contract (per clip grades, contract C3): put this clip's
+  // saved config into the active slot, or the engine defaults when it has
+  // none. Deliberately NOT pushHistory: loading a clip is not an edit to the
+  // clip you just left, and routing it through the undo stack would let one
+  // press of undo drag the previous clip's look onto this one.
+  //
+  // The undo stack is per clip and lives here, in memory only, keyed by the
+  // clip's content key. Leaving a clip parks its stack; coming back restores
+  // it, so an undo after switching back still undoes the change you made
+  // before you left. A reload starts every stack empty, which is honest: the
+  // grade is on the server, the history of how you got there is not.
+  // grades.js has no toast of its own and should not grow one: this is the
+  // page's single notification surface, borrowed rather than duplicated.
+  window.studioToast = function (msg) { toast(msg); };
+  var clipUndo = {};
+  window.applyClipGrade = function (config, key, prevKey) {
+    if (prevKey) {
+      clipUndo[prevKey] = { history: S.history, future: S.future,
+                            last: lastCommitted };
+    }
+    S.slots[S.active] = config ? clone(config) : clone(S.defaults);
+    var kept = key && clipUndo[key];
+    S.history = kept ? kept.history : [];
+    S.future = kept ? kept.future : [];
+    lastCommitted = kept ? kept.last : snapshot();
+    Panels.refresh(cfg(), S.defaults);
+    markStageState();
+    updateModified();
+    updateUndoButtons();
+    scheduleRender(0);
+    if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
   };
 
   function savePreset(name, comment) {
@@ -1508,8 +1610,21 @@
     // merged tab's first lazy load has populated S.browseDirs/browseFiles.
     if (S.browsePath) renderFolderClips();
     buildThumbs();
+    // The previous clip's proxy is a decoder plus tens of MB of video held
+    // for a clip nobody is looking at any more; let it go before asking for
+    // the next one. warmProxy then starts this clip's encode in the
+    // background, so the first press of Play does not have to wait for it.
+    StudioLive.stopProxy();
+    S.proxyReady = false;
+    S.proxyDesc = null;
     setTime(Math.min(S.time, Math.max(0, S.duration - 0.1)));
+    warmProxy();
     scheduleRender(0);
+    // Per clip grades (contract C3). Until this line, switching clips carried
+    // the previous clip's grade across silently. grades.js fetches this
+    // clip's saved grade and hands it back through window.applyClipGrade
+    // above, or the engine defaults when it has none.
+    if (window.StudioGrades) window.StudioGrades.clipChanged(name);
   }
 
   function drawClipInfo(entry) {
@@ -1553,22 +1668,14 @@
      server.py, which this file does not touch beyond that contract. */
 
   var BROWSE_PATH_KEY = "studio.browsepath.v1";
-  var SVGNS = "http://www.w3.org/2000/svg";
-  var XLINKNS = "http://www.w3.org/1999/xlink";
 
-  // Small local twin of panels.js's useIcon: that one is scoped inside its
-  // own closure and not exported, and duplicating six lines here is cheaper
-  // than threading a shared export through a module that otherwise has no
-  // reason to know this file exists.
+  // Small local twin of panels.js's useIcon: both just forward to
+  // StudioIcons.render (studio/static/icons.js), which resolves the name
+  // against window.HUGEICONS (studio/static/vendor/hugeicons.js). Kept as
+  // its own function, not a shared export, for the same reason as before:
+  // this file has no other reason to know panels.js exists.
   function browseIcon(name, cls) {
-    var svg = document.createElementNS(SVGNS, "svg");
-    svg.setAttribute("class", cls);
-    svg.setAttribute("aria-hidden", "true");
-    var use = document.createElementNS(SVGNS, "use");
-    use.setAttribute("href", "#" + name);
-    use.setAttributeNS(XLINKNS, "xlink:href", "#" + name); // older Safari
-    svg.appendChild(use);
-    return svg;
+    return StudioIcons.render(name, cls);
   }
 
   function emptyNote(text) {
@@ -1705,9 +1812,10 @@
   // Three quiet quick jumps (server.py's browse_roots), icon plus label
   // rather than the old permanent row of buttons. Keyed on the server's
   // `label` so an icon still gets picked even if a root this file does not
-  // know about shows up later; icon-folder is close enough a fallback for
-  // any plain-directory shortcut.
-  var QUICKJUMP_ICONS = { home: "icon-home", workspace: "icon-folder", footage: "icon-video" };
+  // know about shows up later; Folder01Icon is close enough a fallback for
+  // any plain-directory shortcut. Values are @hugeicons/core-free-icons
+  // export names (see studio/static/vendor/hugeicons.js).
+  var QUICKJUMP_ICONS = { home: "Home03Icon", workspace: "Folder01Icon", footage: "PlaySquareIcon" };
 
   function renderQuickJumps(roots) {
     var host = $("browseQuick");
@@ -1717,7 +1825,7 @@
       var b = document.createElement("button");
       b.type = "button";
       b.className = "quickjump";
-      b.appendChild(browseIcon(QUICKJUMP_ICONS[key] || "icon-folder", "rowicon"));
+      b.appendChild(browseIcon(QUICKJUMP_ICONS[key] || "Folder01Icon", "rowicon"));
       var lbl = document.createElement("span"); lbl.textContent = r.label || r.name;
       b.appendChild(lbl);
       b.title = r.path;
@@ -1741,7 +1849,7 @@
       var row = document.createElement("div");
       row.className = "lutrow";
       if (i === S.browseCursor) row.classList.add("cursor");
-      row.appendChild(browseIcon("icon-folder", "rowicon"));
+      row.appendChild(browseIcon("Folder01Icon", "rowicon"));
       var n = document.createElement("span"); n.textContent = d.name;
       var sp = document.createElement("span"); sp.className = "spacer";
       row.appendChild(n); row.appendChild(sp);
@@ -1774,7 +1882,7 @@
       var cursorIdx = S.browseDirs.length + i;
       if (cursorIdx === S.browseCursor) row.classList.add("cursor");
       if (loaded && loaded.path === f.path) row.classList.add("active");
-      row.appendChild(browseIcon("icon-video", "rowicon"));
+      row.appendChild(browseIcon("PlaySquareIcon", "rowicon"));
       var n = document.createElement("span"); n.textContent = f.name;
       var sp = document.createElement("span"); sp.className = "spacer";
       var x = document.createElement("span");
@@ -1802,6 +1910,69 @@
     }).catch(function (err) {
       $("browseError").textContent = err.message || String(err);
     });
+  }
+
+  /* ---- upload ------------------------------------------------------------
+     POST /api/upload is the raw file body, not a multipart form: server.py
+     reads the socket itself. XHR rather than fetch because only XHR exposes
+     upload.onprogress, which is what drives #uploadClipBtn's own label while
+     a file is sending -- there is no separate progress element. */
+
+  function uploadOneClip(file) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      // Percent-encoded: an HTTP header value has to stay on one line and
+      // plain ASCII, and a picked file's name is neither guaranteed.
+      xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable && e.total) {
+          $("uploadClipBtn").textContent = Math.round((e.loaded / e.total) * 100) + "%";
+        }
+      };
+      xhr.onload = function () {
+        var j = {};
+        try { j = JSON.parse(xhr.responseText || "{}"); } catch (err) { /* non JSON error page */ }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(j);
+        else reject(new Error(j.error || ("upload failed: HTTP " + xhr.status)));
+      };
+      xhr.onerror = function () { reject(new Error("upload failed: network error")); };
+      xhr.send(file);
+    });
+  }
+
+  // One file at a time, not parallel: FFMPEG_SLOTS on the server is already
+  // shared with every scrub and thumbnail in the room (the ffprobe check
+  // that runs after each upload lands takes one too), and one at a time
+  // also keeps the button's percent readout one real number instead of an
+  // average across several uploads in flight.
+  function uploadClipFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList);
+    var btn = $("uploadClipBtn");
+    btn.disabled = true;
+    function next() {
+      if (!files.length) {
+        btn.disabled = false;
+        btn.textContent = "Upload";
+        return;
+      }
+      var file = files.shift();
+      btn.textContent = "0%";
+      uploadOneClip(file).then(function (j) {
+        S.state.clips = j.clips;
+        // Selects the clip just uploaded, same as opening one from the
+        // browser does; with several files queued the last one to finish
+        // is left selected.
+        selectClip(j.name);
+        toast("uploaded " + j.name);
+        next();
+      }).catch(function (err) {
+        toast(file.name + ": " + (err.message || err), true);
+        next();
+      });
+    }
+    next();
   }
 
   // True only while the merged tab is the one on screen, so ArrowUp/Down/
@@ -1995,7 +2166,11 @@
     $("previewWidth").addEventListener("change", function (e) {
       // Same reasoning: the loop's decoded frames are at the old width.
       if (S.looping || S.loopPreparing) stopLoop();
+      // And the proxy was encoded at the old width, so it is now the wrong
+      // size to grade next to the still path (which follows this select).
+      stopAnyPlayback();
       S.width = parseInt(e.target.value, 10);
+      warmProxy();
       scheduleRender(0);
     });
 
@@ -2052,6 +2227,11 @@
     $("gpuToggle").addEventListener("click", function () {
       S.gpu = !S.gpu;
       $("gpuToggle").classList.toggle("active", S.gpu);
+      // Turning the GPU on is also what makes proxy playback possible, so
+      // this is the other moment worth starting that encode in the
+      // background; turning it off stops a mode 3 playback that has just
+      // lost the renderer it was drawing with.
+      if (S.gpu) warmProxy(); else stopAnyPlayback();
       scheduleRender(0);
     });
     $("beforeExposure").addEventListener("change", function () {
@@ -2175,7 +2355,7 @@
     $("stepFwd").addEventListener("click", function () { setTime(S.time + 1 / S.fps); });
     $("playHead").addEventListener("click", function () { setTime(0); });
     $("playBtn").addEventListener("click", function () {
-      if (S.playing || S.playPreparing) stopPlayback(); else startPlayback();
+      if (playbackActive()) stopAnyPlayback(); else startPlayback();
     });
     $("playerVideo").addEventListener("loadedmetadata", fitViewer);
     $("loopBtn").addEventListener("click", function () {
@@ -2220,6 +2400,13 @@
 
     $("browseUpBtn").addEventListener("click", function () {
       if (S.browseParent) loadBrowseDir(S.browseParent);
+    });
+
+    $("uploadClipBtn").addEventListener("click", function () { $("uploadClipFile").click(); });
+    $("uploadClipFile").addEventListener("change", function (e) {
+      var files = e.target.files;
+      if (files && files.length) uploadClipFiles(files);
+      e.target.value = "";
     });
 
     $("refShow").addEventListener("change", function (e) {
@@ -2367,11 +2554,17 @@
 
   function syncPlayButton() {
     var btn = $("playBtn");
-    btn.classList.toggle("active", S.playing || S.playPreparing);
+    btn.classList.toggle("active", playbackActive());
     // The button's own label is the "is this dead" signal the brief asks
     // for: idle says Play, a press that has not produced a frame yet says
-    // so explicitly, and only an actually playing video says Pause.
-    btn.textContent = S.playing ? "Pause" : (S.playPreparing ? "Preparing..." : "Play");
+    // so explicitly, and only an actually playing video says Pause. Mode 3
+    // adds one more waiting state with a different cause, and says which:
+    // "preparing" there is one ffmpeg pass over the whole clip, not a
+    // fragment of stream, so it can take a while on a long clip and the
+    // user is owed the difference.
+    btn.textContent = (S.playing || S.gpuPlaying) ? "Pause"
+      : (S.proxyPreparing ? "Preparing proxy..."
+        : (S.playPreparing ? "Preparing..." : "Play"));
   }
 
   function stopPlayback(toastMsg) {
@@ -2398,7 +2591,21 @@
     if (toastMsg) toast(toastMsg);
   }
 
+  /* Which of the two playback engines a press of Play gets.
+   *
+   * Mode 3 (the GPU proxy) is the default whenever the GPU path is usable,
+   * because it plays the whole clip, scrubs, and keeps every knob live while
+   * it runs. The server stream below is the fallback for exactly one case:
+   * no usable WebGL2 context, where there is no GPU to grade frames on and
+   * the server has to both grade and encode.
+   */
   function startPlayback() {
+    if (!S.clip || playbackActive()) return;
+    if (gpuPathAvailable()) { startGpuPlayback(); return; }
+    startServerPlayback();
+  }
+
+  function startServerPlayback() {
     if (!S.clip || S.playing || S.playPreparing) return;
     // Mutual exclusion with the GPU loop: both only ever show in
     // #afterLayer, and both are "the" picture on screen, so pressing Play
@@ -2486,6 +2693,240 @@
     });
   }
 
+  /* ---- proxy playback (job: live GPU viewer, mode 3) --------------------
+     Press Play with a working GPU and this is what runs. The server writes
+     one small H.264 proxy of the whole clip once (POST /api/proxy/prepare),
+     a hidden <video> decodes it, and live.js grades every frame the browser
+     presents through the same chain the still viewer uses.
+
+     What it buys over the two older paths: mode 2 (Loop) holds decoded
+     frames in memory, so it is capped at a few seconds by a 700 MB budget;
+     the server stream renders the whole chain on the CPU at about 2 fps and
+     cannot be re-graded once encoded, so any knob change has to stop it.
+     This path holds no frames at all (one video element, one texture), so a
+     whole clip plays and scrubs, and a knob change lands on the next frame.
+
+     What it costs: the proxy is 8-bit 4:2:0 where the still path is 16-bit.
+     The difference is measured, not assumed, and stated in the Limits panel.
+
+     proxyToken is the same idea as playToken above: a press of Play, a
+     scrub and a clip change are all asynchronous and any of them can
+     invalidate the others, so every callback checks the token it captured. */
+
+  var proxyToken = 0;
+  var proxySeekPromise = null;
+
+  // "Something is playing or is about to", across both engines. One
+  // predicate rather than four flags checked by hand at every call site,
+  // because the failure mode of getting that wrong is two playback engines
+  // fighting over the same layer.
+  function playbackActive() {
+    return S.playing || S.playPreparing || S.gpuPlaying || S.proxyPreparing;
+  }
+
+  function gpuPathAvailable() {
+    return !!(S.gpu && StudioLive.available());
+  }
+
+  // What a prepared proxy is prepared FOR. The width is in here because the
+  // proxy is encoded at the preview width, so changing that select makes the
+  // existing proxy the wrong size to compare against the still path.
+  function proxyDesc() {
+    return S.clip + "|" + S.width + "|" + S.autorotate;
+  }
+
+  function whenProxySettled() {
+    return proxySeekPromise
+      ? proxySeekPromise["catch"](function () { /* preview only */ })
+      : Promise.resolve();
+  }
+
+  /* Make sure the proxy for the current clip and width exists and is
+   * attached to the hidden video. Resolves immediately when it already is,
+   * which is what makes pressing Play on an already-prepared clip start in
+   * the time of a seek. */
+  function ensureProxy(onProgress) {
+    var desc = proxyDesc();
+    if (S.proxyReady && S.proxyDesc === desc && StudioLive.proxyReady()) {
+      return Promise.resolve(true);
+    }
+    S.proxyDesc = desc;
+    S.proxyReady = false;
+    return StudioLive.prepareProxy({
+      clip: S.clip, width: S.width, autorotate: S.autorotate
+    }, { onProgress: onProgress }).then(function (info) {
+      if (proxyDesc() !== desc) {
+        throw new Error("the clip changed while its proxy was preparing");
+      }
+      return StudioLive.attachProxy(info, {}).then(function () {
+        if (proxyDesc() !== desc) {
+          throw new Error("the clip changed while its proxy was loading");
+        }
+        S.proxyReady = true;
+        return true;
+      });
+    });
+  }
+
+  /* Start the encode for the newly selected clip in the background, so the
+   * first press of Play is instant instead of paying for a whole-clip ffmpeg
+   * pass. Deliberately quiet: it writes progress into #playStatus and
+   * nothing else, and it never blocks or disables the Play button, because
+   * pressing Play mid-warm simply joins the same server side job. */
+  function warmProxy() {
+    if (!gpuPathAvailable() || !S.clip) return;
+    if (S.proxyWarming || S.proxyPreparing || S.gpuPlaying) return;
+    if (S.proxyReady && S.proxyDesc === proxyDesc()) return;
+    var desc = proxyDesc();
+    S.proxyWarming = true;
+    ensureProxy(function (job) {
+      if (proxyDesc() !== desc) return;
+      var pct = job && job.progress ? Math.round(job.progress * 100) : 0;
+      $("playStatus").textContent = "preparing playback proxy " + pct + "%";
+    }).then(function () {
+      S.proxyWarming = false;
+      // The clip or the preview width changed while this encode was running,
+      // so what just landed is not what the viewer is looking at now. The
+      // change did try to warm and was turned away by the guard at the top of
+      // this function (one warm at a time), and nothing else retries, so the
+      // retry belongs here. Measured before this line existed: switching the
+      // preview width inside the boot warm left the new width with no proxy
+      // at all until Play was pressed, and Play then paid for the whole
+      // encode. It cannot loop: the second pass warms the CURRENT desc, and
+      // a warm whose desc still matches on completion stops here.
+      if (proxyDesc() !== desc) { warmProxy(); return; }
+      $("playStatus").textContent = "";
+    })["catch"](function (e) {
+      S.proxyWarming = false;
+      if (proxyDesc() !== desc) { warmProxy(); return; }
+      // Not a toast: nobody asked for this, it happened on clip select. The
+      // failure only matters when Play is pressed, and that path reports it.
+      $("playStatus").textContent = "proxy unavailable: " + (e.message || e);
+    });
+  }
+
+  /* One graded frame from the proxy at this time, as instant feedback while
+   * the timeline is being dragged. Returns without doing anything whenever
+   * the proxy is not the right thing to show: another engine owns the
+   * canvas, the view is split (the proxy only produces the graded half), or
+   * the matte view is on (a diagnostic of the qualifier, not a picture). */
+  function proxyPreview(t) {
+    if (!gpuPathAvailable() || playbackActive() || S.looping) return;
+    if (!S.proxyReady || S.proxyDesc !== proxyDesc() || !StudioLive.proxyReady()) return;
+    if (S.mask || S.sheet || effectiveMode() !== MODE_AFTER) return;
+    var token = ++proxyToken;
+    proxySeekPromise = StudioLive.seekProxy(t, cfg, {
+      sourceWidth: clipSourceWidth()
+    }).then(function (r) {
+      if (token !== proxyToken || !r) return;
+      setStageLayer("gpu");
+      setRendererBadge("GPU proxy preview (8-bit)", !!cfg().grain.enabled);
+    })["catch"](function () {
+      // The still render scheduled alongside this is the real answer, so a
+      // failed preview is not worth interrupting anyone over.
+    });
+    return proxySeekPromise;
+  }
+
+  function startGpuPlayback() {
+    if (!S.clip || playbackActive()) return;
+    if (S.looping || S.loopPreparing) stopLoop();
+    // Same layer rule as every other playback path: mode 3 presents to
+    // #gpuCanvas, which only #stage.gpu-live shows, and only after-only has
+    // that layer to itself.
+    if (S.viewMode !== MODE_AFTER) setViewMode(MODE_AFTER);
+
+    var token = ++proxyToken;
+    var startedAt = performance.now();
+    var warm = S.proxyReady && S.proxyDesc === proxyDesc();
+    S.proxyPreparing = true;
+    syncPlayButton();
+    $("playStatus").textContent = warm ? "starting..." : "preparing playback proxy...";
+
+    ensureProxy(function (job) {
+      if (token !== proxyToken) return;
+      var pct = job && job.progress ? Math.round(job.progress * 100) : 0;
+      $("playStatus").textContent = "preparing playback proxy " + pct
+        + "% (one ffmpeg pass for the whole clip, then playback is free)";
+    }).then(function () {
+      if (token !== proxyToken) return;
+      S.proxyPreparing = false;
+      S.gpuPlaying = true;
+      syncPlayButton();
+      setStageLayer("gpu");
+      setRendererBadge("GPU playback (8-bit proxy)", !!cfg().grain.enabled);
+      var lastFps = -1;
+      // Start from where the playhead is, not from wherever the video was
+      // left, so Play means "play from here" exactly as the old path did.
+      StudioLive.seekProxy(S.time, null, {})["catch"](function () {})
+        .then(function () {
+          if (token !== proxyToken || !S.gpuPlaying) return;
+          StudioLive.playProxy(cfg, {
+            sourceWidth: clipSourceWidth(),
+            onFrame: function (f) {
+              if (token !== proxyToken) return;
+              S.time = f.time;
+              $("timeLabel").textContent = f.time.toFixed(2) + "s";
+              $("scrub").value = String(Math.round(
+                S.duration ? (f.time / S.duration) * 1000 : 0));
+              highlightThumb();
+              if (f.measuredFps !== lastFps) {
+                lastFps = f.measuredFps;
+                $("playStatus").textContent = "playing " + f.measuredFps
+                  + " fps, " + f.skipped + " skipped, " + f.dropped
+                  + " dropped (first frame "
+                  + Math.round(startedAt ? performance.now() - startedAt : 0) + " ms)";
+              }
+            },
+            onEnded: function () {
+              if (token !== proxyToken) return;
+              stopGpuPlayback();
+            },
+            onError: function (e) {
+              if (token !== proxyToken) return;
+              stopGpuPlayback();
+              toast("GPU playback stopped: " + (e.message || e), true);
+            }
+          });
+        });
+    })["catch"](function (e) {
+      if (token !== proxyToken) return;
+      S.proxyPreparing = false;
+      syncPlayButton();
+      $("playStatus").textContent = "";
+      // The GPU path could not be made to work for this clip, so fall all
+      // the way back rather than leaving Play looking broken: the server
+      // stream renders the same grade, just slower and without live knobs.
+      toast((e.message || e) + " - falling back to the server stream", true);
+      startServerPlayback();
+    });
+  }
+
+  /* Stop mode 3 and hand the viewer back to the still path at the frame
+   * that was last on screen. quiet=true is for setTime, which is already
+   * moving the playhead itself and would otherwise be fought for it. */
+  function stopGpuPlayback(quiet) {
+    if (!S.gpuPlaying && !S.proxyPreparing) return;
+    proxyToken++;
+    var landAt = S.gpuPlaying ? StudioLive.proxyCurrentTime() : S.time;
+    StudioLive.pauseProxy();
+    S.gpuPlaying = false;
+    S.proxyPreparing = false;
+    // S.playing is false here, so this lands on gpu or still per the GPU
+    // toggle, exactly as stopPlayback does for the server path.
+    setStageLayer(S.gpu ? "gpu" : "still");
+    syncPlayButton();
+    $("playStatus").textContent = "";
+    if (!quiet) setTime(landAt);
+  }
+
+  // Stops whichever engine is running, so no caller has to know which one
+  // that was.
+  function stopAnyPlayback(toastMsg) {
+    if (S.playing || S.playPreparing) stopPlayback(toastMsg);
+    if (S.gpuPlaying || S.proxyPreparing) stopGpuPlayback();
+  }
+
   /* ---- live loop (job: live GPU viewer, mode 2) -------------------------
      Press Loop, and the range between #loopStart and #loopEnd decodes once
      (POST /api/range) and then plays back on the GPU forever, re-grading
@@ -2545,7 +2986,7 @@
       toast("no GPU renderer available: " + StudioLive.reason(), true);
       return;
     }
-    if (S.playing || S.playPreparing) stopPlayback();
+    stopAnyPlayback();
     var range = loopDuration();
     if (!isFinite(range.start) || !isFinite(range.end) || range.duration <= 0) {
       toast("loop range needs an end after its start", true);
@@ -2669,7 +3110,7 @@
         // Space already means "hold to peek at the ungraded frame"; while a
         // video is on screen that would mean showing beforeLayer behind a
         // still-playing video, so space stops playback instead of holding.
-        if (S.playing || S.playPreparing) { stopPlayback(); break; }
+        if (playbackActive()) { stopAnyPlayback(); break; }
         if (!S.beforeHold) {
           var wasHeld = effectiveMode();
           S.beforeHold = true;
@@ -3256,6 +3697,16 @@
   /* ---- boot ------------------------------------------------------------ */
 
   function boot() {
+    // Fills every static data-icon placeholder (browseUpBtn, the two
+    // sidebar toggles, #themeToggle's sun/moon) with a real <svg> from the
+    // vendored HugeIcons definitions. Before the state fetch, same reasoning
+    // as initGrid just below: these placeholders are already in the DOM at
+    // page load, not waiting on server data, so there is no reason to leave
+    // them empty while that fetch is in flight. Panels.build and the
+    // filesystem browser render their own icons directly through
+    // StudioIcons.render, so this call never needs to run again.
+    StudioIcons.mount(document);
+
     // Laid out before the state fetch below, not after: the grid does not
     // depend on server data, and starting it immediately is what stops the
     // five widgets from ever being visible in their raw, GridStack-less,
@@ -3294,6 +3745,18 @@
       Panels.refresh(cfg(), S.defaults);
       auditCoverage();
 
+      // The shape editor is handed the same three things the panel uses and
+      // nothing else: where the live config is, how to change it, and how to
+      // repaint the widgets. It never reaches into S, so the overlay cannot
+      // become a second source of truth for the window's numbers.
+      if (window.WindowEditor) {
+        window.WindowEditor.init({
+          getConfig: cfg,
+          onChange: onParamChange,
+          refreshPanels: function () { Panels.refresh(cfg(), S.defaults); }
+        });
+      }
+
       fillPresets(state.presets);
       fillLooks(state.looks);
       fillRefs(state.refs);
@@ -3314,10 +3777,22 @@
       // grading guide says to: look at the flat frame first, then decide. This
       // actually loads it, so the modified indicator means something from the
       // first change onward.
-      if (state.presets.some(function (p) { return p.name === "flat"; })) {
+      // ... but only for a clip that has no saved grade of its own. With per
+      // clip grades (contract C3) selectClip above has already asked the
+      // server for this clip's grade; stamping "flat" over it a moment later
+      // would make a reload silently throw the user's work away.
+      // ifNoSavedGrade waits for that answer and runs this only if there was
+      // none, and holds the autosave off while it does, because opening the
+      // studio is not the user grading anything.
+      var startFlat = function () {
+        if (!state.presets.some(function (p) { return p.name === "flat"; })) {
+          return null;
+        }
         $("presetSelect").value = "flat";
-        loadPreset("flat").catch(function () {});
-      }
+        return loadPreset("flat").catch(function () {});
+      };
+      if (window.StudioGrades) window.StudioGrades.ifNoSavedGrade(startFlat);
+      else startFlat();
       pollJobs();
       applyViewerState();
       setZoom("fit");
