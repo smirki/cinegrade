@@ -63,7 +63,11 @@
     splitPos: 50,
     mask: false,
     sheet: false,
-    zoom: "fit",
+    // The zoom used to live here as "fit" or "one". It is viewer-zoom.js's
+    // now (contract E4: Fit, 100, 200, 400, plus, minus, wheel and pinch
+    // around the pointer, drag to pan), and there is deliberately no copy of
+    // it here: two places holding the same number is how a transform and a
+    // layout come to disagree. Ask window.ViewerZoom.
     history: [],
     future: [],
     blobs: {},
@@ -448,6 +452,12 @@
   function doRender() {
     if (!S.clip) return;
     if (S.sheet) { renderSheet(); return; }
+    // Frames 2 and 4 (contract E4): the picture on screen is the slot grid,
+    // not the stage, so the slots are what a config change has to re-render.
+    // frames.js renders each slot through the same GPU path this function
+    // uses and falls back per slot to the same server route, then calls back
+    // for the statistics and the scopes once slot 1 (the playhead) is up.
+    if (framesActive()) { window.Frames.render(); return; }
     var t0 = performance.now();
     var mode = S.mask ? "mask" : "graded";
 
@@ -893,7 +903,14 @@
     // Mode 3 owns S.time while it plays for the same reason the loop does,
     // so an explicit jump stops it rather than being overwritten a frame later.
     if (S.gpuPlaying) stopGpuPlayback(true);
+    // Mode 1 (contract E3, "until Play is pressed again or the playhead is
+    // scrubbed"): now that Play loops instead of stopping on its own, a
+    // scrub is the other way this path ends.
+    if (S.playing || S.playPreparing) stopPlayback();
     S.time = Math.max(0, Math.min(t, Math.max(0, S.duration - 1 / S.fps)));
+    // Slot 1 of the multi frame viewer IS the playhead (contract E4), so it
+    // is told here rather than keeping a copy that could disagree.
+    if (window.Frames) window.Frames.playheadMoved(S.time);
     $("timeLabel").textContent = S.time.toFixed(2) + "s";
     $("scrub").value = String(Math.round(S.duration ? (S.time / S.duration) * 1000 : 0));
     highlightThumb();
@@ -916,6 +933,21 @@
     imgs.forEach(function (im, i) { im.classList.toggle("active", i === best); });
   }
 
+  /* One drag source definition for both places a timecode can be picked up:
+     a filmstrip thumbnail and a mark chip. The contact sheet's own cells
+     cannot be a third: it replaces the whole viewer while it is on (see
+     #viewport.sheet in style.css), so there is no slot on screen to drop
+     one onto. Its marks are these chips. */
+  function makeTimeDraggable(el, t) {
+    el.draggable = true;
+    el.addEventListener("dragstart", function (ev) {
+      if (!ev.dataTransfer) return;
+      ev.dataTransfer.effectAllowed = "copy";
+      ev.dataTransfer.setData("application/x-studio-time", String(t));
+      ev.dataTransfer.setData("text/plain", String(t));
+    });
+  }
+
   function buildThumbs() {
     var host = $("thumbs");
     host.innerHTML = "";
@@ -931,6 +963,12 @@
       im.addEventListener("click", function (ev) {
         setTime(parseFloat(ev.target.dataset.t));
       });
+      // "I should be able to drag and drop from the preview timeline into
+      // the preview preview" (contract E4). The time travels in a MIME type
+      // of our own so a file dragged in from the desktop can never be read
+      // as a timecode; text/plain carries the same number for anything that
+      // can only read that. frames.js is the drop half.
+      makeTimeDraggable(im, t);
       host.appendChild(im);
     }
     highlightThumb();
@@ -953,6 +991,9 @@
       });
       chip.appendChild(kill);
       chip.addEventListener("click", function () { setTime(t); });
+      // Draggable onto a frame slot for the same reason a thumbnail is
+      // (contract E4): a mark is a time somebody already decided mattered.
+      makeTimeDraggable(chip, t);
       host.appendChild(chip);
     });
     if (!S.marks.length) {
@@ -1018,6 +1059,10 @@
     // nothing reads --wipe outside .mode-wipe).
     setSplitPos(S.splitPos);
     $("viewport").classList.toggle("sheet", S.sheet);
+    // Frames 2 and 4 (contract E4). Same idiom as .sheet just above: one
+    // class on #viewport swaps which box is the picture, so no view mode,
+    // no wipe and no overlay had to learn that slots exist.
+    $("viewport").classList.toggle("frames", framesActive());
     $("viewport").classList.toggle("withref", S.refShow && !!S.refName);
     fitViewer();
   }
@@ -1077,8 +1122,21 @@
     setViewMode(S.viewMode === MODE_WIPE ? MODE_AFTER : MODE_WIPE);
   }
 
+  /* The zoom state lives in viewer-zoom.js (contract E4), which is the one
+     writer of the transform on #stage and #framesGrid. This is the only
+     question the layout has to ask it: at fit the picture elements carry a
+     pixel maximum so they fit the box, and at any other zoom they are
+     released to their natural size and the transform does the rest. */
+  function zoomIsFit() {
+    return !window.ViewerZoom || window.ViewerZoom.isFit();
+  }
+
+  function framesActive() {
+    return !!(window.Frames && window.Frames.active());
+  }
+
   function sizeLayer(img, wBox, hBox) {
-    if (S.zoom !== "fit") {
+    if (!zoomIsFit()) {
       img.style.maxWidth = "none";
       img.style.maxHeight = "none";
     } else {
@@ -1099,6 +1157,22 @@
     var refW = (S.refShow && S.refName) ? $("refPane").offsetWidth + 8 : 0;
     var availW = Math.max(80, box.width - refW - 4);
     var availH = Math.max(80, box.height - 4);
+
+    // Frames 2 and 4 (contract E4) put a grid of slots on screen INSTEAD of
+    // the stage (#viewport.frames in style.css), so the stage's own five
+    // view modes have nothing to size here. Each slot gets its share of the
+    // same box, through the same sizeLayer, so a slot's picture is fitted
+    // exactly the way the single viewer's is.
+    if (framesActive()) {
+      var cells = window.Frames.cells();
+      var cw = (availW - 4 * (cells.cols - 1)) / cells.cols;
+      var ch = (availH - 4 * (cells.rows - 1)) / cells.rows;
+      window.Frames.pictures().forEach(function (el) {
+        sizeLayer(el, Math.max(40, cw), Math.max(40, ch));
+      });
+      zoomFollowedLayout();
+      return;
+    }
 
     // Left/Right and Top/Bottom each show a COMPLETE copy of the frame, not
     // a clip, so each one only gets to claim half the viewer's box before it
@@ -1126,6 +1200,17 @@
     sizeLayer($("bypassCanvas"), wBox, hBox);
 
     matchBeforeSize(mode);
+    zoomFollowedLayout();
+  }
+
+  /* The layout just moved, so the zoom's own readout and its pan clamp are
+     one measurement out of date. This is every case at once: a new frame at
+     a different preview width, a sidebar dragged, a view mode switched, the
+     frames grid turned on. Not a zoom change: viewer-zoom.js calls fitViewer
+     itself when the zoom moves, and refresh() never changes the zoom, so the
+     two cannot recurse into each other. */
+  function zoomFollowedLayout() {
+    if (window.ViewerZoom) window.ViewerZoom.refresh();
   }
 
   function matchBeforeSize(mode) {
@@ -1150,12 +1235,14 @@
     });
   }
 
+  /* Fit and 100% used to be the whole of the zoom, and this function was it.
+     viewer-zoom.js owns the state now (contract E4: 200%, 400%, plus and
+     minus, wheel and pinch around the pointer, drag to pan), so this is one
+     line into it and stays only because the F and 0 keys, and any older
+     caller, name it. "one" is 100%, the name it has always had here. */
   function setZoom(mode) {
-    S.zoom = mode;
-    $("viewport").classList.toggle("zoom", mode !== "fit");
-    $("zoomLabel").textContent = mode === "fit"
-      ? "fit" : ("100% of the " + S.width + "px preview");
-    fitViewer();
+    if (!window.ViewerZoom) return;
+    window.ViewerZoom.set(mode === "fit" ? "fit" : 1);
   }
 
   /* ---- presets --------------------------------------------------------- */
@@ -1315,6 +1402,11 @@
     });
   }
 
+  // Renders list (contract E3, moved into the render dialog): two actions
+  // per row rather than one whole-row click, since "open" (load the file
+  // back in as the source clip, through the same /api/open the file browser
+  // already uses) and "reveal" (Finder, this machine only) are both things
+  // a finished render is for and neither should have to guess at the other.
   function fillRenders(list) {
     var host = $("renderList");
     host.innerHTML = "";
@@ -1325,11 +1417,21 @@
       var sp = document.createElement("span"); sp.className = "spacer";
       var x = document.createElement("span");
       x.className = "x"; x.textContent = (r.bytes / 1e6).toFixed(0) + " MB";
-      row.appendChild(n); row.appendChild(sp); row.appendChild(x);
-      row.title = "click to reveal in Finder";
-      row.addEventListener("click", function () {
+      var openA = document.createElement("span");
+      openA.className = "rowaction"; openA.textContent = "open";
+      openA.title = "load this render into the viewer as the source clip";
+      openA.addEventListener("click", function () {
+        closeRenderDialog();
+        openBrowseFile(r.path);
+      });
+      var revealA = document.createElement("span");
+      revealA.className = "rowaction"; revealA.textContent = "reveal";
+      revealA.title = "reveal in Finder (this machine only)";
+      revealA.addEventListener("click", function () {
         postJSON("/api/reveal", { path: r.path });
       });
+      row.appendChild(n); row.appendChild(sp); row.appendChild(x);
+      row.appendChild(openA); row.appendChild(revealA);
       host.appendChild(row);
     });
   }
@@ -1504,14 +1606,14 @@
      call. Called once per drag, on release, never per pointermove: the live
      rectangle is already on screen, and a POST per frame of a drag would be
      a commit storm for something nobody is reading mid drag. */
-  function saveMatchCrops() {
-    if (!S.refName || !S.clip) return Promise.resolve();
-    var entry = {};
-    if (S.refCrop) entry.ref = S.refCrop.map(round4);
-    if (S.frameCrop) entry.frame = S.frameCrop.map(round4);
-    if (entry.ref || entry.frame) S.matchCrops[S.refName] = entry;
-    else delete S.matchCrops[S.refName];
-    var body = { clip: S.clip, name: "match_crops", value: S.matchCrops };
+  /* One named value on the open clip's project. Shared by the picked match
+     rectangles (contract C7) and the frame slot times (contract E4), which
+     want exactly the same write and the same recovery. `what` names the
+     thing in the message a failure produces, so a toast still says which
+     feature could not save. */
+  function saveProjectExtra(name, value, what) {
+    if (!S.clip) return Promise.resolve();
+    var body = { clip: S.clip, name: name, value: value };
     return postJSON("/api/project/extra", body).then(function (r) {
       if (r.ok) return r;
       // A project row only exists once something has opened it. Opening this
@@ -1528,8 +1630,18 @@
       }
       return r;
     }).catch(function (e) {
-      toast("the rectangle is on screen but was not saved: " + e.message, true);
+      toast(what + " is on screen but was not saved: " + e.message, true);
     });
+  }
+
+  function saveMatchCrops() {
+    if (!S.refName || !S.clip) return Promise.resolve();
+    var entry = {};
+    if (S.refCrop) entry.ref = S.refCrop.map(round4);
+    if (S.frameCrop) entry.frame = S.frameCrop.map(round4);
+    if (entry.ref || entry.frame) S.matchCrops[S.refName] = entry;
+    else delete S.matchCrops[S.refName];
+    return saveProjectExtra("match_crops", S.matchCrops, "the rectangle");
   }
 
   /* The stored rectangles for whichever reference is selected now. Called on
@@ -1545,20 +1657,33 @@
     updateCropUi();
   }
 
-  function loadMatchCrops() {
+  /* One read of the clip's project extras, shared by everything that keeps
+     something there: the picked match rectangles (contract C7) and the
+     frame slot times (contract E4). One request rather than one per
+     feature, because they all want the same document. */
+  function loadProjectExtras() {
     if (!S.clip) return Promise.resolve();
-    return api("/api/project?clip=" + encodeURIComponent(S.clip))
-      .then(function (p) {
-        var bag = p && p.extras && p.extras.match_crops;
+    var clip = S.clip;
+    return api("/api/project?clip=" + encodeURIComponent(clip))
+      .then(function (p) { return (p && p.extras) || {}; })
+      .catch(function () {
+        // No project for this clip yet means nothing stored for it yet. Not
+        // an error, and not worth a toast on every boot.
+        return {};
+      })
+      .then(function (extras) {
+        if (S.clip !== clip) return;         // a faster clip switch won
+        var bag = extras.match_crops;
         S.matchCrops = (bag && typeof bag === "object" && !Array.isArray(bag))
           ? bag : {};
         applyStoredCrops();
-      })
-      .catch(function () {
-        // No project for this clip yet means no rectangles for it yet. Not
-        // an error, and not worth a toast on every boot.
-        S.matchCrops = {};
-        applyStoredCrops();
+        // secs (contract E3): a stored number restores that project's play
+        // length, anything else (never saved, or saved as null for "all")
+        // leaves the field on its own "all" placeholder.
+        var secs = extras.play_secs;
+        $("playDur").value = (typeof secs === "number" && isFinite(secs) && secs > 0)
+          ? String(secs) : "";
+        if (window.Frames) window.Frames.clipChanged(clip, extras);
       });
   }
 
@@ -2135,6 +2260,10 @@
     // Guarded on browsePath because selectClip also runs at boot, before the
     // merged tab's first lazy load has populated S.browseDirs/browseFiles.
     if (S.browsePath) renderFolderClips();
+    // The library list has its own row for this clip when it is showing the
+    // folder the clip lives in; this moves that row's highlight, the same
+    // thing renderFolderClips just did for the anywhere browser's list.
+    if (window.StudioFiles) window.StudioFiles.clipChanged(name);
     buildThumbs();
     // The previous clip's proxy is a decoder plus tens of MB of video held
     // for a clip nobody is looking at any more; let it go before asking for
@@ -2150,10 +2279,12 @@
     // clip it must not offer to copy from. It no longer fetches or applies
     // anything on a clip switch: the project's HEAD is the grade now.
     if (window.StudioGrades) window.StudioGrades.clipChanged(name, entry.key);
-    // The picked match rectangles (contract C7) belong to the clip's project,
-    // so they are re-read here for the same reason the grade is: a rectangle
-    // drawn against the previous shot means nothing on this one.
-    loadMatchCrops();
+    // The picked match rectangles (contract C7) and the frame slot times
+    // (contract E4) belong to the clip's project, so they are re-read here
+    // for the same reason the grade is: a rectangle drawn against the
+    // previous shot, or a slot pointing 8 s into a 4 s clip, means nothing
+    // on this one.
+    loadProjectExtras();
   }
 
   function drawClipInfo(entry) {
@@ -2443,6 +2574,39 @@
     });
   }
 
+  /* Opening a LIBRARY item (contract E2): a clip in a folder of this account's
+     own library, or one in somebody else's that a share reaches. files.js hands
+     over {root, path} and never a path on disk; POST /api/project/open resolves
+     it, checks the read permission and registers the file under a clip name.
+     The clip list is refreshed BEFORE the project is applied because showClip
+     reads that clip's duration and dimensions out of S.state.clips, and a file
+     in a subfolder (or in somebody else's library) has never been in it. The
+     error is rethrown rather than toasted here: files.js puts a refusal in the
+     pane where the click happened as well as in a toast. */
+  function openLibraryClip(root, path) {
+    return api("/api/project/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root: root, path: path, by: "studio" })
+    }).then(function (proj) {
+      return api("/api/clips").then(function (j) {
+        S.state.clips = j.clips || S.state.clips;
+        applyProject(proj, { config: true, select: true });
+        toast("opened " + (proj.name || path));
+        return proj;
+      });
+    });
+  }
+
+  /* The same refresh-then-select for a clip that has just been uploaded into a
+     library folder: it is on the server now but not yet in this page's list. */
+  function selectUploadedClip(name) {
+    if (!name) return Promise.resolve(null);
+    return api("/api/clips").then(function (j) {
+      S.state.clips = j.clips || S.state.clips;
+      return selectClip(name);
+    }).catch(function () { return null; });
+  }
+
   /* ---- upload ------------------------------------------------------------
      POST /api/upload is the raw file body, not a multipart form: server.py
      reads the socket itself. XHR rather than fetch because only XHR exposes
@@ -2479,6 +2643,12 @@
   // also keeps the button's percent readout one real number instead of an
   // average across several uploads in flight.
   function uploadClipFiles(fileList) {
+    // Contract E2: one Upload button now serves two views. In a library root
+    // the files pane owns the upload, because it knows which folder is on
+    // screen and it draws a progress row per file with the server's own
+    // refusal on it; in the anywhere browser this function is unchanged.
+    if (window.StudioFiles && window.StudioFiles.handleUpload
+        && window.StudioFiles.handleUpload(fileList)) return;
     var files = Array.prototype.slice.call(fileList);
     var btn = $("uploadClipBtn");
     btn.disabled = true;
@@ -2756,9 +2926,9 @@
     // of each other.
     $("resetLayoutBtn").addEventListener("click", resetGridLayout);
 
-    // viewer
-    $("fitBtn").addEventListener("click", function () { setZoom("fit"); });
-    $("oneToOneBtn").addEventListener("click", function () { setZoom("one"); });
+    // viewer. The zoom buttons (Fit, 100%, 200%, 400%, minus, plus) are
+    // bound by viewer-zoom.js, which owns that state; binding them here too
+    // would give one press two owners.
     $("viewMode").addEventListener("change", function (e) { setViewMode(e.target.value); });
     // Job: compare. Both buttons are the keyboard shortcuts' own functions,
     // so the button and the key can never drift apart.
@@ -2897,6 +3067,11 @@
     $("playBtn").addEventListener("click", function () {
       if (playbackActive()) stopAnyPlayback(); else startPlayback();
     });
+    // Persist per project (contract E3): "change" rather than "input", so
+    // this writes once when the field is left rather than once a keystroke.
+    $("playDur").addEventListener("change", function () {
+      saveProjectExtra("play_secs", playDurationValue(), "the play length");
+    });
     $("playerVideo").addEventListener("loadedmetadata", fitViewer);
     $("loopBtn").addEventListener("click", function () {
       if (S.looping || S.loopPreparing) stopLoop(); else startLoop();
@@ -2921,6 +3096,18 @@
     // and paste do), so this only trips when the user actually edits the
     // field, which is exactly when their name should stop being overwritten.
     $("renderName").addEventListener("input", function () { S.renderNameAuto = false; });
+    $("renderDialogBtn").addEventListener("click", openRenderDialog);
+    $("renderClose").addEventListener("click", closeRenderDialog);
+    $("renderStart").addEventListener("input", updateRenderEstimate);
+    $("renderDur").addEventListener("input", updateRenderEstimate);
+    // Enter renders, Esc closes (contract E3): scoped to the dialog itself
+    // so it fires before the global handler's blur-then-close Escape and
+    // never reaches for a submit key inside the raw JSON textarea or any
+    // other overlay's own fields.
+    $("renderOverlay").addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { ev.preventDefault(); startRender(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); closeRenderDialog(); }
+    });
 
     // rail tabs
     document.querySelectorAll(".railtab").forEach(function (t) {
@@ -3091,9 +3278,54 @@
 
   var playToken = 0;
 
+  // This play session's server-stream <video> listeners (contract E3, "Play
+  // loops until stopped"). The element is reused lap to lap the same way
+  // #proxyVideo is in live.js, so the next lap (or a fresh Play press)
+  // replaces this set instead of stacking a new one on top of it: without
+  // that, every "ended" from lap N would still be live when lap N+1 ends,
+  // and each lap after the first would start one more loop than the one
+  // before it.
+  var playAttached = null;
+
+  function detachPlayListeners() {
+    if (!playAttached) return;
+    var a = playAttached;
+    a.video.removeEventListener("playing", a.onPlaying);
+    a.video.removeEventListener("timeupdate", a.onTime);
+    a.video.removeEventListener("ended", a.onEnded);
+    a.video.removeEventListener("error", a.onError);
+    playAttached = null;
+  }
+
+  // null means the #playDur field's placeholder value, "all": the whole
+  // clip rather than a fixed number of seconds. Anything else that will not
+  // parse to a positive number (blank, or typed text) means the same thing,
+  // on purpose: this is a plain text field, not a validated one, and a
+  // half-typed value should fall back to "play the whole thing" rather than
+  // silently becoming 5 the way it used to.
   function playDurationValue() {
     var v = parseFloat($("playDur").value);
-    return (isFinite(v) && v > 0) ? v : 5;
+    return (isFinite(v) && v > 0) ? v : null;
+  }
+
+  /* The loop range a press of Play uses, in clip time (contract E3):
+   * "pressing Play plays from the playhead to the end of the range and
+   * starts again ... the range is the whole clip by default".
+   *
+   * secs empty: the range is the whole clip (loopStart 0, loopEnd the
+   * clip's duration), so the first lap plays from wherever the playhead
+   * is to the end and every lap after that is the full clip from its
+   * start. secs a number: the range is the bounded segment starting at
+   * the playhead, which is today's segment-length behaviour, just looped
+   * instead of played once.
+   */
+  function playLoopRange(startTime) {
+    var secs = playDurationValue();
+    if (secs == null) {
+      return { loopStart: 0, loopEnd: S.duration || null, secs: null };
+    }
+    var end = S.duration ? Math.min(startTime + secs, S.duration) : startTime + secs;
+    return { loopStart: startTime, loopEnd: end, secs: secs };
   }
 
   function syncPlayButton() {
@@ -3114,6 +3346,7 @@
   function stopPlayback(toastMsg) {
     if (!S.playing && !S.playPreparing) return;
     playToken++;                    // orphans any in-flight prepare()/video listeners
+    detachPlayListeners();
     var video = $("playerVideo");
     video.pause();
     // Actually aborts the underlying fetch (a paused native <video> does
@@ -3162,79 +3395,99 @@
     // something, which matches "press play, watch the clip move".
     if (S.viewMode !== MODE_AFTER) setViewMode(MODE_AFTER);
 
-    var duration = playDurationValue();
     var startTime = S.time;
+    var range = playLoopRange(startTime);
     var myToken = ++playToken;
-    S.playPreparing = true;
-    syncPlayButton();
-    $("playStatus").textContent = "preparing...";
-    var t0 = performance.now();
 
-    api("/api/play/prepare", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        clip: S.clip, time: startTime, duration: duration, width: S.width,
-        rotation: S.rotation, config: cfg()
-      })
-    }).then(function (j) {
-      if (myToken !== playToken) return;
-      var video = $("playerVideo");
-      S.playSegStart = j.start;
-      $("playStatus").textContent = j.cached ? "cached, starting..." : "rendering...";
+    // Never a silent cap (contract E3): there is no separate "segment
+    // budget" in this path to bound against in the first place, measured in
+    // server.py's own _play_params (grep it) -- a single /api/play/prepare
+    // request is bounded only by how much of the clip is left from `from`,
+    // the same "remaining" clamp the 5s default was always subject to. So
+    // "secs empty" asking for the rest of a long clip is one ordinary
+    // request for a longer segment, not a new code path, and the existing
+    // "preparing.../rendering..." status text is what says a bigger ffmpeg
+    // pass is under way rather than doing it quietly.
+    function segmentDuration(from) {
+      if (range.secs != null) return range.secs;
+      return Math.max(1 / (S.fps || 24), (range.loopEnd || 0) - from);
+    }
 
-      function onPlaying() {
-        if (myToken !== playToken) return;
-        S.playing = true;
-        S.playPreparing = false;
-        setStageLayer("video");
-        syncPlayButton();
-        $("playStatus").textContent = "playing (first frame "
-          + Math.round(performance.now() - t0) + " ms)";
-      }
-      function onTime() {
-        // Guarded on S.playing, not just the token: "timeupdate" keeps
-        // firing on a paused/ended element, and without this a stray event
-        // after stopPlayback() could still write to S.time.
-        if (myToken !== playToken || !S.playing) return;
-        var t = S.playSegStart + video.currentTime;
-        S.time = t;
-        $("timeLabel").textContent = t.toFixed(2) + "s";
-        $("scrub").value = String(Math.round(S.duration ? (t / S.duration) * 1000 : 0));
-        highlightThumb();
-      }
-      function onEnded() {
-        if (myToken !== playToken) return;
-        var landAt = S.playSegStart + (video.currentTime || duration);
-        stopPlayback();
-        // Back to the ordinary still-frame path at exactly where playback
-        // stopped, so the viewer, scopes and stats all agree with the
-        // timeline the instant the video disappears.
-        setTime(landAt);
-      }
-      function onError() {
-        if (myToken !== playToken) return;
-        toast("playback failed to load", true);
-        stopPlayback();
-      }
-
-      video.addEventListener("playing", onPlaying, { once: true });
-      video.addEventListener("timeupdate", onTime);
-      video.addEventListener("ended", onEnded, { once: true });
-      video.addEventListener("error", onError, { once: true });
-
-      video.src = "/api/play/stream?key=" + encodeURIComponent(j.key);
-      video.play().catch(function (e) {
-        if (myToken !== playToken) return;
-        toast(e.message, true);
-        stopPlayback();
-      });
-    }).catch(function (e) {
-      if (myToken !== playToken) return;
-      S.playPreparing = false;
+    function playSegment(from) {
+      detachPlayListeners();
+      S.playPreparing = true;
       syncPlayButton();
-      $("playStatus").textContent = "";
-      toast(e.message, true);
-    });
+      $("playStatus").textContent = "preparing...";
+      var t0 = performance.now();
+      var duration = segmentDuration(from);
+
+      api("/api/play/prepare", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clip: S.clip, time: from, duration: duration, width: S.width,
+          rotation: S.rotation, config: cfg()
+        })
+      }).then(function (j) {
+        if (myToken !== playToken) return;
+        var video = $("playerVideo");
+        S.playSegStart = j.start;
+        $("playStatus").textContent = j.cached ? "cached, starting..." : "rendering...";
+
+        function onPlaying() {
+          if (myToken !== playToken) return;
+          S.playing = true;
+          S.playPreparing = false;
+          setStageLayer("video");
+          syncPlayButton();
+          $("playStatus").textContent = "playing (first frame "
+            + Math.round(performance.now() - t0) + " ms)";
+        }
+        function onTime() {
+          // Guarded on S.playing, not just the token: "timeupdate" keeps
+          // firing on a paused/ended element, and without this a stray event
+          // after stopPlayback() could still write to S.time.
+          if (myToken !== playToken || !S.playing) return;
+          var t = S.playSegStart + video.currentTime;
+          S.time = t;
+          $("timeLabel").textContent = t.toFixed(2) + "s";
+          $("scrub").value = String(Math.round(S.duration ? (t / S.duration) * 1000 : 0));
+          highlightThumb();
+        }
+        function onEnded() {
+          if (myToken !== playToken) return;
+          // Loop (contract E3): the range's own start, not a stop. See
+          // playLoopRange for what that start is in each case.
+          playSegment(range.loopStart);
+        }
+        function onError() {
+          if (myToken !== playToken) return;
+          toast("playback failed to load", true);
+          stopPlayback();
+        }
+
+        playAttached = { video: video, onPlaying: onPlaying, onTime: onTime,
+                          onEnded: onEnded, onError: onError };
+        video.addEventListener("playing", onPlaying, { once: true });
+        video.addEventListener("timeupdate", onTime);
+        video.addEventListener("ended", onEnded, { once: true });
+        video.addEventListener("error", onError, { once: true });
+
+        video.src = "/api/play/stream?key=" + encodeURIComponent(j.key);
+        video.play().catch(function (e) {
+          if (myToken !== playToken) return;
+          toast(e.message, true);
+          stopPlayback();
+        });
+      }).catch(function (e) {
+        if (myToken !== playToken) return;
+        S.playPreparing = false;
+        syncPlayButton();
+        $("playStatus").textContent = "";
+        toast(e.message, true);
+      });
+    }
+
+    playSegment(startTime);
   }
 
   /* ---- proxy playback (job: live GPU viewer, mode 3) --------------------
@@ -3380,6 +3633,10 @@
     // that layer to itself.
     if (S.viewMode !== MODE_AFTER) setViewMode(MODE_AFTER);
 
+    // Loop range (contract E3), computed once from the playhead this press
+    // started at: playProxy wraps back to range.loopStart on its own from
+    // here on, so this call site never has to notice a lap ending.
+    var range = playLoopRange(S.time);
     var token = ++proxyToken;
     var startedAt = performance.now();
     var warm = S.proxyReady && S.proxyDesc === proxyDesc();
@@ -3407,6 +3664,7 @@
           if (token !== proxyToken || !S.gpuPlaying) return;
           StudioLive.playProxy(cfg, {
             sourceWidth: clipSourceWidth(),
+            loop: true, loopStart: range.loopStart, loopEnd: range.loopEnd,
             onFrame: function (f) {
               if (token !== proxyToken) return;
               S.time = f.time;
@@ -3422,6 +3680,9 @@
                   + Math.round(startedAt ? performance.now() - startedAt : 0) + " ms)";
               }
             },
+            // Unreachable while loop: true above (live.js wraps instead of
+            // calling this), kept for the one case it still means "stop":
+            // opts.loop itself failing to resolve true inside live.js.
             onEnded: function () {
               if (token !== proxyToken) return;
               stopGpuPlayback();
@@ -3594,12 +3855,59 @@
     });
   }
 
+  /* ---- render dialog (contract E3) --------------------------------------
+     "the render settings should be a popup ... Render should go in the
+     popup". One .overlay like JSON/Limits/Keys, so Esc already closes it
+     (the global handler's ".overlay" sweep at the bottom of onKey) and the
+     phone layout already fits it; only Enter-to-render is this dialog's
+     own, since a plain text input has no other use for that key here. */
+
+  function renderEstimateDuration() {
+    var start = parseFloat($("renderStart").value);
+    if (!isFinite(start) || start < 0) start = 0;
+    var raw = ($("renderDur").value || "").trim();
+    var secs = raw === "" ? NaN : parseFloat(raw);
+    if (isFinite(secs) && secs > 0) return secs;
+    return Math.max(0, (S.duration || 0) - start);      // empty: to the end
+  }
+
+  function updateRenderEstimate() {
+    var el = $("renderEstimate");
+    if (!el) return;
+    var duration = renderEstimateDuration();
+    var fps = S.fps || 24;
+    var frames = Math.max(0, Math.round(duration * fps));
+    el.textContent = "about " + frames + (frames === 1 ? " frame" : " frames")
+      + " (" + duration.toFixed(2) + "s at " + fps.toFixed(2) + " fps)";
+  }
+
+  function openRenderDialog() {
+    if (!S.clip) { toast("open a clip first", true); return; }
+    // Defaults (contract E3): start at the playhead, secs empty (to the
+    // end), width source, engine ffmpeg -- every time the dialog opens, so
+    // it never carries a stale bound over from a previous render.
+    $("renderStart").value = S.time.toFixed(2);
+    $("renderDur").value = "";
+    $("renderScale").value = "";
+    $("renderEngine").value = "ffmpeg";
+    updateRenderEstimate();
+    $("renderOverlay").classList.add("on");
+  }
+
+  function closeRenderDialog() {
+    $("renderOverlay").classList.remove("on");
+  }
+
   function startRender() {
     var name = ($("renderName").value || "").trim();
     if (!name) { toast("give the render a name", true); return; }
     var body = {
       clip: S.clip, config: cfg(), rotation: S.rotation, name: name,
       start: parseFloat($("renderStart").value) || 0,
+      // Empty means to the end of the clip: the server already renders with
+      // no -t bound whenever duration is null (start_render and
+      // start_gpu_render both read it the same way), so this is not a new
+      // server behaviour, just the field's new default.
       duration: parseFloat($("renderDur").value) || null,
       scale: $("renderScale").value ? parseInt($("renderScale").value, 10) : null,
       // ffmpeg unless the user picked otherwise. The server dispatches on
@@ -3611,6 +3919,7 @@
       body: JSON.stringify(body)
     }).then(function (j) {
       toast("render started: " + j.job.label);
+      closeRenderDialog();
       document.querySelector('.railtab[data-rail="jobs"]').click();
       pollJobs();
     }).catch(function (e) { toast(e.message, true); });
@@ -3681,6 +3990,13 @@
       case "@": S.slots.B = clone(cfg()); toast("stored in B"); break;
       case "f": setZoom("fit"); break;
       case "0": setZoom("one"); break;
+      // One zoom step in and out (contract E4), the same step the plus and
+      // minus buttons in the viewer bar take. Both spellings of each key,
+      // because the shifted one is what a US keyboard actually sends.
+      case "+": case "=":
+        if (window.ViewerZoom) window.ViewerZoom.step(1); break;
+      case "-": case "_":
+        if (window.ViewerZoom) window.ViewerZoom.step(-1); break;
       case "r": $("refShow").checked = !$("refShow").checked;
         S.refShow = $("refShow").checked; applyViewerState(); break;
       case "k": $("maskBtn").click(); break;
@@ -3705,6 +4021,7 @@
         break;
       }
       case "j": openJSON(); break;
+      case "R": openRenderDialog(); break;
       case "?": $("helpBtn").click(); break;
       case "Escape":
         document.querySelectorAll(".overlay").forEach(function (o) { o.classList.remove("on"); });
@@ -4368,6 +4685,62 @@
           getConfig: cfg,
           onChange: onParamChange,
           refreshPanels: function () { Panels.refresh(cfg(), S.defaults); }
+        });
+      }
+
+      // Zoom and the multi frame viewer (contract E4). Both get the same
+      // shape every other module here gets: functions of app.js's, never a
+      // reach into S, so neither can become a second source of truth for
+      // the config, the playhead or the picture on screen.
+      if (window.ViewerZoom) {
+        window.ViewerZoom.init({ onLayout: fitViewer });
+      }
+
+      // The files pane (contract E2). Same shape as every other module here:
+      // three functions of this file's, no reach into S, so the pane cannot
+      // become a second source of truth for which clip is open.
+      if (window.StudioFiles) {
+        window.StudioFiles.init({
+          openLibrary: openLibraryClip,
+          selectClipByName: selectUploadedClip,
+          getClipName: function () { return S.clip; },
+          toast: toast
+        });
+      }
+      if (window.Frames) {
+        window.Frames.init({
+          getClip: function () { return S.clip; },
+          getTime: function () { return S.time; },
+          getDuration: function () { return S.duration; },
+          setTime: function (t) { setTime(t); },
+          // The same test doRender makes before taking the GPU path, and
+          // for the same reason: the matte view is a diagnostic the GPU
+          // does not produce, so it stays on the server unconditionally.
+          useGpu: function () { return !S.mask && S.gpu && StudioLive.available(); },
+          renderStill: function (t) {
+            return StudioLive.renderStill({
+              clip: S.clip, time: t, width: S.width, rotation: S.rotation,
+              config: cfg(), sourceWidth: clipSourceWidth()
+            });
+          },
+          gpuCanvas: function () { return $("gpuCanvas"); },
+          serverFrame: function (i, t, img) {
+            var channel = "slot" + i;
+            return frameRequest(channel, basePayload({
+              time: t, mode: S.mask ? "mask" : "graded"
+            })).then(function (r) { return showBlob(channel, img, r); });
+          },
+          saveExtra: function (name, value) {
+            return saveProjectExtra(name, value, "the frame times");
+          },
+          onCountChange: function () { applyViewerState(); },
+          onLayout: fitViewer,
+          // Scopes and statistics read slot 1, which is the playhead, which
+          // is what S.time already is: these are the same two calls the
+          // single viewer's render path makes.
+          afterRender: function () {
+            if (S.scopesAuto) { refreshStats(); refreshScopes(); }
+          }
         });
       }
 

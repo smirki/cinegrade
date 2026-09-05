@@ -20,6 +20,9 @@
   // ping pong forever.
   var applying = false;
   var stopped = false;
+  // The last refusal this tab showed, so one refused edit is one message
+  // rather than one per keystroke. Cleared by the next accepted publish.
+  var lastRefusal = null;
 
   // One hook any other file can listen for instead of polling on its own
   // timer (contract C3, the History panel): fired on every revision this tab
@@ -55,7 +58,21 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }).then(function (r) { return r.json(); })
-      .then(function (s) { if (s && s.rev) { lastRev = s.rev; dispatchState(s); } })
+      .then(function (s) {
+        if (s && s.rev) { lastRev = s.rev; lastRefusal = null; dispatchState(s); return; }
+        // A session write is a COMMIT (contract E1), so somebody holding this
+        // clip through a viewer grant is refused here with one plain sentence.
+        // Before that rule existed this branch could only be reached by a
+        // server that had gone away mid edit, and staying quiet was right;
+        // now the commonest way to reach it is a refusal, and an edit that is
+        // silently not being kept is the worst possible thing to be quiet
+        // about. Repeats are dropped because publish() runs on every change
+        // and a slider drag would otherwise be forty identical toasts.
+        if (s && s.error && s.error !== lastRefusal) {
+          lastRefusal = s.error;
+          if (typeof global.studioToast === "function") { global.studioToast(s.error, true); }
+        }
+      })
       .catch(function () { /* the server going away is not worth a toast */ });
   }
 

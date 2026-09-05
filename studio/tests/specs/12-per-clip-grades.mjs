@@ -209,6 +209,11 @@ export default async function run(ctx) {
 
   // ---- 5. switching clips opens the other project and writes nothing ------
   await page.click('.railtab[data-rail="browse"]');
+  // Contract E2 gave the Files pane a root switcher, and #browseClips is the
+  // This Mac view's own clip list: it is on screen only while that root is the
+  // one showing. Naming the view this spec uses is the whole change; what it
+  // then does with the list is untouched.
+  await page.click('#filesRoots .filesroot[data-root="thismac"]');
   await page.waitForFunction(() => document.querySelectorAll("#browseClips .lutrow").length >= 2, { timeout: 15000 });
   const beforeSwitch = await counts();
   if (!(await clickClipRow(B))) {

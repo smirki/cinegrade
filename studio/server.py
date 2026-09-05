@@ -70,6 +70,7 @@ sys.path.insert(0, str(STUDIO))
 import auth as AUTH  # noqa: E402  (same reason)
 import db as DB      # noqa: E402  (same reason)
 import grades as GRADES  # noqa: E402  (same reason)
+import library as LIB  # noqa: E402  (same reason)
 import projects as PROJECTS  # noqa: E402  (same reason)
 import render_gpu as RG  # noqa: E402  (same reason)
 
@@ -221,6 +222,31 @@ def resolve_clip(name: str) -> tuple[str, str, str]:
 PROJECTS.bind_resolver(resolve_clip)
 
 
+def library_probe(path: str) -> dict | None:
+    """Duration and frame size for one file in a library listing.
+
+    Bound into library.py rather than reimplemented there: this file already
+    owns every ffprobe call the studio makes. Best effort by design, because a
+    file listing must not fail because one clip in the folder is half
+    uploaded or corrupt; those come back with null duration and size and are
+    still listed.
+
+    clip_info() is not used here on purpose. It takes a clip NAME, and giving
+    every file in every library folder a name would fill EXTERNAL_CLIPS (and
+    therefore the old Clips list) just because somebody opened a folder.
+    """
+    try:
+        info = CG.probe(str(path), rotation="auto")
+    except Exception:                                          # noqa: BLE001
+        return None
+    return {"duration": float(info.get("duration") or 0.0),
+            "width": int(info.get("width") or 0),
+            "height": int(info.get("height") or 0)}
+
+
+LIB.bind(probe=library_probe, video_ext=VIDEO_EXT)
+
+
 def register_external_clip(raw: str) -> str:
     """Take an absolute path to a video file and give it a stable display name.
 
@@ -229,20 +255,26 @@ def register_external_clip(raw: str) -> str:
     hold the same basename, so a colliding name gets a short digest of its
     parent appended rather than silently shadowing the earlier file.
     """
-    p = Path(raw).expanduser()
+    given = Path(raw).expanduser()
     try:
-        p = p.resolve(strict=True)
+        p = given.resolve(strict=True)
     except OSError as exc:
         raise StudioError(f"cannot open {raw}: {exc}") from exc
     if not p.is_file():
         raise StudioError(f"not a file: {p}")
     if p.suffix.lower() not in VIDEO_EXT:
         raise StudioError(f"not a video this tool reads: {p.name}")
-    try:
-        rel = p.relative_to(FOOTAGE.resolve())
-    except ValueError:
-        pass
-    else:
+    # Two ways of already being in the footage folder: the file itself, and a
+    # symlink to it sitting in that folder, which is how --footage lets a test
+    # run point at a temp folder without copying gigabytes. The second is
+    # tested with the folder chain resolved but the last name left alone, so
+    # the clip keeps the name the clip list shows it under.
+    here = Path(os.path.realpath(str(given.parent))) / given.name
+    for cand in (p, here):
+        try:
+            rel = cand.relative_to(FOOTAGE.resolve())
+        except ValueError:
+            continue
         # Already reachable the normal way, so do not create a second identity
         # for it: the clip list would then show the same file twice.
         return rel.name
@@ -255,10 +287,15 @@ def register_external_clip(raw: str) -> str:
 
 
 def _dir_total_bytes(d: Path) -> int:
-    """Sum of file sizes directly inside a folder, for the upload quota check.
+    """Sum of file sizes directly inside a folder. Flat, never recursive.
 
-    Not recursive: a footage folder here is flat, and this server never
-    writes a subfolder into one on its own.
+    This WAS the upload quota check, back when a footage folder had no
+    subfolders in it. The library arc gave people folders, so the quota moved
+    to library.tree_bytes(), which walks the whole tree: a flat sum would be
+    walked around by putting the next hundred gigabytes one level down. Kept
+    here because studio/static/limits.js names this function in an honesty
+    entry, and a name that no longer exists is worse than one that is no
+    longer on the hot path.
     """
     total = 0
     if d.exists():
@@ -377,6 +414,26 @@ def browse_dir(raw: str | None, user: dict | None = None) -> dict:
             "error": error}
 
 
+def set_footage(path) -> None:
+    """Point the shared footage folder somewhere other than content/footage.
+
+    There for the test harness. The harness runs with logins OFF, and with
+    logins off the library's `mine` root IS the shared footage folder, so
+    --data-dir alone does not isolate a test run: a spec that uploads a clip
+    or makes a folder writes into the founder's real footage. This gives the
+    harness a temp folder of symlinks to point at instead.
+
+    Three modules keep their own name for the folder (this one, library.py
+    and projects.py) and every one of them reads it at call time, so setting
+    all three here is the whole change; nothing captured it at import.
+    """
+    global FOOTAGE
+    FOOTAGE = Path(path).expanduser().resolve()
+    FOOTAGE.mkdir(parents=True, exist_ok=True)
+    LIB.FOOTAGE = FOOTAGE
+    PROJECTS.FOOTAGE = FOOTAGE
+
+
 def ensure_dirs() -> None:
     # DB.DATA and AUTH.USERS_DIR are studio/data and studio/data/users: the
     # accounts database and each account's own footage folder live there, and
@@ -395,6 +452,11 @@ def ensure_dirs() -> None:
     # and the old grades table are untouched, and a database made by an older
     # build gains the new tables here on its first boot.
     PROJECTS.init_schema()
+    # And the library tables (contract E1): teams, shares and the activity
+    # feed, plus (through db.init_schema, which this calls first) the default
+    # org and the users.org_id column. Additive in the same way: a database
+    # from before this arc gains the tables and the column, and loses nothing.
+    LIB.init_schema()
     # User 0 is the local no-login account. Its preset folder exists from boot
     # so a "save as" with logins off has somewhere of its own to land instead
     # of writing into the shipped, checked in library.
@@ -869,6 +931,85 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
     return np.frombuffer(data, np.uint8).reshape(height, width, 3), meta
 
 
+# --------------------------------------------------------------------------
+# region and zoom: one patch of the frame, close up
+#
+# The agent-facing half of contract E4. `region` is four fractions of the
+# frame AFTER rotation and `zoom` says how many times its fit size to render
+# it at, exactly as `cinegrade still --region --zoom` defines them: the
+# parsing, the outward pixel rounding and the cap all come from cinegrade
+# itself (CG.normalise_region, CG.normalise_zoom, CG.region_pixels) so the
+# CLI and this server cannot drift into two definitions of the same words.
+#
+# The frame is rendered WHOLE and then cropped, never cropped and then
+# rendered. Every spatial stage in the engine (windows, the radial ramp,
+# vignette, grain) is sized from the whole frame, so a crop before the grade
+# would move all four relative to the picture. Cropping the finished render
+# gives back exactly the pixels the full render has there, which is the only
+# thing that makes a measurement on a patch mean anything.
+# --------------------------------------------------------------------------
+
+def region_render_width(width: int, zoom: float, source_width: int) -> int:
+    """The width to render the WHOLE frame at so the region lands at `zoom`
+    times its fit size. _preview_dims clamps this to the source anyway; the
+    clamp is repeated here so the number in the cache key is the real one.
+    """
+    return max(160, min(int(round(width * zoom)), int(source_width)))
+
+
+def crop_to_region(rgb: np.ndarray, region) -> tuple[np.ndarray, list[int]]:
+    """The region of a rendered frame, plus the pixel box it came from."""
+    h, w = rgb.shape[:2]
+    x, y, cw, ch = CG.region_pixels(region, {"width": w, "height": h})
+    return np.ascontiguousarray(rgb[y:y + ch, x:x + cw]), [x, y, cw, ch]
+
+
+def region_cache_suffix(region, zoom: float) -> str:
+    """What a region adds to a cache key.
+
+    Empty for a plain full frame, so every key written before this feature
+    existed is still the key that request produces. Without this a region
+    request and a full frame request at the same render width would collide
+    in the JPEG cache (encode_jpeg keys on the frame key alone) and one
+    would be served as the other.
+    """
+    if region is None and zoom == 1.0:
+        return ""
+    parts = []
+    if region is not None:
+        parts.append("r" + ",".join(f"{v:.6f}" for v in region))
+    if zoom != 1.0:
+        parts.append(f"z{zoom:g}")
+    return "_" + "_".join(parts)
+
+
+def render_region(clip: str, time_s: float, width: int, cfg: dict, rotation,
+                  region=None, zoom=None) -> tuple[np.ndarray, dict]:
+    """render_raw, plus the region crop and the zoom's bigger render width.
+
+    With no region and zoom 1 this IS render_raw, same cache entry, same
+    bytes: `meta` only grows the extra keys when something was asked for.
+    """
+    region = CG.normalise_region(region)
+    zoom = CG.normalise_zoom(zoom)
+    if region is None and zoom == 1.0:
+        return render_raw(clip, time_s, width, cfg, rotation)
+    info = clip_info(clip, CG.normalise_rotation(rotation))
+    rgb, meta = render_raw(clip, time_s,
+                           region_render_width(width, zoom, info["width"]),
+                           cfg, rotation)
+    meta = dict(meta)
+    meta["full_width"], meta["full_height"] = meta["width"], meta["height"]
+    if region is not None:
+        rgb, box = crop_to_region(rgb, region)
+        meta["region"] = list(region)
+        meta["region_pixels"] = box
+        meta["width"], meta["height"] = box[2], box[3]
+    meta["zoom"] = zoom
+    meta["key"] = meta["key"] + region_cache_suffix(region, zoom)
+    return rgb, meta
+
+
 def render_raw_legacy(clip: str, time_s: float, width: int, cfg: dict,
                       rotation) -> tuple[np.ndarray, dict]:
     """The pre-split single-pass render: decode, downscale and grade in one
@@ -1220,6 +1361,47 @@ def _register_pending(params: dict) -> None:
         _play_pending.move_to_end(params["key"])
         while len(_play_pending) > PLAY_PENDING_MAX:
             _play_pending.popitem(last=False)
+
+
+# Which clip a playback segment key or a proxy key belongs to, contract E1.
+#
+# Both of those files are served by a GET that carries only the cache key,
+# because a <video src> cannot send a body. The key is a hash, so on its own
+# it says nothing about whose clip it is, and the read rule below needs a clip
+# to answer. Every client asks `prepare` before it fetches either file, so
+# `prepare` is where the answer is written down.
+_key_clip: "OrderedDict[str, str]" = OrderedDict()
+_key_clip_lock = threading.Lock()
+KEY_CLIP_MAX = 400
+
+
+def _remember_key(key: str, clip: str) -> None:
+    if not key or not clip:
+        return
+    with _key_clip_lock:
+        _key_clip[key] = clip
+        _key_clip.move_to_end(key)
+        while len(_key_clip) > KEY_CLIP_MAX:
+            _key_clip.popitem(last=False)
+
+
+def _clip_for_key(key: str) -> str | None:
+    """The clip behind a cache key, or None when this server has not been
+    asked to prepare it in this run.
+
+    None is not "allowed": the two callers refuse an unknown key outright
+    when logins are on, because the file it names may have been written by
+    another account (the frame, segment and proxy caches are one folder for
+    the whole machine) and there would be nothing left to check it against.
+    """
+    with _key_clip_lock:
+        clip = _key_clip.get(key)
+        if clip is not None:
+            _key_clip.move_to_end(key)
+            return clip
+    with _play_pending_lock:
+        params = _play_pending.get(key)
+    return params["clip"] if params else None
 
 
 def _prune_cache_bytes(kind: str, max_bytes: int, pattern: str = "*.mp4") -> None:
@@ -3075,9 +3257,17 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(413, f"upload is {length} bytes, over the "
                                  f"{UPLOAD_MAX_BYTES} byte cap")
 
-        dest_dir = AUTH.user_footage(self.user["id"]) if AUTH.enabled() else FOOTAGE
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        existing = _dir_total_bytes(dest_dir)
+        # Contract E1: ?root=&path= puts the file in a folder of the library
+        # instead of at its top, and an editor on a shared folder may upload
+        # into it. With neither parameter this is exactly the old rule (this
+        # account's own folder with logins on, content/footage without), so
+        # every existing client keeps working without knowing about any of it.
+        q = self._query()
+        dest_dir, owner_id, rel_dir = LIB.upload_target(
+            self._uid(), q.get("root"), q.get("path"))
+        # The quota is the whole library tree, not one folder: with folders in
+        # the picture, a flat sum would be evaded by making a subfolder.
+        existing = LIB.tree_bytes(LIB.root_for(owner_id))
         if existing + length > UPLOAD_QUOTA_BYTES:
             raise HttpError(413, "this upload would put the footage folder "
                                  f"over its {UPLOAD_QUOTA_BYTES} byte total; "
@@ -3126,9 +3316,17 @@ class Handler(BaseHTTPRequestHandler):
 
         # Answered the same shape as POST /api/open: a clip entry the client
         # can select immediately, plus the refreshed clip list it belongs in.
+        # `path` and `root` are added for the files pane, which needs to know
+        # where the file landed to refresh the folder it is showing.
         clip_name = register_external_clip(str(final_path))
+        rel = f"{rel_dir}/{final_name}" if rel_dir else final_name
+        LIB.record(self._uid(), "upload", owner_id, rel,
+                   {"name": final_name, "bytes": written})
         self._json({"name": clip_name,
                     "clip": self._clip_entry(clip_path(clip_name), clip_name),
+                    "path": rel,
+                    "root": ("mine" if owner_id == self._uid()
+                             else f"user:{owner_id}"),
                     "clips": self._clips()})
 
     def do_GET(self):                                          # noqa: N802
@@ -3430,6 +3628,10 @@ class Handler(BaseHTTPRequestHandler):
             if AUTH.enabled():
                 raw_open = str(AUTH.confine(
                     raw_open, AUTH.allowed_roots(self.user, FOOTAGE)))
+            # Contract E1: allowed_roots already keeps this inside the roots
+            # this account may browse; the library rule is what says whether
+            # a file inside one of them has been shared with it.
+            LIB.guard_read(self._uid(), raw_open)
             name = register_external_clip(raw_open)
             self._json({"name": name, "clip": self._clip_entry(clip_path(name), name),
                         "clips": self._clips()})
@@ -3439,11 +3641,80 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_upload()
             return
 
+        # --- the library, contract E1 -----------------------------------
+        #
+        # Folders and clips on this server, per account, shared to people and
+        # teams the way a drive is. Every one of these routes hands the work
+        # to library.py, which owns the path confinement and the permission
+        # rule; nothing here builds a path or decides who may do what.
+        if route == "library" and method == "GET":
+            self._json(LIB.listing(self._uid(), q.get("root", "mine"),
+                                   q.get("path", "")))
+            return
+
+        if route == "library/mkdir" and method == "POST":
+            b = self._body()
+            self._json(LIB.mkdir(self._uid(), b.get("root", "mine"),
+                                 b.get("path", ""), b.get("name", "")))
+            return
+
+        if route == "library/rename" and method == "POST":
+            b = self._body()
+            self._json(LIB.rename(self._uid(), b.get("root", "mine"),
+                                  b.get("path", ""), b.get("name", "")))
+            return
+
+        if route == "library/move" and method == "POST":
+            b = self._body()
+            self._json(LIB.move(self._uid(), b.get("root", "mine"),
+                                b.get("path", ""), b.get("to", "")))
+            return
+
+        if route == "library/trash" and method == "POST":
+            b = self._body()
+            self._json(LIB.trash(self._uid(), b.get("root", "mine"),
+                                 b.get("path", "")))
+            return
+
+        if route == "library/restore" and method == "POST":
+            b = self._body()
+            self._json(LIB.restore(self._uid(), b.get("path", ""),
+                                   b.get("root", "trash")))
+            return
+
+        if route == "library/share" and method == "GET":
+            self._json(LIB.item_shares(self._uid(), q.get("path", "")))
+            return
+
+        if route == "library/share" and method == "POST":
+            b = self._body()
+            self._json(LIB.share_item(self._uid(), b.get("path", ""),
+                                      b.get("kind", "folder"),
+                                      b.get("target_kind", "user"),
+                                      b.get("target_id", 0),
+                                      b.get("role", "viewer")))
+            return
+
+        if route == "library/unshare" and method == "POST":
+            b = self._body()
+            gone = LIB.unshare(self._uid(), int(b.get("share_id", 0) or 0))
+            self._json({"removed": gone})
+            return
+
+        if route == "people" and method == "GET":
+            self._json(LIB.people(self._uid()))
+            return
+
+        if route == "activity" and method == "GET":
+            self._json(LIB.activity_feed(self._uid(), int(q.get("limit", 50))))
+            return
+
         if route == "frame" and method == "POST":
             if self._stale():
                 self._json({"stale": True}, 409)
                 return
             payload = self._body()
+            self._guard_read(payload.get("clip"))
             cfg = full_config(payload.get("config"))
             mode = payload.get("mode", "graded")
             if mode == "flat":
@@ -3454,13 +3725,21 @@ class Handler(BaseHTTPRequestHandler):
                 # ever had one layer will send.
                 ml = payload.get("mask_layer")
                 cfg = mask_preview_config(cfg, None if ml is None else int(ml))
-            rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
-                                   int(payload.get("width", 960)), cfg,
-                                   effective_rotation(payload, self._uid()))
+            # region and zoom (contract E4): a close up of one patch, for the
+            # four frame viewer and for an agent inspecting skin or a
+            # highlight. Absent, this is exactly the render_raw call it was.
+            rgb, meta = render_region(payload["clip"], float(payload.get("time", 0)),
+                                      int(payload.get("width", 960)), cfg,
+                                      effective_rotation(payload, self._uid()),
+                                      payload.get("region"), payload.get("zoom"))
             headers = {
                 "X-Frame-Key": meta["key"],
                 "X-Frame-Size": f"{meta['width']}x{meta['height']}",
             }
+            if "region" in meta:
+                headers["X-Frame-Region"] = ",".join(f"{v:.6f}" for v in meta["region"])
+                headers["X-Frame-Region-Pixels"] = ",".join(str(v) for v in meta["region_pixels"])
+                headers["X-Frame-Full-Size"] = f"{meta['full_width']}x{meta['full_height']}"
             if payload.get("format") == "raw":
                 # No JPEG in the way, so a parity harness can diff against the
                 # true ffmpeg render pixel for pixel instead of through 4:4:4
@@ -3473,6 +3752,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "source" and method == "POST":
             payload = self._body()
+            self._guard_read(payload.get("clip"))
             arr, meta = source_frame(payload["clip"], float(payload.get("time", 0)),
                                      int(payload.get("width", 960)),
                                      effective_rotation(payload, self._uid()))
@@ -3486,12 +3766,14 @@ class Handler(BaseHTTPRequestHandler):
         # config: this range is ungraded pixels, graded per frame in the
         # browser by gpu.js (see static/live.js).
         if route == "range/limit" and method == "GET":
+            self._guard_read(q.get("clip"))
             self._json(range_budget(q["clip"], int(q.get("width", 960)),
                                     effective_rotation(q, self._uid())))
             return
 
         if route == "range" and method == "POST":
             payload = self._body()
+            self._guard_read(payload.get("clip"))
             arr, meta = source_range(payload["clip"], float(payload.get("time", 0)),
                                      float(payload.get("duration", 2.0)),
                                      int(payload.get("width", 960)),
@@ -3580,6 +3862,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "session" and method == "POST":
             payload = self._body()
+            # Contract E1: a session write is a commit, so somebody holding
+            # this clip as a viewer is refused here rather than discovering it
+            # after the fact when their edit is not in the history.
+            self._guard_edit(clip=payload.get("clip"))
             self._json(live_set(payload, self._uid(),
                                 author=self._author(payload.get("by"))))
             return
@@ -3614,8 +3900,18 @@ class Handler(BaseHTTPRequestHandler):
         if route == "project/open" and method == "POST":
             payload = self._body()
             clip = str(payload.get("clip", "") or "")
+            if not clip and payload.get("path") is not None:
+                # Contract E1: a clip can also be addressed as a library item,
+                # which is how a file opened from somebody else's shared
+                # folder gets in. The content key is the same whoever owns the
+                # file, so the project and its history are shared
+                # automatically: that is the founder's "when people make
+                # updates it shows up in history".
+                clip = self._library_clip(payload.get("root", "mine"),
+                                          payload.get("path", ""))
             if not clip:
                 raise StudioError("no clip given")
+            self._guard_read(clip)
             proj = PROJECTS.open(self._uid(), clip)
             live_touch(self._uid(), proj, self._author(payload.get("by")))
             self._json(self._project_body(clip, proj))
@@ -3623,7 +3919,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "project/rotation" and method == "POST":
             payload = self._body()
-            key = self._open_key(payload.get("clip"))
+            key = self._edit_key(payload.get("clip"))
             value = payload.get("rotation")
             if value is None and payload.get("autorotate") is not None:
                 # The old wire word, still accepted everywhere in this arc:
@@ -3655,7 +3951,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "project/extra" and method == "POST":
             payload = self._body()
-            key = self._open_key(payload.get("clip"))
+            key = self._edit_key(payload.get("clip"))
             proj = PROJECTS.set_extra(self._uid(), key,
                                       str(payload.get("name", "") or ""),
                                       payload.get("value"))
@@ -3670,7 +3966,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "project/checkout" and method == "POST":
             payload = self._body()
-            key = self._open_key(payload.get("clip"))
+            key = self._edit_key(payload.get("clip"))
             proj = PROJECTS.checkout(self._uid(), key,
                                      str(payload.get("commit", "") or ""))
             live_touch(self._uid(), proj, self._author(payload.get("by")))
@@ -3679,7 +3975,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "project/fork" and method == "POST":
             payload = self._body()
-            key = self._open_key(payload.get("clip"))
+            key = self._edit_key(payload.get("clip"))
             proj = PROJECTS.fork(self._uid(), key,
                                  from_commit=(payload.get("commit") or None),
                                  name=(payload.get("name") or None))
@@ -3689,7 +3985,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route in ("project/undo", "project/redo") and method == "POST":
             payload = self._body()
-            key = self._open_key(payload.get("clip"))
+            key = self._edit_key(payload.get("clip"))
             step = PROJECTS.undo if route.endswith("undo") else PROJECTS.redo
             proj = step(self._uid(), key)
             if proj.get("moved"):
@@ -3733,6 +4029,10 @@ class Handler(BaseHTTPRequestHandler):
         if route == "grade" and method == "PUT":
             payload = self._body()
             name = str(payload.get("clip", "") or "")
+            # Contract E1, same rule as a session write: saving a grade is a
+            # commit, and a viewer does not get to make one.
+            self._guard_edit(clip=(name if not GRADES.is_key(name) else None),
+                             key=(name.lower() if GRADES.is_key(name) else None))
             key = self._grade_key(name)
             # A caller that addressed the clip by key (a backup being put
             # back, an agent working from GET /api/grades) can still say what
@@ -3828,7 +4128,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "match" and method == "POST":
-            self._json(match_reference_job(self._body(), self._uid()))
+            payload = self._body()
+            self._guard_read(payload.get("clip"))
+            self._json(match_reference_job(payload, self._uid()))
             return
 
         if route == "parity/report" and method == "POST":
@@ -3847,18 +4149,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "stats" and method == "POST":
             payload = self._body()
+            self._guard_read(payload.get("clip"))
             cfg = full_config(payload.get("config"))
             if payload.get("mode") == "flat":
                 cfg = flat_config(cfg, bool(payload.get("keep_exposure")))
-            rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
-                                   int(payload.get("width", 640)), cfg,
-                                   effective_rotation(payload, self._uid()))
-            self._json({"key": meta["key"], "stats": frame_stats(rgb),
-                        "size": [meta["width"], meta["height"]]})
+            # region (contract E4): measure a patch instead of the whole
+            # frame, so "what is the skin doing" is a number and not a guess
+            # from a scope of everything.
+            rgb, meta = render_region(payload["clip"], float(payload.get("time", 0)),
+                                      int(payload.get("width", 640)), cfg,
+                                      effective_rotation(payload, self._uid()),
+                                      payload.get("region"), payload.get("zoom"))
+            out = {"key": meta["key"], "stats": frame_stats(rgb),
+                   "size": [meta["width"], meta["height"]]}
+            if "region" in meta:
+                out["region"] = meta["region"]
+                out["region_pixels"] = meta["region_pixels"]
+            self._json(out)
             return
 
         if route == "scope" and method == "POST":
             payload = self._body()
+            self._guard_read(payload.get("clip"))
             cfg = full_config(payload.get("config"))
             rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
                                    int(payload.get("width", 640)), cfg,
@@ -3869,7 +4181,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "thumb" and method == "GET":
-            body = thumbnail(q["clip"], float(q.get("t", 0)),
+            # Contract E1: a thumbnail can be asked for by clip name (what it
+            # always took) or by library item, which is how the files pane
+            # draws a row for a clip in a folder it does not otherwise have a
+            # name for. The permission check is the library's read rule.
+            clip = q.get("clip") or ""
+            if not clip and q.get("path") is not None:
+                clip = self._library_clip(q.get("root", "mine"),
+                                          q.get("path", ""))
+            if not clip:
+                raise StudioError("thumb needs a clip, or a root and a path")
+            self._guard_read(clip)
+            body = thumbnail(clip, float(q.get("t", 0)),
                              int(q.get("w", 160)),
                              effective_rotation(q, self._uid()))
             self._send(200, body, "image/jpeg")
@@ -3960,6 +4283,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "render" and method == "POST":
             body = self._body()
+            # Both engines come through here, so this one check also covers
+            # the GPU plan built by render_gpu.start_gpu_render. The worker's
+            # own routes (render/gpu/*) are not checked here and do not need
+            # to be: they carry the one-off token minted for a render that
+            # already passed this line, and they serve nothing but that job.
+            self._guard_read(body.get("clip"))
             # The GPU engine spawns a browser that has to fetch frames back
             # from this server, and only the request knows which port that is
             # (the studio takes --port, and the tests run it on a random one).
@@ -4028,7 +4357,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "play/prepare" and method == "POST":
-            params = _play_params(self._body(), self._uid())
+            body = self._body()
+            self._guard_read(body.get("clip"))
+            params = _play_params(body, self._uid())
+            _remember_key(params["key"], params["clip"])
             cache_path = _segment_path(params["key"])
             cached = cache_path.exists()
             if cached:
@@ -4046,6 +4378,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "play/stream" and method == "GET":
+            self._guard_read_key(q.get("key", ""))
             self._play_stream(q.get("key", ""))
             return
 
@@ -4054,11 +4387,17 @@ class Handler(BaseHTTPRequestHandler):
         # to watch when it is not, so the client has one call to make either
         # way. The mp4 itself is a plain GET so a <video src> can point at it.
         if route == "proxy/prepare" and method == "POST":
-            self._json(proxy_state(_proxy_params(self._body(), self._uid())))
+            body = self._body()
+            self._guard_read(body.get("clip"))
+            params = _proxy_params(body, self._uid())
+            _remember_key(params["key"], params["clip"])
+            self._json(proxy_state(params))
             return
 
         if route.startswith("proxy/") and method == "GET":
-            self._serve_proxy(route[len("proxy/"):])
+            name = route[len("proxy/"):]
+            self._guard_read_key(name[:-4] if name.endswith(".mp4") else name)
+            self._serve_proxy(name)
             return
 
         raise StudioError(f"no route for {method} {path}")
@@ -4108,6 +4447,108 @@ class Handler(BaseHTTPRequestHandler):
             raise StudioError("no project is open. Open a clip first "
                               "(POST /api/project/open)")
         return key
+
+    # --- the library permission rule, contract E1 -----------------------
+
+    def _guard_edit(self, key=None, clip=None) -> None:
+        """403 if this account only reaches the clip through a viewer grant.
+
+        A project is shared across accounts by the clip's content, so what
+        tells two people apart is not the project, it is the FILE each of them
+        reaches it through. That is why the check runs on a path.
+
+        Everything about finding the path is best effort and swallows its own
+        errors: a clip that has gone offline is not a permission answer, and
+        the routes below already behave sensibly when it has. The refusal
+        itself comes from library.guard_edit, outside the try, so it is never
+        swallowed by accident.
+        """
+        if not AUTH.enabled():
+            return
+        path = ""
+        if clip:
+            try:
+                path = str(clip_path(str(clip)))
+            except Exception:                                 # noqa: BLE001
+                path = ""
+        if not path:
+            # No clip named, or a name this server cannot resolve: fall back
+            # to the project the request will actually land on, so a bad name
+            # cannot be used to walk past the check.
+            try:
+                k = key or PROJECTS.workspace_key(self._uid())
+                if k:
+                    path = (PROJECTS.state(k) or {}).get("path") or ""
+            except Exception:                                 # noqa: BLE001
+                path = ""
+        LIB.guard_edit(self._uid(), path)
+
+    def _guard_read(self, name) -> None:
+        """403 if this account cannot READ the clip it just named.
+
+        Clips are keyed by bare file name in one table shared by every
+        caller, so without this a signed in account could name a file it has
+        never been shown and get its frames, its scopes, its stats, its
+        thumbnail, a playable segment of it or a full render of it back. This
+        is the read half of the same rule _guard_edit enforces on writes, and
+        it runs on the same thing: the path the name resolves to.
+
+        Passes for your own library, for a viewer or an editor grant, for the
+        shared `content/footage` common area, for a file opened from anywhere
+        else on this Mac, and for every caller when logins are off.
+
+        Resolution is best effort in one direction only: a name this server
+        cannot turn into a path is left to the route, which answers "no such
+        clip" the way it always did. It can never turn into an allow for a
+        name that DOES resolve, because the refusal comes from
+        library.guard_read outside the try.
+        """
+        if not AUTH.enabled():
+            return
+        path = ""
+        try:
+            path = str(clip_path(str(name or "")))
+        except Exception:                                     # noqa: BLE001
+            path = ""
+        LIB.guard_read(self._uid(), path)
+
+    def _guard_read_key(self, key: str) -> None:
+        """The same rule for a route that carries only a cache key.
+
+        play/stream and proxy/<key>.mp4 are plain GETs so a <video src> can
+        point straight at them, which means the clip is not in the request.
+        _clip_for_key answers it from the prepare call that minted the key.
+        A key this run has never prepared is refused rather than served: the
+        segment and proxy caches are one folder for the whole machine, so an
+        unknown key may name a file another account built, and there would be
+        nothing left to check it against. Every client prepares before it
+        fetches, so pressing play again is the whole recovery.
+        """
+        if not AUTH.enabled():
+            return
+        clip = _clip_for_key(key or "")
+        if clip is None:
+            raise StudioError("this server has not prepared that key in this "
+                              "run, so it cannot tell whose clip it is; ask "
+                              "for it again with prepare")
+        self._guard_read(clip)
+
+    def _edit_key(self, clip=None) -> str:
+        """_open_key for a route that CHANGES the project, so it also guards."""
+        key = self._open_key(clip)
+        self._guard_edit(key=key)
+        return key
+
+    def _library_clip(self, root, path) -> str:
+        """A library item to a clip name every other route already understands.
+
+        The read permission is checked by library.open_target; after that the
+        file is registered exactly the way POST /api/open registers a file
+        picked in the anywhere browser, so frame, stats, scope, thumb and
+        render need no idea that shares exist.
+        """
+        target, _owner, _rel, _role = LIB.open_target(self._uid(), root, path)
+        return register_external_clip(str(target))
 
     def _project_body(self, clip=None, proj: dict | None = None) -> dict:
         """What GET /api/project answers with, for a clip or the open project."""
@@ -4251,7 +4692,8 @@ def _user_cli(args) -> bool:
             print("no accounts yet. Create one with:\n"
                   "  studio/server.py --create-user NAME --role admin")
         for u in users:
-            print("%4d  %-5s  %s" % (u["id"], u["role"], u["name"]))
+            print("%4d  %-5s  %-20s org %s" % (u["id"], u["role"], u["name"],
+                                               u.get("org") or "default"))
         return True
 
     if args.delete_user:
@@ -4268,11 +4710,101 @@ def _user_cli(args) -> bool:
             if password != getpass.getpass("again: "):
                 sys.exit("the two passwords did not match, so no account was "
                          "created")
+        org = _org_or_exit(getattr(args, "org", None) or "default")
         try:
-            user = AUTH.create_user(args.create_user, password, args.role)
+            user = AUTH.create_user(args.create_user, password, args.role,
+                                    org["id"])
         except AUTH.AuthError as exc:
             sys.exit(str(exc))
-        print(f"created {user['name']} (id {user['id']}, role {user['role']})")
+        print(f"created {user['name']} (id {user['id']}, role {user['role']}, "
+              f"org {org['name']})")
+        return True
+
+    return False
+
+
+def _org_or_exit(name) -> dict:
+    """An org by name (or id), or a message saying how to make one.
+
+    Every account belongs to exactly one org, so a typo here would otherwise
+    silently create the account in the default tenant, which is the one
+    mistake in this whole area that is hard to notice and annoying to undo.
+    """
+    LIB.init_schema()
+    org = LIB.org_by_name(name or "default")
+    if org is None:
+        sys.exit(f"no org called {name}. Make one first:\n"
+                 f"  studio/server.py --create-org {name}")
+    return org
+
+
+def _org_cli(args) -> bool:
+    """Handle the org and team admin flags and stop, contract E1.
+
+    Same rules as the account flags above: they run before anything binds a
+    port, they print what they did, and none of them takes a secret on the
+    command line (there is no secret here to take).
+    """
+    if args.create_org:
+        LIB.init_schema()
+        try:
+            org = LIB.create_org(args.create_org)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        print(f"created org {org['name']} (id {org['id']})")
+        return True
+
+    if args.list_orgs:
+        LIB.init_schema()
+        for o in LIB.list_orgs():
+            print("%4d  %-24s %d account(s)" % (o["id"], o["name"], o["users"]))
+        return True
+
+    if args.create_team:
+        org = _org_or_exit(getattr(args, "org", None) or "default")
+        try:
+            team = LIB.create_team(args.create_team, org["id"])
+        except ValueError as exc:
+            sys.exit(str(exc))
+        print(f"created team {team['name']} (id {team['id']}) in org "
+              f"{org['name']}")
+        return True
+
+    if args.list_teams:
+        LIB.init_schema()
+        teams = LIB.list_teams()
+        if not teams:
+            print("no teams yet. Make one with:\n"
+                  "  studio/server.py --create-team NAME --org ORG")
+        for t in teams:
+            print("%4d  %-24s org %-16s %s" % (
+                t["id"], t["name"], t["org"],
+                ", ".join(t["members"]) or "no members yet"))
+        return True
+
+    for flag, add in ((args.add_to_team, True), (args.remove_from_team, False)):
+        if not flag:
+            continue
+        LIB.init_schema()
+        who, team_name = flag[0], flag[1]
+        user = next((u for u in AUTH.list_users()
+                     if u["name"].lower() == who.strip().lower()), None)
+        if user is None:
+            sys.exit(f"no account named {who}")
+        team = LIB.team_by_name(team_name, LIB.org_of(user["id"]))
+        if team is None:
+            sys.exit(f"no team called {team_name} in org "
+                     f"{user.get('org') or 'default'}")
+        if add:
+            try:
+                LIB.add_to_team(user["id"], team["id"])
+            except ValueError as exc:
+                sys.exit(str(exc))
+            print(f"{user['name']} is now in {team['name']}")
+        else:
+            gone = LIB.remove_from_team(user["id"], team["id"])
+            print(f"{user['name']} removed from {team['name']}" if gone
+                  else f"{user['name']} was not in {team['name']}")
         return True
 
     return False
@@ -4303,11 +4835,35 @@ def main() -> None:
                     help="list accounts and exit")
     ap.add_argument("--delete-user", metavar="NAME",
                     help="delete an account and exit")
+    # Orgs and teams, contract E1. An org is the tenant: accounts in one org
+    # never see accounts in another. A team is a group inside an org that a
+    # folder can be shared with in one go.
+    ap.add_argument("--org", metavar="ORG",
+                    help="which org --create-user or --create-team belongs "
+                         "to, by name or id (default: default)")
+    ap.add_argument("--create-org", metavar="NAME",
+                    help="create an org and exit")
+    ap.add_argument("--list-orgs", action="store_true",
+                    help="list orgs and exit")
+    ap.add_argument("--create-team", metavar="NAME",
+                    help="create a team in --org and exit")
+    ap.add_argument("--list-teams", action="store_true",
+                    help="list teams, their org and their members, and exit")
+    ap.add_argument("--add-to-team", nargs=2, metavar=("USER", "TEAM"),
+                    help="put an account in a team in its own org and exit")
+    ap.add_argument("--remove-from-team", nargs=2, metavar=("USER", "TEAM"),
+                    help="take an account out of a team and exit")
     ap.add_argument("--data-dir", metavar="DIR",
                     help="put the accounts, grades and project database "
                          "somewhere other than studio/data. For tests: this "
                          "database is real work, and a test run must never "
                          "open it. Also settable as STUDIO_DATA_DIR")
+    ap.add_argument("--footage", metavar="DIR",
+                    help="use DIR as the shared footage folder instead of "
+                         "content/footage. For tests: with logins off the "
+                         "library's own root IS that folder, so without this "
+                         "a test upload lands in real footage. Also settable "
+                         "as STUDIO_FOOTAGE")
     ap.add_argument("--upload-max-bytes", type=int, default=UPLOAD_MAX_BYTES,
                     help="reject a single POST /api/upload larger than this "
                          "many bytes (default 8 GiB)")
@@ -4326,7 +4882,14 @@ def main() -> None:
         AUTH.USERS_DIR = DB.DATA / "users"
         GRADES.USERS_DIR = DB.DATA / "users"
 
-    if _user_cli(args):
+    # Same idea for the footage folder, and for the same reason: a test run
+    # must not write into real work. Before ensure_dirs and before the first
+    # request, so nothing has read the old value yet.
+    footage_dir = args.footage or os.environ.get("STUDIO_FOOTAGE", "").strip()
+    if footage_dir:
+        set_footage(footage_dir)
+
+    if _org_cli(args) or _user_cli(args):
         return
 
     # Three ways in, one of which is not a choice: binding anywhere reachable

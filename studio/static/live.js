@@ -401,6 +401,13 @@
   var proxyBusy = false;
   var proxyRaf = null;       // set only on the rAF fallback path
   var proxyStats = null;
+  var proxyEndedFn = null;   // the "ended" listener the current playProxy call
+                              // owns, so a fresh call replaces it instead of
+                              // stacking a second one on the same <video>
+                              // (attachProxy is skipped on a warm proxy, so
+                              // repeated Play presses on the same clip reuse
+                              // one element and would otherwise pile up one
+                              // listener per press)
 
   function proxyReady() { return !!(proxyInfoObj && proxyVideo); }
 
@@ -678,6 +685,14 @@
    * which costs redundant re-grades of an unchanged frame but is never
    * wrong; the fallback reports itself in stats().
    */
+  /* opts.loop (contract E3, "Play loops until stopped"): when true, playback
+   * wraps back to opts.loopStart (clip time, default 0) instead of stopping,
+   * whether it reaches opts.loopEnd (bounded segment, the render dialog's
+   * numeric secs case) or the proxy's own natural end (unbounded, secs
+   * empty). Both paths land on the same wrap() so a short clip whose last
+   * graded frame never quite reaches loopEnd still loops correctly off the
+   * video element's own "ended" event. Without opts.loop this is the old
+   * one-shot behaviour: onEnded fires once and nothing plays again. */
   function playProxy(getCfg, opts) {
     if (!inst) throw new Error("no GPU renderer available");
     if (!proxyVideo) throw new Error("no proxy attached");
@@ -689,6 +704,25 @@
     proxyStats.mode = proxyVideo.requestVideoFrameCallback ? "rvfc" : "raf";
     proxyVideo.playbackRate = 1;
 
+    var loopStart = Math.max(0, (opts.loop && opts.loopStart) || 0);
+    var loopEnd = null;
+    if (opts.loop) {
+      var full = (proxyInfoObj && proxyInfoObj.duration) || null;
+      loopEnd = (typeof opts.loopEnd === "number" && opts.loopEnd > loopStart)
+        ? (full ? Math.min(opts.loopEnd, full) : opts.loopEnd)
+        : full;
+    }
+    var loopFrame = 1 / proxyFps();
+
+    function wrap() {
+      // Same currentTime write a seek makes, deliberately not routed through
+      // seekProxy: this runs from inside a still-playing element and a seek
+      // continues playback on its own once it lands, no separate play() call
+      // needed (the "ended" branch below is the one exception, since by the
+      // time that event exists the element has actually stopped).
+      try { proxyVideo.currentTime = clipToProxyTime(loopStart); } catch (e) { /* next frame retries */ }
+    }
+
     function step(meta) {
       if (!proxyRunning || gen !== proxyGen) return;
       if (proxyBusy) return;
@@ -698,12 +732,13 @@
         proxyBusy = false;
         if (!proxyRunning || gen !== proxyGen) return;
         noteProxyFrame(meta);
+        var clipTime = proxyToClipTime(r.time);
         if (opts.onFrame) {
           opts.onFrame({
             // The clip timecode of the frame just graded, not the video's raw
             // playhead: see proxyToClipTime. A caller that hands this straight
             // to a still render gets the same frame back.
-            time: proxyToClipTime(r.time), videoTime: r.time, ms: r.ms,
+            time: clipTime, videoTime: r.time, ms: r.ms,
             measuredFps: proxyStats.measuredFps,
             frames: proxyStats.frames,
             skipped: proxyStats.skipped,
@@ -711,6 +746,7 @@
             grain: r.grain
           });
         }
+        if (loopEnd != null && clipTime >= loopEnd - loopFrame) wrap();
       })["catch"](function (e) {
         proxyBusy = false;
         proxyRunning = false;
@@ -729,17 +765,35 @@
       step(null);
     }
 
-    // The end of the clip is not an error and not a pause: rVFC simply
-    // stops firing, so without this the caller's UI would sit there saying
-    // "playing" over a video that finished.
-    if (opts.onEnded) {
-      proxyVideo.addEventListener("ended", function onEnd() {
-        proxyVideo.removeEventListener("ended", onEnd);
-        if (gen !== proxyGen) return;
-        proxyRunning = false;
-        opts.onEnded();
-      });
+    // A fresh call replaces whatever "ended" listener the last one left
+    // attached (see proxyEndedFn's own comment): without this, pressing Play
+    // twice on a clip whose proxy is already warm stacks a second listener
+    // on the same element, since ensureProxy skips attachProxy (the thing
+    // that used to bump proxyGen and orphan the old one) on a warm proxy.
+    if (proxyEndedFn) {
+      proxyVideo.removeEventListener("ended", proxyEndedFn);
+      proxyEndedFn = null;
     }
+    // The end of the clip is not an error: without a loop it is a pause, so
+    // the caller's UI would otherwise sit there saying "playing" over a
+    // video that finished; with a loop it is not a pause at all, just the
+    // point the range wraps.
+    function onEnd() {
+      if (gen !== proxyGen) { proxyVideo.removeEventListener("ended", onEnd); return; }
+      if (opts.loop) {
+        wrap();
+        var rp = proxyVideo.play();
+        if (rp && rp["catch"]) rp["catch"](function (e) { if (opts.onError) opts.onError(e); });
+        return;
+      }
+      proxyVideo.removeEventListener("ended", onEnd);
+      proxyEndedFn = null;
+      proxyRunning = false;
+      if (opts.onEnded) opts.onEnded();
+    }
+    proxyEndedFn = onEnd;
+    proxyVideo.addEventListener("ended", onEnd);
+
     var p = proxyVideo.play();
     if (p && p["catch"]) {
       p["catch"](function (e) {
@@ -756,7 +810,17 @@
     proxyBusy = false;
     if (proxyRaf) cancelAnimationFrame(proxyRaf);
     proxyRaf = null;
-    if (proxyVideo) proxyVideo.pause();
+    if (proxyVideo) {
+      proxyVideo.pause();
+      // Stops a loop dead rather than leaving a listener that could still
+      // fire "ended" and wrap the playhead after the user pressed stop:
+      // pausing genuinely ends this play session, the next Play press starts
+      // a fresh one with its own listener.
+      if (proxyEndedFn) {
+        proxyVideo.removeEventListener("ended", proxyEndedFn);
+        proxyEndedFn = null;
+      }
+    }
   }
 
   function isProxyPlaying() { return proxyRunning; }

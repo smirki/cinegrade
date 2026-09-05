@@ -31,6 +31,24 @@ Requirements are the ones the engine already has: the repo venv at
 `content/footage/`, reference images from `content/refs/`, and renders are written to
 `grade/out/`.
 
+Two flags move the two folders that hold real work, and both exist for the same
+reason: a test run must not write into it.
+
+- **`--data-dir DIR`** (env `STUDIO_DATA_DIR`) puts the accounts, grades and
+  project database somewhere other than `studio/data`. `studio/data/studio.db`
+  is somebody's actual grading history, so a test run that opened it would be
+  editing real work.
+- **`--footage DIR`** (env `STUDIO_FOOTAGE`) uses `DIR` as the shared footage
+  folder instead of `content/footage`. This one is easy to miss and matters just
+  as much: with logins OFF the library's own root IS the shared footage folder,
+  so `--data-dir` alone does not isolate anything a spec uploads or any folder it
+  creates. `studio/tests/run.mjs` and `studio/tests/parity-gate.mjs` both make a
+  temp folder of SYMLINKS to the real clips and pass it here. Symlinks rather
+  than copies on purpose: a clip's identity is a hash of its bytes, so the links
+  have to lead to the very same files or every saved grade and every project in
+  the specs would belong to a different clip. Deleting the temp folder afterwards
+  removes the links and never the clips.
+
 ## Logins and accounts
 
 Three ways in. Normally you only ever touch the first one.
@@ -332,6 +350,12 @@ defaults, so a partial config is legal everywhere.
 | `browse` | GET | list one directory anywhere on the machine, videos only |
 | `open` | POST | register a video from outside `footage/` and return its clip entry |
 | `upload` | POST | stream a video file in, see Upload below |
+| `library` | GET | one folder of a library, or the shared / team / trash index, see Library and sharing below |
+| `library/mkdir`, `library/rename`, `library/move`, `library/trash`, `library/restore` | POST | folders and files in a library |
+| `library/share` | GET / POST | the grants on one item, and granting one |
+| `library/unshare` | POST | take one grant off |
+| `people` | GET | users and teams in the caller's org, for the share picker |
+| `activity` | GET | the org's library feed, newest first |
 | `grade` | GET / PUT / DELETE | this account's saved grade for one clip, see Per clip grades below |
 | `grades` | GET | every clip this account has a saved grade for |
 | `grade/copy` | POST | copy one clip's saved grade onto another |
@@ -1097,6 +1121,251 @@ Where it lands depends on logins: with logins off, straight into the shared
 `content/footage/`; with logins on, into that account's own
 `studio/data/users/<id>/footage/`, so two accounts uploading a clip with the same
 name never collide and never see each other's files.
+
+Since the library arc the upload also takes `?root=&path=`, which puts the file
+in a FOLDER of a library instead of at its top: `POST /api/upload?root=mine&path=Shoot`.
+An editor on somebody else's shared folder can upload into it with
+`?root=user:<id>&path=Shoot`, and the file belongs to that folder's owner, not to
+the person who uploaded it. With neither parameter the behaviour is exactly what
+it was before, so nothing that already worked had to change. One thing did
+change: the quota is now measured over the whole library tree rather than one
+flat folder, because with folders in the picture a flat sum would be walked
+around by making a subfolder.
+
+## Library and sharing
+
+The library is the file side of the studio: folders and clips per account,
+shared to people and teams the way a shared drive is. It is all in
+`studio/library.py`; the routes are thin and do no path or permission work of
+their own.
+
+### The model, in four words
+
+- **Library.** One account's own tree of files on this server. With logins off
+  there is one account (id 0) and its library is `content/footage/`, exactly
+  where the files already are. With logins on an account's library is
+  `studio/data/users/<id>/footage/`, exactly where uploads already landed.
+  Nothing moved when this arc shipped.
+- **Org.** The tenant. Every account is in exactly one (`users.org_id`, default
+  org 1 named `default`). Shares, teams, the people picker and the activity feed
+  all stop at the org boundary, so two orgs on one server never see each other.
+- **Team.** A named group inside an org. Sharing to a team shares to everyone in
+  it, including whoever joins later.
+- **Share.** A grant on one folder or one file in an owner's library, to a user
+  or a team in the same org, as `viewer` or `editor`. A grant on a folder covers
+  everything under it. Only the owner grants, and only on their own paths: there
+  is no re-sharing of something you were given, which is what keeps "who can
+  reach this file" answerable by looking at one owner's rows.
+
+Roles mean exactly this:
+
+| | viewer | editor | owner |
+| --- | --- | --- | --- |
+| open, view, scrub, read the history | yes | yes | yes |
+| commit a grade (session write, save, checkout, undo, redo, fork, rotation, extras) | **no** | yes | yes |
+| upload into the folder, rename and move inside it | no | yes | yes |
+| share it, trash it | no | no | yes |
+
+A viewer who tries to commit gets a 403 with one sentence:
+`viewer access: ask the owner for edit rights`.
+
+**With logins off every one of these checks passes.** There is one account, one
+org and one library, so there is nobody to check against, and the founder's local
+use is byte for byte what it was: one early return in `library.best_role()` and
+one in `library.guard_edit()`, not a permission system sprinkled through the code.
+
+### Why a shared clip shows up in the same history
+
+A project is keyed by the clip's CONTENT (contract C3's clip key), not by who
+owns the file. So the same clip reached through your own library and through
+somebody else's share is one project with one commit tree, and an editor's commit
+appears in the owner's History panel with the editor's name on it. That is the
+founder's "when people make updates it shows up in history", and it needed no new
+mechanism: opening a shared clip resolves it to the same key.
+
+### The Files pane
+
+The left rail's Clips tab became **Files** (`studio/static/files.js`). It is the
+same library as the routes above, drawn as a drive: a root switcher (My files,
+Shared with me, one chip per team, Trash, and This Mac, which is the old
+anywhere-on-disk browser kept as it was), a breadcrumb, a toolbar (new folder,
+upload, list or grid, sort), and rows with a thumbnail, the clip's project head,
+and hover actions (open, rename, move, share, trash). Drag a video from the
+desktop onto the pane to upload it into the folder you are looking at, with a
+progress row per file; a refused file keeps its row and says why. Drag a row onto
+a folder to move it. Share opens a dialog that lists people and teams in your org
+with a viewer or editor role; a viewer who tries to grade sees the 403 sentence as
+a toast. Trash is a root, not a delete: everything in it has Restore. The History
+tab carries the org activity feed underneath the commit graph
+(`studio/static/activity.js`). On a phone the same pane is the Clips page of
+mobile mode, with row actions always visible.
+
+### Reading is checked too, not just writing
+
+The permission rule has two halves and they are enforced in different places for
+a reason worth stating plainly. Every route that CHANGES a project (a session
+write, a grade save, checkout, fork, undo, redo, rotation, extras) goes through
+one guard that refuses a viewer. Every route that HANDS BACK PIXELS or facts
+about a file goes through a second guard that refuses an account with no grant at
+all: `frame`, `stats`, `scope`, `source`, `range`, `range/limit`, `match`,
+`thumb`, `render`, `play/prepare`, `proxy/prepare`, `POST /api/open` and
+`POST /api/project/open`.
+
+The reason the second guard exists: clips are addressed by bare FILE NAME, and
+the name table is one table for the whole server. So the moment one account opens
+`holiday.mov`, that name resolves for every other account on the same server, and
+without a check the only thing between somebody else's footage and a stranger is
+guessing its file name. The check runs on the path the name resolves to, so it
+answers the same question the write guard answers: your own library, a viewer or
+editor grant, the shared `content/footage` common area, and anything opened from
+elsewhere on the machine all pass; anything else is a 403 saying the item is in
+another account's library and has not been shared with you.
+
+`play/stream` and `proxy/<key>.mp4` are plain GETs carrying only a cache key,
+because a `<video src>` cannot send a body. Those two answer the key against the
+`prepare` call that minted it, and with logins on a key this server has not
+prepared in this run is refused rather than served: the segment and proxy caches
+are one folder for the whole machine, so an unknown key may name a file another
+account built and there would be nothing left to check it against. Every client
+prepares before it fetches, so pressing play again is the whole recovery.
+
+The GPU render worker's own routes (`render/gpu/*`) are not checked here and do
+not need to be. They carry the one-off token minted for a render that already
+passed the check at `POST /api/render`, and they serve nothing but that job.
+
+With logins off all of this is skipped, so nothing about running the studio on
+your own Mac changes.
+
+### Routes
+
+Paths are POSIX and relative to the library root: no leading slash, no `..`. An
+absolute looking path is read as relative to the library, never as a path on the
+machine. Every one of them goes through one confinement helper that resolves
+symlinks first and compares with `commonpath`, never with a string prefix. One
+deliberate exception, and only with logins OFF: the LAST element of a path may be
+a symlink to a file elsewhere on the machine. There is one library and one person
+when logins are off, so "outside your library" means nothing for a link that
+person put there themselves, and it is what lets a test run point `--footage` at
+a folder of links instead of copies. The folder chain above the last element is
+still resolved and still has to be inside the root, so a symlinked FOLDER is
+never walked through, and with logins on the exception does not apply at all.
+
+```
+GET  /api/library?root=&path=      one folder, or one index view
+GET  /api/library/share?path=      the grants on one item in my library
+POST /api/library/share            {path, kind, target_kind, target_id, role}
+POST /api/library/unshare          {share_id}
+POST /api/library/mkdir            {root, path, name}
+POST /api/library/rename           {root, path, name}
+POST /api/library/move             {root, path, to}
+POST /api/library/trash            {root, path}
+POST /api/library/restore          {path}          (path is the trash entry)
+POST /api/upload?root=&path=       the file body, as before
+GET  /api/people                   users and teams in my org, for the picker
+GET  /api/activity?limit=          the org feed I am allowed to see
+```
+
+`root` is one of:
+
+- `mine`: my own library.
+- `shared`: every grant I hold, direct or through a team, as top level rows.
+  It is an index, not a folder: each row carries `root: "user:<owner id>"`, which
+  is what you navigate into.
+- `team:<id>`: the same index, filtered to grants given to that one team.
+- `user:<id>`: somebody else's library, browsable exactly as far as a grant
+  reaches and no further. Walking above the grant is a 403.
+- `trash`: my own trash.
+
+A listing answers with `{root, path, parent, owner_id, owner, role, can_edit,
+crumbs[], folders[], files[], error}`. A file row carries `name, path, key,
+bytes, mtime, duration, width, height, project, shared_by_me, shared_with_me`,
+where `project` is `{key, head, head_full, branch, updated}` or null for a clip
+nobody has graded. A folder row carries `name, path, count, mtime` and the same
+two share flags. `parent` is null at the top of whatever the caller may see.
+
+`GET /api/thumb` and `POST /api/project/open` take `{root, path}` as an
+alternative to a clip name, which is how a clip in a shared folder is opened and
+drawn without the client ever seeing a path on disk.
+
+Trash never deletes. An item moves to `<library>/.trash/<ts>_<name>`, where the
+name holds where it came from (`/` and `%` are escaped, so a file from the top of
+a library is literally `<ts>_<name>`), and restore puts it back there. Two
+consequences worth knowing: the grants on a trashed item are REMOVED rather than
+followed into the trash, because throwing something away should stop other people
+reading it; and a restore does not bring those grants back.
+
+A rename or a move made THROUGH the app carries every grant on the item with it
+(prefix rewrite, so a folder carries the grants on everything inside it). A
+rename made behind the app's back, in Finder or a shell, cannot be followed: that
+share is reported in the `shared` listing with `missing: true` rather than
+quietly disappearing, so it can be seen and fixed.
+
+### Activity
+
+`GET /api/activity` is the org's feed of library events, newest first: `upload`,
+`mkdir`, `rename`, `move`, `trash`, `restore`, `share`, `unshare`, each with the
+actor, the owner, the path and a small `detail` object. You see events on your own
+library plus anything covered by a grant you hold. Grade edits are deliberately
+NOT in here: they are already commits in the project history with an author on
+each one, and writing them twice would make the feed a worse copy of the History
+panel.
+
+### Admin flags
+
+Orgs and teams are created from a terminal on the machine running the studio, the
+same way accounts are, and never over HTTP:
+
+```bash
+S="content/.venv/bin/python content/studio/server.py"
+
+$S --create-org acme
+$S --list-orgs
+
+# an account belongs to exactly one org; --org names it (default: default)
+echo "the-password" | $S --create-user quinn --role user --org acme --password-stdin
+$S --list-users                       # now prints each account's org
+
+$S --create-team editors --org default
+$S --add-to-team quinn editors        # by account name and team name
+$S --remove-from-team quinn editors
+$S --list-teams                       # teams, their org, and their members
+```
+
+There is no way to create an org, a team or an account over the network, and no
+password ever goes on the command line.
+
+### What this does not cover, stated plainly
+
+- **A clip's NAME is a shared namespace.** Opening any clip (through the
+  anywhere browser, through an upload, or now through a share) registers it in
+  one in-memory table keyed by its bare file name, and the render routes
+  (`frame`, `stats`, `scope`, `thumb`, `play`, `render`) identify a clip by that
+  name with no library check of their own. So with logins on, a signed in
+  account that GUESSES the file name of a clip somebody else has opened on this
+  server can fetch frames of it. That table predates this arc and is what makes
+  a clip openable from anywhere on the Mac at all; sharing widened what can land
+  in it. Closing it properly means either a per account clip namespace or a read
+  check on every render route, which is a design decision for the arc rather
+  than something to slip in quietly. Until then: this is a local tool, and the
+  network deployment story is still "put it behind a proxy and trust the people
+  you gave accounts to".
+- **The shared `content/footage/` is common ground.** With logins on it belongs
+  to nobody, so every account can list it, open it and grade what is in it. That
+  is exactly what it did before this arc; the library rules apply to per account
+  folders, not to that shared one.
+- **A share is not a copy.** Trashing or deleting the owner's file takes it away
+  from everyone it was shared with, and there is no "make a copy in my library"
+  action yet.
+
+### Schema
+
+Additive, created with `IF NOT EXISTS` on every boot, safe on a database made
+before this arc existed. `orgs` and the `users.org_id` column live in `db.py`
+(that file owns the `users` table); `teams`, `team_members`, `shares` and
+`activity` live in `library.py`. The migration inserts org 1 `default` and adds
+`org_id INTEGER NOT NULL DEFAULT 1` to `users` only when the column is not
+already there. Nothing is rewritten, dropped or reordered, so running it against
+a real database cannot lose anything.
 
 ## Render engines
 

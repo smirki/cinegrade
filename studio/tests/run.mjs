@@ -49,7 +49,20 @@ const SPEC_FILES = [
   "20-presets.mjs",
   "21-match-pick.mjs",
   "22-mobile.mjs",
+  "23-files.mjs",
+  "24-playback-render.mjs",
+  "25-viewer-zoom-frames.mjs",
 ];
+
+/* Chasing one failing spec through a whole run costs minutes of GPU work, so
+ * SPECS=12,23 narrows the run to those numbered specs. Unset (every normal run
+ * and anything anyone calls a result) means the full list above, in order.
+ * A narrowed run is a debugging aid only: several specs read state an earlier
+ * one set up, so a subset can pass or fail differently from the real run. */
+const ONLY = (process.env.SPECS || "").split(",").map((s) => s.trim()).filter(Boolean);
+const SPECS_TO_RUN = ONLY.length
+  ? SPEC_FILES.filter((f) => ONLY.some((n) => f.indexOf(n.length < 2 ? "0" + n : n) === 0))
+  : SPEC_FILES;
 
 /* Each spec starts from the same known right sidebar tab, the same way it
  * starts from the same known viewport.
@@ -175,12 +188,32 @@ async function main() {
   // grade autosave and project commit lands there instead of the real
   // studio/data. grade/presets/ (the shipped library) and footage/ are not
   // affected by --data-dir and stay the real, shared, read-mostly ones, which
-  // is what a spec needs to read real library presets and real clips.
+  // is what a spec needs to read real library presets.
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-test-"));
   console.log("[run] isolated data dir " + dataDir);
 
+  // footage/ was shared too, and that was a hole: the harness runs with
+  // logins off, and with logins off the library's own root IS
+  // content/footage, so a spec that uploads a clip or makes a folder wrote
+  // into the founder's real footage. --footage (server.py, also
+  // STUDIO_FOOTAGE) points the run at a temp folder instead. It holds
+  // SYMLINKS to the real clips, never copies: the specs match on content
+  // keys, which are a hash of the file's own bytes, so the links have to
+  // lead to the very same files. Removing the folder afterwards removes the
+  // links and never what they point at.
+  const footageDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-footage-"));
+  const realFootage = path.join(CONTENT_DIR, "footage");
+  for (const name of fs.readdirSync(realFootage)) {
+    const src = path.join(realFootage, name);
+    if (name.charAt(0) === "." || !fs.statSync(src).isFile()) continue;
+    fs.symlinkSync(src, path.join(footageDir, name));
+  }
+  console.log("[run] isolated footage dir " + footageDir
+    + " (" + fs.readdirSync(footageDir).length + " links to real clips)");
+
   const serverLog = { stdout: [], stderr: [] };
-  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port), "--data-dir", dataDir], {
+  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
+    "--data-dir", dataDir, "--footage", footageDir], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -243,7 +276,7 @@ async function main() {
       state: {},
     };
 
-    for (const file of SPEC_FILES) {
+    for (const file of SPECS_TO_RUN) {
       const mod = await import("./specs/" + file);
       const name = file.replace(/^\d+-/, "").replace(/\.mjs$/, "");
       await page.setViewport(DEFAULT_VIEWPORT); // each spec starts from the same known viewport
@@ -253,6 +286,11 @@ async function main() {
         result = await mod.default(ctx);
         if (!result || !result.status) result = { status: "FAIL", evidence: "spec returned no result" };
       } catch (err) {
+        // The table only has room for the message, and "Node is either not
+        // clickable or not an Element" is the same message wherever it came
+        // from, so the whole stack goes to the log as well: without it,
+        // finding which of a spec's forty clicks threw means bisecting a run.
+        console.error("[run] " + name + " threw:\n" + (err && err.stack ? err.stack : String(err)));
         result = { status: "FAIL", evidence: "threw: " + (err && err.stack ? err.stack.split("\n")[0] : String(err)) };
       }
       rows.push({ name, status: result.status, evidence: result.evidence || "" });
@@ -275,6 +313,7 @@ async function main() {
       try { server.kill("SIGKILL"); } catch (e) { /* already gone */ }
     }
     try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+    try { fs.rmSync(footageDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
   }
 
   if (hardFailure) {

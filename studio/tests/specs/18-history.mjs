@@ -382,6 +382,83 @@ export default async function run(ctx) {
   }
   notes.push("hovering the top row lit " + hoverInfo.lit + " ancestry element(s) and dimmed " + hoverInfo.dim + ", both cleared on mouseleave");
 
+  // --- 6d. at 1280x800, default sidebar width, nothing sits past the panel --
+  // The founder's own report ("the buttons and the right half of the right
+  // sidebar is cut off, on the desktop view"): a row's own outer box can
+  // read as correctly clamped to the panel's width while a flex:none CHILD
+  // inside it (the branch pill, the hover only action buttons) still
+  // renders past that box's own right edge, silently clipped by
+  // .historybody's overflow-x:hidden rather than visible or reachable. So
+  // this checks every row's OWN right edge (the row-level regression) and
+  // every one of its children's right edges (the actual bug), plus the
+  // header's own buttons, all against the panel's live client box, not
+  // against an assumed width.
+  await page.setViewport({ width: 1280, height: 800 });
+  await sleep(200);
+  const containment = await page.evaluate(() => {
+    var panel = document.querySelector('.parampane[data-paramtab="history"]');
+    if (!panel) return { error: "no .parampane[data-paramtab=history]" };
+    var panelRight = panel.getBoundingClientRect().right;
+    var offenders = [];
+    ["#histBranch", "#histUndoBtn", "#histRedoBtn"].forEach(function (sel) {
+      var el = document.querySelector(sel);
+      if (el) {
+        var r = el.getBoundingClientRect();
+        if (r.right > panelRight + 0.5) {
+          offenders.push({ sel: sel, right: r.right, overflowPx: r.right - panelRight });
+        }
+      }
+    });
+    var rows = document.querySelectorAll("#historyRows .historyrow");
+    rows.forEach(function (row, idx) {
+      var rr = row.getBoundingClientRect();
+      if (rr.right > panelRight + 0.5) {
+        offenders.push({ row: idx, el: "historyrow", right: rr.right, overflowPx: rr.right - panelRight });
+      }
+      Array.prototype.forEach.call(row.children, function (child) {
+        var cr = child.getBoundingClientRect();
+        if (cr.right > panelRight + 0.5) {
+          offenders.push({ row: idx, el: child.className, right: cr.right, overflowPx: cr.right - panelRight });
+        }
+      });
+    });
+    // The action buttons are hover only: hovering the first row is part of
+    // what "reachable" means, not just present in the DOM at rest.
+    return { panelRight: panelRight, rowCount: rows.length, offenders: offenders };
+  });
+  if (containment.error) return fail(containment.error);
+  if (!containment.rowCount) return fail("no .historyrow elements to check containment against at 1280x800");
+  if (containment.offenders.length) {
+    return fail("at 1280x800 with the default sidebar width, " + containment.offenders.length + " element(s) sit past the panel's right edge (" + containment.panelRight.toFixed(1) + "px): " + JSON.stringify(containment.offenders));
+  }
+  // Now hover the top row: its action buttons only exist in layout on
+  // hover/focus, so "reachable" has to be checked there, not at rest.
+  const rowHandlesForHover = await page.$$("#historyRows .historyrow");
+  await rowHandlesForHover[0].hover();
+  await sleep(150);
+  const hoverContainment = await page.evaluate(() => {
+    var panel = document.querySelector('.parampane[data-paramtab="history"]');
+    var panelRight = panel.getBoundingClientRect().right;
+    var actions = document.querySelector("#historyRows .historyrow .historyrow-actions");
+    if (!actions) return { error: "no .historyrow-actions found on the hovered row" };
+    var r = actions.getBoundingClientRect();
+    var buttons = Array.prototype.slice.call(actions.querySelectorAll("button"));
+    var reachable = buttons.length > 0 && buttons.every(function (b) {
+      var br = b.getBoundingClientRect();
+      return br.right <= panelRight + 0.5 && br.width > 0;
+    });
+    return { panelRight: panelRight, actionsRight: r.right, buttonCount: buttons.length, reachable: reachable };
+  });
+  if (hoverContainment.error) return fail(hoverContainment.error);
+  if (!hoverContainment.reachable) {
+    return fail("at 1280x800 with the default sidebar width, the hovered row's action buttons (" + hoverContainment.buttonCount + ") are not fully inside the panel's right edge (" + hoverContainment.panelRight.toFixed(1) + "px, actions right " + hoverContainment.actionsRight.toFixed(1) + "px)");
+  }
+  await page.mouse.move(0, 0);
+  await sleep(150);
+  notes.push("at 1280x800 with the default sidebar width, all " + containment.rowCount + " row(s), their children and the header buttons sit inside the panel's right edge (" + containment.panelRight.toFixed(1) + "px), including the " + hoverContainment.buttonCount + " hover only action button(s)");
+  await page.setViewport(ctx.defaultViewport || { width: 1440, height: 900 });
+  await sleep(150);
+
   const forkHeadId = await head();
 
   // --- 7. explicit Fork from here, answering the prompt() -------------------

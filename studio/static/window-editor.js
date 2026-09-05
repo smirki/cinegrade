@@ -130,6 +130,28 @@
     return null;
   }
 
+  /* The viewer's zoom (contract E4, viewer-zoom.js) is one CSS transform on
+     #stage, and this SVG is INSIDE #stage, so the transform is already
+     applied to everything drawn here. That is what makes the overlay follow
+     a zoom and a pan for free, and it is also why every measurement below
+     has to be divided by it: getBoundingClientRect answers in screen pixels
+     (scaled), while the SVG's own user units are the unscaled ones. Read
+     from viewer-zoom.js rather than parsed back out of the transform, so
+     there is one definition of the number; 1 when that file is not loaded,
+     which is exactly the pre-zoom behaviour.
+
+     ViewerZoom.stageScale(), NOT ViewerZoom.scale(): the second one is how
+     big the picture is on screen as a multiple of its own pixels, which at
+     fit is the fit ratio (about 0.49 for this footage in a 1440x1500
+     window) and has nothing to do with the transform. Dividing by that at
+     fit drew every grip at twice its distance from the corner, which is the
+     bug specs 13 and 16 caught. */
+  function stageScale() {
+    var s = (global.ViewerZoom && global.ViewerZoom.stageScale)
+      ? Number(global.ViewerZoom.stageScale()) : 1;
+    return (isFinite(s) && s > 0) ? s : 1;
+  }
+
   /* Everything the drawing and the drag maths need, resolved to px against
      the picture's own rect, plus the stage offset the SVG is positioned in.
      The half axis clamp mirrors grade/cinegrade.py _window_geometry, where a
@@ -139,25 +161,30 @@
     var pic = pictureRect();
     if (!stage || !pic) return null;
     var sr = stage.getBoundingClientRect();
+    var z = stageScale();
     var w = win();
+    var pw = pic.width / z, ph = pic.height / z;
     return {
       cfg: w,
       pic: pic,
-      ox: pic.left - sr.left, oy: pic.top - sr.top,
-      pw: pic.width, ph: pic.height,
-      cxp: w.cx * pic.width, cyp: w.cy * pic.height,
-      ax: Math.max(w.w * pic.width / 2, 1),
-      ay: Math.max(w.h * pic.height / 2, 1),
+      z: z,
+      ox: (pic.left - sr.left) / z, oy: (pic.top - sr.top) / z,
+      pw: pw, ph: ph,
+      cxp: w.cx * pw, cyp: w.cy * ph,
+      ax: Math.max(w.w * pw / 2, 1),
+      ay: Math.max(w.h * ph / 2, 1),
       rot: w.rotation, soft: w.softness, shape: w.shape
     };
   }
 
   /* Client point to the shape's own rotated frame, the same two lines the
      matte uses (ux = dx cos r + dy sin r, uy = dy cos r - dx sin r), so the
-     feather drag reads the same distance d the engine will. */
+     feather drag reads the same distance d the engine will. The division by
+     g.z is the zoom, see geometry() above: the pointer arrives in screen
+     pixels and everything it is compared against is in unscaled ones. */
   function localPoint(g, clientX, clientY) {
-    var dx = (clientX - g.pic.left) - g.cxp;
-    var dy = (clientY - g.pic.top) - g.cyp;
+    var dx = (clientX - g.pic.left) / g.z - g.cxp;
+    var dy = (clientY - g.pic.top) / g.z - g.cyp;
     var r = g.rot * Math.PI / 180;
     var c = Math.cos(r), s = Math.sin(r);
     return { dx: dx, dy: dy, ux: dx * c + dy * s, uy: dy * c - dx * s };
@@ -404,8 +431,8 @@
   /* The pointer as [x, y] fractions of the picture, clamped so a drag that
      leaves the picture (or the window) still ends exactly at its edge. */
   function pickPoint(g, ev) {
-    return [clamp((ev.clientX - g.pic.left) / g.pw, 0, 1),
-            clamp((ev.clientY - g.pic.top) / g.ph, 0, 1)];
+    return [clamp((ev.clientX - g.pic.left) / (g.z * g.pw), 0, 1),
+            clamp((ev.clientY - g.pic.top) / (g.z * g.ph), 0, 1)];
   }
 
   function normBox(b) {
@@ -498,8 +525,8 @@
     var g = drag.g;
     var role = drag.role;
     if (role === "centre") {
-      var cx = ((ev.clientX - g.pic.left) - drag.grabDx) / g.pw;
-      var cy = ((ev.clientY - g.pic.top) - drag.grabDy) / g.ph;
+      var cx = ((ev.clientX - g.pic.left) / g.z - drag.grabDx) / g.pw;
+      var cy = ((ev.clientY - g.pic.top) / g.z - drag.grabDy) / g.ph;
       return [["cx", clamp(cx, 0, 1)], ["cy", clamp(cy, 0, 1)]];
     }
     var p = localPoint(g, ev.clientX, ev.clientY);
@@ -548,7 +575,7 @@
        nudge is there to line the shape up with something the eye can see at
        the size it is being seen at, and a fraction of the rendered rect is
        what that means. */
-    var step = ev.shiftKey ? 10 : 1;
+    var step = (ev.shiftKey ? 10 : 1) / g.z;   /* screen px, so the zoom divides it */
     var pairs = [];
     if (dx) pairs.push(["cx", clamp(g.cfg.cx + (dx * step) / g.pw, 0, 1)]);
     if (dy) pairs.push(["cy", clamp(g.cfg.cy + (dy * step) / g.ph, 0, 1)]);

@@ -208,7 +208,8 @@ def _row_user(row) -> dict:
     return {"id": row["id"], "name": row["name"], "role": row["role"]}
 
 
-def create_user(name: str, password: str, role: str = "user") -> dict:
+def create_user(name: str, password: str, role: str = "user",
+                org_id: int = 1) -> dict:
     name = (name or "").strip()
     if not name:
         raise AuthError(400, "a user needs a name")
@@ -226,9 +227,10 @@ def create_user(name: str, password: str, role: str = "user") -> dict:
     try:
         try:
             cur = con.execute(
-                "INSERT INTO users (name, role, password, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (name, role, hash_password(password), time.time()))
+                "INSERT INTO users (name, role, password, created_at, org_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, role, hash_password(password), time.time(),
+                 int(org_id or 1)))
         except sqlite3.IntegrityError:
             raise AuthError(409, f"a user named {name} already exists") from None
         con.commit()
@@ -239,17 +241,22 @@ def create_user(name: str, password: str, role: str = "user") -> dict:
     # confinement check below has a real directory to compare against rather
     # than a path that does not resolve.
     (USERS_DIR / str(uid) / "footage").mkdir(parents=True, exist_ok=True)
-    return {"id": uid, "name": name, "role": role}
+    return {"id": uid, "name": name, "role": role, "org_id": int(org_id or 1)}
 
 
 def list_users() -> list[dict]:
     db.init_schema()
     con = db.connect()
     try:
-        rows = con.execute("SELECT id, name, role, created_at FROM users "
-                           "ORDER BY id").fetchall()
+        rows = con.execute(
+            "SELECT u.id AS id, u.name AS name, u.role AS role, "
+            "       u.created_at AS created_at, u.org_id AS org_id, "
+            "       o.name AS org FROM users u "
+            "LEFT JOIN orgs o ON o.id = u.org_id ORDER BY u.id").fetchall()
         return [{"id": r["id"], "name": r["name"], "role": r["role"],
-                 "created_at": r["created_at"]} for r in rows]
+                 "created_at": r["created_at"],
+                 "org_id": r["org_id"] or 1,
+                 "org": r["org"] or "default"} for r in rows]
     finally:
         con.close()
 

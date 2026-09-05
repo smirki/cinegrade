@@ -2276,6 +2276,114 @@ def cli_rotation(a) -> str:
     return "0" if getattr(a, "no_autorotate", False) else "auto"
 
 
+# --------------------------------------------------------------------------
+# region and zoom: looking closely at part of a frame
+#
+# An agent judging skin, a highlight roll off or a single edge needs the
+# pixels of one patch at a usable size, not a 560px wide postcard of the
+# whole shot. --region picks the patch and --zoom says how big to render it.
+#
+# The crop runs AFTER the whole grade and after the rotation, and before the
+# output scale. That ordering is the whole correctness argument: every
+# spatial stage in this engine (power windows, the radial ramp, vignette,
+# the grain plate) is sized from probe's post-rotation frame, so cropping
+# first would hand those stages a smaller frame and move the window, the
+# vignette and the grain relative to the picture. Cropping the finished
+# render cannot: the patch is exactly the pixels the full render has there.
+# --------------------------------------------------------------------------
+
+MIN_REGION = 0.01     # a region under 1% of an axis is refused, not measured
+
+
+def normalise_region(box):
+    """Four fractions of the frame AFTER rotation, as [x0, y0, x1, y1].
+
+    Either drag direction is the same rectangle (the corners are sorted),
+    values outside 0..1 clamp, and anything that is not four numbers, or is
+    a sliver under MIN_REGION on an axis, raises rather than being silently
+    measured somewhere else.
+    """
+    if box is None:
+        return None
+    if isinstance(box, str):
+        box = box.replace(",", " ").split()
+    try:
+        vals = [float(v) for v in box]
+    except (TypeError, ValueError):
+        raise GradeError("region wants four numbers: x0 y0 x1 y1")
+    if len(vals) != 4:
+        raise GradeError(f"region wants four numbers, got {len(vals)}")
+    vals = [min(1.0, max(0.0, v)) for v in vals]
+    x0, x1 = min(vals[0], vals[2]), max(vals[0], vals[2])
+    y0, y1 = min(vals[1], vals[3]), max(vals[1], vals[3])
+    if x1 - x0 < MIN_REGION or y1 - y0 < MIN_REGION:
+        raise GradeError(
+            f"region is too small to render: {x1 - x0:.3f} by {y1 - y0:.3f} "
+            f"of the frame, the minimum is {MIN_REGION} on each axis")
+    return [x0, y0, x1, y1]
+
+
+def normalise_zoom(value):
+    """How many times the size the region gets, 1 meaning its fit size."""
+    if value is None:
+        return 1.0
+    try:
+        z = float(value)
+    except (TypeError, ValueError):
+        raise GradeError(f"zoom wants a number, got {value!r}")
+    if not (z > 0):
+        raise GradeError(f"zoom must be greater than zero, got {z:g}")
+    return z
+
+
+def region_pixels(region, info):
+    """A region as whole pixels of the post-rotation frame: (x, y, w, h).
+
+    Rounds OUTWARD (floor the start, ceil the end), the same convention
+    match_ref.crop_box uses, so a rectangle drawn on a small preview still
+    covers every pixel it visibly covered.
+    """
+    fw, fh = int(info["width"]), int(info["height"])
+    x0 = max(0, min(fw - 1, int(math.floor(region[0] * fw))))
+    y0 = max(0, min(fh - 1, int(math.floor(region[1] * fh))))
+    x1 = max(x0 + 1, min(fw, int(math.ceil(region[2] * fw))))
+    y1 = max(y0 + 1, min(fh, int(math.ceil(region[3] * fh))))
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def region_tail(region, zoom, width, info):
+    """The crop and scale filters a still's tail needs, in order.
+
+    Replaces the plain `scale={width}:-2` a still used before this existed.
+    With no region and zoom 1 it IS that plain scale, character for
+    character, so an unzoomed still is byte identical to the one this engine
+    rendered before the flags existed.
+
+    The zoom cap is the source itself: a region cannot be rendered wider
+    than the pixels it actually contains, because there are no more of them.
+    Without --width there is no scale at all, which is already the cap, so
+    zoom has nothing left to do there.
+    """
+    region = normalise_region(region)
+    zoom = normalise_zoom(zoom)
+    if region is None:
+        if not width:
+            return []
+        if zoom == 1.0:
+            return [f"scale={width}:-2"]
+        target = max(2, min(int(round(width * zoom)), int(info["width"])))
+        return [f"scale={target}:-2"]
+    x, y, w, h = region_pixels(region, info)
+    out = [f"crop={w}:{h}:{x}:{y}"]
+    if width:
+        # The region's fit size is the share of a `width` wide frame it
+        # covers; zoom multiplies that, and the region's own pixel width is
+        # where it stops.
+        target = max(2, min(int(round(width * zoom * w / float(info["width"]))), w))
+        out.append(f"scale={target}:-2")
+    return out
+
+
 def cmd_render(a):
     cfg = apply_overrides(load_preset(a.preset), a)
     info = probe(a.input, rotation=cli_rotation(a))
@@ -2302,7 +2410,8 @@ def cmd_render(a):
 def cmd_still(a):
     cfg = apply_overrides(load_preset(a.preset), a)
     info = probe(a.input, rotation=cli_rotation(a))
-    extra = ([f"scale={a.width}:-2"] if a.width else []) + ["format=rgb24"]
+    extra = region_tail(getattr(a, "region", None), getattr(a, "zoom", None),
+                        a.width, info) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
     args = ffmpeg_inputs(a.input, cfg, info, a.time)
     args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1", a.output]
@@ -2326,13 +2435,16 @@ def cmd_compare(a):
 
     tmp = ROOT / "stills" / "_compare"
     tmp.mkdir(parents=True, exist_ok=True)
+    # One tail for every panel: the panels are hstacked, so a region that
+    # resolved to a different pixel size per panel would not stack at all.
+    tail = region_tail(getattr(a, "region", None), getattr(a, "zoom", None),
+                       a.width, info) + ["format=rgb24"]
     paths = []
     for name, spec in variants:
         cfg = load_preset(spec.get("preset") or a.preset)
         if "look" in spec:
             cfg["look"]["lut"] = spec["look"]
-        graph = graph_with_mask(cfg, info, encode_out=False,
-                                tail_extra=[f"scale={a.width}:-2", "format=rgb24"])
+        graph = graph_with_mask(cfg, info, encode_out=False, tail_extra=tail)
         out = tmp / f"{name}.png"
         args = ffmpeg_inputs(a.input, cfg, info, a.time)
         args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1", str(out)]
@@ -2947,16 +3059,38 @@ def main():
     r.add_argument("--no-audio", action="store_true")
     r.set_defaults(fn=cmd_render)
 
+    def region_flags(p):
+        """--region and --zoom, identical on still and compare.
+
+        Both are about looking closely at part of the frame: the crop runs
+        after the whole grade and before the output scale, so the patch is
+        exactly the pixels the full render has there (see region_tail).
+        """
+        p.add_argument("--region", nargs=4, type=float,
+                       metavar=("X0", "Y0", "X1", "Y1"),
+                       help="render only this rectangle: four fractions of "
+                            "the frame AFTER rotation, 0 0 1 1 being the "
+                            "whole frame. Cropped after the grade, so "
+                            "windows, vignette and grain sit where the full "
+                            "render puts them")
+        p.add_argument("--zoom", type=float, default=1.0,
+                       help="render the region N times the size it would "
+                            "have inside a --width wide frame (default 1). "
+                            "Capped by the region's own pixels: there are no "
+                            "more of them than the source has")
+
     s = sub.add_parser("still"); common(s)
     s.add_argument("--output", "-o", required=True)
     s.add_argument("--time", type=float, default=0.0)
     s.add_argument("--width", type=int)
+    region_flags(s)
     s.set_defaults(fn=cmd_still)
 
     c = sub.add_parser("compare"); common(c)
     c.add_argument("--output", "-o", default=str(ROOT / "stills" / "compare.png"))
     c.add_argument("--time", type=float, default=0.0)
     c.add_argument("--width", type=int, default=560)
+    region_flags(c)
     c.add_argument("--looks", help="comma separated look names")
     c.add_argument("--presets", help="comma separated preset names")
     c.add_argument("--open", action="store_true", help="open in Preview.app")

@@ -432,9 +432,18 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
   flex: none; display: flex; flex-direction: column; gap: 4px;
   padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--panel2);
 }
-.historyhead-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.historyhead-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+/* flex-wrap alone only reaches items whose OWN content is already narrower
+   than the row: a single unbroken span (a long clip filename, the longest
+   branch name in the select's own display) is not itself allowed to shrink
+   without min-width:0, so it could still push past the row on its own line
+   instead of wrapping. Ellipsis it in place instead: nothing about the
+   header should ever extend past the panel, only wrap or truncate. */
+#histKey, #histClip, #histRotation, #histHead {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
 #histBranch { max-width: 150px; }
-.historynote { color: var(--warn); font-size: 10px; }
+.historynote { color: var(--warn); font-size: 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .historybody {
   flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
@@ -484,19 +493,48 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
   .historyrow:not(.expanded) .hid,
   .historyrow:not(.expanded) .htime { display: none; }
 }
+/* A second, narrower tier: on a dragged-down sidebar (measured down to
+   260px) plus a project with several live branches, the graph column's own
+   cap (history.js, GRAPH_MAX_W) still leaves less room than the branch pill
+   plus the message's 140px floor both need. The pill is next to go, same
+   as id/time above and for the same reason: it is still one hover away
+   (the row's own title) and still visible expanded. */
+@container historyrows (max-width: 220px) {
+  .historyrow:not(.expanded) .htag { display: none; }
+}
 /* Branch pill: filled in the tip's own lane colour (--lane-hue, set inline
    in history.js), the same colour as that lane's nodes and edges in the
-   graph column, so a glance ties a row to its place in the tree. */
+   graph column, so a glance ties a row to its place in the tree. max-width
+   plus ellipsis bounds a long branch name the same way #histBranch already
+   bounds the header's own select, so one long name cannot alone reopen the
+   overflow this whole block exists to close. */
 .historyrow .htag {
   flex: none; font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
   font-weight: 600; border-radius: var(--radius-sm); padding: 0 4px;
   background: hsl(var(--lane-hue, 210) 55% 26%); color: #fff;
+  max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 [data-theme="light"] .historyrow .htag { background: hsl(var(--lane-hue, 210) 70% 88%); color: hsl(var(--lane-hue, 210) 55% 24%); }
 .historyrow .htime { flex: none; color: var(--text-dim); font-size: 10px; }
-.historyrow-actions { flex: none; display: none; gap: 4px; }
+/* Absolutely positioned, not a flex sibling: two buttons of hover-only
+   content have no business competing with the message/tag/id/time for the
+   same width budget every time the row's OWN layout is worked out, and at
+   the sidebar's default width that competition is exactly what pushed them
+   (measured: as far as 189px) past the panel's own right edge, where
+   .historybody's overflow-x:hidden made them impossible to reach at all,
+   not merely narrow. Anchored to the row's own right edge instead, so
+   there is nothing past the panel to be clipped: an opaque background
+   (matched to whatever this row's own background already is, plain, .head
+   or :hover) covers the row content underneath cleanly rather than
+   overlapping it illegibly. */
+.historyrow-actions {
+  display: none; position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  gap: 4px; padding-left: 8px; background: var(--panel);
+}
 .historyrow:hover .historyrow-actions, .historyrow:focus-within .historyrow-actions,
 .historyrow.expanded .historyrow-actions { display: flex; }
+.historyrow:hover .historyrow-actions { background: var(--panel2); }
+.historyrow.head .historyrow-actions { background: var(--accent-wash); }
 .historyrow-actions .btn { height: 18px; padding: 0 8px; font-size: 10px; }
 .historyrow-changes { padding: 2px 4px 4px 26px; display: none; }
 .historyrow.expanded .historyrow-changes { display: block; }
@@ -851,6 +889,16 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 .lutrow:hover { background: var(--panel2); }
 .lutrow.active { background: var(--accent-dim); color: #fff; }
 .lutrow .x { color: var(--text-dim); font-family: var(--mono); font-size: 10px; }
+/* The Renders list (moved into the render dialog, contract E3) has no
+   whole-row click of its own: a finished render needs two different
+   actions, not one, so each is its own small text target instead of one
+   guess about which action a click on the row means. */
+.lutrow .rowaction {
+  color: var(--text-dim); font-family: var(--mono); font-size: 10px;
+  cursor: pointer; text-decoration: underline; text-underline-offset: 2px;
+  flex: none; margin-left: 6px;
+}
+.lutrow .rowaction:hover { color: var(--accent); }
 /* Keyboard cursor for the merged Clips/Browse list (job: file browser):
    an inset ring, not a fill, so it stays visibly separate from .active's
    solid accent fill -- a folder or clip can be under the keyboard cursor
@@ -1009,6 +1057,252 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 .quickjump:hover { color: var(--accent); }
 .quickjump .rowicon { width: 13px; height: 13px; }
 
+/* ---- the files pane (contract E2) ---------------------------------------
+   One rail pane, two views, chosen by data-filesroot on .filespane (files.js
+   writes it). Everything marked .libonly belongs to the library view and
+   everything marked .macview to the anywhere browser, and exactly one of the
+   two sets is displayed at a time. Written as display:none rather than a
+   second pane so the anywhere browser's markup, its ids and app.js's own
+   browse* code all stay exactly where they were: this contract adds a view,
+   it does not rewrite the old one.
+
+   Sizing: .browsehalf's flex: 1 1 0 gives the two visible halves an even
+   split, which is right for the anywhere browser (folders above, clips
+   below) and wrong for the library, where the whole list is in the top half
+   and the bottom half is only Rotation plus Source. So in a library root the
+   bottom half stops growing and is capped, and the list takes the rest. */
+.filespane { --files-thumb: 44px; }
+.filespane[data-filesroot="thismac"] .libonly { display: none; }
+.filespane:not([data-filesroot="thismac"]) .macview { display: none; }
+.filespane:not([data-filesroot="thismac"]) .browsebottom {
+  flex: 0 0 auto; max-height: 42%; overflow-y: auto;
+}
+#filesRoots, #filesCrumbs, #filesTools { flex: none; }
+
+/* Root switcher: My files, Shared with me, a chip per team, Trash, and (only
+   when the server runs without logins) This Mac. Chips rather than a <select>
+   because there are rarely more than a handful and one tap has to reach any
+   of them on a phone; the row scrolls sideways rather than wrapping into
+   three lines and eating the list's height. */
+.filesroots {
+  display: flex; gap: 4px; align-items: center; padding: 5px 6px;
+  border-bottom: 1px solid var(--line); overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+}
+.filesroots::-webkit-scrollbar { display: none; }
+.filesroot {
+  flex: none; background: none; border: 1px solid transparent; cursor: pointer;
+  color: var(--text-dim); font: 10px var(--ui); text-transform: uppercase;
+  letter-spacing: 0.5px; padding: 4px 8px; border-radius: var(--radius-full);
+  white-space: nowrap; max-width: 130px; overflow: hidden; text-overflow: ellipsis;
+}
+.filesroot:hover { color: var(--text-hi); background: var(--panel2); }
+.filesroot.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+[data-theme="light"] .filesroot.active { color: #fff; }
+
+/* The breadcrumb is the .crumb language the anywhere browser already uses, so
+   the two views read the same; it only gets its own class for the wrap and
+   the drop target a crumb becomes while a row is being dragged onto it. */
+.filescrumbs { padding: 4px 6px 2px; row-gap: 2px; }
+.crumb.dropinto { background: var(--accent-dim); color: #fff; }
+
+.filestools {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 4px 6px 6px; border-bottom: 1px solid var(--line);
+}
+.filestools .tb { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-dim); }
+.filestools select { max-width: 92px; }
+
+.filestop { position: relative; }
+#filesError:empty, #filesUploads:empty { display: none; }
+#filesError { flex: none; padding: 4px 8px; }
+#filesUploads { flex: none; }
+
+/* One upload, one row: name, a bar that fills, and either a percentage or
+   the server's own refusal in full. The rule the founder asked for is that
+   nothing about an upload is ever silent, so a failed row STAYS on screen
+   with its message until it is dismissed rather than fading with a toast. */
+.uploadrow {
+  display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  border-bottom: 1px solid var(--line); font-size: 11px;
+}
+.uploadrow .uname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uploadrow .upct { flex: none; font: 10px var(--mono); color: var(--text-dim); }
+.uploadrow .ubar { flex: none; width: 54px; height: 3px; background: color-mix(in srgb, var(--text) 10%, transparent); }
+.uploadrow .ubar i { display: block; height: 100%; background: var(--accent); }
+.uploadrow.failed { align-items: flex-start; }
+.uploadrow.failed .uname { white-space: normal; color: var(--danger); }
+.uploadrow.failed .ubar { display: none; }
+.uploadrow .udismiss {
+  flex: none; background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font: 11px var(--ui); padding: 2px 4px;
+}
+
+/* The list itself. Folders first, then clips, one row each: a thumbnail (or a
+   folder glyph), the name, what it is (a duration or an item count), the
+   project's short HEAD when the clip has one, a shared badge, and the row
+   actions. Grid mode is the same rows re-flowed into auto-fill columns, so
+   there is one renderer and one set of handlers, not two. */
+.fileslist { display: flex; flex-direction: column; min-height: 40px; }
+.fileslist > .note { padding: 6px 8px; }
+.filerow {
+  display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  border-bottom: 1px solid var(--line); font-size: 11px; cursor: pointer;
+  min-width: 0; position: relative;
+}
+.filerow:hover { background: var(--panel2); }
+.filerow.active { background: var(--accent-dim); color: #fff; }
+.filerow.dropinto { outline: 2px solid var(--accent); outline-offset: -2px; }
+.filerow.dragging { opacity: 0.45; }
+.filerow .fthumb {
+  flex: none; width: var(--files-thumb); height: calc(var(--files-thumb) * 0.5625);
+  background: var(--panel2); object-fit: cover; display: block; border-radius: 3px;
+}
+.filerow .rowicon { width: 16px; height: 16px; flex: none; color: var(--text-dim); }
+.filerow.active .rowicon { color: #fff; }
+.filerow .fmeta { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.filerow .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filerow .fsub {
+  display: flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden;
+  font: 10px var(--mono); color: var(--text-dim);
+}
+.filerow.active .fsub { color: rgba(255, 255, 255, 0.82); }
+/* The parts of the subtitle keep their own width and the line is clipped at
+   the end instead: shrinking them all equally turned "0:04  109 MB  29ef3a1"
+   into "0. 10. 29e." in a narrow rail, which is three facts and none of them
+   readable. The last part, the least important one, is the one that gets the
+   ellipsis. */
+.filerow .fsub > * { flex: none; white-space: nowrap; }
+.filerow .fsub > *:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fbadge {
+  flex: none; font: 9px var(--ui); text-transform: uppercase; letter-spacing: 0.4px;
+  padding: 1px 5px; border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);
+}
+.filerow.active .fbadge { background: rgba(255, 255, 255, 0.22); color: #fff; }
+.fbadge.warn { background: color-mix(in srgb, var(--danger) 22%, transparent); color: var(--danger); }
+
+/* Row actions: quiet until the row is hovered or something inside it has
+   focus, which is what keeps a list of forty clips from reading as a wall of
+   links, and always on where there is no hover to have (see the phone block
+   at the end of this file). They keep their click box while hidden, so
+   keyboard focus reaches them in the same order they read. */
+.filerow .facts { flex: none; display: flex; align-items: center; gap: 2px; }
+@media (hover: hover) {
+  /* Floated over the right of the row rather than sitting in its line: Open,
+     Rename, Share and Trash come to about 150px, and a 260px rail has none to
+     spare, so keeping them in the flow cut every file name down to a stub for
+     the sake of buttons that are invisible most of the time. */
+  .filerow .facts {
+    position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+    opacity: 0; transition: opacity 120ms ease-out;
+    background: var(--panel2); border-radius: var(--radius-sm);
+    padding: 2px 3px; box-shadow: 0 0 0 1px var(--line);
+  }
+  .filerow:hover .facts, .filerow:focus-within .facts { opacity: 1; }
+  .filerow.active .facts { background: var(--accent-dim); }
+}
+.faction {
+  background: none; border: none; cursor: pointer; padding: 3px 4px;
+  color: var(--text-dim); font: 10px var(--ui); border-radius: var(--radius-sm);
+}
+.faction:hover { color: var(--accent); background: var(--panel); }
+.filerow.active .faction { color: rgba(255, 255, 255, 0.85); }
+
+/* A share that points at a path nobody can find any more (renamed in Finder,
+   behind the app's back). The row stays, greyed and unclickable, because a
+   share that silently vanishes is a share nobody can debug. */
+.filerow.missing { opacity: 0.6; cursor: default; }
+.filerow.missing:hover { background: none; }
+
+/* Rename and New folder happen in the row itself: an input that takes the
+   name's place, Enter to commit, Escape to cancel. A prompt() was the other
+   option and it cannot be styled, blocks the page, and is unreachable to a
+   test harness or an agent driving the page. */
+.frename {
+  flex: 1 1 auto; min-width: 0; width: 100%;
+  background: var(--panel2); border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  color: var(--text-hi); font: 11px var(--ui); padding: 3px 5px;
+}
+
+.fileslist.grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 4px; padding: 6px; align-content: start;
+}
+.fileslist.grid .filerow {
+  flex-direction: column; align-items: stretch; gap: 3px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 6px;
+}
+.fileslist.grid .filerow .fthumb { width: 100%; height: 54px; }
+.fileslist.grid .filerow .facts { justify-content: flex-end; flex-wrap: wrap; }
+/* A card is taller than it is wide, so the floating panel goes along its
+   bottom edge rather than across the middle of the picture. */
+@media (hover: hover) {
+  .fileslist.grid .filerow .facts { top: auto; bottom: 4px; transform: none; }
+}
+.fileslist.grid > .note { grid-column: 1 / -1; }
+
+/* Drag and drop from the desktop. The whole pane lights up, not just the row
+   under the pointer, because the founder's ask was "drag and drop a file
+   (or upload)" onto the app at all, so a drop anywhere on the page lands in
+   the folder on screen and the highlight has to say so. */
+.filespane.dropping { outline: 2px dashed var(--accent); outline-offset: -3px; }
+.filesdrop {
+  position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  color: var(--accent); font: 11px var(--ui); text-align: center; padding: 12px;
+  pointer-events: none; z-index: 2;
+}
+.filespane.dropping .filesdrop { display: flex; }
+
+/* Share dialog: the same overlay shape as the render dialog and the token
+   dialog, built by files.js. Two halves, both plain rows: who already has it
+   (with a remove button each) and who to add. */
+#shareOverlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 60;
+  display: none; align-items: center; justify-content: center; padding: 16px;
+}
+#shareOverlay.on { display: flex; }
+#shareOverlay .sharebox {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-4xl);
+  width: min(420px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+#shareOverlay .sharebody { padding: 10px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+#shareOverlay .sharefoot { padding: 8px 12px; border-top: 1px solid var(--line); display: flex; gap: 6px; align-items: center; }
+.sharerow {
+  display: flex; align-items: center; gap: 6px; font-size: 11px;
+  padding: 4px 0; border-bottom: 1px solid var(--line); min-width: 0;
+}
+.sharerow .sname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sharerow select { max-width: 110px; }
+.sharenote { font-size: 10px; color: var(--text-dim); line-height: 1.45; }
+.shareadd { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.shareadd select { flex: 1 1 120px; min-width: 0; }
+
+/* ---- activity feed (contract E2) ---------------------------------------
+   At the foot of the History tab. Capped and self scrolling so it never
+   takes height from the commit graph above it, which is the panel the
+   History tab exists for. */
+.activitypanel {
+  flex: none; display: flex; flex-direction: column; max-height: 34%;
+  min-height: 0; border-top: 1px solid var(--line);
+}
+.activitypanel > .panelhead { flex: none; }
+.activitylist {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--line2) var(--panel);
+}
+.activityrow {
+  display: flex; align-items: flex-start; gap: 6px; padding: 5px 10px;
+  border-bottom: 1px solid var(--line); font-size: 11px; min-width: 0;
+}
+.activityrow .atext { flex: 1 1 auto; min-width: 0; }
+.activityrow .aname { overflow-wrap: anywhere; }
+.activityrow .awhen { flex: none; font: 10px var(--mono); color: var(--text-dim); }
+.activityrow .aactor { color: var(--text-hi); }
+.activitylist > .note { padding: 8px 10px; }
+
 /* ---- viewer ------------------------------------------------------------ */
 
 #viewerbar, .dockhead, .tlbar {
@@ -1025,7 +1319,14 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
   flex: 1 1 auto; min-height: 120px; background: #0e0e0e; position: relative;
   display: flex; align-items: center; justify-content: center; gap: 6px; overflow: hidden;
 }
-#viewport.zoom { align-items: flex-start; justify-content: flex-start; overflow: auto; }
+/* Zoomed in (contract E4): still centred, still clipped, never scrolled. The
+   pan is a transform (viewer-zoom.js), not a scroll position, because the
+   window overlay and the picked match rectangle are positioned against the
+   picture's own rect and a scroll container would move the picture under
+   them between redraws. Keeping the flex centring is what makes the anchor
+   maths stable: the centre is the one point that does not move when the
+   layout box changes size. */
+#viewport.zoom { overflow: hidden; }
 
 /* ---- viewer: before/after view modes ------------------------------------
    Each half is a plain container (.layer) that can hold either an <img> or,
@@ -2152,3 +2453,121 @@ html[data-mobile="on"] .track .rail,
 html[data-mobile="on"] .track .fill { top: 12px; }
 html[data-mobile="on"] .track .knob { top: 7px; width: 18px; height: 18px; margin-left: -9px; }
 html[data-mobile="on"] .track .detent { top: 9px; height: 10px; }
+
+/* ---- viewer zoom, pan, and the two/four frame grid (contract E4) ---------
+   static/viewer-zoom.js and static/frames.js.
+
+   One transform on one box. #stage and #framesGrid are the only two things
+   #viewport ever shows a picture in, so scaling whichever one is on screen
+   scales the picture, the GPU canvas, the played video, the bypassed copy in
+   a split view AND the window overlay together. Transforming each of those
+   separately was the alternative and it is the bug: the overlay is a sibling
+   of the picture, not a child, so it would need its own copy of the same
+   maths (see the note at the top of viewer-zoom.js).
+
+   transform-origin is the centre because #viewport centres its content with
+   flex, so the centre is the one point that does not move when the layout
+   box changes size. */
+#stage, #framesGrid { transform-origin: center center; }
+/* Cursors that say what a drag will do. .grab is on whenever a drag would
+   pan (zoomed in, or the space bar held), which is exactly when the picture
+   has somewhere to move to. */
+#viewport.grab { cursor: grab; }
+#viewport.panning { cursor: grabbing; }
+
+/* Two, and four, frames at once. max-content columns, so the grid is as wide
+   as the pictures inside it and the flex centring of #viewport still has a
+   real box to centre: the pictures are sized in JS (fitViewer), the same way
+   the single viewer's are, and the grid follows them rather than the other
+   way round. */
+#framesGrid { display: none; gap: 4px; justify-content: center; align-content: center; }
+#viewport.frames #framesGrid { display: grid; }
+#viewport.frames #stage { display: none; }
+/* The contact sheet wins over both, the same way it already wins over the
+   stage: it is a full-viewport view of its own. */
+#viewport.sheet #framesGrid { display: none; }
+#framesGrid.n1 { grid-template-columns: max-content; }
+#framesGrid.n2 { grid-template-columns: repeat(2, max-content); }
+#framesGrid.n4 { grid-template-columns: repeat(2, max-content); }
+
+.fslot { position: relative; line-height: 0; min-width: 40px; min-height: 40px; background: #0e0e0e; }
+.fslot.off { display: none; }
+.fslot img, .fslot canvas { display: block; user-select: none; }
+/* Exactly one of the two is the picture at any moment, decided per slot:
+   a slot whose GPU render failed falls back to the server frame on its own
+   without taking the other three with it. */
+.fslot .fcanvas { display: none; }
+.fslot.gpu .fimg { display: none; }
+.fslot.gpu .fcanvas { display: block; }
+/* Same corner badge recipe as .layer b and .sheetcell b, so the timecode
+   reads as chrome on the picture rather than as something in it. */
+.fslot b.ftime {
+  position: absolute; left: 0; top: 0; background: rgba(0,0,0,0.7);
+  color: var(--text-hi); font: 10px var(--mono); font-weight: 400;
+  letter-spacing: 0.5px; padding: 1px 5px; text-transform: uppercase;
+  pointer-events: none; white-space: nowrap;
+}
+.fslot .fset {
+  position: absolute; right: 3px; top: 3px; font-size: 9px; padding: 1px 5px;
+  min-height: 0; line-height: 14px; opacity: 0; transition: opacity 0.12s;
+}
+.fslot:hover .fset, .fslot .fset:focus { opacity: 1; }
+/* Slot 1 is the playhead, which is the frame every other reader in the app
+   (the scopes, the statistics, the window) is about, so it is marked. */
+.fslot.head { outline: 1px solid var(--line); outline-offset: -1px; }
+.fslot.drop { outline: 2px solid var(--accent); outline-offset: -2px; }
+.fslot.failed { outline: 1px solid var(--bad, #c96); outline-offset: -1px; }
+
+/* The drag sources for a slot: a filmstrip thumbnail and a mark chip
+   (frames.js reads application/x-studio-time off either). */
+#thumbs img[draggable="true"], .markchip[draggable="true"] { cursor: grab; }
+
+/* Phones: the slot's own button has no hover to appear on, so it is always
+   visible there, and it is a real touch target rather than a 14px strip. */
+html[data-mobile="on"] .fslot .fset { opacity: 1; min-height: 24px; line-height: 20px; }
+
+/* ---- the files pane on a phone (contract E2) ----------------------------
+   The Clips page of the phone layout IS this pane, so every part of it has to
+   be reachable with a thumb. Three things change and nothing else does.
+
+   1. Row actions have no hover to appear on, so they are always visible, and
+      each one is a real 36 px target rather than a 10 px word. Same for the
+      root chips, the breadcrumb segments and the toolbar buttons.
+   2. The bottom half's cap comes off: on a phone the pane is the whole
+      screen, so Rotation and Source have room of their own and the list does
+      not need to be squeezed into a fraction of a short viewport.
+   3. Thumbnails grow, because a 44 px still tells a person nothing about
+      which take this is on a screen held at arm's length.
+
+   36 px is the number in the contract; it is min-height plus real padding, so
+   a target keeps its size even when its label is one short word. */
+html[data-mobile="on"] .filespane { --files-thumb: 64px; }
+/* Always shown, and back in the row's own line. There is no hover here to
+   reveal them with, and a narrow desktop window counts as mobile too, where
+   the floating panel above would sit permanently on top of the name. */
+html[data-mobile="on"] .filerow .facts {
+  position: static; transform: none; opacity: 1;
+  background: none; box-shadow: none; padding: 0;
+}
+html[data-mobile="on"] .faction { min-height: 36px; min-width: 36px; padding: 6px 8px; font-size: 11px; }
+html[data-mobile="on"] .filesroot { min-height: 36px; padding: 8px 12px; font-size: 11px; }
+html[data-mobile="on"] .filescrumbs .crumb { min-height: 36px; padding: 8px 8px; font-size: 12px; }
+html[data-mobile="on"] .filerow { padding: 7px 8px; min-height: 44px; }
+html[data-mobile="on"] .filestools .btn { min-height: 36px; }
+html[data-mobile="on"] .filestools select { min-height: 36px; }
+html[data-mobile="on"] .uploadrow .udismiss { min-height: 36px; min-width: 36px; }
+html[data-mobile="on"] .filespane:not([data-filesroot="thismac"]) .browsebottom {
+  max-height: none; flex: 0 0 auto;
+}
+/* The share dialog is a sheet on a phone: full width at the bottom of the
+   screen rather than a small box floating in the middle of it. */
+html[data-mobile="on"] #shareOverlay { align-items: flex-end; padding: 0; }
+html[data-mobile="on"] #shareOverlay .sharebox {
+  width: 100%; max-height: 90vh; border-radius: var(--radius-4xl) var(--radius-4xl) 0 0;
+}
+html[data-mobile="on"] .sharerow { min-height: 40px; }
+/* The activity feed gets a bigger share of the History page here: the phone
+   History page has no sidebar competing with it for width, and a 34 % cap on
+   a tall narrow screen leaves it showing two rows. */
+html[data-mobile="on"] .activitypanel { max-height: 45%; }
+html[data-mobile="on"] .activityrow { padding: 8px 10px; }

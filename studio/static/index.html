@@ -101,7 +101,7 @@
         <button class="railtab active" data-rail="refs">Refs</button>
         <button class="railtab" data-rail="looks">LUTs</button>
         <button class="railtab" data-rail="jobs">Jobs</button>
-        <button class="railtab" data-rail="browse">Clips</button>
+        <button class="railtab" data-rail="browse">Files</button>
       </div>
 
       <section class="railpane active" data-rail="refs">
@@ -124,8 +124,6 @@
           <button id="rebuildCstBtn" class="btn">Rebuild CST</button>
         </div>
         <div id="lutList" class="lutlist"></div>
-        <div class="panelhead">Renders</div>
-        <div id="renderList" class="lutlist"></div>
       </section>
 
       <section class="railpane" data-rail="jobs">
@@ -152,8 +150,58 @@
            lazy-first-open check all already key off that string, so
            keeping it avoids renaming half the file for a label change
            alone. -->
-      <section class="railpane browsepane" data-rail="browse">
-        <div class="browsehalf browsetop">
+      <!-- Contract E2 (the founder's "fix the ui and layout of the file
+           explorer ... if you drag and drop a file it should upload into the
+           server's folders so multiple users can use this ... but they can
+           share it to other people"): the pane now has TWO views behind one
+           root switcher, and data-filesroot on this section says which one is
+           showing (static/files.js sets it; style.css hides .libonly or
+           .macview accordingly).
+
+             the library   #filesCrumbs + #filesTools + #filesTop: one list of
+                           folders and clips on the SERVER, per account, with
+                           New folder, Upload, drag and drop upload, drag to
+                           move, Share, Trash and Restore. Roots: My files,
+                           Shared with me, one per team, Trash.
+             This Mac      .browsetop plus #browseClips below it: the anywhere
+                           browser exactly as it was, offered only when the
+                           server runs without logins (with logins on the
+                           account has no business walking the disk). Its
+                           markup and its app.js code are untouched, which is
+                           why #browseCrumbs, #browseQuick and #browseDirs all
+                           still read the way they always did.
+
+           #uploadClipBtn and its hidden input moved up here out of the "Clips
+           here" head so ONE Upload button serves both views: in a library
+           root files.js takes the click and puts the file in the folder on
+           screen with a progress row per file, in This Mac app.js's own
+           handler runs unchanged. Rotation and Source stay below, visible in
+           both views, because they are about the clip that is loaded rather
+           than about where it was found. -->
+      <section class="railpane browsepane filespane" data-rail="browse" data-filesroot="mine">
+        <div id="filesRoots" class="filesroots" role="tablist" aria-label="Where to look"></div>
+        <div id="filesCrumbs" class="crumbs filescrumbs libonly" aria-label="Folder path"></div>
+        <div id="filesTools" class="filestools">
+          <button id="filesNewFolder" class="btn libonly" type="button" title="Make a new folder in this folder">New folder</button>
+          <button id="uploadClipBtn" class="btn" type="button" title="Bring a video file from this computer into this folder">Upload</button>
+          <input type="file" id="uploadClipFile" accept="video/*" multiple hidden>
+          <span class="spacer"></span>
+          <button id="filesLayout" class="btn libonly" type="button" title="Switch between the list and the grid">Grid</button>
+          <label class="tb libonly">Sort
+            <select id="filesSort" title="How to order this folder">
+              <option value="name">Name</option>
+              <option value="new">Newest</option>
+              <option value="size">Largest</option>
+            </select>
+          </label>
+        </div>
+        <div class="browsehalf filestop libonly" id="filesTop">
+          <div id="filesError" class="err"></div>
+          <div id="filesUploads" class="uploadrows"></div>
+          <div id="filesList" class="fileslist"></div>
+          <div id="filesDrop" class="filesdrop">Drop video files here to put them in this folder</div>
+        </div>
+        <div class="browsehalf browsetop macview">
           <div class="browsenav">
             <button id="browseUpBtn" class="btn iconbtn" type="button" title="Up one level" aria-label="Up one level">
               <span class="rowicon" aria-hidden="true" data-icon="ArrowUp01Icon"></span>
@@ -166,17 +214,13 @@
           <div id="browseDirs" class="lutlist"></div>
         </div>
         <div class="browsehalf browsebottom">
-          <!-- #uploadClipBtn brings a file in from this computer instead of
-               navigating to one already on disk: POST /api/upload streams the
-               hidden input's file straight to disk server side (server.py),
-               no multipart form. The button's own label doubles as the
-               progress readout while a file is sending (see app.js), which is
-               why it is not paired with a separate progress element the way
-               the LUT import button is. -->
-          <div class="panelhead">Clips here <span class="spacer"></span>
-            <button id="uploadClipBtn" class="btn" type="button" title="Bring a video file from this computer into footage">Upload</button>
-            <input type="file" id="uploadClipFile" accept="video/*" multiple hidden>
-          </div>
+          <!-- The Upload button that used to sit in this head moved up to
+               #filesTools so one button serves both views; POST /api/upload is
+               still the raw file body with the display name in X-File-Name and
+               no multipart form, and its label is still the progress readout
+               while a file is sending (app.js, and files.js drives the same
+               label so a caller waiting on it sees the truth in either view). -->
+          <div class="panelhead macview">Clips here</div>
           <!-- #rotSeg replaces the old two-state #rotBtn (contract C4). The
                camera's rotation tag is unreliable on this footage, so any of
                the five turns has to be reachable, not just "honour the tag"
@@ -195,7 +239,7 @@
               <button class="btn toggle" type="button" data-rotation="270" title="Ignore the tag, then turn a quarter anticlockwise">270</button>
             </span>
           </div>
-          <div id="browseClips" class="lutlist"></div>
+          <div id="browseClips" class="lutlist macview"></div>
           <div class="panelhead">Source</div>
           <div id="clipInfo" class="kv"></div>
         </div>
@@ -286,9 +330,36 @@
         <div class="widgethead">Viewer</div>
         <section id="centre">
           <div id="viewerbar">
-            <button class="btn" id="fitBtn">Fit</button>
-            <button class="btn" id="oneToOneBtn">100%</button>
+            <!-- Zoom (contract E4, viewer-zoom.js). Fit and the three fixed
+                 steps are one press each because "show me that edge close
+                 up" is asked constantly; the plus and minus buttons are the
+                 same steps for a trackpad with no wheel, and ctrl or cmd
+                 with the wheel (or a pinch) zooms around the pointer. The
+                 label is a percentage of the preview's own pixels, so 100%
+                 means one preview pixel per screen pixel, not one source
+                 pixel: the preview width select on the right of this bar is
+                 what decides how many pixels there are. -->
+            <button class="btn" id="fitBtn" title="Fit the whole frame in the viewer (F)">Fit</button>
+            <button class="btn" id="oneToOneBtn" title="One preview pixel per screen pixel (0)">100%</button>
+            <button class="btn" id="zoom200Btn" title="Twice the preview's pixels">200%</button>
+            <button class="btn" id="zoom400Btn" title="Four times the preview's pixels">400%</button>
+            <button class="btn" id="zoomOutBtn" title="Zoom out (-)">-</button>
+            <button class="btn" id="zoomInBtn" title="Zoom in (+)">+</button>
             <span class="mono muted" id="zoomLabel">fit</span>
+            <span class="sep"></span>
+            <!-- Frames (contract E4, frames.js): one, two or four times in
+                 the viewer at once, every one of them graded with the live
+                 config. Slot 1 is always the playhead; the others are set
+                 by dragging a filmstrip thumbnail or a mark onto them, or
+                 with each slot's own playhead button, and they are stored
+                 on the project so they come back after a reload. -->
+            <label class="tb" id="frameCountLabel" title="How many frames to show at once. Slot 1 is the playhead; drag a thumbnail from the filmstrip onto any other slot to set its time">Frames
+              <select id="frameCount">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="4">4</option>
+              </select>
+            </label>
             <span class="sep"></span>
             <label class="tb" id="viewModeLabel" title="\\ toggles after only / before only. Y cycles left/right, top/bottom, wipe, then back to after only.">View
               <select id="viewMode" title="\\ toggles after only / before only. Y cycles left/right, top/bottom, wipe, then back to after only.">
@@ -450,6 +521,14 @@
                 <div id="matchRefResult"></div>
               </div>
             </div>
+            <!-- The two, and four, frame viewer (contract E4). A sibling of
+                 #stage rather than a rebuild of it: #stage carries five view
+                 modes, a wipe and the window overlay, none of which a grid
+                 of slots shares, and #viewport.frames simply swaps which of
+                 the two is on screen the same way #viewport.sheet already
+                 swaps in the contact sheet. The slots themselves are built
+                 by frames.js, so this stays an empty box in the markup. -->
+            <div id="framesGrid"></div>
             <div id="sheet"></div>
           </div>
         </section>
@@ -520,8 +599,8 @@
             <button class="btn" id="stepBack" title="one frame back (,)">&lt;</button>
             <button class="btn" id="stepFwd" title="one frame forward (.)">&gt;</button>
             <span class="sep"></span>
-            <button class="btn toggle" id="playBtn" title="Play from the current playhead with the current grade (P)">Play</button>
-            <label class="tb" title="Length of clip rendered per press of Play">secs <input type="text" id="playDur" class="mono num" size="3" value="5"></label>
+            <button class="btn toggle" id="playBtn" title="Play from the current playhead with the current grade, looping until stopped or scrubbed (P)">Play</button>
+            <label class="tb" title="Length of clip played per loop; empty plays the whole clip">secs <input type="text" id="playDur" class="mono num" size="3" placeholder="all"></label>
             <span class="mono muted" id="playStatus"></span>
             <span class="sep"></span>
             <input type="range" id="scrub" min="0" max="1000" value="0">
@@ -529,25 +608,7 @@
             <button class="btn" id="markBtn" title="Mark this frame (M)">Mark</button>
             <button class="btn" id="clearMarksBtn">Clear marks</button>
             <span class="spacer"></span>
-            <label class="tb">Render
-              <input type="text" id="renderName" class="mono" size="14" placeholder="name">
-            </label>
-            <label class="tb">start <input type="text" id="renderStart" class="mono num" size="5" value="0"></label>
-            <label class="tb">secs <input type="text" id="renderDur" class="mono num" size="5" value="3"></label>
-            <label class="tb">width
-              <select id="renderScale">
-                <option value="">source</option>
-                <option value="1920">1920</option>
-                <option value="1280">1280</option>
-              </select>
-            </label>
-            <label class="tb" title="ffmpeg runs the whole grade in one filter graph and is the reference. GPU decodes with ffmpeg, grades every frame through gpu.js in a headless Chrome, and encodes with ffmpeg: same codec and colour tags, needs Chrome and node on this machine.">engine
-              <select id="renderEngine">
-                <option value="ffmpeg">ffmpeg</option>
-                <option value="gpu">GPU (headless Chrome)</option>
-              </select>
-            </label>
-            <button class="btn accent" id="renderBtn">Render</button>
+            <button class="btn accent" id="renderDialogBtn" title="Open the render dialog (R)">Render</button>
           </div>
           <!-- Live loop (job: live GPU viewer, mode 2). Its own row, its own
                button, deliberately not sharing playBtn above: Play streams a
@@ -672,6 +733,19 @@
           <div class="historyrows" id="historyRows"></div>
         </div>
         <div class="historylegend" id="historyLegend"></div>
+        <!-- Activity (contract E2): the library's own feed, at the foot of the
+             History tab because it answers the same question one step out --
+             the graph above says what happened to THIS clip's grade, this says
+             what happened to the FILES (uploaded, moved, renamed, shared,
+             trashed) and who did it. Filled by static/activity.js, which is a
+             separate file from history.js on purpose: the two are refreshed by
+             the same studio:session event but share no state, so neither can
+             break the other. Its own height is capped and it scrolls itself,
+             so it never takes room from the graph. -->
+        <section id="activityPanel" class="activitypanel" aria-label="Library activity">
+          <div class="panelhead">Activity</div>
+          <div id="activityList" class="activitylist"></div>
+        </section>
       </div>
       <div id="sidebarutil">
         <span class="mono muted" id="renderTime">idle</span>
@@ -700,6 +774,45 @@
 </div>
 
 <!-- overlays ------------------------------------------------------------ -->
+<!-- Render dialog (contract E3, "the render settings should be a popup ...
+     Render should go in the popup"): every field that used to sit inline in
+     the timeline bar, plus the frame estimate and the Renders list (moved
+     here from the LUTs rail pane, same #renderList element and id so
+     app.js's existing fillRenders keeps working unchanged). Opened by
+     #renderDialogBtn in the timeline bar or the R key, same .overlay/
+     .sheetbox pattern as JSON/Limits/Keys below, so Esc already closes it
+     (the global handler's ".overlay" sweep) and the phone layout already
+     fits it (that pattern is fixed position, not tied to any sidebar). -->
+<div id="renderOverlay" class="overlay">
+  <div class="sheetbox">
+    <div class="panelhead">Render <span class="spacer"></span>
+      <button class="btn accent" id="renderBtn">Render</button>
+      <button class="btn" id="renderClose">Close</button>
+    </div>
+    <div class="pad row wrap">
+      <label class="tb">name <input type="text" id="renderName" class="mono" size="20" placeholder="name"></label>
+      <label class="tb" title="Defaults to the playhead when the dialog opens">start <input type="text" id="renderStart" class="mono num" size="6" value="0"></label>
+      <label class="tb" title="Empty renders to the end of the clip">secs <input type="text" id="renderDur" class="mono num" size="6" placeholder="to the end"></label>
+      <label class="tb">width
+        <select id="renderScale">
+          <option value="">source</option>
+          <option value="1920">1920</option>
+          <option value="1280">1280</option>
+        </select>
+      </label>
+      <label class="tb" title="ffmpeg runs the whole grade in one filter graph and is the reference. GPU decodes with ffmpeg, grades every frame through gpu.js in a headless Chrome, and encodes with ffmpeg: same codec and colour tags, needs Chrome and node on this machine.">engine
+        <select id="renderEngine">
+          <option value="ffmpeg">ffmpeg</option>
+          <option value="gpu">GPU (headless Chrome)</option>
+        </select>
+      </label>
+    </div>
+    <div class="pad mono muted" id="renderEstimate"></div>
+    <div class="panelhead">Renders</div>
+    <div id="renderList" class="lutlist"></div>
+  </div>
+</div>
+
 <div id="jsonOverlay" class="overlay">
   <div class="sheetbox">
     <div class="panelhead">Raw config <span class="spacer"></span>
@@ -769,6 +882,20 @@
 <script src="/grades.js"></script>
 <script src="/gpu.js"></script>
 <script src="/live.js"></script>
+<!-- Zoom and the multi frame viewer (contract E4). Before app.js because
+     boot() wires both of them synchronously, and both are pure modules: they
+     hold no config state, they are handed a small api object of app.js's own
+     functions exactly the way window-editor.js and layers.js are. -->
+<script src="/viewer-zoom.js"></script>
+<script src="/frames.js"></script>
+<!-- The files pane and the activity feed (contract E2). Before app.js for the
+     same reason viewer-zoom.js and frames.js are: app.js hands each of them a
+     small api object of its own functions during boot(), so the global has to
+     exist by then. activity.js needs nothing from app.js at all; it listens for
+     the studio:session event session.js dispatches and for the studio:library
+     event files.js dispatches after a write, and asks the server itself. -->
+<script src="/files.js"></script>
+<script src="/activity.js"></script>
 <script src="/app.js"></script>
 <script src="/window-editor.js"></script>
 <!-- Mobile mode (contract C8): the page bar, the floating preview mirror and

@@ -24,13 +24,17 @@ nothing and means a database created by any code path is in the right mode.
 
 Other modules (per clip grades in wave 2, uploads after that) create their
 own tables in their own init function with CREATE TABLE IF NOT EXISTS. This
-module owns the auth tables and nothing else.
+module owns the auth tables and nothing else: accounts, sessions, agent
+tokens, and the `orgs` an account belongs to, which is here rather than in
+library.py because it adds a column to `users` and this file owns that table.
+The library's own tables (teams, shares, activity) are library.py's.
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 STUDIO = Path(__file__).resolve().parent
@@ -91,6 +95,12 @@ CREATE TABLE IF NOT EXISTS tokens (
   last_used  REAL
 );
 CREATE INDEX IF NOT EXISTS tokens_user ON tokens(user_id);
+
+CREATE TABLE IF NOT EXISTS orgs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -114,10 +124,44 @@ def connect() -> sqlite3.Connection:
 
 
 def init_schema() -> None:
-    """Create the auth tables if they are not there yet."""
+    """Create the auth tables if they are not there yet, then migrate.
+
+    Both halves are safe to run on every boot and on a database that has
+    already been through them, which is what makes this callable from four
+    places without any of them coordinating.
+    """
     con = connect()
     try:
         con.executescript(SCHEMA)
+        _migrate(con)
         con.commit()
     finally:
         con.close()
+
+
+def _migrate(con) -> None:
+    """The additive steps a CREATE TABLE IF NOT EXISTS cannot express.
+
+    Two of them, both from the library arc, both idempotent:
+
+    1. Org 1 named `default` exists. Every account belongs to exactly one org
+       and this is the one they all start in, so a server that has never
+       heard of orgs behaves afterwards exactly as it did before: one tenant,
+       everybody in it.
+    2. `users.org_id` exists, defaulting to 1. ALTER TABLE ADD COLUMN is the
+       only way to add a column to a table that already holds somebody's
+       accounts, and SQLite allows NOT NULL there as long as the default is a
+       constant, which 1 is. The column is checked for first rather than
+       added inside a try, because "duplicate column name" is an error string
+       to parse and PRAGMA table_info is an answer.
+
+    Nothing here rewrites, drops or reorders an existing row or column, so
+    running it against a real database cannot lose anything.
+    """
+    if con.execute("SELECT COUNT(*) AS n FROM orgs").fetchone()["n"] == 0:
+        con.execute("INSERT INTO orgs (id, name, created_at) VALUES (1, ?, ?)",
+                    ("default", time.time()))
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
+    if "org_id" not in cols:
+        con.execute("ALTER TABLE users ADD COLUMN org_id INTEGER NOT NULL "
+                    "DEFAULT 1")

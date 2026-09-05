@@ -79,6 +79,10 @@ export default async function run(ctx) {
   // here goes through this first, exactly as a person would have to.
   async function showClipsPane() {
     await page.click('.railtab[data-rail="browse"]');
+    // Contract E2 gave that pane a root switcher; #browseClips below is the
+    // This Mac view's own clip list, so this spec says which view it is using
+    // rather than relying on whichever one happens to be remembered.
+    await page.click('#filesRoots .filesroot[data-root="thismac"]');
     await page.waitForFunction(() => {
       const el = document.querySelector('#rotSeg button[data-rotation="90"]');
       if (!el) return false;
@@ -255,6 +259,7 @@ export default async function run(ctx) {
       notes.push("only one clip in footage, the clip switch half of this spec had nothing to switch to");
     } else {
       await page.click('.railtab[data-rail="browse"]');
+      await page.click('#filesRoots .filesroot[data-root="thismac"]');
       await page.waitForFunction(() => document.querySelectorAll("#browseClips .lutrow").length >= 2,
         { timeout: 15000 });
       if (!(await clickClipRow(other))) return fail("no row for " + other + " in #browseClips");

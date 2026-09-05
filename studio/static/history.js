@@ -304,14 +304,16 @@
     row.className = "historyrow" + (c.is_head ? " head" : "") + (state.expanded[c.id] ? " expanded" : "");
     row.dataset.commit = c.id;
     row.tabIndex = 0;
-    // A narrow sidebar hides .hid/.htime by container query (see style.css)
-    // rather than crushing the message down to a few letters, the way
-    // GitKraken drops its own secondary columns first; this single title on
-    // the row itself (not a second one on .hmsg, which would otherwise win
-    // the tooltip whenever the pointer sits over the message, the row's
-    // biggest area) keeps the short id and the exact time one hover away
-    // regardless of width, on top of the always visible expanded view.
-    row.title = c.short + " · " + absoluteTime(c.ts) + "\n" + (c.message || "");
+    // A narrow sidebar hides .hid/.htime, and below that .htag too, by
+    // container query (see style.css) rather than crushing the message down
+    // to a few letters or pushing the row's own hover actions past the
+    // panel's edge, the way GitKraken drops its own secondary columns
+    // first; this single title on the row itself (not a second one on
+    // .hmsg, which would otherwise win the tooltip whenever the pointer
+    // sits over the message, the row's biggest area) keeps the short id,
+    // the exact time and the branch name one hover away regardless of
+    // width, on top of the always visible expanded view.
+    row.title = c.short + " · " + c.branch + " · " + absoluteTime(c.ts) + "\n" + (c.message || "");
 
     // One compact GitKraken style line: avatar, then the message (the
     // answer to "what changed", the founder's own framing: "like if i move
@@ -433,6 +435,29 @@
 
   var NS = "http://www.w3.org/2000/svg";
   var LANE_W = 14;
+  // A graph column that grows by 14px per live branch, uncapped, is exactly
+  // how a project with seven or more forks pushed the row list (and the
+  // hover action buttons past its own right edge, `overflow-x: hidden`ing
+  // out of the picture rather than reachable) -- the sidebar's own width
+  // does not grow with the browser window, so this hits at every viewport
+  // size alike. GRAPH_MAX_W is a hard ceiling on the column regardless of
+  // lane count; once branches.length would blow past it, every lane
+  // compresses together (not just the newest ones) so the column still
+  // reads as one graph, just a denser one, the same trade a few hundred
+  // commits already asks of the row list itself.
+  var GRAPH_MAX_W = 70;
+
+  function laneWidthFor(laneCount) {
+    var raw = laneCount * LANE_W + 10;
+    if (raw <= GRAPH_MAX_W || laneCount <= 0) return LANE_W;
+    // No floor here on purpose: the SVG's own declared width (below) is
+    // computed from this same laneW, so whatever this returns, every lane
+    // still lands inside it. A floor sounds safer but is not: it would let
+    // laneCount * flooredLaneW exceed GRAPH_MAX_W again once there were
+    // enough lanes, which is the exact bug this column exists to close, one
+    // lane count higher.
+    return (GRAPH_MAX_W - 10) / laneCount;
+  }
 
   function buildGraph(log) {
     var svg = els.graph;
@@ -452,7 +477,8 @@
     }
 
     var branches = log.branches && log.branches.length ? log.branches : [{ name: log.branch || "main" }];
-    var width = branches.length * LANE_W + 10;
+    var laneW = laneWidthFor(branches.length);
+    var width = branches.length * laneW + 10; // always exactly what laneX below uses: no lane can land outside it
 
     var top = els.rows.getBoundingClientRect().top;
     var centres = [];
@@ -467,7 +493,7 @@
     svg.setAttribute("height", String(Math.ceil(height)));
     svg.setAttribute("viewBox", "0 0 " + width + " " + Math.ceil(height));
 
-    function laneX(branchName) { return laneIndex(branches, branchName) * LANE_W + (LANE_W / 2) + 4; }
+    function laneX(branchName) { return laneIndex(branches, branchName) * laneW + (laneW / 2) + 4; }
 
     // Edges are drawn first, nodes after, in the same DOM order as before:
     // an edge is always painted underneath every node, so a curve sweeping

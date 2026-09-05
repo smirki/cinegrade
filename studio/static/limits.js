@@ -875,6 +875,45 @@
      "GPU-vs-ffmpeg parity harness reports both new rows " +
      "(look_two_slots_balance_half, look_two_slots_balance_full_mix2) as " +
      "EXACT at both preview widths it checks, 640 and 1280."],
+    ["The zoom percentage counts preview pixels, not camera pixels.",
+     "works, but not what 100% usually means",
+     "The viewer's picture is a preview render, so \"100%\" is one preview " +
+     "pixel per screen pixel and not one sensor pixel per screen pixel. " +
+     "Measured on the test clip in a 1440x900 window: the preview is 960 " +
+     "wide, Fit shows it 185 px wide and the label reads 19%, and 200% is " +
+     "1920 px wide on screen from a source that is 2160 px wide after " +
+     "rotation. So zooming past about 225% here is enlarging preview pixels, " +
+     "not revealing detail. Raise the preview width if you need to judge " +
+     "fine detail at a high zoom."],
+    ["The power window and the pick rectangle are not drawn on 2 or 4 frames.",
+     "known limit, on purpose",
+     "The overlay lives inside #stage, and the frames grid replaces #stage " +
+     "entirely (#viewport.frames #stage is display none in style.css), so " +
+     "with Frames on 2 or 4 there is no window overlay and no pick " +
+     "rectangle on any slot. Switch back to Frames 1 to drag a window or " +
+     "pick a rectangle; the grade being shown in the slots is the same one " +
+     "either way. Drawing four overlays would need four independent " +
+     "geometries, which is a bigger change than this contract."],
+    ["The contact sheet's own cells cannot be dragged onto a frame slot.",
+     "known limit, measured",
+     "The contact sheet takes over the whole viewer, so while it is open " +
+     "there are no slots on screen to drop onto. The two drag sources that " +
+     "do work are the filmstrip thumbnails and the mark chips on the " +
+     "timeline, and the mark chips ARE the contact sheet's marks, so every " +
+     "marked time is still reachable by drag, just from the timeline rather " +
+     "than from the sheet."],
+    ["A region render costs a whole frame render at the zoom width.",
+     "works, more expensive than it looks",
+     "Every spatial stage (power windows, the radial ramp, the vignette, " +
+     "the grain plate) is sized from the whole frame, so a region has to be " +
+     "cropped AFTER the grade or those stages would re-centre on the patch. " +
+     "Both the CLI and POST /api/frame therefore render the full frame at " +
+     "the zoomed width and then crop: a 480 wide request for the middle " +
+     "half at zoom 4 renders the whole frame at 1920 and hands back 960 px " +
+     "of it. The one thing that caps the cost is the source: no region " +
+     "renders wider than its own pixels (measured on the test clip, 2160 " +
+     "wide after rotation, a middle half at zoom 999 comes back 1080 px " +
+     "wide, not wider)."],
   ];
 
   var FIXED = [
