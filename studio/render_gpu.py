@@ -259,14 +259,20 @@ def _decode_args(clip_file: str, cfg: dict, info: dict, rinfo: dict,
     """
     W, H = rinfo["width"], rinfo["height"]
     steps = []
+    # The rotation heads the chain, before the scale: W and H are probe's
+    # post-rotation size, so a scale ahead of the turn would distort. Nothing
+    # is emitted at all for auto or 0, so an unrotated render is the same
+    # command it has always been.
+    prefix = SRV.CG.rotate_prefix(info)
+    if prefix:
+        steps.append(prefix.rstrip(","))
     if scaled:
         steps.append(f"scale={W}:{H}:flags=bicubic,setsar=1")
     steps.append(f"scale=in_color_matrix={SRV.CG.source_matrix(info)}"
                  f":in_range={info['color_range']}:out_range=full")
     steps.append("format=gbrp16le")
     args = ["ffmpeg", "-v", "error", "-y"]
-    if not info.get("autorotate", True):
-        args += ["-noautorotate"]
+    args += SRV.CG.rotate_args(SRV.CG.rotation_of(info))
     if start:
         args += ["-ss", str(start)]
     args += ["-i", clip_file]
@@ -318,8 +324,9 @@ def _encode_args(out_path: Path, clip_file: str, cfg: dict, rcfg: dict,
     audio_idx = None
     if not no_audio:
         audio_idx = 2 if grain else 1
-        if not info.get("autorotate", True):
-            args += ["-noautorotate"]
+        # Audio only, but the flag has to match the video pass or ffmpeg
+        # reads the same file two different ways in one command.
+        args += SRV.CG.rotate_args(SRV.CG.rotation_of(info))
         if start:
             args += ["-ss", str(start)]
         args += ["-i", clip_file]
@@ -683,14 +690,17 @@ class _Session:
 # entry point
 # --------------------------------------------------------------------------
 
-def start_gpu_render(payload: dict, base_url: str = ""):
+def start_gpu_render(payload: dict, base_url: str = "", user_id=None):
     """Same payload as start_render, plus engine="gpu". Returns a Job."""
     clip = payload["clip"]
     cfg = SRV.full_config(payload.get("config"))
-    autorotate = bool(payload.get("autorotate", True))
-    info = SRV.clip_info(clip, autorotate)
+    # start_render resolves the rotation and writes it into the payload
+    # before delegating here, so both engines render the same orientation;
+    # the fallback chain still runs for a direct caller.
+    rotation = SRV.effective_rotation(payload, user_id)
+    info = SRV.clip_info(clip, rotation)
     info = dict(info, duration=float(info.get("duration") or 0.0),
-                autorotate=autorotate)
+                rotate=rotation)
     start = float(payload.get("start") or 0.0)
     duration = payload.get("duration")
     duration = float(duration) if duration not in (None, "") else None

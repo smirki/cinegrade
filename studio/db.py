@@ -29,12 +29,32 @@ module owns the auth tables and nothing else.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
 STUDIO = Path(__file__).resolve().parent
-DATA = STUDIO / "data"
+# studio/data unless somebody says otherwise. The override exists for tests:
+# this database is somebody's real accounts, grades and project history, and a
+# test suite must never open it. STUDIO_DATA_DIR (or server.py --data-dir,
+# which sets it) points the whole data folder somewhere temporary; with the
+# variable unset the path is exactly what it always was.
+DATA = Path(os.environ.get("STUDIO_DATA_DIR") or (STUDIO / "data"))
 DB_PATH = DATA / "studio.db"
+
+
+def set_data_dir(path) -> Path:
+    """Point the data folder somewhere else. Call before anything connects.
+
+    Rebinds the module globals rather than handing every caller a new path,
+    because connect() reads DB_PATH on each call and the other modules read
+    db.DATA, so one assignment moves all of them.
+    """
+    global DATA, DB_PATH
+    DATA = Path(path).expanduser().resolve()
+    DB_PATH = DATA / "studio.db"
+    os.environ["STUDIO_DATA_DIR"] = str(DATA)
+    return DATA
 
 # Auth tables only, per contract C1. Every statement is IF NOT EXISTS so
 # init_schema() is safe to call on every boot.

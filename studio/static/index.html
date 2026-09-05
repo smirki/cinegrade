@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- Without this a phone browser lays the page out at a pretend 980px wide and
+     then scales the result down to fit the screen, so mobile mode (contract
+     C8) would render the desktop shell shrunk to a third size rather than the
+     phone layout: measured before it was added, document.scrollWidth was 980
+     on a 390px viewport and every mobile @media rule in style.css was
+     therefore matching against a width no real device had. It has no effect at
+     a desktop width. -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fixxr Studio</title>
 <!-- Empty data-URI favicon: Chrome requests /favicon.ico on every load regardless of
      whether the page links one, and the server 404ing that shows up as a console.error
@@ -39,6 +47,24 @@
 
 <div id="appshell">
 
+  <!-- Mobile page bar (contract C8, direct request: "make a mobile mode too
+       where those are buttons at the top and the widgets are scrolling. the
+       sidebars are basically new pages"). Present in every layout but only
+       shown when <html data-mobile="on"> (static/sidebars.js decides that
+       before first paint; style.css's mobile block is the only thing that
+       displays this). Four buttons for the app's three regions: Clips is the
+       left sidebar, Preview is the middle column of widgets, and Grade and
+       History are the two tabs of the right sidebar, which is one page here
+       (data-mobilepage="params") with data-paramtab still choosing between
+       them exactly as on desktop. Wired in static/mobile.js. -->
+  <nav id="mobilebar" aria-label="Pages">
+    <button class="mobiletab" type="button" data-mobilepage="clips">Clips</button>
+    <button class="mobiletab" type="button" data-mobilepage="preview">Preview</button>
+    <button class="mobiletab" type="button" data-mobilepage="params" data-paramtab="grade">Grade</button>
+    <button class="mobiletab" type="button" data-mobilepage="params" data-paramtab="history">History</button>
+  </nav>
+
+
   <!-- Left sidebar: the old topbar's brand plus the old "sources" card,
        demoted out of GridStack entirely (job: app shell restructure, modelled
        on research/unsloth/studio's own AppSidebar -- see components/ui/
@@ -49,7 +75,7 @@
        (the left) and main background" literally true instead of "a widget
        that happens to be alone in a column". #leftrail below is unchanged
        from the inside out -- same tab strip, same four panes -- only the
-       brand at its top and #rotBtn (see the Clips pane) are new arrivals,
+       brand at its top and #rotSeg (see the Clips pane) are new arrivals,
        both relocated out of the deleted #topbar. Collapse/expand is driven
        by the data-sidebar-left attribute static/sidebars.js sets on <html>
        (see style.css); #sidebarLeftToggle below, in #maintoolbar, is the
@@ -140,21 +166,34 @@
           <div id="browseDirs" class="lutlist"></div>
         </div>
         <div class="browsehalf browsebottom">
-          <!-- #rotBtn: relocated from the deleted #topbar. It is a view
-               toggle for whichever clip is already selected (not part of
-               picking one), so it sits in this panelhead, right against the
-               list of clips it applies to, rather than back up in the
-               navigation half above. #uploadClipBtn brings a file in from
-               this computer instead of navigating to one already on disk:
-               POST /api/upload streams the hidden input's file straight to
-               disk server side (server.py), no multipart form. The button's
-               own label doubles as the progress readout while a file is
-               sending (see app.js), which is why it is not paired with a
-               separate progress element the way the LUT import button is. -->
+          <!-- #uploadClipBtn brings a file in from this computer instead of
+               navigating to one already on disk: POST /api/upload streams the
+               hidden input's file straight to disk server side (server.py),
+               no multipart form. The button's own label doubles as the
+               progress readout while a file is sending (see app.js), which is
+               why it is not paired with a separate progress element the way
+               the LUT import button is. -->
           <div class="panelhead">Clips here <span class="spacer"></span>
             <button id="uploadClipBtn" class="btn" type="button" title="Bring a video file from this computer into footage">Upload</button>
             <input type="file" id="uploadClipFile" accept="video/*" multiple hidden>
-            <button id="rotBtn" class="btn" title="Rotation metadata on these clips is unreliable. Flip this if the frame is sideways.">autorotate</button>
+          </div>
+          <!-- #rotSeg replaces the old two-state #rotBtn (contract C4). The
+               camera's rotation tag is unreliable on this footage, so any of
+               the five turns has to be reachable, not just "honour the tag"
+               and "ignore it". This is a project setting now, not a browser
+               one: it is stored per clip on the server (POST
+               /api/project/rotation), so a render started from the CLI comes
+               out the same way up as the frame on screen, and reloading the
+               page brings it back. It sits here, right against the list of
+               clips it applies to, which is where the old button was. -->
+          <div class="panelhead">Rotation <span class="spacer"></span>
+            <span id="rotSeg" class="rotseg" role="group" aria-label="Rotation for this clip">
+              <button class="btn toggle" type="button" data-rotation="auto" title="Honour the rotation tag in the file">Auto</button>
+              <button class="btn toggle" type="button" data-rotation="0" title="Ignore the rotation tag, no turn">0</button>
+              <button class="btn toggle" type="button" data-rotation="90" title="Ignore the tag, then turn a quarter clockwise">90</button>
+              <button class="btn toggle" type="button" data-rotation="180" title="Ignore the tag, then turn half">180</button>
+              <button class="btn toggle" type="button" data-rotation="270" title="Ignore the tag, then turn a quarter anticlockwise">270</button>
+            </span>
           </div>
           <div id="browseClips" class="lutlist"></div>
           <div class="panelhead">Source</div>
@@ -363,9 +402,23 @@
               <div id="matchRef">
                 <div id="matchRefBar">
                   <button class="btn" id="matchRefBtn">Match to reference</button>
-                  <button class="btn" id="clearRefCropBtn" title="Go back to automatic content detection" disabled>Clear box</button>
+                  <!-- The rectangle tools (contract C7). Pick draws on the
+                       reference above, Pick on frame draws on the picture in
+                       the viewer through the same overlay the power window
+                       uses. Each rectangle is saved on the project against
+                       this reference's name, so it survives a reload and an
+                       agent can read it in GET /api/project. -->
+                  <button class="btn toggle" id="pickRefBtn" aria-pressed="false" title="Draw a rectangle on the reference: the match measures only that part of it">Pick</button>
+                  <button class="btn" id="clearRefCropBtn" title="Drop the reference rectangle and go back to automatic content detection" disabled>Clear</button>
+                  <button class="btn toggle" id="pickFrameBtn" aria-pressed="false" title="Draw a rectangle on the frame in the viewer: the match measures only that part of the shot">Pick on frame</button>
+                  <button class="btn" id="clearFrameCropBtn" title="Drop the frame rectangle and measure the whole frame" disabled>Clear</button>
                   <span class="mono muted" id="matchRefStatus"></span>
                 </div>
+                <!-- What the next match will actually measure, in the same
+                     fractions the request carries and GET /api/project
+                     stores, so what is on screen and what an agent reads are
+                     the same four numbers. -->
+                <div class="mono muted" id="matchCropReadout"></div>
                 <!-- The matcher's real options (grade/tools/match_ref.py:
                      METHODS, strength, luma_preserve), not hardcoded to
                      reinhard and luma_preserve true. Bound and persisted to
@@ -393,7 +446,7 @@
                      transform toward its colour statistics instead. Kept as
                      visible text, not just a button title, so it cannot be
                      missed on a device with no hover. -->
-                <div class="mono muted" id="matchRefCaption">Fits a transform toward the reference's colours. Does not copy a LUT. Drag on the reference above to match only that region; otherwise the auto content detector picks it.</div>
+                <div class="mono muted" id="matchRefCaption">Fits a transform toward the reference's colours. Does not copy a LUT. Press Pick and drag a rectangle to match only that part of the reference, and Pick on frame to measure only part of the shot; with neither, the whole reference goes through the automatic content detector and the whole frame is measured.</div>
                 <div id="matchRefResult"></div>
               </div>
             </div>
@@ -560,8 +613,66 @@
        collapsing element itself. -->
   <aside id="sidebarRight">
     <div id="paramsdock">
-      <div class="panelhead">Parameters</div>
-      <aside id="params"></aside>
+      <!-- Grade | History (contract C3, project history). Visibility and the
+           active tab's highlight are both driven by data-paramtab on <html>
+           (static/sidebars.js sets it pre-paint, same as
+           data-sidebar-left/right just above); the two buttons only ever
+           flip that one attribute (history.js), never toggle a class here
+           directly. #params is untouched from the inside out, just wrapped
+           by a plain pane div instead of sitting on #paramsdock directly. -->
+      <div class="paramtabs">
+        <button class="paramtab" data-paramtab="grade" type="button">Grade</button>
+        <button class="paramtab" data-paramtab="history" type="button">History</button>
+      </div>
+      <div class="parampane" data-paramtab="grade">
+        <!-- Floating preview (contract C8, direct request: "On the properties
+             right sidebar, i should be able to see the preview while scrolling
+             (so preview floats, and scrolling properties/parameters widget/
+             panels should fade underneath it)"). Mobile mode only: style.css
+             hides it outright at desktop widths, where the picture is already
+             beside the sidebar. It is `position: sticky` at the top of this
+             pane's own scroll box, so #params scrolls UNDER it and the
+             gradient below its edge fades a row out as it passes.
+
+             The canvas is a mirror, never a second renderer: static/mobile.js
+             copies whatever the main viewer is already showing this frame
+             (#frameImg, #gpuCanvas or #playerVideo, whichever #stage's own
+             classes say is live) into it with one drawImage. Nothing here
+             asks the server for a frame, touches the config, or starts a
+             second GPU pipeline, so a slider drag costs exactly what it costs
+             on desktop. -->
+        <div id="mobilepreview">
+          <canvas id="mobilePreviewCanvas"></canvas>
+          <span class="mono muted" id="mobilePreviewNote">preview</span>
+        </div>
+        <aside id="params"></aside>
+      </div>
+      <div class="parampane" data-paramtab="history">
+        <div class="historyhead">
+          <div class="historyhead-row">
+            <span class="mono muted" id="histKey">no project</span>
+            <span id="histClip"></span>
+          </div>
+          <div class="historyhead-row">
+            <label class="tb">Branch
+              <select id="histBranch"></select>
+            </label>
+            <span class="mono muted" id="histRotation"></span>
+            <span class="mono" id="histHead" title="HEAD commit"></span>
+          </div>
+          <div class="historyhead-row">
+            <button class="btn" id="histUndoBtn" title="Undo (moves HEAD back one commit)">Undo</button>
+            <button class="btn" id="histRedoBtn" title="Redo">Redo</button>
+            <span class="spacer"></span>
+            <span class="historynote" id="histNote"></span>
+          </div>
+        </div>
+        <div class="historybody" id="historyBody">
+          <svg id="historyGraph" xmlns="http://www.w3.org/2000/svg"></svg>
+          <div class="historyrows" id="historyRows"></div>
+        </div>
+        <div class="historylegend" id="historyLegend"></div>
+      </div>
       <div id="sidebarutil">
         <span class="mono muted" id="renderTime">idle</span>
         <button id="resetLayoutBtn" class="btn" title="Put every panel back to its default size and position">Reset layout</button>
@@ -645,6 +756,13 @@
 <script src="/layers.js"></script>
 <script src="/limits.js"></script>
 <script src="/session.js"></script>
+<!-- History panel (contract C3, project history): the Grade | History tab
+     strip's History pane in #sidebarRight. After session.js, whose one new
+     "studio:session" event (see that file) is how this file learns a commit
+     landed without polling on its own timer; needs nothing from app.js and
+     never touches S, so its own place in the load order does not matter
+     relative to app.js, only relative to session.js and the DOM above. -->
+<script src="/history.js"></script>
 <!-- Per clip grades (contract C3). Before app.js so window.StudioGrades
      exists by the time boot() runs, and after the DOM so it can mount its
      saved indicator and copy-grade control into the clips panel. -->
@@ -653,5 +771,13 @@
 <script src="/live.js"></script>
 <script src="/app.js"></script>
 <script src="/window-editor.js"></script>
+<!-- Mobile mode (contract C8): the page bar, the floating preview mirror and
+     the GridStack "stop being draggable" switch. Last on purpose. It reads the
+     GridStack instance off #gridMid (GridStack stores itself there as
+     el.gridstack), which app.js only creates during boot(), so this file waits
+     for it rather than assuming load order gives it one; and it touches no
+     state any other file owns, only <html>'s own data-mobile/data-mobilepage
+     attributes through window.fixxrSidebars. -->
+<script src="/mobile.js"></script>
 </body>
 </html>

@@ -42,10 +42,14 @@ import cases_slice            # noqa: E402
 import cases_grain            # noqa: E402
 import cases_layers           # noqa: E402
 import cases_detail           # noqa: E402
+import cases_rotation         # noqa: E402
+import cases_match_crop       # noqa: E402
+import cases_cli_project      # noqa: E402
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,
-           cases_slice, cases_grain, cases_layers, cases_detail, cases_cli]
+           cases_slice, cases_grain, cases_layers, cases_detail,
+           cases_rotation, cases_match_crop, cases_cli, cases_cli_project]
 
 
 def main():

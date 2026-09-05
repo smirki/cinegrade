@@ -113,10 +113,17 @@ def test_scopes(ctx):
 
 
 def test_orient(ctx):
+    """orient now builds a five-up: auto plus every fixed rotation.
+
+    The sheet is taller than the panels because each one carries a drawn
+    label strip, which is the whole point of it: a wrong display matrix is
+    supposed to be readable off one image without counting panels.
+    """
     out = H.WORK / "cli_orient.png"
     _cli(ctx, "orient", ["orient", SRC, "--time", str(H.TIME_A),
                          "--height", "200", "-o", str(out)],
-         expect_stdout=("autorotate", "no-autorotate"))
+         expect_stdout=("--rotate auto", "--rotate 90", "--rotate 270",
+                        "left to right"))
     _check_image(ctx, "orient", out, min_h=200)
 
 
@@ -142,6 +149,7 @@ def register(suite):
     suite.add(g, "render", test_render, doc="render writes a decodable ProRes file")
     suite.add(g, "compare", test_compare, doc="compare builds a multi-panel sheet")
     suite.add(g, "scopes", test_scopes, doc="scopes builds the waveform sheet")
-    suite.add(g, "orient", test_orient, doc="orient builds the two-up")
+    suite.add(g, "orient", test_orient,
+              doc="orient builds the labelled five-up rotation sheet")
     suite.add(g, "bad_preset_fails_cleanly", test_unknown_preset_fails_cleanly,
               doc="a user error is a message and a non-zero exit")

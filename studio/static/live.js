@@ -103,6 +103,26 @@
     });
   }
 
+  /* Rotation (contract C2) as a string: auto, 0, 90, 180 or 270.
+   *
+   * Every request this file makes carries it, and every cache key in this
+   * file is built on it, because a rotation change makes the decoded source
+   * a different picture at a different size: an entry keyed for one turn
+   * must never be served to another. It used to be the boolean `autorotate`,
+   * which could only say "honour the tag" or "ignore it".
+   *
+   * A caller that says nothing means `auto`, the one that reproduces the
+   * old default. A caller that still passes the old boolean gets what it
+   * used to mean, so an outside page (the parity harness) does not have to
+   * move in the same commit. */
+  function rotationOf(p) {
+    if (p && p.rotation !== undefined && p.rotation !== null && p.rotation !== "") {
+      return String(p.rotation);
+    }
+    if (p && p.autorotate === false) return "0";
+    return "auto";
+  }
+
   // ------------------------------------------------------------------
   // Mode 1: still frames
   // ------------------------------------------------------------------
@@ -110,7 +130,7 @@
   var stillCache = null; // { key, data, w, h }
 
   function stillKey(p) {
-    return p.clip + "|" + (+p.time).toFixed(4) + "|" + p.width + "|" + (p.autorotate !== false);
+    return p.clip + "|" + (+p.time).toFixed(4) + "|" + p.width + "|" + rotationOf(p);
   }
 
   // The expensive half of a preview (a real ffmpeg decode) cached by
@@ -124,7 +144,7 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         clip: p.clip, time: p.time, width: p.width,
-        autorotate: p.autorotate !== false
+        rotation: rotationOf(p)
       })
     }).then(function (r) {
       var size = (r.headers.get("X-Frame-Size") || "0x0").split("x").map(Number);
@@ -140,7 +160,7 @@
    * trusted for this config, so a caller can always `.catch` into the
    * server path without a try/catch of its own.
    *
-   * p: { clip, time, width, autorotate, config, sourceWidth, apiBase }
+   * p: { clip, time, width, rotation, config, sourceWidth, apiBase }
    * sourceWidth is the clip's own upright width (pre-downscale), needed to
    * compute the same pixelScale the server's scale_for_preview would use;
    * without it a reduced-size preview overstates every pixel-denominated FX.
@@ -193,7 +213,7 @@
     var base = p.apiBase || "";
     var qs = "clip=" + encodeURIComponent(p.clip)
       + "&width=" + encodeURIComponent(p.width)
-      + "&rot=" + (p.autorotate !== false ? "1" : "0");
+      + "&rotation=" + encodeURIComponent(rotationOf(p));
     return fetchJSON(base + "/api/range/limit?" + qs).then(function (r) { return r.json(); });
   }
 
@@ -215,16 +235,16 @@
    * ffmpeg call: the plain-English refusal comes back before any real work
    * happens, not after minutes of decoding or a filled-up response buffer.
    *
-   * p: { clip, time (range start), duration, width, autorotate, apiBase }
+   * p: { clip, time (range start), duration, width, rotation, apiBase }
    * Resolves { width, height, frames, fps, start, duration, loadMs }.
    */
   function prepareLoop(p) {
     var base = p.apiBase || "";
-    var clip = p.clip, autorotate = p.autorotate !== false;
+    var clip = p.clip, rotation = rotationOf(p);
     var width = p.width, start = p.time || 0, duration = p.duration;
     if (!(duration > 0)) return Promise.reject(new Error("loop range must be longer than 0s"));
 
-    return budget({ clip: clip, width: width, autorotate: autorotate, apiBase: base })
+    return budget({ clip: clip, width: width, rotation: rotation, apiBase: base })
       .then(function (b) {
         if (duration > b.max_seconds + 1e-6) {
           var msg = "That loop range is " + duration.toFixed(1) + "s at " + b.width
@@ -239,7 +259,7 @@
         return fetchJSON(base + "/api/range", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            clip: clip, time: start, duration: duration, width: width, autorotate: autorotate
+            clip: clip, time: start, duration: duration, width: width, rotation: rotation
           })
         }).then(function (r) {
           var size = (r.headers.get("X-Frame-Size") || "0x0").split("x").map(Number);
@@ -416,13 +436,13 @@
    * polling it is also how progress is reported. onProgress gets the job
    * dict, which is what the Play button's "preparing proxy" state reads.
    *
-   * p: { clip, width, autorotate, range, duration, apiBase, timeoutMs }
+   * p: { clip, width, rotation, range, duration, apiBase, timeoutMs }
    */
   function prepareProxy(p, opts) {
     opts = opts || {};
     var base = p.apiBase || "";
     var body = {
-      clip: p.clip, width: p.width || 960, autorotate: p.autorotate !== false
+      clip: p.clip, width: p.width || 960, rotation: rotationOf(p)
     };
     if (p.range) body.range = p.range;
     if (p.duration) body.duration = p.duration;

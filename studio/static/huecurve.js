@@ -275,7 +275,12 @@
 
     canvas.addEventListener("contextmenu", function (ev) { ev.preventDefault(); });
 
-    canvas.addEventListener("mousedown", function (ev) {
+    // Pointer events, not mouse events (contract C8, mobile mode): a touch
+    // drag produces no stream of compatibility mousemove events, so a curve
+    // bound to mousedown plus document mousemove would see the tap and never
+    // the drag. See the header comment in controls.js for the full reasoning;
+    // the CSS half is `touch-action: none` on this canvas in style.css.
+    canvas.addEventListener("pointerdown", function (ev) {
       ev.preventDefault();
       var p = localPos(ev);
       var idx = nearest(p[0], p[1]);
@@ -314,14 +319,16 @@
         commit(false);
       }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
         dragIndex = -1;
         draw();
         commit(true);
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
     });
 
     canvas.addEventListener("dblclick", function (ev) {

@@ -75,6 +75,17 @@
   --mono: ui-monospace, "SF Mono", Menlo, Monaco, "Courier New", monospace;
   --ui: "Space Grotesk Variable", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
 
+  /* The height of the one horizontal strip that runs across the whole top of
+     the app (contract C8, direct request: "fixxr studio line should be flush
+     to the middle top bar"). Three separate elements draw that strip, one per
+     app-shell column: #leftrail > .brand, #maintoolbar and .paramtabs. Before
+     this token they each picked their own height (12px/10px padding, 34px and
+     24px respectively), so the bottom hairline stepped twice on its way
+     across the window instead of reading as one line. They all read this now,
+     and each keeps its own 1px bottom border, so the line is continuous.
+     Content-box height plus that border, so a row is --toolbar-h + 1 tall. */
+  --toolbar-h: 34px;
+
   /* Radius scale: one base, then linear px steps, the same shape as
      UNSLOTH-TOKENS.md section 3.1 (there: --radius: 1.1rem = 17.6px at a
      16px root, because upstream's body text runs 15px; here the body text
@@ -183,6 +194,27 @@ html, body {
 .btn.accent:hover { background: var(--accent); }
 .btn.danger:hover { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn[disabled] { opacity: 0.35; cursor: default; }
+
+/* Segmented control (contract C4, #rotSeg in the Clips pane). Five .btn
+   children flush against each other reading as one control with one choice
+   made, rather than five pills that happen to sit in a row: only the outer
+   corners are rounded, the shared edges collapse into a single 1px line
+   (margin-left: -1px), and the chosen one is raised with the same
+   .btn.toggle.active accent every other toggle in the app uses, so there is
+   nothing new to learn. Tighter padding than a free standing .btn because
+   the whole group has to fit a 260px sidebar next to its own label. */
+.rotseg { display: inline-flex; align-items: center; flex: none; }
+.rotseg .btn {
+  border-radius: 0; padding: 3px 7px; height: 18px; margin-left: -1px;
+  letter-spacing: 0; text-transform: none;
+}
+.rotseg .btn:first-child {
+  border-radius: var(--radius-full) 0 0 var(--radius-full); margin-left: 0; padding-left: 9px;
+}
+.rotseg .btn:last-child { border-radius: 0 var(--radius-full) var(--radius-full) 0; padding-right: 9px; }
+/* Raised above its neighbours so the accent border draws whole rather than
+   being overlapped by the next button's own left border. */
+.rotseg .btn.active { position: relative; z-index: 1; }
 
 /* min-width: 0 here (not just on .slot around it) is the actual Bug A fix:
    a flex item's automatic minimum size defaults to its CONTENT size, and for
@@ -302,9 +334,15 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    animates to/from 0 on collapse -- this one just gets progressively
    covered, never reflowed. */
 #leftrail { width: var(--sidebar-left-w, 260px); height: 100%; min-height: 0; display: flex; flex-direction: column; }
+/* Flush with #maintoolbar to its right (contract C8, direct request: "fixxr
+   studio line should be flush to the middle top bar"). Same --toolbar-h, same
+   1px bottom border, and a flex row rather than a block with asymmetric
+   padding, so the wordmark sits on the toolbar controls' own optical centre
+   instead of 2px above it. Nothing about the sidebar's resize handle or its
+   collapse behaviour reads this rule, so both are unchanged. */
 #leftrail > .brand {
-  flex: none; display: block; padding: 12px 14px 10px;
-  border-bottom: 1px solid var(--line);
+  flex: none; height: var(--toolbar-h); display: flex; align-items: center;
+  padding: 0 14px; border-bottom: 1px solid var(--line);
 }
 .brand { font: 700 13px var(--ui); letter-spacing: 1.5px; color: var(--text-hi); }
 .brand span { color: var(--accent); margin-left: 3px; font-weight: 400; }
@@ -336,6 +374,140 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
   display: flex; flex-direction: column;
 }
 #paramsdock > .panelhead { flex: none; }
+
+/* Right sidebar tab strip (contract C3, project history): Grade | History,
+   above #params, replacing the plain "Parameters" .panelhead label. Same
+   railtab/railpane VISUAL language as the left rail below, but under new
+   class names, and switched purely by the data-paramtab attribute
+   static/sidebars.js sets on <html> -- same pre-paint, no-flash technique as
+   data-sidebar-left/right above, so a reload never flashes the Grade pane
+   before switching to a History tab somebody left open, and no JS
+   class-toggle is needed to switch panes at all, only to flip that one
+   attribute (see history.js). Kept as its own class names rather than
+   literally .railtab/.railpane on purpose: app.js already binds one
+   delegated click handler to EVERY .railtab/.railpane element on the page
+   for the left rail's OWN tabs (reads t.dataset.rail), and reusing those
+   classes here would register these buttons in that same handler, which
+   would try to open a `.railpane[data-rail="undefined"]` and throw.
+
+   #params itself keeps its own id, its own CSS below and its own block
+   layout completely unchanged: it is not given .parampane itself, it is
+   wrapped by one, so the wrapper does the growing/scrolling role #params
+   used to do directly against #paramsdock, and #params still does its own
+   internal overflow-y exactly as before (Grade is the untouched panel). */
+/* The strip itself carries --toolbar-h and the buttons fill it, rather than
+   the buttons carrying the height and the strip adding its own border on top:
+   with `box-sizing: border-box` set globally, the second arrangement makes
+   this strip one pixel taller than #maintoolbar and #leftrail > .brand
+   (measured: 35 against 34), which is exactly the stepped top line contract
+   C8 is here to remove. */
+.paramtabs { display: flex; border-bottom: 1px solid var(--line); flex: none; height: var(--toolbar-h); }
+.paramtab {
+  flex: 1; min-width: 0; background: var(--panel2); border: none; border-right: 1px solid var(--line);
+  color: var(--text-dim); font: 10px var(--ui); text-transform: uppercase;
+  letter-spacing: 0.6px; height: 100%; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  /* No 300ms synthetic click delay and no double-tap-to-zoom on a phone: the
+     tab strip is the first thing a thumb reaches for in mobile mode. */
+  touch-action: manipulation;
+}
+.paramtab:last-child { border-right: none; }
+html[data-paramtab="grade"] .paramtab[data-paramtab="grade"],
+html[data-paramtab="history"] .paramtab[data-paramtab="history"] {
+  background: var(--panel); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent);
+}
+.parampane { display: none; flex-direction: column; min-height: 0; overflow-y: hidden; flex: 1 1 auto; }
+html[data-paramtab="grade"] .parampane[data-paramtab="grade"],
+html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: flex; }
+
+/* ---- history panel: git style project history (contract C3) ------------
+   Header: the open project's identity (short key, clip name, branch select,
+   rotation as text, HEAD short id) plus Undo/Redo, which call the same
+   /api/project/undo|redo the top bar's own Undo/Redo buttons and cmd+Z call
+   -- one undo model. Body: the whole tree, newest first, a compact SVG graph
+   column (one lane per branch, fork points as a diagonal edge) beside a
+   scrolling list of rows. Legend: which colour family is you, other people,
+   and agents. */
+.historyhead {
+  flex: none; display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--panel2);
+}
+.historyhead-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#histBranch { max-width: 150px; }
+.historynote { color: var(--warn); font-size: 10px; }
+
+.historybody {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  display: flex; align-items: stretch;
+  scrollbar-width: thin; scrollbar-color: var(--line2) var(--panel);
+}
+#historyGraph { flex: none; display: block; }
+.historyrows { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+
+.historyrow {
+  position: relative; padding: 4px 8px 4px 4px; border-bottom: 1px solid var(--line);
+  cursor: pointer; display: flex; flex-direction: column; gap: 2px;
+}
+.historyrow:hover { background: var(--panel2); }
+.historyrow.head { background: var(--accent-wash); }
+/* Meta line (id, author chip, branch tag, time, the hover actions) above the
+   message: kept off the message's own line so nothing flex:none ever eats
+   its width, on any sidebar width. Wraps rather than clips when the
+   metadata alone cannot fit. */
+.historyrow-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.historyrow .hid { flex: none; color: var(--text-dim); }
+.historyrow-msgline { display: flex; min-width: 0; margin-top: 1px; }
+.historyrow .hmsg {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--text-hi); font-weight: 500;
+}
+/* Expanded: the full message, not just what fit on one line, alongside the
+   already expanded change list below it. */
+.historyrow.expanded .hmsg { white-space: normal; overflow: visible; text-overflow: clip; }
+.historyrow .htag {
+  flex: none; font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--text-dim); border: 1px solid var(--line2); border-radius: var(--radius-sm);
+  padding: 0 4px;
+}
+.historyrow .htime { flex: none; color: var(--text-dim); font-size: 10px; }
+.historyrow-actions { flex: none; display: flex; gap: 4px; visibility: hidden; }
+.historyrow:hover .historyrow-actions, .historyrow:focus-within .historyrow-actions,
+.historyrow.expanded .historyrow-actions { visibility: visible; }
+.historyrow-actions .btn { height: 18px; padding: 0 8px; font-size: 10px; }
+.historyrow-changes { padding: 2px 4px 4px 26px; display: none; }
+.historyrow.expanded .historyrow-changes { display: block; }
+.historyrow-changes div { font-size: 10px; color: var(--text-dim); padding: 1px 0; }
+.historyrow-changes div span.hchange-label { color: var(--text); }
+
+/* Author chip: shape carries person/agent (round pill vs a tag's smaller
+   radius), a stable per-author hue carries "which one", and an accent ring
+   marks the chip that is you regardless of hue -- three independent signals
+   so "you" versus "another person" versus "an agent" all read at a glance,
+   per the legend below. --hue is set inline per chip (history.js). */
+.hchip {
+  display: inline-flex; align-items: center; flex: none;
+  padding: 1px 7px; border-radius: var(--radius-full);
+  font-size: 9px; font-weight: 600; white-space: nowrap;
+  background: hsl(var(--hue, 210) 55% 26%); color: #fff;
+}
+[data-theme="light"] .hchip { background: hsl(var(--hue, 210) 70% 88%); color: hsl(var(--hue, 210) 55% 24%); }
+.hchip-agent { border-radius: var(--radius-sm); }
+.hchip-you { box-shadow: 0 0 0 1px var(--accent) inset; }
+
+.hnode { fill: var(--text-dim); stroke: var(--panel2); stroke-width: 2; }
+.hnode.head { fill: var(--accent); stroke: var(--accent-wash); stroke-width: 3; }
+.hedge { stroke: var(--line2); stroke-width: 1.5; fill: none; }
+.hedge.fork { stroke: var(--accent); }
+
+.historylegend {
+  flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 10px; border-top: 1px solid var(--line); background: var(--panel2);
+  font-size: 10px; color: var(--text-dim);
+}
+.historylegend .hchip { --hue: 210; margin-right: 3px; }
+
+.historyempty, .historyerr { padding: 10px; color: var(--text-dim); font-size: 11px; }
+.historyerr { color: var(--danger); font-family: var(--mono); }
 
 /* #sidebarutil: the former #sidebarRight body verbatim (#renderTime, Reset
    layout, JSON, Limits, Keys, the theme toggle), relocated out of the
@@ -397,7 +569,7 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    initSidebarResizers in app.js). */
 #mainBg { flex: 1 1 auto; min-width: 0; height: 100%; display: flex; flex-direction: column; }
 #maintoolbar {
-  flex: none; height: 34px; display: flex; align-items: center; gap: 4px;
+  flex: none; height: var(--toolbar-h); display: flex; align-items: center; gap: 4px;
   padding: 0 10px; background: var(--panel2); border-bottom: 1px solid var(--line);
   overflow-x: auto; overflow-y: hidden;
 }
@@ -1021,7 +1193,17 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
 #refPane { display: none; height: 100%; flex-direction: column;
            border-left: 1px solid var(--line); flex: 0 0 36%; overflow: hidden; }
 #viewport.withref #refPane { display: flex; }
-#refImgWrap { flex: 1 1 auto; min-height: 0; display: flex; align-items: center;
+/* Fixed share of the pane rather than "whatever is left" (contract C8 item 5).
+   Measured before the change, at 1440x900 with a match result on screen: the
+   image box took 156px and #matchRef was squeezed to its 45% cap, 127px of
+   visible box holding 495px of content, so the whole readout ("applied: ...
+   measured: reference 0.18 0.30 ...") sat below that box's fold. Scrolling it
+   into view then pushed the Match button and the Pick tools out of the strip
+   entirely, which is what reads as the readout landing on top of the
+   reference image instead of below it. Pinning the image here and letting the
+   strip below it take the rest (see #matchRef) puts the readout in normal
+   flow under the picture and gives it the room to be read. */
+#refImgWrap { flex: 0 0 45%; min-height: 96px; display: flex; align-items: center;
               justify-content: center; overflow: hidden; position: relative;
               cursor: crosshair; }
 #refImgWrap img { max-height: 100%; max-width: 100%; display: block; }
@@ -1037,9 +1219,23 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    panel, since it only ever needs a button, one status line and a handful
    of short result lines, never the amount of content #dockbody's scopes
    scroll deals with. */
-#matchRef { flex: 0 0 auto; max-height: 45%; overflow-y: auto;
-            border-top: 1px solid var(--line); padding: 6px 8px; }
-#matchRefBar { display: flex; align-items: center; gap: 8px; }
+/* The pane's scroller now, and a flex column so the readout can be ordered
+   next to the picture it describes without moving anything in index.html
+   (that markup is contract C7's). Reading order top to bottom: the action
+   bar, then what the next match will measure, then the result of the last
+   one, then the settings and the long "this fits a transform, it does not
+   copy a LUT" caption. The two readouts are what a person looks at right
+   after pressing the button, so they sit directly under the reference image;
+   the settings and the caption are reference material and scroll below. */
+#matchRef { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto;
+            border-top: 1px solid var(--line); padding: 6px 8px;
+            display: flex; flex-direction: column; }
+#matchRefBar { display: flex; align-items: center; gap: 8px; order: 0; flex: none; }
+#matchCropReadout { order: 1; flex: none; }
+#matchRefResult { order: 2; flex: none; }
+#matchRefControls { order: 3; flex: none; }
+#matchMethodDesc { order: 4; flex: none; }
+#matchRefCaption { order: 5; flex: none; }
 #matchRefBtn:disabled { opacity: 0.5; cursor: default; }
 #matchRefCaption { margin-top: 3px; }
 #matchRefResult { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
@@ -1395,6 +1591,25 @@ html[data-sidebar-right="collapsed"] #sidebarRight { width: 0; border-left-color
    track "FILLED in the accent colour", and a full-width bar can carry a
    brighter fill than a slider that used to be squeezed to 40px could. */
 .track { position: relative; flex: 1 1 auto; height: 20px; min-width: 40px; cursor: pointer; }
+
+/* The CSS half of the pointer-event conversion in controls.js and huecurve.js
+   (contract C8, mobile mode). Every element listed here is something a finger
+   DRAGS rather than taps, and by default a browser treats a drag that starts
+   on any of them as the beginning of a page scroll: it takes the gesture back
+   and fires pointercancel, so the knob stops following the thumb part way
+   through. `touch-action: none` is what tells it this element handles its own
+   gesture. Set unconditionally, not only inside the mobile media query, since
+   the same thing happens on a touchscreen laptop at a desktop width.
+   `manipulation` (not `none`) on plain buttons: they are tapped, not dragged,
+   so they only need the double-tap-to-zoom delay gone, and taking scrolling
+   away from a button would make a list of them impossible to scroll past. */
+.track, .numfield, .ctl-value, .wheel canvas, #curveCanvas, #hueCurveCanvas,
+#refImgWrap, #windowOverlay, #splitHandle, .sidebar-resize, #scrub {
+  touch-action: none;
+}
+.btn, .railtab, .paramtab, .mobiletab, .check, .dockhead .btn {
+  touch-action: manipulation;
+}
 .track .rail { position: absolute; top: 8px; left: 0; right: 0; height: 4px; border-radius: var(--radius-full);
                background: color-mix(in srgb, var(--text) 10%, transparent); }
 .track .fill { position: absolute; top: 8px; height: 4px; border-radius: var(--radius-full); background: var(--accent); }
@@ -1555,6 +1770,15 @@ input[type="checkbox"].ctl-switch:focus-visible { outline: 2px solid var(--accen
   background: var(--panel2); border: 1px solid var(--line2); color: var(--text-hi);
   padding: 6px 14px; border-radius: var(--radius-full); box-shadow: var(--card-shadow);
   font: 11px var(--mono); display: none; z-index: 60; max-width: 70vw;
+  /* A notification must never take a pointer event. Without this the toast
+     is a real hit target for as long as it is up (2.6 s, 6 s for a bad one),
+     and anything under it stops responding: measured with the harness, a
+     wheel aimed at the middle of #dock at a 600px tall window landed on the
+     toast instead (elementFromPoint returned #toast), which stopped the
+     widget column scrolling and failed 06-widget-scroll. #toast is position:
+     fixed with no scrollport of its own, so the gesture had nowhere to go
+     and did not chain to the column underneath. */
+  pointer-events: none;
 }
 #toast.on { display: block; }
 #toast.bad { border-color: var(--danger); color: #e79b9b; }
@@ -1624,3 +1848,252 @@ input[type="checkbox"].ctl-switch:focus-visible { outline: 2px solid var(--accen
    as the hole it has become rather than as the graded region. */
 #windowOverlay.inverted .win-outline { stroke-dasharray: 2 3; }
 #windowOverlay:focus-visible .win-centre { stroke-width: 2.5; }
+
+/* ---- picked rectangles for Match to reference (contract C7) -------------
+   Two rectangles, one on the reference in #refPane and one on the frame in
+   the viewer overlay, both saying "measure THIS part" before a match runs.
+   Kept in one block because they are one feature and have to look like it.
+
+   The frame rectangle is drawn by window-editor.js into the SVG overlay it
+   already owns (#windowOverlay), so it inherits that file's picture rect,
+   pointer capture and resize observers rather than growing a second overlay
+   with its own copy of all three. .picking is the only class that decides
+   which of the two things that overlay is showing. */
+#windowOverlay .pick-catch { fill: transparent; pointer-events: none; }
+#windowOverlay.picking .pick-catch { pointer-events: all; cursor: crosshair; }
+/* One at a time, and neither one is destroyed to show the other: leaving
+   pick mode redraws the window exactly as it was. */
+#windowOverlay.picking .win-grp { display: none; }
+#windowOverlay:not(.picking) .pick-grp { display: none; }
+/* Dashed, never filled. A permanent wash over a picture being judged for
+   colour is the one thing this overlay must not do, so the crop reads as a
+   boundary line and the picture inside it stays untouched. */
+#windowOverlay .pick-box {
+  fill: none; stroke: var(--accent); stroke-width: 1.25;
+  stroke-dasharray: 6 4; pointer-events: none;
+}
+#windowOverlay .pick-grip {
+  fill: var(--panel); stroke: var(--accent); stroke-width: 1.25;
+  pointer-events: all; cursor: crosshair;
+}
+#windowOverlay .pick-grip:hover { fill: var(--accent); }
+
+/* The reference's own rectangle. The picture outside it is dimmed rather
+   than the inside being tinted, for the same reason: what is inside is what
+   the fit will measure and it has to be seen as it is. The dim is one huge
+   spread box-shadow clipped by #refImgWrap's overflow: hidden, which needs
+   no extra elements and cannot drift out of step with the box itself. */
+#refImgWrap.picking { cursor: crosshair; }
+#refCropBox { box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55); background: none; }
+#refCropBox .crophandle {
+  position: absolute; width: 11px; height: 11px; margin: -6px 0 0 -6px;
+  background: var(--panel); border: 1.5px solid var(--accent);
+  border-radius: 50%; pointer-events: all; cursor: crosshair;
+}
+#refCropBox .crophandle:hover { background: var(--accent); }
+/* Only while the tool is on: with Pick off the rectangle is a readout of
+   what will be measured, not something to be nudged by a stray click. */
+#refImgWrap:not(.picking) #refCropBox .crophandle { display: none; }
+
+/* The match toolbar grew two toggles and two clear buttons, and #refPane is
+   a third of the viewer wide, so the row wraps instead of overflowing. */
+#matchRefBar { flex-wrap: wrap; row-gap: 4px; }
+#matchCropReadout { margin-top: 4px; white-space: pre-line; }
+
+/* ---- mobile mode (contract C8) ------------------------------------------
+
+   Direct request: "make a mobile mode too where those are buttons at the top
+   and the widgets are scrolling. the sidebars are basically new pages. On the
+   properties right sidebar, i should be able to see the preview while
+   scrolling (so preview floats, and scrolling properties/parameters widget/
+   panels should fade underneath it)".
+
+   This file had no @media rule of any kind before this block: at a phone
+   width the three-column shell simply squeezed until every control was a few
+   pixels wide. What follows is not a squeezed desktop, it is a different
+   layout: the app's three regions stop being columns side by side and become
+   three PAGES stacked on the same rectangle, with #mobilebar's buttons
+   choosing which one is showing.
+
+   The switch is an attribute, not the media query itself: static/sidebars.js
+   evaluates the query once in <head> and paints data-mobile / data-mobilepage
+   on <html> before first paint, and re-evaluates it live on a
+   matchMedia change. Everything below keys off those attributes rather than
+   repeating the query, for two reasons that matter. First, one source of
+   truth: static/mobile.js has to know the same fact (to turn GridStack's drag
+   and resize off and to run the preview mirror) and reading an attribute is
+   exact where re-testing a query string in JS is a second copy to keep in
+   step. Second, no flash: an @media rule cannot be applied earlier than the
+   stylesheet, but an attribute set by a blocking head script is already there
+   when the stylesheet first matches.
+
+   The two sidebars are hidden with `display: none` and the middle is not, and
+   that asymmetry is load bearing rather than an oversight. #mainBg holds the
+   viewer, and the viewer is what the floating preview on the Grade page
+   mirrors: a display: none region has no layout at all, so #frameImg's fit
+   maths, #gpuCanvas's own size and the ResizeObservers app.js keeps on the
+   scopes and timeline cards would every one of them collapse to zero the
+   moment you left the Preview page, and the mirror would have nothing to
+   copy. So the middle stays laid out and is taken off screen with opacity and
+   pointer-events instead, which keeps every box exactly the size it would be
+   if it were showing.
+
+   `visibility: hidden` was tried for both first and is wrong here, measured
+   not assumed: visibility is inherited but a descendant can set
+   `visibility: visible` and paint anyway, and two already do (.stagebody at
+   the bottom of this file, .dot.on for the MODIFIED chip). The result was the
+   grade panel's own body text painting straight through the middle of the
+   Preview page. opacity cannot be undone by a descendant, so it does not have
+   that hole. */
+
+/* Off at every desktop width; the mobile rules below are the only thing that
+   ever shows either of these. */
+#mobilebar { display: none; }
+#mobilepreview { display: none; }
+
+.mobiletab {
+  flex: 1 1 0; min-width: 0; background: var(--panel2); border: none;
+  border-right: 1px solid var(--line); color: var(--text-dim);
+  font: 10px var(--ui); text-transform: uppercase; letter-spacing: 0.6px;
+  height: 100%; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mobiletab:last-child { border-right: none; }
+.mobiletab.active {
+  background: var(--panel); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+html[data-mobile="on"] #appshell { display: block; position: relative; overflow: hidden; }
+
+html[data-mobile="on"] #mobilebar {
+  display: flex; position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+  height: var(--toolbar-h); background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+}
+
+/* The three regions, all on the same rectangle under the bar. */
+html[data-mobile="on"] #sidebarLeft,
+html[data-mobile="on"] #mainBg,
+html[data-mobile="on"] #sidebarRight {
+  position: absolute; left: 0; right: 0; top: var(--toolbar-h); bottom: 0;
+  width: auto; height: auto;
+  border-left: none; border-right: none; transition: none;
+}
+/* The sidebars: nothing live inside either of them, so they are simply not
+   rendered when they are not the page. */
+html[data-mobile="on"] #sidebarLeft,
+html[data-mobile="on"] #sidebarRight { display: none; z-index: 2; }
+html[data-mobile="on"][data-mobilepage="clips"] #sidebarLeft { display: block; }
+html[data-mobile="on"][data-mobilepage="params"] #sidebarRight { display: block; }
+/* The middle: always laid out (see the long comment above), just not seen and
+   not touchable unless it is the page. */
+html[data-mobile="on"] #mainBg { z-index: 1; }
+html[data-mobile="on"]:not([data-mobilepage="preview"]) #mainBg {
+  opacity: 0; pointer-events: none; z-index: 0;
+}
+
+/* Both inner bodies are pinned to their sidebar's dragged width on desktop
+   (see the app shell section); on a phone there is no drag and no second
+   column to trade width with, so they simply fill the page. */
+html[data-mobile="on"] #leftrail,
+html[data-mobile="on"] #paramsdock { width: 100%; }
+
+/* Nothing to drag and nothing to collapse into: one page is showing and the
+   bar is what changes it. */
+html[data-mobile="on"] .sidebar-resize,
+html[data-mobile="on"] .sidebar-toggle { display: none; }
+
+/* ---- the Preview page: one scrolling column of widgets -------------------
+   GridStack lays its cards out with absolute positioning and inline pixel
+   left/top/width/height, so overriding it takes !important (an author rule
+   with !important beats an inline rule without one, which is exactly the
+   case here). The JS half, in static/mobile.js, calls setStatic(true) so the
+   drag handle and the resize grips stop responding at all rather than merely
+   looking wrong; this half is what makes the cards stack and the column
+   scroll while they are static. */
+html[data-mobile="on"] #grid { display: block; overflow-y: auto; overflow-x: hidden; }
+html[data-mobile="on"] .gridcol { display: block; height: auto; }
+html[data-mobile="on"] .grid-stack { height: auto !important; min-height: 0 !important; }
+html[data-mobile="on"] .grid-stack > .grid-stack-item {
+  position: relative !important; inset: auto !important;
+  width: 100% !important; height: auto !important; min-height: 0 !important;
+  transform: none !important; margin: 0 0 8px 0 !important;
+}
+html[data-mobile="on"] .grid-stack > .grid-stack-item > .grid-stack-item-content {
+  position: relative !important; inset: auto !important;
+  width: auto !important; height: auto !important; overflow: visible;
+}
+html[data-mobile="on"] .grid-stack-item > .ui-resizable-handle { display: none !important; }
+/* GridStack's own drag handle is .widgethead, and with the grid static it no
+   longer picks a card up, but the grab cursor still says it might. */
+html[data-mobile="on"] .widgethead { cursor: default; }
+/* The preset row plus undo/reset does not fit on one 390px line, and a
+   horizontally scrolling toolbar hides half of itself behind a gesture nobody
+   knows is there. Wrapping is the phone answer. */
+html[data-mobile="on"] #maintoolbar {
+  height: auto; min-height: var(--toolbar-h); flex-wrap: wrap;
+  overflow-x: visible; padding: 4px 8px; row-gap: 4px;
+}
+html[data-mobile="on"] #maintoolbar .spacer { display: none; }
+/* The right sidebar's own Grade | History strip would be a second copy of two
+   buttons already in #mobilebar, stacked directly under them. One strip. The
+   buttons themselves stay in the DOM (mobile.js clicks the real one so
+   history.js's handler still runs), they are just not drawn twice. */
+html[data-mobile="on"] .paramtabs { display: none; }
+/* The viewer card has no dragged height here, so the picture needs a floor of
+   its own or it collapses to #viewport's 120px desktop minimum. */
+html[data-mobile="on"] #centre { overflow: visible; }
+html[data-mobile="on"] #viewport { min-height: 46vh; }
+/* At a phone width the reference beside the frame leaves neither of them
+   enough room, so it goes under the picture instead of next to it. */
+html[data-mobile="on"] #viewport.withref { flex-direction: column; }
+html[data-mobile="on"] #refPane { flex: 0 0 auto; height: 50vh; border-left: none; border-top: 1px solid var(--line); }
+
+/* ---- the Grade page: the floating preview -------------------------------
+   The pane itself becomes the scroll box (on desktop that job is #params's
+   own), so that #mobilepreview, its first child, can be `position: sticky` at
+   the top of it: the panels then scroll UNDER the picture instead of pushing
+   it off the top, which is the whole point of the request. The gradient below
+   its edge is the fade a row passes through on its way behind the preview. */
+html[data-mobile="on"] .parampane[data-paramtab="grade"] { overflow-y: auto; overflow-x: hidden; }
+html[data-mobile="on"] #params { flex: 0 0 auto; overflow: visible; }
+html[data-mobile="on"][data-mobilepage="params"] #mobilepreview {
+  display: block; position: sticky; top: 0; z-index: 4; flex: none;
+  height: 34vh; min-height: 140px; background: #0e0e0e;
+  border-bottom: 1px solid var(--line);
+}
+/* The fade the request asks for by name ("scrolling properties/parameters
+   widget/panels should fade underneath it"): a band of the sidebar's own
+   surface colour, --panel2, going to nothing over 28px directly below the
+   preview's edge. A row sliding up dissolves into the background across that
+   band instead of being guillotined at a hard line. It is part of the sticky
+   element, so it travels with it and cannot drift out of step; it is
+   pointer-events: none, so it never eats a tap meant for the control under
+   it. --panel2 rather than --panel because the pane behind these controls is
+   #sidebarRight's own background and the accordion sections draw no surface
+   of their own. */
+#mobilepreview::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 28px;
+  background: linear-gradient(to bottom, var(--panel2), transparent);
+  pointer-events: none;
+}
+#mobilePreviewCanvas { display: block; width: 100%; height: 100%; }
+/* Same corner badge idiom as .layer b on the main viewer, so it reads as
+   chrome on the picture rather than as something in it. */
+#mobilePreviewNote {
+  position: absolute; left: 0; top: 0; background: rgba(0, 0, 0, 0.7);
+  color: var(--text-hi); font: 10px var(--mono); padding: 1px 5px;
+  text-transform: uppercase; letter-spacing: 0.5px; pointer-events: none;
+}
+
+/* Bigger hit targets: 24px tall tabs and 20px tall buttons are a mouse
+   measurement. Nothing here changes a control's behaviour, only its box. */
+html[data-mobile="on"] .railtab,
+html[data-mobile="on"] .paramtab,
+html[data-mobile="on"] .mobiletab { height: var(--toolbar-h); font-size: 11px; }
+html[data-mobile="on"] .btn { min-height: 28px; }
+html[data-mobile="on"] .track { height: 28px; }
+html[data-mobile="on"] .track .rail,
+html[data-mobile="on"] .track .fill { top: 12px; }
+html[data-mobile="on"] .track .knob { top: 7px; width: 18px; height: 18px; margin-left: -9px; }
+html[data-mobile="on"] .track .detent { top: 9px; height: 10px; }

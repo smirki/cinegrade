@@ -5,7 +5,7 @@
 // so the coupling is one small documented contract instead of a tangle. app.js
 // only has to do two things:
 //
-//   window.StudioSession.publish(config, clip, time)   after every local change
+//   window.StudioSession.publish(config, clip, time, message)   after every local change
 //   window.applyExternalConfig = function (config) {}  to accept an outside one
 //
 // Both are optional. If app.js defines neither, this file does nothing except
@@ -21,11 +21,31 @@
   var applying = false;
   var stopped = false;
 
-  function publish(config, clip, time) {
+  // One hook any other file can listen for instead of polling on its own
+  // timer (contract C3, the History panel): fired on every revision this tab
+  // learns about, whether that came from ITS OWN publish just below (a local
+  // commit) or from the long poll further down (somebody else's commit, a
+  // checkout, an undo, a redo, a fork, a rotation change). Carries the same
+  // state GET /api/session already answers with (config, project, head,
+  // rotation, branch, by), so a listener can read what moved without a
+  // second fetch, though the History panel just uses it as a cue to refetch
+  // /api/project/log for the full tree. Deliberately NOT gated on the
+  // `by !== "studio"` echo filter below: that filter is about whether THIS
+  // tab's picture should redraw from an outside config, which is a different
+  // question from "did the project's history just grow".
+  function dispatchState(state) {
+    global.dispatchEvent(new CustomEvent("studio:session", { detail: state }));
+  }
+
+  function publish(config, clip, time, message) {
     if (applying || stopped) { return; }
     var body = { config: config, by: "studio" };
     if (clip !== undefined && clip !== null) { body.clip = clip; }
     if (time !== undefined && time !== null) { body.time = time; }
+    // Optional: the server already generates a description for a plain edit
+    // ("N changes: ..."), so only send one when the caller has something more
+    // useful to say, such as app.js naming a preset load as its own commit.
+    if (message) { body.message = message; }
     // replace, not merge: the page is the source of truth for its own state, so
     // a key the user cleared has to actually disappear rather than survive as a
     // leftover from the previous revision.
@@ -35,7 +55,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }).then(function (r) { return r.json(); })
-      .then(function (s) { if (s && s.rev) { lastRev = s.rev; } })
+      .then(function (s) { if (s && s.rev) { lastRev = s.rev; dispatchState(s); } })
       .catch(function () { /* the server going away is not worth a toast */ });
   }
 
@@ -68,6 +88,7 @@
         if (stopped) { return; }
         if (state && state.rev > lastRev) {
           lastRev = state.rev;
+          dispatchState(state);
           // Only an edit from somewhere else should be pushed back into the
           // page. Our own publish comes back with by "studio" and applying it
           // would fight whatever the user has typed since.

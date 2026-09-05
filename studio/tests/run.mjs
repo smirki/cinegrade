@@ -12,6 +12,8 @@
 
 import puppeteer from "puppeteer-core";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { findFreePort, waitForHttp200, sleep, renderTable } from "./lib/util.mjs";
@@ -42,7 +44,32 @@ const SPEC_FILES = [
   "15-gpu-render.mjs",
   "16-layers.mjs",
   "17-slice.mjs",
+  "18-history.mjs",
+  "19-reload-state.mjs",
+  "20-presets.mjs",
+  "21-match-pick.mjs",
+  "22-mobile.mjs",
 ];
+
+/* Each spec starts from the same known right sidebar tab, the same way it
+ * starts from the same known viewport.
+ *
+ * The tab is remembered in localStorage (fixxr-studio-paramtab, sidebars.js)
+ * and painted on <html> before first paint, so it survives every reload for
+ * the rest of the run. 18-history leaves it on History by design (that is
+ * what it is testing), and every later spec that clicks a control inside
+ * #params then finds that pane display: none and puppeteer refuses the click
+ * with "Node is either not clickable or not an Element". Resetting it here,
+ * once per spec, is the same kind of leak guard as the viewport reset rather
+ * than a change to any spec's own behaviour. */
+async function resetParamTab(page) {
+  try {
+    await page.evaluate(() => {
+      try { window.localStorage.setItem("fixxr-studio-paramtab", "grade"); } catch (e) { /* private mode */ }
+      document.documentElement.setAttribute("data-paramtab", "grade");
+    });
+  } catch (err) { /* no page yet, or navigating: the next spec resets it too */ }
+}
 
 /* The one place every spec waits for "the app finished its first boot":
  * Panels.build() only runs after boot()'s /api/state fetch resolves, and it
@@ -141,8 +168,19 @@ async function main() {
   const baseUrl = "http://127.0.0.1:" + port;
   console.log("[run] port " + port);
 
+  // studio/data/studio.db and studio/data/users/<id>/presets are somebody's
+  // real accounts, grades and presets, not test fixtures. --data-dir (server.py,
+  // also STUDIO_DATA_DIR) is exactly the escape hatch server.py documents for
+  // this: a fresh temp folder per run, so every spec's Overwrite, Save as,
+  // grade autosave and project commit lands there instead of the real
+  // studio/data. grade/presets/ (the shipped library) and footage/ are not
+  // affected by --data-dir and stay the real, shared, read-mostly ones, which
+  // is what a spec needs to read real library presets and real clips.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-test-"));
+  console.log("[run] isolated data dir " + dataDir);
+
   const serverLog = { stdout: [], stderr: [] };
-  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port)], {
+  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port), "--data-dir", dataDir], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -195,6 +233,7 @@ async function main() {
       page,
       baseUrl,
       port,
+      dataDir,
       consoleEvents,
       pageErrors,
       marks: { load: loadFence, afterLoad: afterLoadFence },
@@ -208,6 +247,7 @@ async function main() {
       const mod = await import("./specs/" + file);
       const name = file.replace(/^\d+-/, "").replace(/\.mjs$/, "");
       await page.setViewport(DEFAULT_VIEWPORT); // each spec starts from the same known viewport
+      await resetParamTab(page);                // ... and the same known sidebar tab
       let result;
       try {
         result = await mod.default(ctx);
@@ -234,6 +274,7 @@ async function main() {
       await sleep(500);
       try { server.kill("SIGKILL"); } catch (e) { /* already gone */ }
     }
+    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
   }
 
   if (hardFailure) {

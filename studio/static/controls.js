@@ -4,7 +4,20 @@
  * viewer can update, and once more with commit=true when the pointer is
  * released. Undo history is written on commit only, otherwise dragging one
  * slider across the panel would push a hundred entries and undo would become
- * useless. */
+ * useless.
+ *
+ * Every gesture below is bound with POINTER events (pointerdown/pointermove/
+ * pointerup/pointercancel), not mouse events (contract C8, mobile mode). This
+ * is not a style preference: a touch drag never produces a stream of
+ * compatibility mousemove events. Chrome sends one synthesised mousemove,
+ * mousedown, mouseup and click at the END of a touch, so a control bound to
+ * mousedown plus document mousemove sees the press and never sees the drag,
+ * which is exactly "the slider does not move under my thumb". Pointer events
+ * carry mouse, pen and touch through one path, and clientX/clientY, button,
+ * shiftKey, altKey and metaKey all read the same, so the gesture logic itself
+ * is unchanged. The CSS half of this is `touch-action: none` on the same
+ * elements (style.css): without it the browser claims the gesture as a page
+ * scroll and fires pointercancel mid drag. */
 
 (function (global) {
   "use strict";
@@ -60,7 +73,7 @@
       el.focus();
     }
 
-    el.addEventListener("mousedown", function (ev) {
+    el.addEventListener("pointerdown", function (ev) {
       if (editing || ev.button !== 0) return;
       ev.preventDefault();
       var x0 = ev.clientX, v0 = value, moved = false;
@@ -73,8 +86,9 @@
         set(v0 + dx * step * mult);
       }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
         document.body.style.cursor = "";
         if (moved) {
           opts.onChange(value, true);
@@ -90,8 +104,9 @@
           beginEdit();
         }
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
       document.body.style.cursor = "ew-resize";
     });
 
@@ -176,7 +191,7 @@
       return min + clamp((clientX - r.left) / r.width, 0, 1) * (max - min);
     }
 
-    el.addEventListener("mousedown", function (ev) {
+    el.addEventListener("pointerdown", function (ev) {
       if (ev.button !== 0) return;
       ev.preventDefault();
       var fine = ev.shiftKey;
@@ -191,12 +206,14 @@
         }
       }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
         opts.onChange(value, true);
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
     });
 
     el.addEventListener("dblclick", function (ev) {
@@ -497,7 +514,7 @@
       opts.onChange(value.slice(), !!commit);
     }
 
-    canvas.addEventListener("mousedown", function (ev) {
+    canvas.addEventListener("pointerdown", function (ev) {
       ev.preventDefault();
       function at(e) {
         var r = canvas.getBoundingClientRect();
@@ -510,12 +527,14 @@
       var p = at(ev); applyPuck(p[0], p[1], false);
       function move(e) { var q = at(e); applyPuck(q[0], q[1], false); }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
         opts.onChange(value.slice(), true);
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
     });
 
     function reset() {
@@ -713,7 +732,7 @@
       return [ev.clientX - r.left, ev.clientY - r.top];
     }
 
-    canvas.addEventListener("mousedown", function (ev) {
+    canvas.addEventListener("pointerdown", function (ev) {
       ev.preventDefault();
       var p = localPos(ev);
       var idx = nearest(p[0], p[1]);
@@ -753,14 +772,16 @@
         opts.onChange(curves, false);
       }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        document.removeEventListener("pointercancel", up);
         dragIndex = -1;
         draw();
         opts.onChange(curves, true);
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+      document.addEventListener("pointercancel", up);
     });
 
     canvas.addEventListener("contextmenu", function (ev) { ev.preventDefault(); });

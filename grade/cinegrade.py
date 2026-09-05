@@ -25,9 +25,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -200,10 +204,110 @@ def load_preset(name_or_path: str | None) -> dict:
 
 
 # --------------------------------------------------------------------------
+# rotation
+# --------------------------------------------------------------------------
+#
+# Rotation is a setting, not a guess. "auto" is ffmpeg's own behaviour (it
+# honours the display matrix the file carries), "0" ignores that tag, and 90,
+# 180 and 270 ignore it and then turn the picture that many degrees CLOCKWISE
+# as it is seen on screen. That last group exists because a camera can write a
+# tag that does not match the picture: this footage carries a -90 display
+# matrix on shots that are already upright, so "auto" delivers them sideways
+# and "0" delivers the ones that really are tagged correctly sideways instead.
+#
+# 180 is two clockwise quarter turns rather than hflip,vflip. Both are exact
+# reorderings of the same samples (no resampling either way), and doing it as
+# 90 twice means this file has one definition of "clockwise" instead of two
+# that could drift apart.
+
+ROTATIONS = ("auto", "0", "90", "180", "270")
+
+_ROTATE_FILTERS = {
+    "auto": [],
+    "0": [],
+    "90": ["transpose=1"],                     # 1 = 90 degrees clockwise
+    "180": ["transpose=1", "transpose=1"],
+    "270": ["transpose=2"],                    # 2 = 90 degrees anticlockwise
+}
+
+
+def normalise_rotation(value=None, default: str = "auto") -> str:
+    """One of ROTATIONS out of whatever a caller happens to have.
+
+    Accepts the new rotation strings, the old autorotate boolean (True is
+    "auto", False is "0"), and the "1"/"0" query form the browser has always
+    sent, so a request written before rotation existed still means exactly
+    what it used to mean.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return "auto" if value else "0"
+    s = str(value).strip().lower()
+    if s in ROTATIONS:
+        return s
+    if s in ("true", "yes", "on", "1", "tag"):
+        return "auto"
+    if s in ("false", "no", "off", "none"):
+        return "0"
+    try:
+        n = int(round(float(s))) % 360
+    except ValueError:
+        raise GradeError(f"rotation must be one of {', '.join(ROTATIONS)}, "
+                         f"got {value!r}") from None
+    if n % 90:
+        raise GradeError(f"rotation must be a quarter turn "
+                         f"({', '.join(ROTATIONS)}), got {value!r}")
+    return str(n)
+
+
+def rotate_filters(rotation) -> list[str]:
+    """The ffmpeg filter steps this rotation needs, empty for auto and 0."""
+    return list(_ROTATE_FILTERS[normalise_rotation(rotation)])
+
+
+def rotation_of(info) -> str:
+    """The rotation an info dict (probe's shape) was built for.
+
+    Falls back to the old autorotate boolean so an info dict assembled by
+    hand, by a tool or by an older caller keeps its meaning.
+    """
+    info = info or {}
+    chosen = info.get("rotate")
+    if chosen:
+        return normalise_rotation(chosen)
+    return "auto" if info.get("autorotate", True) else "0"
+
+
+def rotate_prefix(info) -> str:
+    """The transpose steps for a -vf chain, comma terminated, "" for none.
+
+    For the callers that decode with a plain -vf rather than a filter_complex
+    (the studio's source frame, its proxy, the orient sheet). The rotation has
+    to come FIRST in those chains: every scale target downstream is computed
+    from probe's post-rotation dimensions.
+    """
+    steps = rotate_filters(rotation_of(info))
+    return (",".join(steps) + ",") if steps else ""
+
+
+def rotate_args(rotation) -> list[str]:
+    """The pre-input ffmpeg args. Anything but auto ignores the display tag."""
+    return [] if normalise_rotation(rotation) == "auto" else ["-noautorotate"]
+
+
+# --------------------------------------------------------------------------
 # probe
 # --------------------------------------------------------------------------
 
-def probe(path: str, autorotate: bool = True) -> dict:
+def probe(path: str, autorotate: bool = True, rotation=None) -> dict:
+    """Stream facts, with width and height AFTER the chosen rotation.
+
+    rotation wins when it is given; autorotate is the old two-value form of
+    the same argument and stays for every caller that has not moved yet.
+    """
+    mode = normalise_rotation(rotation if rotation is not None
+                              else bool(autorotate))
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_streams", "-show_entries", "stream_side_data", "-of", "json", path],
@@ -214,10 +318,16 @@ def probe(path: str, autorotate: bool = True) -> dict:
     for sd in st.get("side_data_list", []):
         if "rotation" in sd:
             rot = int(float(sd["rotation"]))
-    if autorotate and abs(rot) in (90, 270):
-        w, h = h, w        # ffmpeg auto-rotates, so the graph sees these
+    if mode == "auto":
+        if abs(rot) in (90, 270):
+            w, h = h, w    # ffmpeg auto-rotates, so the graph sees these
+    elif mode in ("90", "270"):
+        # A fixed quarter turn runs on the untagged stream (-noautorotate),
+        # so it is the file's own width and height that swap.
+        w, h = h, w
     return {
-        "width": w, "height": h, "rotation": rot, "autorotate": autorotate,
+        "width": w, "height": h, "rotation": rot, "rotate": mode,
+        "autorotate": mode == "auto",
         "pix_fmt": st.get("pix_fmt"), "color_range": st.get("color_range", "tv"),
         "color_space": st.get("color_space", "bt2020nc"),
         "nb_frames": st.get("nb_frames"), "duration": st.get("duration"),
@@ -2069,8 +2179,11 @@ def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
     # Must precede -i. Some clips carry a display matrix whose content is
     # already upright, in which case honouring the tag rotates it INTO being
     # sideways. Check with `cinegrade orient` before a long render.
-    if not info.get("autorotate", True):
-        args += ["-noautorotate"]
+    #
+    # Every rotation but auto ignores the tag here; the quarter turns 90, 180
+    # and 270 then transpose in the graph (graph_with_mask), because ffmpeg
+    # has no pre-input filter to do it with.
+    args += rotate_args(rotation_of(info))
     if seek is not None:
         args += ["-ss", str(seek)]
     args += ["-i", src]
@@ -2086,7 +2199,29 @@ def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
 
 
 def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
-                    src_label="0:v", head_extra=None, src_normalised=False):
+                    src_label="0:v", head_extra=None, src_normalised=False,
+                    src_rotated=None):
+    """The whole filter_complex, including the matte inputs and the rotation.
+
+    src_rotated says the source this graph is handed has ALREADY been turned
+    (the studio's cached source frame, or a caller whose own head_extra chain
+    does the transpose before its scale). Left as None it means "True when
+    head_extra is given", because a caller building its own source chain is
+    exactly the caller whose scale target would be wrong if the turn happened
+    after it: the transpose has to run before any resize, since every scale
+    target in this engine is computed from probe's post-rotation size.
+
+    For auto and 0 there is no transpose at all, so the graph text is byte for
+    byte what it was before rotation existed.
+    """
+    if src_rotated is None:
+        src_rotated = head_extra is not None
+    rotate = ([] if (src_normalised or src_rotated)
+              else rotate_filters(rotation_of(info)))
+    rotate_seg = None
+    if rotate:
+        rotate_seg = f"[{src_label}]{','.join(rotate)},setsar=1[rotsrc]"
+        src_label = "rotsrc"
     graph, needs_mask = build_graph(cfg, info, out_label, tail_extra, encode_out,
                                     src_label, src_normalised)
     idxs = mask_input_indices(cfg)
@@ -2111,6 +2246,8 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
     # array index so build_layers and this function name the same link without
     # either having to replay the other's control flow.
     pre = []
+    if rotate_seg:
+        pre.append(rotate_seg)
     if needs_mask:
         pre.append(f"[{idxs['radial']}:v]{WINDOW_MASK_FORMAT},setsar=1[mask]")
     for i, _win in window_layers(cfg):
@@ -2126,9 +2263,22 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
 # commands
 # --------------------------------------------------------------------------
 
+def cli_rotation(a) -> str:
+    """The rotation one parsed command line asks for.
+
+    --rotate wins when it is given. --no-autorotate stays as the alias of
+    --rotate 0 it always was, so every script and every note written before
+    this flag existed keeps working unchanged.
+    """
+    chosen = getattr(a, "rotate", None)
+    if chosen:
+        return normalise_rotation(chosen)
+    return "0" if getattr(a, "no_autorotate", False) else "auto"
+
+
 def cmd_render(a):
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, autorotate=not getattr(a, 'no_autorotate', False))
+    info = probe(a.input, rotation=cli_rotation(a))
     graph = graph_with_mask(cfg, info)
     o = cfg["output"]
     args = ffmpeg_inputs(a.input, cfg, info, a.start, a.duration)
@@ -2151,7 +2301,7 @@ def cmd_render(a):
 
 def cmd_still(a):
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, autorotate=not getattr(a, 'no_autorotate', False))
+    info = probe(a.input, rotation=cli_rotation(a))
     extra = ([f"scale={a.width}:-2"] if a.width else []) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
     args = ffmpeg_inputs(a.input, cfg, info, a.time)
@@ -2166,7 +2316,7 @@ def cmd_compare(a):
     This is the agent feedback loop: one image showing every candidate, so a
     grading decision is a single look instead of N separate renders.
     """
-    info = probe(a.input, autorotate=not getattr(a, 'no_autorotate', False))
+    info = probe(a.input, rotation=cli_rotation(a))
     if a.presets:
         variants = [(v, {"preset": v}) for v in a.presets.split(",")]
     elif a.looks:
@@ -2206,7 +2356,7 @@ def cmd_compare(a):
 def cmd_scopes(a):
     """Waveform + vectorscope + the frame, so a grade can be read numerically."""
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, autorotate=not getattr(a, 'no_autorotate', False))
+    info = probe(a.input, rotation=cli_rotation(a))
     graph = graph_with_mask(cfg, info, encode_out=False)
     W = a.width
     graph += (
@@ -2232,7 +2382,7 @@ def cmd_scopes(a):
 def cmd_stats(a):
     """Numeric readback: an agent can verify a grade without looking at it."""
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, autorotate=not getattr(a, 'no_autorotate', False))
+    info = probe(a.input, rotation=cli_rotation(a))
     graph = graph_with_mask(cfg, info, encode_out=False, tail_extra=[
         "format=yuv420p", "signalstats", "metadata=mode=print:file=-"])
     args = ffmpeg_inputs(a.input, cfg, info, a.time)
@@ -2258,29 +2408,118 @@ def cmd_stats(a):
 
 
 
+# A 5x7 bitmap font, only the glyphs the orient sheet's labels use. This
+# ffmpeg build has no drawtext filter (no libfreetype) and the venv has no
+# Pillow, so the labels are drawn here, as pixels, rather than not drawn at
+# all: an unlabelled five-up contact sheet is a puzzle, not a diagnosis.
+_ORIENT_GLYPHS = {
+    "0": "01110 10001 10011 10101 11001 10001 01110",
+    "1": "00100 01100 00100 00100 00100 00100 01110",
+    "2": "01110 10001 00001 00010 00100 01000 11111",
+    "3": "11111 00010 00100 00010 00001 10001 01110",
+    "4": "00010 00110 01010 10010 11111 00010 00010",
+    "5": "11111 10000 11110 00001 00001 10001 01110",
+    "6": "00110 01000 10000 11110 10001 10001 01110",
+    "7": "11111 00001 00010 00100 01000 01000 01000",
+    "8": "01110 10001 10001 01110 10001 10001 01110",
+    "9": "01110 10001 10001 01111 00001 00010 01100",
+    "a": "00000 00000 01110 00001 01111 10001 01111",
+    "o": "00000 00000 01110 10001 10001 10001 01110",
+    "t": "01000 01000 11100 01000 01000 01001 00110",
+    "u": "00000 00000 10001 10001 10001 10011 01101",
+    "x": "00000 00000 10001 01010 00100 01010 10001",
+    " ": "00000 00000 00000 00000 00000 00000 00000",
+}
+_ORIENT_GLYPH_W, _ORIENT_GLYPH_H = 5, 7
+
+
+def _orient_label_png(text: str, width: int, scale: int, out: Path,
+                      verbose=False) -> int:
+    """Write a dark strip of the given width with text drawn in white.
+
+    Returns the strip's height so the caller can vstack it onto its panel.
+    Written as rawvideo through ffmpeg's png encoder, the same no-Pillow trick
+    the test harness uses for its patch sources.
+    """
+    import numpy as np                                       # noqa: PLC0415
+    pad = 2 * scale
+    height = _ORIENT_GLYPH_H * scale + 2 * pad
+    strip = np.zeros((height, width, 3), dtype=np.uint8)
+    strip[:, :] = (24, 24, 28)
+    x = pad
+    for ch in text.lower():
+        rows = _ORIENT_GLYPHS.get(ch)
+        if rows is None:
+            x += (_ORIENT_GLYPH_W + 1) * scale
+            continue
+        for ry, row in enumerate(rows.split()):
+            for rx, bit in enumerate(row):
+                if bit != "1":
+                    continue
+                x0 = x + rx * scale
+                y0 = pad + ry * scale
+                if x0 + scale > width:
+                    continue
+                strip[y0:y0 + scale, x0:x0 + scale] = (235, 235, 235)
+        x += (_ORIENT_GLYPH_W + 1) * scale
+    run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-s", f"{width}x{height}", "-i", "-", "-frames:v", "1", str(out)],
+        verbose, stdin_bytes=strip.tobytes())
+    return height
+
+
 def cmd_orient(a):
-    """Render the same frame both ways so orientation is decided by looking."""
-    outs = []
-    for rotate in (True, False):
-        info = probe(a.input, autorotate=rotate)
+    """One contact sheet of every rotation, so a wrong tag is read off it.
+
+    auto is what ffmpeg does on its own (it honours the file's display
+    matrix); 0 ignores that tag; 90, 180 and 270 ignore it and then turn the
+    picture clockwise. The panel that is upright names the --rotate value to
+    pass to every other command.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cinegrade-orient-"))
+    try:
+        panels = []
+        for mode in ROTATIONS:
+            info = probe(a.input, rotation=mode)
+            out = tmp / f"orient_{mode}.png"
+            args = ["ffmpeg", "-v", "error", "-y"] + rotate_args(mode)
+            args += ["-ss", str(a.time), "-i", a.input,
+                     "-vf", f"{rotate_prefix(info)}scale=-2:{a.height},format=rgb24",
+                     "-frames:v", "1", str(out)]
+            run(args, a.verbose)
+            shot = probe(str(out))
+            label = f"{mode} {info['width']}x{info['height']}"
+            panels.append({"mode": mode, "path": out, "label": label,
+                           "width": shot["width"]})
+            print(f"  --rotate {mode:<5} {info['width']}x{info['height']}")
+
+        # One scale for every label, chosen from the narrowest panel, so no
+        # label runs off the end of the picture it belongs to.
+        longest = max(len(p["label"]) for p in panels)
+        narrowest = min(p["width"] for p in panels)
+        scale = max(1, min(5, (narrowest - 8) // (longest * (_ORIENT_GLYPH_W + 1))))
+
         args = ["ffmpeg", "-v", "error", "-y"]
-        if not rotate:
-            args += ["-noautorotate"]
-        out = f"/tmp/orient_{'auto' if rotate else 'raw'}.png"
-        args += ["-ss", str(a.time), "-i", a.input,
-                 "-vf", f"scale=-2:{a.height},format=rgb24", "-frames:v", "1", out]
+        segs, cols = [], []
+        for i, p in enumerate(panels):
+            strip = tmp / f"label_{p['mode']}.png"
+            _orient_label_png(p["label"], p["width"], scale, strip, a.verbose)
+            args += ["-i", str(strip), "-i", str(p["path"])]
+            segs.append(f"[{2 * i}:v][{2 * i + 1}:v]vstack[c{i}]")
+            cols.append(f"[c{i}]")
+        segs.append("".join(cols) + f"hstack=inputs={len(panels)},format=rgb24[sheet]")
+        args += ["-filter_complex", ";".join(segs), "-map", "[sheet]",
+                 "-frames:v", "1", a.output]
         run(args, a.verbose)
-        outs.append(out)
-        print(f"  {'autorotate (default)' if rotate else '--no-autorotate':22} "
-              f"{info['width']}x{info['height']}")
-    run(["ffmpeg", "-v", "error", "-y", "-i", outs[0], "-i", outs[1],
-         "-filter_complex", "[0:v][1:v]hstack,format=rgb24",
-         "-frames:v", "1", a.output], a.verbose)
-    print(f"left = autorotate, right = --no-autorotate  -> {a.output}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print(f"left to right: {', '.join(ROTATIONS)}  -> {a.output}")
     rot = probe(a.input)["rotation"]
     if rot:
-        print(f"note: this clip carries a {rot} degree display matrix. If the "
-              f"right frame is the upright one, pass --no-autorotate.")
+        print(f"note: this clip carries a {rot} degree display matrix, which "
+              f"is what the auto panel honours. If a different panel is the "
+              f"upright one, pass its --rotate value.")
     if a.open:
         subprocess.run(["open", "-a", "Preview", a.output])
 
@@ -2301,18 +2540,77 @@ def apply_overrides(cfg, a):
     return cfg
 
 
-def run(args, verbose=False):
+def run(args, verbose=False, stdin_bytes=None):
+    """Run one ffmpeg command, raising on a non-zero exit.
+
+    stdin_bytes feeds the process raw bytes (the orient sheet's label strips
+    go in as rawvideo); the text pipe is only used when there is no binary
+    input, since the two cannot be mixed on one call.
+    """
     if verbose:
         print(" ".join(shlex.quote(x) for x in args), file=sys.stderr)
-    r = subprocess.run(args, capture_output=True, text=True)
+    if stdin_bytes is None:
+        r = subprocess.run(args, capture_output=True, text=True)
+        err = r.stderr
+    else:
+        r = subprocess.run(args, input=stdin_bytes, capture_output=True)
+        err = r.stderr.decode("utf-8", "replace")
     if r.returncode != 0:
-        raise GradeError(f"ffmpeg failed ({r.returncode})\n{r.stderr[-4000:]}")
+        raise GradeError(f"ffmpeg failed ({r.returncode})\n{err[-4000:]}")
     return r
 
 
 # The studio server's default port. Only used to talk to an already running
 # one, so there is nothing to bind or configure here.
 STUDIO_PORT = 7431
+
+
+def resolve_by(a) -> str:
+    """Who a server write is FROM, decided the same way by every command here.
+
+    `--by` wins. Failing that, the `CINEGRADE_AGENT` environment variable, so
+    a fleet of agents can each export their own name once and never type
+    `--by` on every call. Failing that, `cli`. The server does not add an
+    `agent:` prefix by itself (studio/projects.py stores whatever label it is
+    given), so an agent that wants to read as one spells it out itself, either
+    on the command line or in the environment variable: `agent:colorbot-3`.
+    """
+    by = getattr(a, "by", None)
+    if by:
+        return str(by)
+    env = os.environ.get("CINEGRADE_AGENT")
+    if env:
+        return env
+    return "cli"
+
+
+def _studio_call(port: int, path: str, method: str = "GET",
+                 payload: dict | None = None) -> dict:
+    """One HTTP round trip to a running studio server.
+
+    Same reasoning as cmd_session below: plain HTTP to 127.0.0.1 and nothing
+    else, against a server that is already running and already bound to the
+    loopback interface, so this adds no listener, no port and no remote
+    surface of its own. A 4xx from the server (a bad clip name, no project
+    open, an unknown commit id) comes back as a message, not a traceback.
+    """
+    import urllib.error                                     # noqa: PLC0415
+    import urllib.request                                   # noqa: PLC0415
+
+    url = f"http://127.0.0.1:{port}/api/{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()[:400]
+        raise GradeError(f"studio refused it: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GradeError(
+            f"no studio server answering on 127.0.0.1:{port} ({exc.reason}). "
+            f"Start one with ./studio.sh, or pass --port.") from exc
 
 
 def cmd_session(a):
@@ -2348,7 +2646,9 @@ def cmd_session(a):
         # it in {"config": ...}.
         if not set(patch) & {"config", "clip", "time"}:
             patch = {"config": patch}
-        patch.setdefault("by", "cli")
+        patch.setdefault("by", resolve_by(a))
+        if getattr(a, "message", None):
+            patch.setdefault("message", a.message)
         patch["replace"] = bool(a.replace)
         body = json.dumps(patch).encode()
 
@@ -2372,6 +2672,246 @@ def cmd_session(a):
     print(json.dumps(out, indent=2))
 
 
+def cmd_whoami(a):
+    """Who a write from this shell counts as, and what project is open.
+
+    `user` and `auth` and `project` are the server's own answer: an account
+    name (or none, with logins off), whether logins are on at all, and the
+    content key of whatever project this account currently has open. `by` is
+    NOT read back from the server: the whoami route has no write to attach it
+    to, so it always reports its own quiet default (`cli`) regardless of what
+    a caller might send. What actually signs a commit is decided per write, by
+    resolve_by() above, the same way for `session patch` and every `project`
+    command, so that is what is shown here: the account name when logins are
+    on (nothing overrides that, ever), otherwise --by, else CINEGRADE_AGENT,
+    else cli.
+    """
+    out = _studio_call(a.port, "whoami")
+    effective_by = out.get("user") if (out.get("auth") and out.get("user")) \
+        else resolve_by(a)
+    if a.json:
+        shown = dict(out)
+        shown["by"] = effective_by
+        print(json.dumps(shown, indent=2))
+        return
+    print(f"user     {out.get('user') or '(no account, logins are off)'}")
+    print(f"by       {effective_by}")
+    print(f"logins   {'on' if out.get('auth') else 'off'}")
+    print(f"project  {out.get('project') or '(none open)'}")
+
+
+def _relative_time(ts: float) -> str:
+    """A short, human age for a commit timestamp. No exact clock needed."""
+    delta = max(0.0, time.time() - float(ts or 0.0))
+    if delta < 5:
+        return "just now"
+    steps = (
+        (60, 1, "second"), (3600, 60, "minute"), (86400, 3600, "hour"),
+        (604800, 86400, "day"), (2629800, 604800, "week"),
+        (31557600, 2629800, "month"),
+    )
+    for limit, unit_seconds, name in steps:
+        if delta < limit:
+            value = int(delta // unit_seconds)
+            return f"{value} {name}{'' if value == 1 else 's'} ago"
+    value = int(delta // 31557600)
+    return f"{value} year{'' if value == 1 else 's'} ago"
+
+
+def _print_project_state(out: dict) -> None:
+    """The fields `project show`, `open`, `rotate`, `undo` and friends share.
+
+    Same order every time: key, clip, branch, head, rotation, time, preset,
+    branches, so a script tailing this output always finds a field on the
+    same line.
+    """
+    if not out.get("open"):
+        print(out.get("note") or "no project is open")
+        return
+    print(f"key       {out.get('key')}")
+    print(f"clip      {out.get('name')}")
+    print(f"branch    {out.get('branch')}")
+    print(f"head      {out.get('head')}")
+    print(f"rotation  {out.get('rotation')}")
+    if out.get("time") is not None:
+        print(f"time      {float(out['time']):.2f}s")
+    print(f"preset    {out.get('preset') or '(none)'}")
+    branches = out.get("branches") or []
+    if branches:
+        bits = []
+        for b in branches:
+            tag = "current" if b.get("is_current") else "other"
+            bits.append(f"{b.get('name')} (tip {b.get('short')}, {tag})")
+        print(f"branches  {', '.join(bits)}")
+    if "moved" in out:
+        print(f"moved     {'yes' if out['moved'] else 'no'}")
+    if out.get("note"):
+        print(f"note      {out['note']}")
+    _print_saved_picks(out)
+
+
+def _print_saved_picks(out: dict) -> None:
+    """`extras.match_crops` (contract C7): the rectangles saved per reference.
+
+    Shaped `{REF_NAME: {"ref": [x0, y0, x1, y1], "frame": [...]}}`, either key
+    optional. Fractions of the image, printed to two decimals, no dashes or
+    arrows: `POST /api/match` inherits these when a request leaves ref_crop
+    or frame_crop out, so an agent reading them here knows what a plain match
+    call is actually going to measure.
+    """
+    crops = ((out.get("extras") or {}).get("match_crops") or {})
+    if not crops:
+        return
+    print("saved picks")
+    for ref in sorted(crops):
+        sides = crops[ref] or {}
+        bits = []
+        for side in ("ref", "frame"):
+            box = sides.get(side)
+            if box and len(box) == 4:
+                x0, y0, x1, y1 = (float(v) for v in box)
+                bits.append(f"{side} {x0:.2f} {y0:.2f} {x1:.2f} {y1:.2f}")
+        if bits:
+            print(f"  {ref}  {', '.join(bits)}")
+
+
+def _project_output(a, out: dict, header: str | None) -> None:
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    if header:
+        print(header)
+    _print_project_state(out)
+
+
+def _fork_points(commits: list) -> dict:
+    """Commit id to the list of branch names that split off it.
+
+    A commit is a fork point when some OTHER commit names it as parent but
+    carries a different branch: that is the moment `project fork` happened.
+    Only commits inside the fetched page can be seen this way, which is fine:
+    a fork far outside the window a human asked to see is not what they are
+    looking at anyway.
+    """
+    by_id = {c["id"]: c for c in commits}
+    out: dict = {}
+    for c in commits:
+        parent = c.get("parent")
+        if parent and parent in by_id and by_id[parent]["branch"] != c["branch"]:
+            out.setdefault(parent, []).append(c["branch"])
+    return out
+
+
+def _print_log(out: dict, showed_all: bool) -> None:
+    if not out.get("total"):
+        print("no commits yet")
+        return
+    print(f"project {out.get('key')}  {out.get('name')}")
+    branches = out.get("branches") or []
+    if branches:
+        bits = []
+        for b in branches:
+            tag = "current" if b.get("is_current") else "other"
+            bits.append(f"{b.get('name')} (tip {b.get('short')}, "
+                        f"{b.get('commits')} commits, {tag})")
+        print("branches  " + "; ".join(bits))
+    print()
+    commits = out.get("commits") or []
+    forks = _fork_points(commits)
+    for c in commits:
+        marks = []
+        if c.get("is_head"):
+            marks.append("HEAD")
+        if c.get("is_tip") and not c.get("is_head"):
+            marks.append("tip")
+        tag = " ".join(marks)
+        when = _relative_time(c.get("ts"))
+        print(f"{c['short']:<8} {c['branch']:<10} {c['author']:<18} "
+              f"{when:<14} {tag:<5} {c['message']}")
+        for child_branch in forks.get(c["id"], ()):
+            print(f"         forked into {child_branch} from here")
+    seen = len(commits)
+    if showed_all or seen >= out.get("total", seen):
+        print(f"\n{out.get('total')} commits total")
+    else:
+        print(f"\n{seen} of {out.get('total')} commits shown "
+              f"(pass --all or a larger --limit to see the rest)")
+
+
+def cmd_project(a):
+    """Everything in the `project` command group: one function, one dispatch.
+
+    Plain HTTP to the studio port, the same shape cmd_session uses, so a
+    project command is exactly as safe to run alongside a browser tab open on
+    the same clip: it is the same server, the same routes, the same commits.
+    """
+    by = resolve_by(a)
+    cmd = a.project_cmd
+
+    if cmd == "open":
+        out = _studio_call(a.port, "project/open", "POST",
+                           {"clip": a.clip, "by": by})
+        if a.rotation:
+            out = _studio_call(a.port, "project/rotation", "POST",
+                               {"rotation": a.rotation, "by": by})
+        _project_output(a, out, f"opened {a.clip}")
+        return
+
+    if cmd == "show":
+        out = _studio_call(a.port, "project", "GET")
+        _project_output(a, out, None)
+        return
+
+    if cmd == "log":
+        limit = 2000 if a.all else max(1, int(a.limit))
+        out = _studio_call(a.port, f"project/log?limit={limit}", "GET")
+        if a.json:
+            print(json.dumps(out, indent=2))
+        else:
+            _print_log(out, a.all)
+        return
+
+    if cmd == "checkout":
+        out = _studio_call(a.port, "project/checkout", "POST",
+                           {"commit": a.commit, "by": by})
+        _project_output(a, out, f"checked out {a.commit}")
+        return
+
+    if cmd == "fork":
+        payload = {"by": by}
+        if a.name:
+            payload["name"] = a.name
+        if a.from_commit:
+            payload["commit"] = a.from_commit
+        out = _studio_call(a.port, "project/fork", "POST", payload)
+        _project_output(a, out, f"forked {out.get('branch', '')}".rstrip())
+        return
+
+    if cmd == "undo":
+        out = _studio_call(a.port, "project/undo", "POST", {"by": by})
+        _project_output(a, out, "undo")
+        return
+
+    if cmd == "redo":
+        out = _studio_call(a.port, "project/redo", "POST", {"by": by})
+        _project_output(a, out, "redo")
+        return
+
+    if cmd == "rotate":
+        out = _studio_call(a.port, "project/rotation", "POST",
+                           {"rotation": a.rotation, "by": by})
+        _project_output(a, out, f"rotation set to {a.rotation}")
+        return
+
+    if cmd == "time":
+        out = _studio_call(a.port, "project/time", "POST",
+                           {"time": a.seconds, "by": by})
+        _project_output(a, out, f"time set to {a.seconds:g}s")
+        return
+
+    raise GradeError(f"unknown project command {cmd!r}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2391,8 +2931,13 @@ def main():
         p.add_argument("--saturation", type=float)
         p.add_argument("--temperature", type=float)
         p.add_argument("--tint", type=float)
+        p.add_argument("--rotate", choices=list(ROTATIONS),
+                       help="auto honours the file's display matrix (the "
+                            "default), 0 ignores it, and 90/180/270 ignore it "
+                            "and turn the picture that many degrees clockwise "
+                            "(see: cinegrade orient)")
         p.add_argument("--no-autorotate", action="store_true",
-                       help="ignore the display matrix (see: cinegrade orient)")
+                       help="alias of --rotate 0: ignore the display matrix")
         p.add_argument("--verbose", "-v", action="store_true")
 
     r = sub.add_parser("render"); common(r)
@@ -2446,7 +2991,95 @@ def main():
     ss.add_argument("--port", type=int, default=STUDIO_PORT)
     ss.add_argument("--replace", action="store_true",
                     help="overwrite the live config instead of merging into it")
+    ss.add_argument("--by",
+                    help="who this write is from (else CINEGRADE_AGENT, else cli)")
+    ss.add_argument("--message",
+                    help="for patch: a readable message for the commit this "
+                         "write records, sent as message; without it the "
+                         "server writes its own one line description")
     ss.set_defaults(fn=cmd_session)
+
+    def common_project(p):
+        """--port, --by and --json, identical on every project command and
+        on whoami, so an agent's own wrapper script has one shape to build."""
+        p.add_argument("--port", type=int, default=STUDIO_PORT)
+        p.add_argument("--by",
+                       help="who this write is from (else CINEGRADE_AGENT, "
+                            "else cli); an agent should send agent:NAME")
+        p.add_argument("--json", action="store_true",
+                       help="print the server's raw JSON instead of a table")
+
+    wh = sub.add_parser(
+        "whoami",
+        help="who a write from this shell counts as, and what project is open")
+    common_project(wh)
+    wh.set_defaults(fn=cmd_whoami)
+
+    pr = sub.add_parser(
+        "project",
+        help="open, inspect and move through a clip's git style history: "
+             "one shared project per clip, seen by every account and agent")
+    proj_sub = pr.add_subparsers(dest="project_cmd", required=True)
+
+    po = proj_sub.add_parser(
+        "open", help="open or create the project for a clip, and make it "
+                     "this account's current one")
+    po.add_argument("clip")
+    po.add_argument("--rotation", choices=list(ROTATIONS),
+                    help="set the project's rotation right after opening")
+    common_project(po)
+    po.set_defaults(fn=cmd_project)
+
+    psh = proj_sub.add_parser(
+        "show", help="the open project: key, clip, branch, head, rotation, "
+                     "time, preset, branches")
+    common_project(psh)
+    psh.set_defaults(fn=cmd_project)
+
+    pl = proj_sub.add_parser(
+        "log", help="the whole commit tree of the open project, newest first")
+    pl.add_argument("--limit", type=int, default=50,
+                    help="how many commits to show, newest first (default 50)")
+    pl.add_argument("--all", action="store_true",
+                    help="show the whole tree instead of just the newest ones")
+    common_project(pl)
+    pl.set_defaults(fn=cmd_project)
+
+    pc = proj_sub.add_parser(
+        "checkout", help="move HEAD to a commit, without losing anything")
+    pc.add_argument("commit", help="a commit id, or its short form")
+    common_project(pc)
+    pc.set_defaults(fn=cmd_project)
+
+    pf = proj_sub.add_parser(
+        "fork", help="branch off HEAD, or off --from, under a new name")
+    pf.add_argument("name", nargs="?",
+                    help="the branch name; left out, the server names it "
+                         "fork-N")
+    pf.add_argument("--from", dest="from_commit",
+                    help="fork from this commit instead of HEAD")
+    common_project(pf)
+    pf.set_defaults(fn=cmd_project)
+
+    pu = proj_sub.add_parser("undo", help="HEAD steps back one commit")
+    common_project(pu)
+    pu.set_defaults(fn=cmd_project)
+
+    pd = proj_sub.add_parser("redo", help="HEAD steps forward one commit")
+    common_project(pd)
+    pd.set_defaults(fn=cmd_project)
+
+    prt = proj_sub.add_parser(
+        "rotate", help="set the project's rotation (the only rotation "
+                       "control there is, once a project exists)")
+    prt.add_argument("rotation", choices=list(ROTATIONS))
+    common_project(prt)
+    prt.set_defaults(fn=cmd_project)
+
+    pt = proj_sub.add_parser("time", help="set the project's playhead")
+    pt.add_argument("seconds", type=float)
+    common_project(pt)
+    pt.set_defaults(fn=cmd_project)
 
     a = ap.parse_args()
     try:

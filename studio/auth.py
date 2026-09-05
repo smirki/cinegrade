@@ -53,7 +53,9 @@ from pathlib import Path
 import db
 
 STUDIO = Path(__file__).resolve().parent
-USERS_DIR = STUDIO / "data" / "users"
+# Derived from db.DATA rather than STUDIO so a test data directory
+# (STUDIO_DATA_DIR) moves each account's footage folder with it.
+USERS_DIR = db.DATA / "users"
 
 SESSION_COOKIE = "studio_session"
 SESSION_IDLE_SECONDS = 30 * 24 * 3600          # contract C2: 30 days idle

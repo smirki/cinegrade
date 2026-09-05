@@ -1,70 +1,38 @@
-/* Per clip grades: the client half of contract C3.
+/* Per clip grades: what is left of contract C3 after contract C4 took the
+ * saving over.
  *
- * The studio used to hold one grade for the whole session. Selecting a
- * different clip kept whatever look was on screen, so a night interior grade
- * followed you onto a beach shot silently. Now every clip owns its grade, every
- * account owns its own copy, and switching clips loads the right one.
+ * The history: the studio used to hold one grade for the whole session, so a
+ * night interior grade followed you onto a beach shot silently. Contract C3
+ * gave every clip its own grade, saved with a debounced PUT /api/grade, and
+ * this file was the client half of it.
  *
- * Split out of app.js the same way session.js is, and for the same reason: the
- * coupling is a small written contract instead of a tangle. app.js provides
+ * Contract C4 replaced that. A clip's grade is now its project's HEAD commit
+ * (studio/projects.py): opening a clip is POST /api/project/open and a
+ * committed edit is POST /api/session, both of which the server records as
+ * commits. So this file no longer fetches, applies or saves a grade. The old
+ * `grades` table is still there and is still written by PUT /api/grade (the
+ * CLI, a restore from backup), which is why the picker below reads it as well
+ * as the projects. Two things are left, and both are real:
  *
- *   window.applyClipGrade(config, key, prevKey)   load a config into the
- *                                                 active slot, swap the undo
- *                                                 stack, refresh the panels.
- *                                                 A null config means "the
- *                                                 engine defaults", so this
- *                                                 file never carries its own
- *                                                 copy of them.
+ *   the copy-from picker  "take the grade off that clip and put it on this
+ *                          one", which is a genuine action with no other home
+ *   #gradeSaveState       the element in the Clips panelhead. app.js writes it
+ *                          (it shows the short id of the commit on screen);
+ *                          this file only puts it there.
  *
- * and calls into here at exactly three points:
- *
- *   StudioGrades.clipChanged(name)     from selectClip
- *   StudioGrades.commit(name, config)  from pushHistory and loadPreset
- *   StudioGrades.ifNoSavedGrade(fn)    from boot, so the "start on flat"
- *                                      default does not stamp over a grade
- *                                      that was just loaded from the server
- *
- * If app.js defines none of that, this file mounts its indicator and does
- * nothing else, and nothing breaks.
- *
- * The saving rule: a save is a PUT of the WHOLE config, debounced 600 ms after
- * the last committed change. Committed means a slider release or a checkbox,
- * not every pixel of a drag (app.js already draws that line for the undo
- * stack, and this reuses it), so a drag costs one request, not two hundred.
+ * app.js provides window.applyClipGrade(config) to put a copied grade into the
+ * active slot, and calls StudioGrades.clipChanged(name, key) when the clip
+ * changes so the picker knows which clip it must not offer. commit() and
+ * isPending() survive as no-ops so older call sites and the test harness keep
+ * working without pretending a save is in flight.
  */
 (function (global) {
   "use strict";
 
-  var DEBOUNCE_MS = 600;
-
   var current = { clip: null, key: null };
-  // Held up while a fetched grade is being pushed into the page. Without it a
-  // load could look like an edit and be saved straight back, which at best is
-  // a pointless request and at worst overwrites a newer grade with an older
-  // one during a slow response.
-  //
-  // A COUNTER, not a boolean, and that is not fussiness: two holds overlap at
-  // boot (the first clip's grade being applied, and the starting preset being
-  // loaded on top of it when there is none). With a boolean the inner hold's
-  // release cleared the outer one's too, and the boot preset was saved as if
-  // the user had graded the clip. Measured before the fix: one PUT per boot.
-  var holds = 0;
-  var timer = null;
-  var pending = null;
-  var initial = null;          // the first clip's load, awaited by boot
-  var lastSavedJSON = null;    // what the server is believed to hold
   var knownKeys = {};          // clip keys that have a saved grade
   var mounted = false;
   var els = {};
-
-  function hold() { holds += 1; }
-  // Released a turn later, for the same reason session.js clears its own flag
-  // late: app.js's handlers can be queued rather than synchronous, and
-  // releasing too early lets a load echo back out as a save.
-  function releaseHold() {
-    setTimeout(function () { holds = holds > 0 ? holds - 1 : 0; }, 0);
-  }
-  function held() { return holds > 0; }
 
   function json(res) {
     if (!res.ok) {
@@ -75,35 +43,12 @@
     return res.json();
   }
 
-  /* ---- the saved indicator --------------------------------------------- */
+  /* ---- the commit indicator --------------------------------------------- */
 
-  // Four states, and the wording is deliberately literal. "unsaved" means the
-  // debounce timer is still running, "saving" means a PUT is in flight,
-  // "saved" means the server acknowledged it, "error" means it did not and
-  // the grade on screen is NOT on the server. A single silent dot would hide
-  // the one case that matters.
-  var STATES = {
-    saved:   { text: "saved",   colour: "var(--text-dim)",
-               title: "This clip's grade is saved to your account." },
-    saving:  { text: "saving",  colour: "var(--accent)",
-               title: "Writing this clip's grade to your account." },
-    unsaved: { text: "unsaved", colour: "var(--warn)",
-               title: "Edited. It saves automatically a moment after you stop." },
-    error:   { text: "not saved", colour: "var(--danger)",
-               title: "The last save failed, so this grade is only in this tab." },
-    idle:    { text: "", colour: "var(--text-dim)", title: "" }
-  };
-
-  function setState(name, detail) {
-    var s = STATES[name] || STATES.idle;
-    if (!els.dot) { return; }
-    els.dot.textContent = s.text;
-    els.dot.style.color = s.colour;
-    els.dot.style.borderColor = s.colour;
-    els.dot.style.visibility = s.text ? "visible" : "hidden";
-    els.dot.title = s.title + (detail ? "  " + detail : "");
-  }
-
+  // Created here, written by app.js (updateHeadLabel). It used to say saved /
+  // saving / unsaved / not saved for the debounced autosave; with the commit
+  // as the save there is no in flight window to report, so what it shows now
+  // is which commit the picture on screen is.
   function mount() {
     if (mounted) { return; }
     var head = document.querySelector(".browsebottom .panelhead");
@@ -144,16 +89,60 @@
     els.select = sel;
     els.button = btn;
     btn.addEventListener("click", copyFromSelected);
-    setState("idle");
+    dot.style.visibility = "hidden";
     refreshCopyList();
   }
 
   /* ---- the copy picker -------------------------------------------------- */
 
+  /* Which clips have a grade to copy FROM.
+   *
+   * Two sources, merged, because the answer moved house halfway through this
+   * arc. GET /api/grades lists the old per account `grades` table, which is
+   * still the right answer for anything graded before contract C4 or saved
+   * from the CLI. But a clip graded in the studio today has a PROJECT and no
+   * row in that table (a commit does not write one), so asking only the old
+   * table would show "no other graded clips yet" the day after this shipped.
+   * The second source asks each listed clip whether a project exists for it.
+   *
+   * Capped at PROBE_MAX clips: this is a dropdown, the browser can be sitting
+   * in a folder of hundreds, and one small JSON GET each is fine for a few
+   * dozen and rude for a few hundred. The clip probe behind it is cached
+   * server side, so this is cheap after the first clip listing. */
+  var PROBE_MAX = 24;
+
+  function projectGrades(known) {
+    return fetch("/api/clips").then(json).then(function (body) {
+      var clips = (body && body.clips) || [];
+      var todo = clips.filter(function (c) {
+        return c && c.name && c.key && !known[c.key] && c.key !== current.key;
+      }).slice(0, PROBE_MAX);
+      return Promise.all(todo.map(function (c) {
+        return fetch("/api/project?clip=" + encodeURIComponent(c.name))
+          .then(json)
+          .then(function (p) {
+            return (p && p.open && p.key)
+              ? { clip_key: p.key, clip_name: p.name || c.name }
+              : null;
+          })
+          .catch(function () { return null; });
+      }));
+    }).then(function (found) {
+      return found.filter(Boolean);
+    }).catch(function () { return []; });
+  }
+
   function refreshCopyList() {
     if (!els.select) { return Promise.resolve(); }
     return fetch("/api/grades").then(json).then(function (body) {
-      var rows = (body && body.grades) || [];
+      var saved = (body && body.grades) || [];
+      var known = {};
+      saved.forEach(function (r) { known[r.clip_key] = true; });
+      return projectGrades(known).then(function (extra) {
+        extra.forEach(function (r) { known[r.clip_key] = true; });
+        return saved.concat(extra);
+      });
+    }).then(function (rows) {
       knownKeys = {};
       rows.forEach(function (r) { knownKeys[r.clip_key] = true; });
       var keep = els.select.value;
@@ -182,158 +171,68 @@
     }).catch(function () { /* a picker that cannot fill is not worth a toast */ });
   }
 
+  /* Read the source clip's grade and put it on this one.
+   *
+   * GET /api/grade?clip=<key> rather than POST /api/grade/copy: that route
+   * reads the source out of the old `grades` table and errors with "that clip
+   * has no saved grade to copy" for anything graded since contract C4, which
+   * is now most things. The plain GET answers with the project's HEAD when
+   * there is a project and falls back to the old row when there is not, which
+   * is exactly the "whatever that clip's grade currently is" this button
+   * means. app.js then puts it on screen AND publishes it, and that publish
+   * is what makes the copy a commit on THIS clip rather than a change with no
+   * history behind it. */
   function copyFromSelected() {
     if (!els.select || !els.select.value || !current.clip) { return; }
     var from = els.select.value;
-    setState("saving");
-    fetch("/api/grade/copy", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: from, to: current.clip })
-    }).then(json).then(function (body) {
-      apply(body.config, body.key, current.key);
-      current.key = body.key;
-      lastSavedJSON = JSON.stringify(body.config);
-      knownKeys[body.key] = true;
-      setState("saved");
+    els.button.disabled = true;
+    fetch("/api/grade?clip=" + encodeURIComponent(from)).then(json).then(function (body) {
+      if (!body || !body.exists || !body.config) {
+        throw new Error("that clip has no grade to copy");
+      }
+      if (typeof global.applyClipGrade === "function") {
+        global.applyClipGrade(body.config, body.key, current.key);
+      }
+      knownKeys[current.key] = true;
       refreshCopyList();
       if (typeof global.studioToast === "function") {
         global.studioToast("copied the grade onto " + current.clip);
       }
     }).catch(function (err) {
-      setState("error", err.message || "");
-    });
+      if (typeof global.studioToast === "function") {
+        global.studioToast("could not copy that grade: " + (err.message || err), true);
+      }
+    }).then(function () { els.button.disabled = false; });
   }
 
-  /* ---- loading a clip's grade ------------------------------------------- */
+  /* ---- which clip is open ----------------------------------------------- */
 
-  function apply(config, key, prevKey) {
-    if (typeof global.applyClipGrade !== "function") { return; }
-    hold();
-    try {
-      global.applyClipGrade(config, key, prevKey);
-    } finally {
-      releaseHold();
-    }
-  }
-
-  function clipChanged(name) {
+  /* Called from app.js's showClip. It used to fetch this clip's saved grade
+   * and push it into the page; that is POST /api/project/open's job now, and
+   * doing it here as well is exactly how a clip switch could republish a
+   * stale config on top of an agent's edit. All that is left is bookkeeping
+   * for the picker: which clip we are on, so it is not offered as a source
+   * for itself, and a refresh of the list.
+   *
+   * The key comes from the caller (/api/state carries it per clip) rather
+   * than from a round trip of this file's own. */
+  function clipChanged(name, key) {
     mount();
-    if (!name) { return Promise.resolve({ exists: false }); }
-    // A pending autosave belongs to the clip that is on its way out, so it is
-    // flushed now rather than dropped: leaving a clip must not lose the edit
-    // that was still inside the debounce window.
-    flush();
-    var prevKey = current.key;
+    if (!name) { return Promise.resolve({ key: null }); }
     current.clip = name;
-    setState("saving");
-    var p = fetch("/api/grade?clip=" + encodeURIComponent(name))
-      .then(json)
-      .then(function (body) {
-        current.key = body.key || null;
-        if (body.exists && body.config) {
-          apply(body.config, body.key, prevKey);
-          lastSavedJSON = JSON.stringify(body.config);
-          setState("saved");
-        } else {
-          // No grade for this clip: the engine defaults, not whatever the
-          // previous clip happened to be showing. That is the whole point.
-          // A null config is the agreed way to ask for them, so this file
-          // does not need its own copy of what the defaults are.
-          apply(null, body.key, prevKey);
-          lastSavedJSON = null;
-          setState("idle");
-        }
-        refreshCopyList();
-        return { exists: !!body.exists, key: body.key };
-      })
-      .catch(function (err) {
-        setState("error", err.message || "");
-        return { exists: false, key: null };
-      });
-    if (initial === null) { initial = p; }
-    return p;
+    current.key = key || null;
+    return refreshCopyList().then(function () { return { key: current.key }; });
   }
 
-  /* ---- saving ----------------------------------------------------------- */
+  /* ---- retired, kept callable ------------------------------------------- */
 
-  function put(clip, config) {
-    var body = JSON.stringify(config);
-    setState("saving");
-    return fetch("/api/grade", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clip: clip, config: config })
-    }).then(json).then(function (res) {
-      // Only trust the acknowledgement for the clip that is still open. A save
-      // that lands after the user moved on must not relabel the new clip.
-      if (current.clip === clip) {
-        current.key = res.key || current.key;
-        lastSavedJSON = body;
-        setState("saved");
-      }
-      if (res.key && !knownKeys[res.key]) {
-        knownKeys[res.key] = true;
-        refreshCopyList();
-      }
-    }).catch(function (err) {
-      if (current.clip === clip) { setState("error", err.message || ""); }
-    });
-  }
-
-  function commit(clip, config) {
-    mount();
-    if (held() || !clip || !config) { return; }
-    var body = JSON.stringify(config);
-    if (body === lastSavedJSON) { return; }   // nothing actually moved
-    pending = { clip: clip, config: JSON.parse(body) };
-    setState("unsaved");
-    if (timer) { clearTimeout(timer); }
-    timer = setTimeout(function () {
-      timer = null;
-      var job = pending;
-      pending = null;
-      if (job) { put(job.clip, job.config); }
-    }, DEBOUNCE_MS);
-  }
-
-  function flush() {
-    if (timer) { clearTimeout(timer); timer = null; }
-    var job = pending;
-    pending = null;
-    if (job) { return put(job.clip, job.config); }
-    return Promise.resolve();
-  }
-
-  /* ---- boot ordering ---------------------------------------------------- */
-
-  // boot() in app.js loads the "flat" preset as a starting point. That is the
-  // right default for a clip nobody has graded and exactly the wrong thing for
-  // one that has a saved grade, so the default only runs once the first
-  // clip's grade has come back and said there is none.
-  //
-  // It also runs with a hold in place, so the starting preset is NOT saved:
-  // opening the studio is not the user grading anything, and a boot that wrote
-  // a row would fill the copy-from picker with clips nobody has touched and
-  // make "this clip has no grade yet" a state that never occurs again.
-  function ifNoSavedGrade(fn) {
-    function guarded() {
-      hold();
-      var out;
-      try {
-        out = fn();
-      } finally {
-        if (out && typeof out.then === "function") {
-          out.then(releaseHold, releaseHold);
-        } else {
-          releaseHold();
-        }
-      }
-    }
-    if (initial === null) { guarded(); return; }
-    initial.then(function (r) { if (!r || !r.exists) { guarded(); } })
-           .catch(function () { guarded(); });
-  }
+  // The debounced PUT /api/grade autosave (contract C3) is gone: a committed
+  // edit is a commit on the project now (contract C4), and the server writes
+  // the grades row itself as part of it. These three keep their names so
+  // call sites elsewhere, and the test harness, do not have to care.
+  function commit() { /* the commit is the save */ }
+  function flush() { return Promise.resolve(); }
+  function ifNoSavedGrade(fn) { if (typeof fn === "function") { fn(); } }
 
   global.StudioGrades = {
     clipChanged: clipChanged,
@@ -342,27 +241,11 @@
     ifNoSavedGrade: ifNoSavedGrade,
     refreshCopyList: refreshCopyList,
     currentKey: function () { return current.key; },
-    // Exposed for the UI test harness: the debounce means "did it save" is a
-    // question about a timer, and a spec should be able to ask rather than
-    // sleep and hope.
-    isPending: function () { return !!(timer || pending); }
+    // Always false now. It reported whether the autosave debounce was still
+    // running; there is no debounce left, so there is never a save in flight
+    // for a spec to wait on.
+    isPending: function () { return false; }
   };
-
-  // A last chance to write: closing the tab inside the debounce window would
-  // otherwise lose the edit. keepalive lets the request outlive the page.
-  global.addEventListener("beforeunload", function () {
-    if (!pending) { return; }
-    var job = pending;
-    pending = null;
-    if (timer) { clearTimeout(timer); timer = null; }
-    try {
-      fetch("/api/grade", {
-        method: "PUT", keepalive: true,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clip: job.clip, config: job.config })
-      });
-    } catch (e) { /* the page is going away; nothing to report to */ }
-  });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", mount);

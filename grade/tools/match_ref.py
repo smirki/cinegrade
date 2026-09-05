@@ -232,9 +232,13 @@ def _measure_cfg(preset: str | None) -> dict:
 
 
 def load_source_frame(clip: Path, seconds: float, preset: str | None,
-                      autorotate: bool, width: int) -> tuple[np.ndarray, dict]:
+                      autorotate: bool, width: int,
+                      rotation=None) -> tuple[np.ndarray, dict]:
     cfg = _measure_cfg(preset)
-    info = cinegrade.probe(str(clip), autorotate=autorotate)
+    # rotation is the full setting (auto, 0, 90, 180, 270); autorotate is its
+    # old two-value form and still works. graph_with_mask adds the transpose
+    # itself here, since this call passes no head_extra of its own.
+    info = cinegrade.probe(str(clip), autorotate=autorotate, rotation=rotation)
     sw = min(width, info["width"])
     sh = int(round(info["height"] * sw / info["width"] / 2)) * 2
     graph = cinegrade.graph_with_mask(
@@ -422,6 +426,98 @@ def parse_crop(text: str, w: int, h: int, fraction: bool) -> dict:
             "frac": [round(x / w, 4), round(yy / h, 4),
                      round((x + cw) / w, 4), round((yy + ch) / h, 4)],
             "image": [w, h], "area_pct": round(100.0 * cw * ch / (w * h), 1)}
+
+
+# --------------------------------------------------------------------------
+# the picked rectangle (contract C7)
+#
+# A rectangle the user drew, on the reference and/or on the frame, as
+# [x0, y0, x1, y1] fractions of the image (0 to 1, top left origin). It is
+# applied FIRST, before anything else looks at the picture, so the automatic
+# chrome detector above runs INSIDE the rectangle rather than fighting it:
+# "match this part of this photograph" and "throw away Instagram's icons" are
+# two different questions and both still get answered.
+#
+# Fractions, not pixels, because the rectangle is drawn on a preview that is
+# some arbitrary size and on a frame whose size depends on the rotation, and a
+# fraction means the same region at every one of those sizes.
+# --------------------------------------------------------------------------
+
+def parse_box(value, what: str = "crop") -> list | None:
+    """[x0, y0, x1, y1] fractions, or None for the whole image.
+
+    Accepts a list, a tuple or a comma separated string, in any corner order:
+    a rectangle dragged up and to the left arrives with x1 < x0 and means the
+    same region as the same drag made the other way.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parts = [p for p in text.replace(",", " ").split() if p]
+    else:
+        try:
+            parts = list(value)
+        except TypeError:
+            raise MatchError(f"{what} must be x0,y0,x1,y1 as fractions "
+                             f"of the image") from None
+    if not parts:
+        return None
+    if len(parts) != 4:
+        raise MatchError(f"{what} must be four numbers x0,y0,x1,y1 as "
+                         f"fractions of the image, got {len(parts)}")
+    try:
+        v = [float(p) for p in parts]
+    except (TypeError, ValueError):
+        raise MatchError(f"{what} must be four numbers, got {value!r}") from None
+    if not all(np.isfinite(v)):
+        raise MatchError(f"{what} has a non finite number in it: {value!r}")
+    x0, x1 = sorted((v[0], v[2]))
+    y0, y1 = sorted((v[1], v[3]))
+    box = [min(max(n, 0.0), 1.0) for n in (x0, y0, x1, y1)]
+    if (box[2] - box[0]) < 0.01 or (box[3] - box[1]) < 0.01:
+        raise MatchError(
+            f"{what} {box} is thinner than 1% of the image on one axis, "
+            f"which is not a region anything can be measured from")
+    return box
+
+
+def crop_box(rgb: np.ndarray, box, what: str = "crop") -> np.ndarray:
+    """The part of the image inside a fraction rectangle.
+
+    Rounds outward to whole pixels, so a rectangle drawn on a 200px preview
+    still covers the pixels it visibly covered on a 4000px original.
+    """
+    if box is None:
+        return rgb
+    h, w = rgb.shape[:2]
+    x0 = int(np.floor(box[0] * w))
+    y0 = int(np.floor(box[1] * h))
+    x1 = int(np.ceil(box[2] * w))
+    y1 = int(np.ceil(box[3] * h))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, max(x1, x0 + 1)), min(h, max(y1, y0 + 1))
+    if (x1 - x0) < 16 or (y1 - y0) < 16:
+        raise MatchError(
+            f"the {what} rectangle {box} is {x1 - x0}x{y1 - y0} pixels of a "
+            f"{w}x{h} image, too small to measure a colour distribution from")
+    return rgb[y0:y1, x0:x1]
+
+
+def box_report(box, rgb_before, rgb_after) -> dict | None:
+    """What a picked rectangle actually kept, for the report and the UI."""
+    if box is None:
+        return None
+    hb, wb = rgb_before.shape[:2]
+    ha, wa = rgb_after.shape[:2]
+    return {
+        "box": [round(float(v), 4) for v in box],
+        "pixels": [int(wa), int(ha)],
+        "image": [int(wb), int(hb)],
+        "area_pct": round(100.0 * (wa * ha) / float(wb * hb), 1),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -980,8 +1076,10 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
                     method: str = "reinhard", strength: float = 1.0,
                     luma_preserve: bool = False, crop: str | None = None,
                     crop_frac: str | None = None, auto_crop: bool = True,
+                    ref_crop=None, frame_crop=None,
                     size: int = 33, name: str | None = None,
-                    autorotate: bool = True, out_dir: str | None = None,
+                    autorotate: bool = True, rotation=None,
+                    out_dir: str | None = None,
                     width: int = 960, ref_gamut: str = "auto",
                     reject_blown: bool = True, verify: bool = True) -> dict:
     """Build one LUT and measure whether it actually helped.
@@ -1005,6 +1103,15 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
     decode = DECODERS.get(encode_name, decode_gamma22)
 
     ref_img, gamut = load_reference(ref_path, ref_gamut, encode_name)
+    # Contract C7: the rectangle the user picked comes off first, and every
+    # later step (the chrome detector, the explicit --crop, the measurement)
+    # sees only what is inside it. Nothing happens when it is None, which is
+    # what keeps every call made before this option existed byte identical.
+    ref_box = parse_box(ref_crop, "ref-crop")
+    ref_full = ref_img
+    if ref_box is not None:
+        ref_img = crop_box(ref_img, ref_box, "reference")
+    ref_pick = box_report(ref_box, ref_full, ref_img)
     rh, rw = ref_img.shape[:2]
     if crop:
         region = parse_crop(crop, rw, rh, fraction=False)
@@ -1024,10 +1131,20 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         src_img = read_image(Path(still))
         src_label = f"still {Path(still).name}"
     elif clip:
-        src_img, cfg = load_source_frame(Path(clip), time, preset, autorotate, width)
+        src_img, cfg = load_source_frame(Path(clip), time, preset, autorotate,
+                                         width, rotation)
         src_label = f"{Path(clip).name} @ {time}s"
     else:
         raise MatchError("give either --clip (with --time) or --source-still")
+
+    # The frame's own picked rectangle, in fractions of the frame AS SHOWN
+    # (after the rotation above), so a rectangle drawn on the viewer covers
+    # the same part of the picture the matcher measures.
+    frame_box = parse_box(frame_crop, "frame-crop")
+    src_full = src_img
+    if frame_box is not None:
+        src_img = crop_box(src_img, frame_box, "frame")
+    frame_pick = box_report(frame_box, src_full, src_img)
 
     m_ref = measure(ref_crop, reject_blown)
     m_src = measure(src_img, reject_blown)
@@ -1035,6 +1152,9 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
     div = hue_divergence(m_src, m_ref)
 
     warnings: list[str] = []
+    # Not warnings: plain statements of what was measured, kept apart so the
+    # warn coloured list in the studio stays a list of things that are wrong.
+    notes_used: list[str] = []
     if div > 0.35:
         gaps = sorted(m_src["families"].keys(),
                       key=lambda k: -abs(m_src["families"][k]
@@ -1058,6 +1178,22 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         warnings.append(
             f"crop kept only {region['area_pct']:.1f}% of the reference, so the "
             f"statistics come from a small sample. check it with `detect`")
+    # What the picked rectangles kept, said in the warnings as well as in the
+    # result, because "which part of the picture did this actually measure" is
+    # the one thing a picked match can silently get wrong.
+    for label, pick in (("reference", ref_pick), ("frame", frame_pick)):
+        if pick is None:
+            continue
+        b = pick["box"]
+        line = (f"{label} picked rectangle {b[0]:.2f} {b[1]:.2f} {b[2]:.2f} "
+                f"{b[3]:.2f}, {pick['area_pct']:.1f}% of the image "
+                f"({pick['pixels'][0]}x{pick['pixels'][1]} of "
+                f"{pick['image'][0]}x{pick['image'][1]} pixels)")
+        if pick["area_pct"] < 1.0:
+            warnings.append(line + ": under 1% of the picture, so this is a "
+                                   "very small sample to fit a transform from")
+        else:
+            notes_used.append(line)
 
     ref_px, _ = _flat(ref_crop, reject_blown)
     src_px, _ = _flat(src_img, reject_blown)
@@ -1081,7 +1217,15 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         "Generated by content/grade/tools/match_ref.py",
         "Domain: Rec.709 display code. Apply AFTER the CST, never to raw log.",
         f"Reference: {ref_path.name} ({gamut}) crop "
-        f"{region['x']},{region['y']},{region['w']},{region['h']}",
+        f"{region['x']},{region['y']},{region['w']},{region['h']}"
+        + ("" if ref_pick is None
+           else " inside picked rectangle "
+                + " ".join(f"{v:.3f}" for v in ref_pick["box"])),
+        # Only when there is one: a match with no picked rectangle writes the
+        # comment block it has always written, byte for byte.
+        *([] if frame_pick is None else
+          ["Frame: picked rectangle "
+           + " ".join(f"{v:.3f}" for v in frame_pick["box"])]),
         f"Source: {src_label} preset={preset or 'defaults'} "
         f"encode={encode_name}",
         f"Method: {method} strength={strength} "
@@ -1102,6 +1246,10 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         "preset": preset or "defaults",
         "encode": encode_name,
         "crop": region,
+        # Contract C7. `crops` is what the studio's match readout prints and
+        # what an agent reads back to know which part of which picture this
+        # cube was fitted from. Both are None for a whole image match.
+        "crops": {"ref": ref_pick, "frame": frame_pick},
         "hue_divergence": round(div, 4),
         "method_info": minfo,
         "lut_health": health,
@@ -1192,6 +1340,7 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
             f"{health['neutral_min_step']:.5f} against a nominal "
             f"{1.0 / (size - 1):.5f}). tones there will collapse together")
         result["ok"] = False
+    result["notes"] = notes_used
     result["elapsed_s"] = round(_time.time() - t0, 2)
     return result
 
@@ -1220,6 +1369,16 @@ def print_report(r: dict) -> None:
           f"= v{r['crop']['frac'][1]:.3f}-{r['crop']['frac'][3]:.3f} "
           f"h{r['crop']['frac'][0]:.3f}-{r['crop']['frac'][2]:.3f} "
           f"[{r['crop']['source']}]")
+    crops = r.get("crops") or {}
+    for label in ("ref", "frame"):
+        pick = crops.get(label)
+        if not pick:
+            continue
+        b = pick["box"]
+        print(f"  {label + ' pick':10} "
+              f"{b[0]:.3f} {b[1]:.3f} {b[2]:.3f} {b[3]:.3f}  "
+              f"{pick['area_pct']:.1f}% of the image "
+              f"({pick['pixels'][0]}x{pick['pixels'][1]} px)")
     print(f"  source     {r['source']}  preset={r['preset']} "
           f"encode={r['encode']}")
     print(f"  method     {r['method']} strength={r['strength']} "
@@ -1287,8 +1446,11 @@ def cmd_match(a) -> None:
             ref=a.ref, clip=a.clip, time=a.time, still=a.source_still,
             preset=a.preset, method=m, strength=a.strength,
             luma_preserve=a.luma_preserve, crop=a.crop, crop_frac=a.crop_frac,
-            auto_crop=not a.no_auto_crop, size=a.size, name=a.name,
-            autorotate=not a.no_autorotate, out_dir=a.out_dir, width=a.width,
+            auto_crop=not a.no_auto_crop,
+            ref_crop=a.ref_crop, frame_crop=a.frame_crop,
+            size=a.size, name=a.name,
+            autorotate=not a.no_autorotate, rotation=a.rotate,
+            out_dir=a.out_dir, width=a.width,
             ref_gamut=a.ref_gamut, reject_blown=not a.no_reject_blown,
             verify=not a.no_verify)
         results.append(r)
@@ -1326,8 +1488,21 @@ def main() -> None:
     m.add_argument("--crop", help="x,y,w,h in pixels of the reference")
     m.add_argument("--crop-frac", help="x,y,w,h as fractions of the reference")
     m.add_argument("--no-auto-crop", action="store_true")
+    m.add_argument("--ref-crop", nargs=4, type=float,
+                   metavar=("X0", "Y0", "X1", "Y1"),
+                   help="the rectangle to measure on the REFERENCE, as "
+                        "fractions of it (0 to 1). Applied before the "
+                        "automatic chrome trim, so the trim runs inside it")
+    m.add_argument("--frame-crop", nargs=4, type=float,
+                   metavar=("X0", "Y0", "X1", "Y1"),
+                   help="the rectangle to measure on the FRAME, as fractions "
+                        "of the frame as shown at the chosen rotation")
+    m.add_argument("--rotate", choices=list(cinegrade.ROTATIONS),
+                   help="auto honours the clip's display matrix, 0 ignores "
+                        "it, 90/180/270 ignore it and turn the picture "
+                        "clockwise (see cinegrade orient)")
     m.add_argument("--no-autorotate", action="store_true",
-                   help="ignore the clip's display matrix, see cinegrade orient")
+                   help="alias of --rotate 0")
     m.add_argument("--size", type=int, default=33)
     m.add_argument("--name")
     m.add_argument("--out-dir")

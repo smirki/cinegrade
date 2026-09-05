@@ -1261,6 +1261,64 @@
      "measure EXACT: max 1 code value, 0 percent of channel samples off by " +
      "more than 1, mean 0.0056 to 0.0060 of 255. Negative mid_detail measured " +
      "exact before and after, which is what an overshoot only wrap predicts."],
+    ["Loading a preset, then Saving As or Overwriting a different one",
+     "leaked the wrong comment",
+     "The founder saw it directly: a preset saved as Manav_1_2 with no " +
+     "typed comment still carried the comment of nature_cinema, a preset " +
+     "loaded earlier, so the file described a different grade. Two bugs, " +
+     "both in server.py. read_preset() ran the file through full_config() " +
+     "to fill in every field the file omits, which correctly reached inside " +
+     "_comment too (deep_merge keeps any key not in DEFAULTS as is), so a " +
+     "loaded preset's comment rode along into the live config that becomes " +
+     "the starting point for every future save. write_preset(), asked to " +
+     "keep an existing comment when Save As or Overwrite is given a blank " +
+     "one, read that 'existing' comment off the live config's leftover " +
+     "_comment instead of off the actual target file on disk, so whichever " +
+     "preset was loaded most recently kept describing itself no matter what " +
+     "was actually being saved over. read_preset() now strips _comment " +
+     "before the config reaches the page. write_preset() now reads the " +
+     "kept-if-blank comment from the target file itself, keyed by the name " +
+     "being written, never from the live config. Measured with a real " +
+     "browser driving the actual UI (studio/tests/specs/20-presets.mjs): " +
+     "loading cinematic (its own comment: 'Loud teal/orange...') then Save " +
+     "As with an empty comment field now writes a file with no _comment key " +
+     "at all, and Overwrite on a library preset with a blank comment now " +
+     "keeps only that preset's own prior comment, never a loaded one's."],
+    ["Load only replaced the fields a preset happened to set",
+     "now fully replaces the config",
+     "Not a defect found in the Load code path itself (loadPreset() already " +
+     "did S.slots[S.active] = j.config, a full replace, and server.py's " +
+     "read_preset() already ran the file through full_config() before this " +
+     "fix, so it always returned every field, layers and the second look " +
+     "slot included). This entry records what the audit actually verified " +
+     "with a real browser round trip end to end, because the founder's own " +
+     "words ('doesnt overwrite or LOAD the full settings') named Load as a " +
+     "suspect alongside the comment bug above. Measured: loading a preset " +
+     "with layers and a second look LUT, saving that as p5_full, loading a " +
+     "plain preset (layers back to [], look.lut2 back to null), then " +
+     "loading p5_full again restores the layer array and look.lut2 exactly, " +
+     "matching full_config(p5_full) field for field. The one real gap was " +
+     "in the test harness, not the product: a reload right after Load could " +
+     "read the config before boot()'s own per clip grade restore had " +
+     "settled, making a correct Load look like a no op. Fixed in the spec " +
+     "with the same StudioGrades.isPending()/#gradeSaveState poll specs 12 " +
+     "and 16 already use instead of a fixed sleep."],
+    ["Loading a preset left no record of what happened",
+     "now commits \"loaded preset NAME\"",
+     "loadPreset()'s call to StudioSession.publish() carried no message, so " +
+     "the project history recorded a generic 'N changes: ...' line " +
+     "indistinguishable from an ordinary edit, with no way to tell from the " +
+     "log alone that a preset load, not a hand grade, put the picture where " +
+     "it is. session.js's publish() now takes an optional fourth message " +
+     "argument, sent only when the caller has one, and loadPreset() passes " +
+     "'loaded preset ' + name. Server support for this already existed " +
+     "(live_set() in server.py already read payload.message and threaded it " +
+     "into PROJECTS.commit(), and projects.py's own commit() docstring " +
+     "already named 'loaded preset nature_cinema' as the intended example), " +
+     "so this was a one line client gap, not a server change. Measured with " +
+     "a real browser: loading flat now posts {message: \"loaded preset " +
+     "flat\"} to POST /api/session, and GET /api/project/log grows by " +
+     "exactly one commit whose message is \"loaded preset flat\"."],
   ];
 
   function rows(items) {

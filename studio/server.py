@@ -70,6 +70,7 @@ sys.path.insert(0, str(STUDIO))
 import auth as AUTH  # noqa: E402  (same reason)
 import db as DB      # noqa: E402  (same reason)
 import grades as GRADES  # noqa: E402  (same reason)
+import projects as PROJECTS  # noqa: E402  (same reason)
 import render_gpu as RG  # noqa: E402  (same reason)
 
 # render_gpu drives ffmpeg and the browser worker through this module's own
@@ -203,6 +204,21 @@ def clip_path(name: str) -> Path:
     if not p.exists():
         raise StudioError(f"clip not found: {name}")
     return p
+
+
+def resolve_clip(name: str) -> tuple[str, str, str]:
+    """(content key, display name, path) for a clip name, for projects.py.
+
+    projects.py is handed this rather than working it out itself because clip
+    resolution is this module's job: a clip opened from outside content/footage
+    exists only in EXTERNAL_CLIPS, in memory, and a project must still be able
+    to find it while the server is up.
+    """
+    p = clip_path(name)
+    return GRADES.clip_key(p), str(name).strip(), str(p)
+
+
+PROJECTS.bind_resolver(resolve_clip)
 
 
 def register_external_clip(raw: str) -> str:
@@ -375,6 +391,10 @@ def ensure_dirs() -> None:
     # data folder that cannot be written fails at boot with a clear traceback
     # instead of inside a request somebody is waiting on.
     GRADES.init_schema()
+    # Same story for the project tables (contract C1). Additive: the accounts
+    # and the old grades table are untouched, and a database made by an older
+    # build gains the new tables here on its first boot.
+    PROJECTS.init_schema()
     # User 0 is the local no-login account. Its preset folder exists from boot
     # so a "save as" with logins off has somewhere of its own to land instead
     # of writing into the shipped, checked in library.
@@ -405,16 +425,64 @@ def ensure_dirs() -> None:
 
 
 # --------------------------------------------------------------------------
+# rotation
+# --------------------------------------------------------------------------
+
+def _project_rotation(user_id) -> str | None:
+    """The rotation of the project this account has open, or None.
+
+    Imported lazily and defensively: the project store is a separate module
+    and this server has to keep working the same way when it is absent, half
+    written, or holding a database it cannot open. Any failure here means
+    "no project", which lands on the same "auto" default the studio has
+    always used.
+    """
+    if user_id is None:
+        return None
+    try:
+        import projects as PROJECTS                          # noqa: PLC0415
+        return PROJECTS.open_rotation(user_id)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def effective_rotation(payload_or_query, user_id=None) -> str:
+    """The rotation one request means, from the four places it can come from.
+
+    In order: an explicit "rotation" field, then the legacy autorotate flag
+    (the POST body's "autorotate" and the query string's "rot", where true or
+    1 means "auto" and false or 0 means "0"), then the rotation stored on the
+    project this account has open, then "auto".
+
+    The legacy flag is not deprecated-and-ignored: the browser still sends it
+    on every request, and a CLI script written before rotation existed still
+    means what it meant. It only loses to an explicit rotation field.
+    """
+    src = payload_or_query if isinstance(payload_or_query, dict) else {}
+    for key in ("rotation", "rot", "autorotate"):
+        if src.get(key) not in (None, ""):
+            return CG.normalise_rotation(src[key])
+    return CG.normalise_rotation(_project_rotation(user_id))
+
+
+# --------------------------------------------------------------------------
 # probe
 # --------------------------------------------------------------------------
 
-def clip_info(name: str, autorotate: bool) -> dict:
-    key = (name, autorotate)
+def clip_info(name: str, rotation) -> dict:
+    """probe() one clip at one rotation, cached.
+
+    rotation is the new string form; a bare boolean still works and means
+    what autorotate meant, so callers outside this file (the GPU render, the
+    audit tools) did not have to move in the same commit.
+    """
+    rotation = CG.normalise_rotation(rotation)
+    key = (name, rotation)
     with _probe_lock:
         if key in _probe_cache:
             return dict(_probe_cache[key])
     path = clip_path(name)
-    info = CG.probe(str(path), autorotate=autorotate)
+    info = CG.probe(str(path), rotation=rotation)
     info["name"] = name
     info["path"] = str(path)
     info["fps"] = _fps(str(path))
@@ -630,7 +698,7 @@ def _preview_dims(info: dict, width: int) -> tuple[int, int]:
 
 
 def source_frame(clip: str, time_s: float, width: int,
-                 autorotate: bool) -> tuple[np.ndarray, dict]:
+                 rotation) -> tuple[np.ndarray, dict]:
     """The decoded, downscaled, range/matrix-normalised source frame, cached.
 
     This is exactly the prefix every grade graph used to start with: the
@@ -647,14 +715,19 @@ def source_frame(clip: str, time_s: float, width: int,
     share the one decode without risking one of them corrupting it for the
     others.
     """
-    info = clip_info(clip, autorotate)
+    rotation = CG.normalise_rotation(rotation)
+    info = clip_info(clip, rotation)
     width, height = _preview_dims(info, width)
     # The decode matrix is part of the identity of the cached bytes, not a
     # constant: an ordinary bt709 delivery file and an Apple Log clip normalise
     # differently, so leaving it out of the key would serve one clip's frame
     # decoded by the other's rule.
     matrix = CG.source_matrix(info)
-    mem_key = f"{clip}|{round(float(time_s), 4)}|{width}|{autorotate}|{matrix}"
+    # The rotation goes in the key as its own string, not as the old boolean:
+    # "auto" and "0" and "90" are three different pictures, and a key that
+    # could only say True or False would hand a rotated request a frame
+    # decoded for a different one.
+    mem_key = f"{clip}|{round(float(time_s), 4)}|{width}|{rotation}|{matrix}"
 
     with _src_mem_lock:
         hit = _src_mem.get(mem_key)
@@ -680,12 +753,14 @@ def source_frame(clip: str, time_s: float, width: int,
             # exactly like a cache miss instead of failing the request.
             data = None
     if data is None:
-        vf = (f"scale={width}:{height}:flags=bilinear,setsar=1,"
+        # The transpose comes first: width and height above are probe's
+        # POST-rotation size, so scaling before the turn would squeeze the
+        # picture into the wrong aspect.
+        vf = (f"{CG.rotate_prefix(info)}"
+              f"scale={width}:{height}:flags=bilinear,setsar=1,"
               f"scale=in_color_matrix={matrix}:in_range={info['color_range']}"
               f":out_range=full,format=gbrp16le")
-        args = ["ffmpeg", "-v", "error", "-y"]
-        if not autorotate:
-            args += ["-noautorotate"]
+        args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(rotation)
         args += ["-ss", str(time_s), "-i", str(clip_path(clip)),
                  "-vf", vf, "-frames:v", "1",
                  "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
@@ -732,7 +807,7 @@ def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
 
 
 def render_raw(clip: str, time_s: float, width: int, cfg: dict,
-               autorotate: bool) -> tuple[np.ndarray, dict]:
+               rotation) -> tuple[np.ndarray, dict]:
     """One graded frame as an RGB array, cached on disk.
 
     Everything else the UI shows (the JPEG in the viewer, every scope, every
@@ -747,7 +822,8 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
     layer underneath it, not a replacement for it.
     """
     cfg = full_config(cfg)
-    info = clip_info(clip, autorotate)
+    rotation = CG.normalise_rotation(rotation)
+    info = clip_info(clip, rotation)
     width, height = _preview_dims(info, width)
     factor = width / float(info["width"])
     pinfo = dict(info, width=width, height=height)
@@ -755,7 +831,7 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
 
     key = hashlib.sha1(json.dumps({
         "clip": clip, "t": round(float(time_s), 4), "w": width,
-        "rot": autorotate, "cfg": pcfg, "engine": ENGINE_HASH,
+        "rot": rotation, "cfg": pcfg, "engine": ENGINE_HASH,
     }, sort_keys=True).encode()).hexdigest()
 
     raw_path = _cache_path("frames", key, "rgb")
@@ -769,7 +845,9 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
         except FileNotFoundError:
             pass  # pruned between exists() and read; fall through and re-render
 
-    src, _smeta = source_frame(clip, time_s, width, autorotate)
+    # source_frame has already turned the picture, so the grade graph must
+    # not turn it again: src_normalised says exactly that.
+    src, _smeta = source_frame(clip, time_s, width, rotation)
 
     graph = CG.graph_with_mask(pcfg, pinfo, encode_out=False,
                                tail_extra=["format=rgb24"],
@@ -792,13 +870,14 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
 
 
 def render_raw_legacy(clip: str, time_s: float, width: int, cfg: dict,
-                      autorotate: bool) -> tuple[np.ndarray, dict]:
+                      rotation) -> tuple[np.ndarray, dict]:
     """The pre-split single-pass render: decode, downscale and grade in one
     ffmpeg call. Kept only so the parity check script can render the same
     config both ways and diff the pixels; no route calls this any more.
     """
     cfg = full_config(cfg)
-    info = clip_info(clip, autorotate)
+    rotation = CG.normalise_rotation(rotation)
+    info = clip_info(clip, rotation)
     width, height = _preview_dims(info, width)
     factor = width / float(info["width"])
     pinfo = dict(info, width=width, height=height)
@@ -807,7 +886,10 @@ def render_raw_legacy(clip: str, time_s: float, width: int, cfg: dict,
     meta = {"key": "legacy", "width": width, "height": height,
             "source_width": info["width"], "source_height": info["height"]}
 
-    head = (f"[0:v]scale={width}:{height}:flags=bilinear,"
+    # The rotation heads this chain, before the scale, for the same reason it
+    # heads source_frame's: width and height are the post-rotation size.
+    head = (f"[0:v]{CG.rotate_prefix(pinfo)}"
+            f"scale={width}:{height}:flags=bilinear,"
             f"setsar=1[studiosrc]")
     graph = CG.graph_with_mask(pcfg, pinfo, encode_out=False,
                                tail_extra=["format=rgb24"],
@@ -967,7 +1049,7 @@ def encode_jpeg(rgb: np.ndarray, key: str, quality: int = 2) -> bytes:
 # gpu.js; this route is the multi-frame twin of source_frame() above (same
 # scale + colour-matrix-normalise vf chain, so a loop frame and a still of the
 # same timecode decode to the same bytes) and nothing else. A grade parameter
-# never invalidates this cache, only clip/start/duration/width/autorotate do.
+# never invalidates this cache, only clip/start/duration/width/rotation do.
 # --------------------------------------------------------------------------
 
 # A decoded rgb48le frame is width * height * 3 channels * 2 bytes each. This
@@ -987,7 +1069,7 @@ def _range_bytes_per_frame(width: int, height: int) -> int:
     return width * height * 3 * 2
 
 
-def range_budget(clip: str, width: int, autorotate: bool) -> dict:
+def range_budget(clip: str, width: int, rotation) -> dict:
     """What a caller can ask for at this width, computed from the real clip
     (fps and dimensions), before anyone commits to a decode. Used by the
     client to clamp the loop range in the UI, and mirrored by the hard check
@@ -995,7 +1077,7 @@ def range_budget(clip: str, width: int, autorotate: bool) -> dict:
     skipped the preflight) still gets the same answer, never a silent
     truncation or a hang.
     """
-    info = clip_info(clip, autorotate)
+    info = clip_info(clip, rotation)
     pwidth, pheight = _preview_dims(info, width)
     fps = float(info.get("fps") or 24.0)
     per_frame = _range_bytes_per_frame(pwidth, pheight)
@@ -1008,7 +1090,7 @@ def range_budget(clip: str, width: int, autorotate: bool) -> dict:
 
 
 def source_range(clip: str, start: float, duration: float, width: int,
-                 autorotate: bool) -> tuple[np.ndarray, dict]:
+                 rotation) -> tuple[np.ndarray, dict]:
     """The decoded, normalised source frames for [start, start+duration),
     one ffmpeg process, at the preview width. Mirrors source_frame()'s own
     vf chain exactly (scale, then the colour-matrix normalise into full
@@ -1019,7 +1101,8 @@ def source_range(clip: str, start: float, duration: float, width: int,
     the actual frame count and fps so the client can compute a real playback
     rate rather than assuming one.
     """
-    info = clip_info(clip, autorotate)
+    rotation = CG.normalise_rotation(rotation)
+    info = clip_info(clip, rotation)
     pwidth, pheight = _preview_dims(info, width)
     fps = float(info.get("fps") or 24.0)
 
@@ -1042,12 +1125,13 @@ def source_range(clip: str, start: float, duration: float, width: int,
             f"a shorter range.")
 
     matrix = CG.source_matrix(info)
-    vf = (f"scale={pwidth}:{pheight}:flags=bilinear,setsar=1,"
+    # Rotation first, exactly as in source_frame, so a loop frame and a still
+    # of the same timecode stay byte for byte the same picture.
+    vf = (f"{CG.rotate_prefix(info)}"
+          f"scale={pwidth}:{pheight}:flags=bilinear,setsar=1,"
           f"scale=in_color_matrix={matrix}:in_range={info['color_range']}"
           f":out_range=full,format=gbrp16le")
-    args = ["ffmpeg", "-v", "error", "-y"]
-    if not autorotate:
-        args += ["-noautorotate"]
+    args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(rotation)
     # -t bounds this the same way every other ffmpeg call in this file is
     # bounded (house rule: a call with no duration limit never terminates on
     # its own). -vsync cfr + -r locks the output to one frame per fps tick
@@ -1181,7 +1265,7 @@ def _play_bitrate(width: int, height: int) -> str:
     return str(max(2_000_000, int(bits)))
 
 
-def _play_params(payload: dict) -> dict:
+def _play_params(payload: dict, user_id=None) -> dict:
     """Resolve one /api/play/prepare request into everything the ffmpeg
     command and the cache key need.
 
@@ -1193,8 +1277,8 @@ def _play_params(payload: dict) -> dict:
     fractions of the frame.
     """
     clip = payload["clip"]
-    autorotate = bool(payload.get("autorotate", True))
-    info = clip_info(clip, autorotate)
+    rotation = effective_rotation(payload, user_id)
+    info = clip_info(clip, rotation)
     cfg = full_config(payload.get("config"))
     start = max(0.0, float(payload.get("time") or 0.0))
     fps = float(info.get("fps") or 24.0)
@@ -1210,11 +1294,11 @@ def _play_params(payload: dict) -> dict:
 
     key = hashlib.sha1(json.dumps({
         "clip": clip, "start": round(start, 4), "duration": round(duration, 4),
-        "w": pwidth, "rot": autorotate, "cfg": pcfg, "engine": ENGINE_HASH,
+        "w": pwidth, "rot": rotation, "cfg": pcfg, "engine": ENGINE_HASH,
     }, sort_keys=True).encode()).hexdigest()
 
     return {"key": key, "clip": clip, "start": start, "duration": duration,
-            "autorotate": autorotate, "cfg": cfg, "pcfg": pcfg,
+            "rotation": rotation, "cfg": cfg, "pcfg": pcfg,
             "info": info, "pinfo": pinfo, "fps": fps}
 
 
@@ -1252,12 +1336,14 @@ def _play_ffmpeg_args(params: dict) -> list[str]:
     """
     pcfg, pinfo = params["pcfg"], params["pinfo"]
     width, height = pinfo["width"], pinfo["height"]
-    head = f"[0:v]scale={width}:{height}:flags=bicubic,setsar=1[studiosrc]"
+    # The turn heads this chain, before the scale (the scale target is the
+    # post-rotation size), so graph_with_mask must not add a second one:
+    # head_extra already means "this caller owns its own source chain".
+    head = (f"[0:v]{CG.rotate_prefix(pinfo)}"
+            f"scale={width}:{height}:flags=bicubic,setsar=1[studiosrc]")
     graph = CG.graph_with_mask(pcfg, pinfo, src_label="studiosrc", head_extra=head)
 
-    args = ["ffmpeg", "-v", "error", "-y"]
-    if not params["autorotate"]:
-        args += ["-noautorotate"]
+    args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(params["rotation"])
     args += ["-ss", str(params["start"]), "-i", str(clip_path(params["clip"]))]
     args += _play_extra_inputs(pcfg, pinfo)
     # An output option here (it comes after every -i), so it caps how much
@@ -1468,7 +1554,13 @@ def read_preset(name: str, user_id: int = 0) -> dict:
         raise StudioError(f"preset not found: {name}")
     # full_config, not a bare deep_merge, so a preset saved before layers
     # existed is migrated on read like every other config that reaches here.
-    return full_config(json.loads(p.read_text()))
+    cfg = full_config(json.loads(p.read_text()))
+    # _comment describes the FILE, not the grade. Leaving it in the config
+    # that becomes the live session meant loading a preset silently poisoned
+    # every future save (Save As with a blank comment, Overwrite on a
+    # different preset) with the text of whatever was loaded most recently.
+    cfg.pop("_comment", None)
+    return cfg
 
 
 def write_preset(name: str, cfg: dict, comment: str = "",
@@ -1478,11 +1570,20 @@ def write_preset(name: str, cfg: dict, comment: str = "",
         raise StudioError("preset names may use letters, digits, dot, dash and "
                           "underscore only")
     body = config_diff(full_config(cfg))
-    # A config carried in from a loaded preset still has that preset's comment
-    # attached. An explicit new comment has to win over it, otherwise "save as"
-    # would silently keep describing the grade it came from.
-    existing = body.pop("_comment", "")
-    comment = comment or existing
+    # The live config must never be trusted for "the existing comment": since
+    # read_preset now strips _comment on load, a config with one on it would
+    # only mean the caller injected it directly, and even before that fix a
+    # config carried in from a DIFFERENT loaded preset could still have that
+    # preset's comment attached. The only honest source for "the comment this
+    # preset already has" is the preset's own file on disk, keyed by the name
+    # being written, not by whatever was last loaded into the editor.
+    body.pop("_comment", None)
+    p = GRADES.user_presets_dir(user_id) / f"{name}.json"
+    if not comment and p.exists():
+        try:
+            comment = json.loads(p.read_text()).get("_comment", "") or ""
+        except (json.JSONDecodeError, OSError):
+            comment = ""
     if comment:
         body = {"_comment": comment, **body}
     # Always the account's own folder, never the shipped library: same file
@@ -1490,7 +1591,6 @@ def write_preset(name: str, cfg: dict, comment: str = "",
     # user owns. "Overwrite" on a library preset therefore writes a user copy
     # that shadows it, which is the only sane meaning of overwrite on a file
     # every other account is also reading.
-    p = GRADES.user_presets_dir(user_id) / f"{name}.json"
     p.write_text(json.dumps(body, indent=2) + "\n")
     return p
 
@@ -1644,17 +1744,22 @@ def _register(job: Job) -> Job:
     return job
 
 
-def start_render(payload: dict) -> Job:
+def start_render(payload: dict, user_id=None) -> Job:
     # Engine "gpu" is the same render through a headless Chrome running
     # gpu.js instead of ffmpeg's filter graph (studio/render_gpu.py). Every
     # other option in this payload means the same thing to both engines, and
     # ffmpeg stays the default and the reference.
+    #
+    # The rotation is resolved here, once, and written back into the payload
+    # as an explicit field so both engines render the same orientation even
+    # when the request only carried the legacy flag or nothing at all.
+    rotation = effective_rotation(payload, user_id)
+    payload = dict(payload, rotation=rotation)
     if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
-        return RG.start_gpu_render(payload)
+        return RG.start_gpu_render(payload, user_id=user_id)
     clip = payload["clip"]
     cfg = full_config(payload.get("config"))
-    autorotate = bool(payload.get("autorotate", True))
-    info = clip_info(clip, autorotate)
+    info = clip_info(clip, rotation)
     start = float(payload.get("start") or 0.0)
     duration = payload.get("duration")
     duration = float(duration) if duration not in (None, "") else None
@@ -1671,7 +1776,10 @@ def start_render(payload: dict) -> Job:
         height = max(2, int(round(info["height"] * factor / 2)) * 2)
         rinfo = dict(info, width=width, height=height)
         rcfg = scale_for_preview(cfg, factor)
-        head = f"[0:v]scale={width}:{height}:flags=bicubic,setsar=1[studiosrc]"
+        # Rotation before the scale here too; without the head_extra branch
+        # graph_with_mask puts it in front of the graph itself.
+        head = (f"[0:v]{CG.rotate_prefix(rinfo)}"
+                f"scale={width}:{height}:flags=bicubic,setsar=1[studiosrc]")
         src = "studiosrc"
 
     graph = CG.graph_with_mask(rcfg, rinfo, src_label=src, head_extra=head)
@@ -1842,16 +1950,20 @@ def _proxy_fps(clip: str, info: dict) -> float:
     return fps
 
 
-def _proxy_params(payload: dict) -> dict:
+def _proxy_params(payload: dict, user_id=None) -> dict:
     """Resolve a proxy request into dimensions, duration and a cache key.
 
     No grade config anywhere in here on purpose: the proxy is the source, not
     the picture. That is what makes it one file per clip instead of one per
     grade, and what lets a knob turn during playback cost nothing.
+
+    The rotation IS part of it, though: the proxy is encoded already turned,
+    so it is one file per clip per rotation, and the rotation is in the key
+    so a 90 request can never be served the auto file that is on disk.
     """
     clip = payload["clip"]
-    autorotate = bool(payload.get("autorotate", True))
-    info = clip_info(clip, autorotate)
+    rotation = effective_rotation(payload, user_id)
+    info = clip_info(clip, rotation)
     rng = "limited" if str(payload.get("range") or PROXY_RANGE) == "limited" else "full"
 
     # Rounded to even BEFORE _preview_dims so the proxy asks that function the
@@ -1878,13 +1990,13 @@ def _proxy_params(payload: dict) -> dict:
 
     matrix = CG.source_matrix(info)
     key = hashlib.sha1(json.dumps({
-        "clip": clip, "w": pwidth, "h": pheight, "rot": autorotate,
+        "clip": clip, "w": pwidth, "h": pheight, "rot": rotation,
         "dur": round(duration, 3), "range": rng, "matrix": matrix,
         "src_range": info["color_range"], "crf": PROXY_CRF, "gop": PROXY_GOP,
         "v": PROXY_VERSION,
     }, sort_keys=True).encode()).hexdigest()
 
-    return {"key": key, "clip": clip, "autorotate": autorotate, "range": rng,
+    return {"key": key, "clip": clip, "rotation": rotation, "range": rng,
             "width": pwidth, "height": pheight, "duration": duration,
             "fps": fps, "matrix": matrix, "info": info}
 
@@ -1904,14 +2016,16 @@ def _proxy_ffmpeg_args(params: dict, out_path: Path) -> list[str]:
     """
     info = params["info"]
     out_range = "full" if params["range"] == "full" else "limited"
-    vf = (f"scale={params['width']}:{params['height']}:flags=bilinear,setsar=1,"
+    # Step 0, ahead of all three: the rotation, so the file the browser plays
+    # is already the right way up and the width and height below (the
+    # post-rotation size) are the size it is actually scaled to.
+    vf = (f"{CG.rotate_prefix(info)}"
+          f"scale={params['width']}:{params['height']}:flags=bilinear,setsar=1,"
           f"scale=in_color_matrix={params['matrix']}"
           f":in_range={info['color_range']}:out_range=full,format=gbrp16le,"
           f"scale=out_color_matrix=bt709:out_range={out_range},format=yuv420p")
 
-    args = ["ffmpeg", "-v", "error", "-y"]
-    if not params["autorotate"]:
-        args += ["-noautorotate"]
+    args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(params["rotation"])
     args += ["-i", str(clip_path(params["clip"]))]
     # An output option, after every -i, so it bounds the ENCODE and not just
     # the seek: the house rule for every ffmpeg call in this file.
@@ -2061,10 +2175,91 @@ def _live_state(user_id: int) -> dict:
     """This user's live state, created on first touch. Call with the lock held."""
     st = LIVE.get(int(user_id))
     if st is None:
+        # project, head, rotation and branch are contract C1: the live state is
+        # now a VIEW of the open project rather than a free floating config, so
+        # a tab (or an agent) reading /api/session learns which project it is
+        # looking at and which commit it is standing on without a second call.
+        # The four are None until a project is opened, which is exactly what a
+        # server with nothing open should say.
         st = {"rev": 0, "config": None, "clip": None, "time": 0.0,
-              "by": "server"}
+              "by": "server", "project": None, "head": None, "rotation": None,
+              "branch": None}
         LIVE[int(user_id)] = st
     return st
+
+
+def _live_from_project(state: dict, proj: dict | None) -> None:
+    """Point one live state at a project record. Call with the lock held."""
+    if not proj:
+        return
+    state["project"] = proj["key"]
+    state["head"] = PROJECTS.short(proj["head"])
+    state["rotation"] = proj["rotation"]
+    state["branch"] = proj["branch"]
+    state["config"] = proj["config"]
+    if proj["name"]:
+        state["clip"] = proj["name"]
+    state["time"] = float(proj["time"])
+
+
+def live_touch(user_id: int, proj: dict, by: str) -> dict:
+    """Publish a project move (checkout, undo, redo, fork, rotation, open).
+
+    Bumps the revision so the long poll returns at once and the tab repaints
+    from the new HEAD's config. Without this, going back a commit from the CLI
+    would change the database and leave the picture on screen unchanged, which
+    is exactly the "who is editing what" confusion this arc is here to end.
+    """
+    with _live_lock:
+        state = _live_state(user_id)
+        _live_from_project(state, proj)
+        state["by"] = str(by or "server")
+        state["rev"] += 1
+        _live_changed.notify_all()
+        return deepcopy(state)
+
+
+def live_sync(user_id: int, proj: dict) -> None:
+    """Bring the live mirror in line with a project WITHOUT waking anybody.
+
+    Used where the caller already has this config on screen: the tab's own
+    autosave (PUT /api/grade) writes what it just published. Bumping the
+    revision there would send the tab its own edit back as somebody else's,
+    which reads as a toast and an undo entry for a change nobody made.
+    """
+    with _live_lock:
+        state = _live_state(user_id)
+        clip_before = state["clip"]
+        _live_from_project(state, proj)
+        if clip_before:
+            state["clip"] = clip_before
+
+
+def live_rebuild() -> None:
+    """Rebuild the live state from the workspace table at boot.
+
+    A restart used to lose the open clip, the playhead and the config, so the
+    first tab to connect started from nothing and republished whatever it had.
+    The workspace table already knows which project each account had open, so
+    the mirror can be rebuilt exactly, with revision 0: nobody is woken, and
+    the first long poll waits like it always did.
+    """
+    try:
+        open_projects = PROJECTS.workspaces()
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"warning: could not restore open projects: {exc}", file=sys.stderr)
+        return
+    for user_id, key in open_projects.items():
+        try:
+            proj = PROJECTS.state(key)
+        except Exception:                                     # noqa: BLE001
+            continue
+        if not proj:
+            continue
+        with _live_lock:
+            state = _live_state(user_id)
+            _live_from_project(state, proj)
+            state["by"] = "server"
 
 
 def live_get(user_id: int = 0) -> dict:
@@ -2072,8 +2267,20 @@ def live_get(user_id: int = 0) -> dict:
         return deepcopy(_live_state(user_id))
 
 
-def live_set(payload: dict, user_id: int = 0) -> dict:
-    """Merge a patch into the live config and wake anything waiting on it."""
+def live_set(payload: dict, user_id: int = 0, author: str | None = None) -> dict:
+    """Merge a patch into the live config, COMMIT it, and wake the waiters.
+
+    The wire shape is unchanged: same body, same fields back, plus the four
+    project fields. What changed underneath is that a session write is now the
+    way an edit enters the history. `clip` opens that clip's project, `config`
+    becomes a commit on it (deduped, so a republish of the same config is not
+    a commit), `time` moves the playhead, and `message` names the commit when
+    the caller has something better to say than the generated description.
+
+    `author` is who the server decided the caller is (the account name with
+    logins on). `by` stays exactly what the caller sent, because session.js
+    filters its own echo on it and changing it would make the tab fight itself.
+    """
     with _live_lock:
         state = _live_state(user_id)
         patch = payload.get("config")
@@ -2088,6 +2295,52 @@ def live_set(payload: dict, user_id: int = 0) -> dict:
             if payload.get(key) is not None:
                 state[key] = payload[key]
         state["by"] = str(payload.get("by") or "cli")
+
+        # --- the project side of the same write ---------------------------
+        #
+        # Wrapped rather than allowed to fail the request: a clip that cannot
+        # be resolved (an external clip from a previous server run, a drive
+        # that went away) used to leave the live mirror working, and it still
+        # does. The session route is what the tab depends on to show anything
+        # at all, so it degrades to the old behaviour instead of erroring.
+        who = str(author or state["by"] or "cli")
+        proj = None
+        try:
+            key = None
+            if payload.get("clip") is not None:
+                ckey, cname, cpath = resolve_clip(str(payload["clip"]))
+                PROJECTS.ensure(ckey, cname, cpath)
+                if PROJECTS.workspace_key(user_id) != ckey:
+                    PROJECTS.set_workspace(user_id, ckey)
+                key = ckey
+            else:
+                key = PROJECTS.workspace_key(user_id)
+            if key:
+                if payload.get("time") is not None:
+                    PROJECTS.set_time(user_id, key, payload["time"])
+                if patch is not None:
+                    message = payload.get("message")
+                    proj = PROJECTS.commit(user_id, key, state["config"], who,
+                                           message=(str(message) if message else None))
+                else:
+                    proj = PROJECTS.state(key)
+        except Exception as exc:                              # noqa: BLE001
+            if VERBOSE:
+                print(f"session write: no project for this write ({exc})",
+                      file=sys.stderr)
+        if proj:
+            clip_before = state["clip"]
+            _live_from_project(state, proj)
+            # The caller's clip name wins over the project's stored one: a clip
+            # opened from outside footage/ is known by the name THIS server run
+            # gave it, and the project may have been created under another.
+            if payload.get("clip") is not None:
+                state["clip"] = payload["clip"]
+            elif clip_before:
+                state["clip"] = clip_before
+            if payload.get("time") is not None:
+                state["time"] = payload["time"]
+
         state["rev"] += 1
         _live_changed.notify_all()
         return deepcopy(state)
@@ -2111,7 +2364,50 @@ def live_wait(since: int, timeout: float = 25.0, user_id: int = 0) -> dict:
         return deepcopy(state)
 
 
-def match_reference_job(payload: dict) -> dict:
+def stored_match_crops(payload: dict, user_id=None) -> dict:
+    """The rectangles this project has saved, per reference (contract C7).
+
+    Lives in the project's extras bag under `match_crops`, written by the tab
+    through POST /api/project/extra and readable by an agent in
+    GET /api/project. Shaped {REF_NAME: {"ref": [x0,y0,x1,y1],
+    "frame": [x0,y0,x1,y1]}}, either key optional.
+
+    Best effort by design: a match must not fail because the project store had
+    a bad day, so anything unreadable here means "no stored rectangle" and the
+    match runs on the whole image, which is what it did before this existed.
+    """
+    try:
+        key = None
+        clip = payload.get("clip")
+        if clip:
+            key = PROJECTS.resolve(str(clip))[0]
+        if not key and user_id is not None:
+            key = PROJECTS.workspace_key(user_id)
+        if not key:
+            return {}
+        st = PROJECTS.state(key) or {}
+        bag = (st.get("extras") or {}).get("match_crops")
+        return bag if isinstance(bag, dict) else {}
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _crop_from(payload: dict, field: str, stored):
+    """One rectangle and where it came from.
+
+    Three cases, and the difference between the last two matters: a field the
+    caller did not send falls back to what the project saved (that is how an
+    agent or the CLI picks up the rectangle the person drew), while a field
+    sent as null is the caller saying "this one, whole image", which must not
+    be quietly overridden by a saved rectangle they cannot see.
+    """
+    if field in payload:
+        value = payload.get(field)
+        return (value, "request") if value else (None, "none")
+    return (stored, "project") if stored else (None, "none")
+
+
+def match_reference_job(payload: dict, user_id=None) -> dict:
     """Fit a look cube that moves the current frame toward a reference image.
 
     Synchronous rather than a background Job because the tool costs 1.4 to 3.0
@@ -2151,6 +2447,20 @@ def match_reference_job(payload: dict) -> dict:
     # rather than stacking with it; with no box, auto_crop stays on and the
     # detector runs exactly as before this option existed.
     crop_frac = payload.get("crop_frac")
+    # ref_crop and frame_crop are contract C7's picked rectangles, four
+    # fractions [x0, y0, x1, y1] each: the reference one is applied before the
+    # automatic chrome trim (so the trim runs INSIDE the rectangle rather than
+    # arguing with it), the frame one crops the frame the fit measures. Absent
+    # means "use whatever this project saved for this reference"; explicitly
+    # null means "whole image". With neither, this call is byte for byte the
+    # call it was before the rectangles existed.
+    saved = stored_match_crops(payload, user_id)
+    for_ref = saved.get(str(ref)) or saved.get(ref_path.name) or {}
+    if not isinstance(for_ref, dict):
+        for_ref = {}
+    ref_crop, ref_from = _crop_from(payload, "ref_crop", for_ref.get("ref"))
+    frame_crop, frame_from = _crop_from(payload, "frame_crop",
+                                        for_ref.get("frame"))
     # The match panel (static/index.html, static/app.js) exposes method,
     # strength and luma_preserve as real controls: match_ref.py actually
     # takes all three (METHODS is "reinhard" or "histogram"), so validated
@@ -2171,7 +2481,9 @@ def match_reference_job(payload: dict) -> dict:
             ref=str(ref_path),
             clip=str(clip_path(payload["clip"])),
             time=float(payload.get("time", 0)),
-            autorotate=bool(payload.get("autorotate", True)),
+            # The fit has to measure the frame the user is looking at, which
+            # means the frame at the rotation they are looking at it in.
+            rotation=effective_rotation(payload, user_id),
             preset=str(tmp),
             method=method,
             # Baking anything other than full strength was previously
@@ -2185,11 +2497,19 @@ def match_reference_job(payload: dict) -> dict:
             luma_preserve=luma_preserve,
             crop_frac=crop_frac,
             auto_crop=crop_frac is None,
+            ref_crop=ref_crop,
+            frame_crop=frame_crop,
         )
     except MatchError as exc:
         raise StudioError(str(exc)) from exc
     finally:
         tmp.unlink(missing_ok=True)
+    # Where each rectangle came from, so the panel can say "the one you drew"
+    # against "the one this project had saved" instead of leaving the user to
+    # guess which picture was measured.
+    crops = result.setdefault("crops", {"ref": None, "frame": None})
+    crops["ref_source"] = ref_from if crops.get("ref") else "none"
+    crops["frame_source"] = frame_from if crops.get("frame") else "none"
     result["looks"] = list_looks()
     return result
 
@@ -2287,8 +2607,9 @@ def clear_frame_cache() -> int:
 # thumbnails and references
 # --------------------------------------------------------------------------
 
-def thumbnail(clip: str, time_s: float, width: int, autorotate: bool) -> bytes:
-    key = hashlib.sha1(f"{clip}|{time_s:.3f}|{width}|{autorotate}".encode()).hexdigest()
+def thumbnail(clip: str, time_s: float, width: int, rotation) -> bytes:
+    rotation = CG.normalise_rotation(rotation)
+    key = hashlib.sha1(f"{clip}|{time_s:.3f}|{width}|{rotation}".encode()).hexdigest()
     path = _cache_path("thumbs", key, "jpg")
     if path.exists():
         try:
@@ -2296,7 +2617,7 @@ def thumbnail(clip: str, time_s: float, width: int, autorotate: bool) -> bytes:
             return path.read_bytes()
         except FileNotFoundError:
             pass  # pruned between exists() and read; re-render instead of failing
-    info = clip_info(clip, autorotate)
+    info = clip_info(clip, rotation)
     height = max(2, int(round(info["height"] * width / info["width"] / 2)) * 2)
     # Thumbnails run the conversion only. They are a "where am I in the clip"
     # index, and running the full grade on every one would make the strip cost
@@ -2305,7 +2626,8 @@ def thumbnail(clip: str, time_s: float, width: int, autorotate: bool) -> bytes:
     graph = CG.graph_with_mask(cfg, dict(info, width=width, height=height),
                                encode_out=False, tail_extra=["format=rgb24"],
                                src_label="studiosrc",
-                               head_extra=f"[0:v]scale={width}:{height}"
+                               head_extra=f"[0:v]{CG.rotate_prefix(info)}"
+                                          f"scale={width}:{height}"
                                           f":flags=bilinear,setsar=1[studiosrc]")
     args = CG.ffmpeg_inputs(str(clip_path(clip)), cfg, info, float(time_s))
     args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
@@ -2854,6 +3176,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, exc.code)
         except StudioError as exc:
             self._json({"error": str(exc)}, 400)
+        except ValueError as exc:
+            # projects.py says no to a rotation that is not one of the five, a
+            # commit id nobody has, or a branch name already taken by raising
+            # ValueError. Those are the caller's mistake, so they answer 400
+            # with the message rather than a 500 and a traceback.
+            self._json({"error": str(exc)}, 400)
         except CG.GradeError as exc:
             self._json({"error": str(exc)}, 400)
         except BrokenPipeError:
@@ -3128,7 +3456,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = mask_preview_config(cfg, None if ml is None else int(ml))
             rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
                                    int(payload.get("width", 960)), cfg,
-                                   bool(payload.get("autorotate", True)))
+                                   effective_rotation(payload, self._uid()))
             headers = {
                 "X-Frame-Key": meta["key"],
                 "X-Frame-Size": f"{meta['width']}x{meta['height']}",
@@ -3147,7 +3475,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._body()
             arr, meta = source_frame(payload["clip"], float(payload.get("time", 0)),
                                      int(payload.get("width", 960)),
-                                     bool(payload.get("autorotate", True)))
+                                     effective_rotation(payload, self._uid()))
             self._send(200, arr.tobytes(), "application/octet-stream", {
                 "X-Frame-Size": f"{meta['width']}x{meta['height']}",
             })
@@ -3159,7 +3487,7 @@ class Handler(BaseHTTPRequestHandler):
         # browser by gpu.js (see static/live.js).
         if route == "range/limit" and method == "GET":
             self._json(range_budget(q["clip"], int(q.get("width", 960)),
-                                    q.get("rot", "1") == "1"))
+                                    effective_rotation(q, self._uid())))
             return
 
         if route == "range" and method == "POST":
@@ -3167,7 +3495,7 @@ class Handler(BaseHTTPRequestHandler):
             arr, meta = source_range(payload["clip"], float(payload.get("time", 0)),
                                      float(payload.get("duration", 2.0)),
                                      int(payload.get("width", 960)),
-                                     bool(payload.get("autorotate", True)))
+                                     effective_rotation(payload, self._uid()))
             self._send(200, arr.tobytes(), "application/octet-stream", {
                 "X-Frame-Size": f"{meta['width']}x{meta['height']}",
                 "X-Frame-Count": str(meta["frames"]),
@@ -3251,7 +3579,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "session" and method == "POST":
-            self._json(live_set(self._body(), self._uid()))
+            payload = self._body()
+            self._json(live_set(payload, self._uid(),
+                                author=self._author(payload.get("by"))))
             return
 
         if route == "session/wait" and method == "GET":
@@ -3259,6 +3589,116 @@ class Handler(BaseHTTPRequestHandler):
             # edit immediately instead of on its next poll tick.
             self._json(live_wait(int(q.get("since", 0)),
                                  float(q.get("timeout", 25)), self._uid()))
+            return
+
+        # --- projects and history, contract C1 --------------------------
+        #
+        # A project is one clip's whole state: rotation, playhead, loaded
+        # preset, extras, and the commit tree. Shared by every account, keyed
+        # by the clip's content, and the thing the live session above is now a
+        # view of. The auth and CSRF checks at the top of _api already cover
+        # every route here, the same way they cover /api/session.
+        if route == "whoami" and method == "GET":
+            self._json({
+                "user": (self.user["name"] if self.user else None),
+                "by": self._author(None),
+                "auth": AUTH.enabled(),
+                "project": PROJECTS.workspace_key(self._uid()),
+            })
+            return
+
+        if route == "project" and method == "GET":
+            self._json(self._project_body(q.get("clip")))
+            return
+
+        if route == "project/open" and method == "POST":
+            payload = self._body()
+            clip = str(payload.get("clip", "") or "")
+            if not clip:
+                raise StudioError("no clip given")
+            proj = PROJECTS.open(self._uid(), clip)
+            live_touch(self._uid(), proj, self._author(payload.get("by")))
+            self._json(self._project_body(clip, proj))
+            return
+
+        if route == "project/rotation" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            value = payload.get("rotation")
+            if value is None and payload.get("autorotate") is not None:
+                # The old wire word, still accepted everywhere in this arc:
+                # true is "honour the file's tag", false is "no rotation".
+                value = "auto" if payload.get("autorotate") else "0"
+            proj = PROJECTS.set_rotation(self._uid(), key, str(value))
+            live_touch(self._uid(), proj, self._author(payload.get("by")))
+            self._json(self._project_body(None, proj))
+            return
+
+        if route == "project/time" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            proj = PROJECTS.set_time(self._uid(), key, payload.get("time"))
+            # Deliberately no revision bump: the playhead moves continuously
+            # while somebody scrubs, and waking every long poll on each frame
+            # would be a stream of wakeups for something the tab already knows.
+            with _live_lock:
+                _live_state(self._uid())["time"] = float(proj["time"])
+            self._json(self._project_body(None, proj))
+            return
+
+        if route == "project/preset" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            proj = PROJECTS.set_preset(self._uid(), key, payload.get("name"))
+            self._json(self._project_body(None, proj))
+            return
+
+        if route == "project/extra" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            proj = PROJECTS.set_extra(self._uid(), key,
+                                      str(payload.get("name", "") or ""),
+                                      payload.get("value"))
+            self._json(self._project_body(None, proj))
+            return
+
+        if route == "project/log" and method == "GET":
+            key = self._open_key(q.get("clip"))
+            self._json(PROJECTS.log(self._uid(), key,
+                                    int(q.get("limit", 200))))
+            return
+
+        if route == "project/checkout" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            proj = PROJECTS.checkout(self._uid(), key,
+                                     str(payload.get("commit", "") or ""))
+            live_touch(self._uid(), proj, self._author(payload.get("by")))
+            self._json(self._project_body(None, proj))
+            return
+
+        if route == "project/fork" and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            proj = PROJECTS.fork(self._uid(), key,
+                                 from_commit=(payload.get("commit") or None),
+                                 name=(payload.get("name") or None))
+            live_touch(self._uid(), proj, self._author(payload.get("by")))
+            self._json(self._project_body(None, proj))
+            return
+
+        if route in ("project/undo", "project/redo") and method == "POST":
+            payload = self._body()
+            key = self._open_key(payload.get("clip"))
+            step = PROJECTS.undo if route.endswith("undo") else PROJECTS.redo
+            proj = step(self._uid(), key)
+            if proj.get("moved"):
+                live_touch(self._uid(), proj, self._author(payload.get("by")))
+            out = self._project_body(None, proj)
+            out["moved"] = bool(proj.get("moved"))
+            if proj.get("note"):
+                out["note"] = proj["note"]
+            self._json(out)
             return
 
         # --- per clip grades, contract C3 -------------------------------
@@ -3269,6 +3709,18 @@ class Handler(BaseHTTPRequestHandler):
         # separate a clip from its grade.
         if route == "grade" and method == "GET":
             key = self._grade_key(q.get("clip", ""))
+            # Contract C1: once a project exists, HEAD is the grade. The old
+            # per account row is only consulted for a clip nobody has opened
+            # yet, which is also the row that becomes that project's root the
+            # moment somebody does.
+            proj = PROJECTS.state(key)
+            if proj is not None:
+                self._json({"exists": True, "key": key,
+                            "config": proj["config"],
+                            "updated_at": proj["updated"],
+                            "head": proj["head_short"],
+                            "branch": proj["branch"]})
+                return
             row = GRADES.get_grade(self._uid(), key)
             if row is None:
                 self._json({"exists": False, "key": key, "config": None,
@@ -3295,7 +3747,30 @@ class Handler(BaseHTTPRequestHandler):
             # defaults happened to be on the day it was saved.
             cfg = full_config(payload.get("config"))
             updated = GRADES.put_grade(self._uid(), key, name, cfg)
-            self._json({"key": key, "updated_at": updated})
+            # Contract C1: a save is a commit. The old row is written too, and
+            # deliberately: GET /api/grades and the copy picker are built from
+            # it, and it is the migration source for any account that opens
+            # this clip on a server that has never seen it.
+            head = None
+            try:
+                path = ""
+                try:
+                    path = str(clip_path(name)) if name else ""
+                except StudioError:
+                    path = ""
+                PROJECTS.ensure(key, name, path)
+                proj = PROJECTS.commit(self._uid(), key, cfg,
+                                       self._author(payload.get("by") or "cli"),
+                                       message=str(payload.get("message")
+                                                   or "saved grade"))
+                head = proj["head_short"]
+                if PROJECTS.workspace_key(self._uid()) == key:
+                    live_sync(self._uid(), proj)
+            except Exception as exc:                          # noqa: BLE001
+                if VERBOSE:
+                    print(f"grade save: no project recorded ({exc})",
+                          file=sys.stderr)
+            self._json({"key": key, "updated_at": updated, "head": head})
             return
 
         if route == "grades" and method == "GET":
@@ -3304,8 +3779,29 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "grade" and method == "DELETE":
             key = self._grade_key(q.get("clip", ""))
-            self._json({"deleted": GRADES.delete_grade(self._uid(), key),
-                        "key": key})
+            gone = GRADES.delete_grade(self._uid(), key)
+            # Contract C1 keeps this route's promise: after a delete, the clip
+            # reads as ungraded. HEAD is the grade now, so the delete is a
+            # commit back to the defaults rather than a row removal, which is
+            # the same result WITHOUT destroying a shared project's history.
+            # Deleting the tree instead was considered and refused: the UI
+            # harness clears every grade at the start of each run, and that
+            # would have made a test run wipe the founder's history.
+            head = None
+            try:
+                proj = PROJECTS.state(key)
+                if proj is not None:
+                    proj = PROJECTS.commit(self._uid(), key,
+                                           full_config({}),
+                                           self._author(q.get("by")))
+                    head = proj["head_short"]
+                    if PROJECTS.workspace_key(self._uid()) == key:
+                        live_sync(self._uid(), proj)
+            except Exception as exc:                          # noqa: BLE001
+                if VERBOSE:
+                    print(f"grade delete: no project reset ({exc})",
+                          file=sys.stderr)
+            self._json({"deleted": gone, "key": key, "head": head})
             return
 
         if route == "grade/copy" and method == "POST":
@@ -3332,7 +3828,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "match" and method == "POST":
-            self._json(match_reference_job(self._body()))
+            self._json(match_reference_job(self._body(), self._uid()))
             return
 
         if route == "parity/report" and method == "POST":
@@ -3356,7 +3852,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = flat_config(cfg, bool(payload.get("keep_exposure")))
             rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
                                    int(payload.get("width", 640)), cfg,
-                                   bool(payload.get("autorotate", True)))
+                                   effective_rotation(payload, self._uid()))
             self._json({"key": meta["key"], "stats": frame_stats(rgb),
                         "size": [meta["width"], meta["height"]]})
             return
@@ -3366,7 +3862,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = full_config(payload.get("config"))
             rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
                                    int(payload.get("width", 640)), cfg,
-                                   bool(payload.get("autorotate", True)))
+                                   effective_rotation(payload, self._uid()))
             body = render_scope(rgb, meta["key"], payload.get("kind", "waveform"),
                                 int(payload.get("size", 480)))
             self._send(200, body, "image/jpeg")
@@ -3374,7 +3870,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "thumb" and method == "GET":
             body = thumbnail(q["clip"], float(q.get("t", 0)),
-                             int(q.get("w", 160)), q.get("rot", "1") == "1")
+                             int(q.get("w", 160)),
+                             effective_rotation(q, self._uid()))
             self._send(200, body, "image/jpeg")
             return
 
@@ -3467,7 +3964,7 @@ class Handler(BaseHTTPRequestHandler):
             # from this server, and only the request knows which port that is
             # (the studio takes --port, and the tests run it on a random one).
             body.setdefault("port", self.server.server_address[1])
-            job = start_render(body)
+            job = start_render(body, self._uid())
             self._json({"job": job.as_dict()})
             return
 
@@ -3531,7 +4028,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if route == "play/prepare" and method == "POST":
-            params = _play_params(self._body())
+            params = _play_params(self._body(), self._uid())
             cache_path = _segment_path(params["key"])
             cached = cache_path.exists()
             if cached:
@@ -3557,7 +4054,7 @@ class Handler(BaseHTTPRequestHandler):
         # to watch when it is not, so the client has one call to make either
         # way. The mp4 itself is a plain GET so a <video src> can point at it.
         if route == "proxy/prepare" and method == "POST":
-            self._json(proxy_state(_proxy_params(self._body())))
+            self._json(proxy_state(_proxy_params(self._body(), self._uid())))
             return
 
         if route.startswith("proxy/") and method == "GET":
@@ -3584,6 +4081,79 @@ class Handler(BaseHTTPRequestHandler):
             return value.lower()
         return GRADES.clip_key(clip_path(value))
 
+    # --- projects, contract C1 -----------------------------------------
+
+    def _author(self, by) -> str:
+        """Who this write is FROM, decided by the server, not by the body.
+
+        With logins on the account name wins: a signed in browser cannot sign
+        somebody else's name to a commit by editing a JSON body. With logins
+        off there is no account to name, so the caller's own label is used,
+        which is `studio` from the tab and `--by`, CINEGRADE_AGENT or `cli`
+        from the command line. That is the whole identity model, and it is
+        deliberately small: this is a local colour tool, not a bank.
+        """
+        if AUTH.enabled() and self.user:
+            return str(self.user["name"])
+        label = str(by or "").strip()
+        return label or "cli"
+
+    def _open_key(self, clip=None) -> str:
+        """The project this request is about: the named clip, or the open one."""
+        clip = str(clip or "").strip()
+        if clip:
+            return PROJECTS.resolve(clip)[0]
+        key = PROJECTS.workspace_key(self._uid())
+        if not key:
+            raise StudioError("no project is open. Open a clip first "
+                              "(POST /api/project/open)")
+        return key
+
+    def _project_body(self, clip=None, proj: dict | None = None) -> dict:
+        """What GET /api/project answers with, for a clip or the open project."""
+        if proj is None:
+            clip = str(clip or "").strip()
+            if clip:
+                key = PROJECTS.resolve(clip)[0]
+                proj = PROJECTS.state(key)
+            else:
+                key = PROJECTS.workspace_key(self._uid())
+                proj = PROJECTS.state(key) if key else None
+        if not proj:
+            return {"open": False, "key": None, "name": None, "config": None,
+                    "rotation": "auto", "branch": None, "head": None,
+                    "branches": [], "extras": {},
+                    "note": "no project is open on this account yet"}
+        out = {"open": True, "key": proj["key"], "name": proj["name"],
+               "path": proj["path"], "rotation": proj["rotation"],
+               "time": proj["time"], "preset": proj["preset"],
+               "head": proj["head_short"], "head_full": proj["head"],
+               "head_commit": proj["head_commit"], "branch": proj["branch"],
+               "branches": proj["branches"], "extras": proj["extras"],
+               "config": proj["config"], "created": proj["created"],
+               "updated": proj["updated"]}
+        out["dims"] = self._rotation_dims(proj["name"], proj["rotation"])
+        return out
+
+    def _rotation_dims(self, name: str, rotation: str) -> dict | None:
+        """The frame size this project's rotation actually produces.
+
+        Best effort: a clip that has gone offline, or a probe that fails, costs
+        this one field and not the whole request. 90 and 270 are the raw frame
+        turned on its side, which is why the raw probe is the base for them
+        rather than the autorotated one.
+        """
+        if not name:
+            return None
+        try:
+            info = clip_info(name, rotation == "auto")
+        except Exception:                                     # noqa: BLE001
+            return None
+        width, height = int(info["width"]), int(info["height"])
+        if rotation in ("90", "270"):
+            width, height = height, width
+        return {"width": width, "height": height, "rotation": rotation}
+
     def _clip_entry(self, p: Path, name: str) -> dict:
         entry = {"name": name, "bytes": p.stat().st_size, "path": str(p),
                  "external": name in EXTERNAL_CLIPS,
@@ -3607,6 +4177,23 @@ class Handler(BaseHTTPRequestHandler):
             entry.setdefault("pix_fmt", info["pix_fmt"])
             entry.setdefault("color_range", info["color_range"])
             entry.setdefault("color_space", info["color_space"])
+        # The two dimension blocks above are the two the app has always shown
+        # (autorotate and raw). Once a project exists, the rotation it stores
+        # can be a quarter turn that is neither of them, so its size is
+        # reported as a third block rather than by quietly redefining one of
+        # the first two, which the clip picker and proxy-fidelity.mjs read.
+        # Absent entirely when there is no project, so today's shape is
+        # unchanged for anyone who has not opened one.
+        chosen = _project_rotation(self._uid())
+        if chosen and "error" not in entry:
+            try:
+                info = clip_info(name, chosen)
+                entry["effective"] = {
+                    "rotation": CG.normalise_rotation(chosen),
+                    "width": info["width"], "height": info["height"],
+                }
+            except Exception:                                 # noqa: BLE001
+                pass
         return entry
 
     def _clips(self) -> list[dict]:
@@ -3716,6 +4303,11 @@ def main() -> None:
                     help="list accounts and exit")
     ap.add_argument("--delete-user", metavar="NAME",
                     help="delete an account and exit")
+    ap.add_argument("--data-dir", metavar="DIR",
+                    help="put the accounts, grades and project database "
+                         "somewhere other than studio/data. For tests: this "
+                         "database is real work, and a test run must never "
+                         "open it. Also settable as STUDIO_DATA_DIR")
     ap.add_argument("--upload-max-bytes", type=int, default=UPLOAD_MAX_BYTES,
                     help="reject a single POST /api/upload larger than this "
                          "many bytes (default 8 GiB)")
@@ -3727,6 +4319,12 @@ def main() -> None:
     VERBOSE = args.verbose
     UPLOAD_MAX_BYTES = args.upload_max_bytes
     UPLOAD_QUOTA_BYTES = args.upload_quota_bytes
+
+    # Before anything opens the database, including --create-user below.
+    if args.data_dir:
+        DB.set_data_dir(args.data_dir)
+        AUTH.USERS_DIR = DB.DATA / "users"
+        GRADES.USERS_DIR = DB.DATA / "users"
 
     if _user_cli(args):
         return
@@ -3763,6 +4361,11 @@ def main() -> None:
     if not TECHNICAL.exists() or not any(TECHNICAL.glob("*.cube")):
         print("warning: no technical LUTs yet. Use Rebuild LUTs in the UI, or "
               "run grade/tools/make_cst.py.", file=sys.stderr)
+
+    # Contract C1: the open project survives a restart. Done after ensure_dirs
+    # (the tables have to exist) and before the port is bound, so the first
+    # request already sees the restored state rather than an empty mirror.
+    live_rebuild()
 
     httpd = StudioServer((args.host, args.port), Handler)
     # flush explicitly: piped into a log file Python block-buffers stdout, and a

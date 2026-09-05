@@ -45,9 +45,22 @@
      measure zero, so the first non-empty rect is the picture. */
   var PICTURE_IDS = ["frameImg", "gpuCanvas", "playerVideo"];
 
+  /* The picked rectangle's own constants (contract C7). MIN_PICK is a little
+     over the 1% of the image the matcher refuses outright, so a handle
+     dragged past itself stops at something that can still be measured
+     instead of at an error. */
+  var MIN_PICK = 0.02;
+  var PICK_EDGES = {
+    "pick-nw": { x0: 1, y0: 1 }, "pick-n": { y0: 1 }, "pick-ne": { x1: 1, y0: 1 },
+    "pick-e": { x1: 1 }, "pick-se": { x1: 1, y1: 1 }, "pick-s": { y1: 1 },
+    "pick-sw": { x0: 1, y1: 1 }, "pick-w": { x0: 1 }
+  };
+
   var api = null;
   var svg = null;
   var grp = null;
+  var pgrp = null;          /* the picked rectangle's group, untransformed */
+  var pick = null;          /* {frac: [x0,y0,x1,y1] or null, onChange: fn} */
   var el = {};
   var drag = null;
   var forced = false;       /* the toolbar button: draw before the window is on */
@@ -244,6 +257,44 @@
     el.centreRing = mk("circle", "win-grip win-centre", grp);
     el.centreRing.setAttribute("r", "9");
 
+    /* The picked rectangle (contract C7). A second thing this overlay can
+       draw: not the selected layer's power window but a plain rectangle
+       saying which part of the frame "Match to reference" should measure.
+       It lives in this file rather than in an overlay of its own because
+       everything it needs is already solved here: the PICTURE's rendered
+       rect (which is not the stage's in wipe mode), the pointer capture
+       that keeps a drag alive once it leaves a 5px grip, and the observers
+       that reposition on a resize, a zoom or a new frame.
+
+       It is its own untransformed group: grp carries the window's
+       translate and rotate, and a crop rectangle is neither translated nor
+       rotated. It writes nothing into the config either, it hands the
+       rectangle to whoever called setPick, so a layer's window cannot be
+       disturbed by picking and leaving pick mode puts back exactly what
+       was on screen before it. */
+    pgrp = mk("g", "pick-grp", svg);
+    /* The full stage catcher, so a drag can START anywhere on the picture
+       and draw a new rectangle. Only takes the pointer while picking (see
+       #windowOverlay.picking .pick-catch in style.css), so outside pick
+       mode the overlay is as click-through as it always was. */
+    el.pickCatch = mk("rect", "pick-catch", pgrp);
+    el.pickCatch.setAttribute("x", "0");
+    el.pickCatch.setAttribute("y", "0");
+    el.pickCatch.setAttribute("width", "100%");
+    el.pickCatch.setAttribute("height", "100%");
+    el.pickBox = mk("rect", "pick-box", pgrp);
+    el.pickGrips = [];
+    Object.keys(PICK_EDGES).forEach(function (role) {
+      var c = mk("circle", "pick-grip", pgrp);
+      c.setAttribute("r", "5");
+      c.dataset.role = role;
+      bindHandle(c, role);
+      el.pickGrips.push(c);
+    });
+    el.pickCatch.addEventListener("pointerdown", function (ev) {
+      if (pick) onDown("pick-new", el.pickCatch, ev);
+    });
+
     bindHandle(el.centreRing, "centre");
     el.hw.forEach(function (c) { bindHandle(c, c.dataset.role); });
     bindHandle(el.rot, "rot");
@@ -335,15 +386,75 @@
       startD: shapeDistance(g, p),
       axOffset: g.ax - Math.abs(p.ux),
       ayOffset: g.ay - Math.abs(p.uy),
-      pairs: null
+      pairs: null,
+      /* Picking (contract C7) takes the same drag lifecycle and the same
+         pointer capture and answers with a rectangle instead of window
+         fields. startBox is the rectangle as it was at pointerdown, so a
+         handle drag is computed against it rather than accumulated frame to
+         frame, exactly like every branch of compute() below. */
+      pick: role.indexOf("pick") === 0,
+      anchor: pickPoint(g, ev),
+      startBox: (pick && pick.frac) ? pick.frac.slice() : null,
+      box: null
     };
     svg.classList.add("dragging");
     if (svg.focus) svg.focus();
   }
 
+  /* The pointer as [x, y] fractions of the picture, clamped so a drag that
+     leaves the picture (or the window) still ends exactly at its edge. */
+  function pickPoint(g, ev) {
+    return [clamp((ev.clientX - g.pic.left) / g.pw, 0, 1),
+            clamp((ev.clientY - g.pic.top) / g.ph, 0, 1)];
+  }
+
+  function normBox(b) {
+    var x0 = Math.min(b[0], b[2]), x1 = Math.max(b[0], b[2]);
+    var y0 = Math.min(b[1], b[3]), y1 = Math.max(b[1], b[3]);
+    var c;
+    if (x1 - x0 < MIN_PICK) {
+      c = (x0 + x1) / 2;
+      x0 = clamp(c - MIN_PICK / 2, 0, 1 - MIN_PICK); x1 = x0 + MIN_PICK;
+    }
+    if (y1 - y0 < MIN_PICK) {
+      c = (y0 + y1) / 2;
+      y0 = clamp(c - MIN_PICK / 2, 0, 1 - MIN_PICK); y1 = y0 + MIN_PICK;
+    }
+    return [x0, y0, x1, y1];
+  }
+
+  function computePick(ev) {
+    var g = drag.g;
+    var p = pickPoint(g, ev);
+    if (drag.role === "pick-new" || !drag.startBox) {
+      return normBox([drag.anchor[0], drag.anchor[1], p[0], p[1]]);
+    }
+    var edges = PICK_EDGES[drag.role] || {};
+    var b = drag.startBox.slice();
+    if (edges.x0) b[0] = p[0];
+    if (edges.x1) b[2] = p[0];
+    if (edges.y0) b[1] = p[1];
+    if (edges.y1) b[3] = p[1];
+    return normBox(b);
+  }
+
+  function pickChanged(box, commit) {
+    if (!pick) return;
+    pick.frac = box;
+    sync();
+    if (pick.onChange) pick.onChange(box ? box.slice() : null, !!commit);
+  }
+
   function onMove(ev) {
     if (!drag || ev.pointerId !== drag.id) return;
     ev.preventDefault();
+    if (drag.pick) {
+      var box = computePick(ev);
+      if (!box) return;
+      drag.box = box;
+      pickChanged(box, false);
+      return;
+    }
     var pairs = compute(ev);
     if (!pairs) return;
     drag.pairs = pairs;
@@ -357,6 +468,17 @@
     try {
       if (node.hasPointerCapture(ev.pointerId)) node.releasePointerCapture(ev.pointerId);
     } catch (e) { /* same as the capture above */ }
+    if (drag.pick) {
+      /* Same rule as the window below: a press with no movement is not an
+         edit, so a plain click on the picture leaves whatever rectangle was
+         already drawn exactly where it was. */
+      var box = drag.box ? (computePick(ev) || drag.box) : null;
+      drag = null;
+      svg.classList.remove("dragging");
+      if (box) pickChanged(box, true);
+      else sync();
+      return;
+    }
     var pairs = compute(ev) || drag.pairs;
     var moved = !!drag.pairs;
     drag = null;
@@ -491,12 +613,55 @@
     svg.classList.toggle("inverted", !!g.cfg.invert);
   }
 
+  /* The picked rectangle, drawn in the picture's own pixels: a plain
+     outline and eight grips, no wash and no fill. The wash the window uses
+     is a momentary "this is what is inside" hint on a shape being placed;
+     a crop rectangle sits on screen for as long as the user is matching,
+     and a permanent tint over a picture being judged for colour is the one
+     thing this overlay must never do (see the note at the top of the
+     #windowOverlay block in style.css). */
+  function drawPick(g) {
+    var b = pick.frac;
+    show(el.pickBox, !!b);
+    el.pickGrips.forEach(function (c) { show(c, !!b); });
+    if (!b) return;
+    var x = g.ox + b[0] * g.pw, y = g.oy + b[1] * g.ph;
+    var w = (b[2] - b[0]) * g.pw, h = (b[3] - b[1]) * g.ph;
+    el.pickBox.setAttribute("x", x.toFixed(2));
+    el.pickBox.setAttribute("y", y.toFixed(2));
+    el.pickBox.setAttribute("width", Math.max(w, 1).toFixed(2));
+    el.pickBox.setAttribute("height", Math.max(h, 1).toFixed(2));
+    var at = {
+      "pick-nw": [x, y], "pick-n": [x + w / 2, y], "pick-ne": [x + w, y],
+      "pick-e": [x + w, y + h / 2], "pick-se": [x + w, y + h],
+      "pick-s": [x + w / 2, y + h], "pick-sw": [x, y + h],
+      "pick-w": [x, y + h / 2]
+    };
+    el.pickGrips.forEach(function (c) {
+      var p = at[c.dataset.role];
+      move(c, p[0].toFixed(2), p[1].toFixed(2));
+    });
+  }
+
   /* The one entry point app.js calls whenever the config may have moved:
      scheduleRender, which every config change from anywhere funnels through
      (a slider, an undo, a preset, a clip switch, an outside session patch).
      The observers above call it for layout and view mode. */
   function sync() {
     if (!svg) return;
+    svg.classList.toggle("picking", !!pick);
+    if (pick) {
+      /* Pick mode owns the overlay for as long as it is on. The window's
+         own state (forced, and the selected layer's mask.window) is not
+         touched here, so switching the pick off falls straight through to
+         the branch below and draws exactly what was there before. */
+      var stage0 = byId("stage");
+      var busy = !!(stage0 && stage0.classList.contains("playing"));
+      var gp = busy ? null : geometry();
+      svg.classList.toggle("on", !!gp);
+      if (gp) drawPick(gp);
+      return;
+    }
     var w = win();
     var stage = byId("stage");
     /* Playback owns the layer while it runs and the overlay would be drawn
@@ -528,5 +693,36 @@
     sync();
   }
 
-  global.WindowEditor = { init: init, sync: sync };
+  /* Pick mode on and off (contract C7), the whole of this file's public
+     surface for it.
+
+       setPick({crop: [x0,y0,x1,y1] or null, onChange: fn})   turn it on
+       setPick(null)                                          turn it off
+
+     onChange(box, committed) fires on every pointermove with committed
+     false and once on release with true, the same shape the window's own
+     drag uses, so the caller can preview live and save once. Turning it off
+     redraws the window overlay as it was: nothing about the layer was
+     touched while picking. */
+  function setPick(opts) {
+    build();
+    if (!opts) {
+      pick = null;
+    } else {
+      pick = {
+        frac: opts.crop ? normBox(opts.crop.slice()) : null,
+        onChange: opts.onChange || (pick && pick.onChange) || null
+      };
+    }
+    sync();
+  }
+
+  function getPick() {
+    return (pick && pick.frac) ? pick.frac.slice() : null;
+  }
+
+  global.WindowEditor = {
+    init: init, sync: sync, setPick: setPick, getPick: getPick,
+    picking: function () { return !!pick; }
+  };
 })(window);

@@ -32,6 +32,43 @@ it can be driven by a script or an agent.
 | A / B look nodes | `look.lut2` / `.mix2` / `.balance`, blended in parallel with `look.lut` / `.mix` |
 | Grain stock choices | `grain.stock` (`16mm`, `35mm`, `65mm`) |
 | Scopes, gallery stills | `scopes`, `stats`, `compare` |
+| Clip attributes, flip and rotate | `--rotate auto\|0\|90\|180\|270` on every command, `orient` to diagnose a wrong one |
+
+## Rotation
+
+Every clip off a phone or a gimbal carries a display matrix in its container
+saying how many degrees it should be turned before playback, and until this
+arc that tag was the only control this tool had: `-noautorotate` could ignore
+it, but nothing could ask for a DIFFERENT rotation than the one the file
+claims. A camera that writes the wrong tag (or a rig that writes none)
+rendered wrong every time, and fixing it meant re-tagging the file with an
+outside tool or transcoding it first.
+
+`--rotate auto|0|90|180|270` is on every command that reads a frame from the
+source: `render`, `still`, `compare`, `scopes`, `stats`, `orient`. `auto` (the
+default) is today's ffmpeg behaviour, honour whatever the container says. `0`
+ignores the tag entirely, no transpose is added. `90`, `180` and `270` ignore
+the tag and turn the picture that many degrees CLOCKWISE as seen on screen,
+regardless of what the container claims, which is the fix for a camera that
+tags its footage wrong: point the render at the rotation that actually looks
+upright, not the one the file says is upright. `--no-autorotate` still works,
+unchanged, as the exact alias of `--rotate 0` it always was.
+
+The turn happens before anything else in the graph (the transpose is the
+FIRST filter), because every scale target, window matte and grain plate this
+engine builds is sized from the frame's dimensions AFTER rotation; `probe()`
+reports that turned size for every rotation mode, not only `auto` and `0`.
+
+`cinegrade orient IN.MOV` is the diagnostic: a five panel contact sheet, `auto`
+beside all four fixed rotations, each panel labelled with its rotation and its
+size, so a wrong tag is readable off one image instead of guessing which of
+five renders looks right.
+
+```bash
+python cinegrade.py orient IN.MOV --time 2 -o stills/orient.png --open
+python cinegrade.py render IN.MOV -p natural --rotate 90 -o out/upright.mov
+python cinegrade.py still  IN.MOV -p natural --no-autorotate -o stills/flat.png
+```
 
 ## Color science
 

@@ -16,7 +16,19 @@
     state: null,
     defaults: {},
     clip: null,
-    autorotate: true,
+    // The open project (contract C4): the whole record GET /api/project
+    // answers with, refreshed whenever the server says HEAD moved. It is the
+    // one place the tab keeps "which clip, which commit, which rotation" now
+    // that a reload has to bring all three back, and it is deliberately NOT
+    // the live config: cfg() is still the truth for what is on screen, and
+    // S.project.config is only read when the server hands us a new HEAD.
+    project: null,
+    // One of auto, 0, 90, 180 or 270, as strings, exactly as the server and
+    // the engine spell them. Mirrors the open project's rotation; it is not
+    // a browser preference any more (the old S.autorotate lived in
+    // localStorage, invisible to an agent and to any render started outside
+    // this tab, which is what made a CLI render come out sideways).
+    rotation: "auto",
     time: 0,
     duration: 0,
     fps: 24,
@@ -30,11 +42,18 @@
     scopesAuto: true,
     refName: null,
     refShow: false,
-    // The match region drawn on the reference, as [x, y, w, h] fractions of
-    // the reference's own size (0 to 1, same shape match_reference's
-    // crop_frac wants). null means no box: the auto content detector picks
-    // the region, same as before this existed.
-    refCropFrac: null,
+    // The picked rectangles (contract C7), each [x0, y0, x1, y1] as
+    // fractions of its own picture (0 to 1). refCrop is drawn on the
+    // reference, frameCrop on the frame in the viewer; null means whole
+    // image, which is what a match did before this existed. matchCrops is
+    // the whole per project bag as the server stores it, keyed by reference
+    // name, so switching references brings each one's rectangle back.
+    // pickRef and pickFrame are only which tool is switched on right now.
+    refCrop: null,
+    frameCrop: null,
+    matchCrops: {},
+    pickRef: false,
+    pickFrame: false,
     viewMode: "after",
     beforeHold: false,
     // Where the wipe's split sits, as a percentage of the frame's width.
@@ -136,8 +155,29 @@
   function clipSourceWidth() {
     var entry = S.state && S.state.clips.filter(function (c) { return c.name === S.clip; })[0];
     if (!entry) return S.width;
-    var dims = S.autorotate ? entry.autorotate : entry.raw;
+    var dims = clipDims(entry);
     return (dims && dims.width) || S.width;
+  }
+
+  /* The frame size the graph actually sees at the project's rotation.
+   *
+   * The same rule the server uses (server.py _rotation_dims): `auto` is the
+   * file's own tag honoured, every fixed rotation starts from the RAW frame
+   * (the tag ignored), and a quarter turn swaps the two axes. /api/state also
+   * reports this as entry.effective once a project is open, and that is used
+   * when it is there; this is the fallback for the moment right after a
+   * rotation change, before the next /api/state, and for a clip nobody has a
+   * project for yet. */
+  function clipDims(entry) {
+    if (!entry) return null;
+    if (entry.effective && entry.effective.rotation === S.rotation) return entry.effective;
+    if (S.rotation === "auto") return entry.autorotate || entry.raw || null;
+    var raw = entry.raw || entry.autorotate;
+    if (!raw) return null;
+    if (S.rotation === "90" || S.rotation === "270") {
+      return { width: raw.height, height: raw.width };
+    }
+    return raw;
   }
 
   // The one place that writes #rendererBadge, so "which renderer produced
@@ -234,56 +274,78 @@
   }
 
   var lastCommitted = null;
+
+  /* One committed edit (a slider release, a checkbox, reset all, a pasted
+   * JSON config). Contract C4: the publish below IS the commit now, so this
+   * no longer keeps a stack of its own.
+   *
+   * There used to be a second, private undo history in this file (S.history,
+   * S.future) sitting beside the server's. Two histories of the same thing
+   * disagree the moment anybody else touches the project: an agent's commit
+   * did not appear in the tab's stack, and the tab's undo silently rewound
+   * past it. The project's commit tree is the only history now (Undo, Redo,
+   * cmd+Z and the History panel all call /api/project/undo|redo), so this
+   * publishes and nothing else. S.history and S.future stay as empty arrays
+   * purely so older call sites that clear them are still harmless.
+   *
+   * The debounced PUT /api/grade autosave that used to fire from here is
+   * gone with it: the commit is the save. The grades row is still written
+   * server side on every commit, so the copy-from picker still fills. */
   function pushHistory() {
     var snap = snapshot();
     if (snap === lastCommitted) return;
-    S.history.push(lastCommitted === null ? snap : lastCommitted);
     lastCommitted = snap;
-    if (S.history.length > 150) S.history.shift();
-    S.future.length = 0;
-    updateUndoButtons();
-    // Every committed edit (a slider release, reset all, a pasted JSON
-    // config) is a real change to the live grade, so this is the one place
-    // that covers all of them for session.js: an outside agent polling
-    // /api/session sees the same config the page just settled on. Session
-    // publishing is a no-op with nothing loaded (see session.js), so this
-    // costs nothing when no outside agent is attached.
+    // Session publishing is a no-op with nothing loaded (see session.js), so
+    // this costs nothing before the first clip is open.
     if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
-    // Same hook, same definition of "committed", for the per clip autosave
-    // (grades.js). It debounces, so a slider release and a checkbox and a
-    // reset all cost one PUT between them if they happen inside 600 ms.
-    if (window.StudioGrades) window.StudioGrades.commit(S.clip, cfg());
   }
 
-  function restore(snap) {
-    var o = JSON.parse(snap);
-    S.slots.A = o.A; S.slots.B = o.B; S.active = o.active;
-    lastCommitted = snap;
+  /* Put a config from the server (a checkout, an undo, a redo, a clip
+   * switch, an outside agent's patch) on screen without publishing it back
+   * out. Nothing here writes to the server: whatever handed us this config
+   * is already the server's HEAD. */
+  function applyServerConfig(config) {
+    S.slots[S.active] = clone(config);
+    lastCommitted = snapshot();
     syncSlotButtons();
     Panels.refresh(cfg(), S.defaults);
+    markStageState();
     updateModified();
-    scheduleRender();
-    updateUndoButtons();
-    // An undo or a redo moves the grade as much as a slider does, so it
-    // autosaves too. Without this the screen would show the undone grade
-    // while the server still held the one before it, which is exactly the
-    // silent disagreement per clip grades exist to remove.
-    if (window.StudioGrades) window.StudioGrades.commit(S.clip, cfg());
+    scheduleRender(0);
   }
 
-  function undo() {
-    if (!S.history.length) return;
-    S.future.push(snapshot());
-    restore(S.history.pop());
+  // Undo and redo are the project's, not this tab's. The response carries the
+  // new HEAD and its config, which applyProject puts on screen.
+  var stepBusy = false;
+  function projectStep(which) {
+    if (stepBusy || !S.project || !S.project.open) return Promise.resolve();
+    stepBusy = true;
+    return api("/api/project/" + which, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      // Signed "studio", the same label StudioSession.publish uses for this
+      // tab's own edits. Without it the server signs the write "cli", the
+      // long poll hands this tab its own undo back as somebody else's
+      // change, and the late re-apply lands on top of whatever was done in
+      // between (measured: it wiped a window drag made right after an undo).
+      body: JSON.stringify({ by: "studio" })
+    }).then(function (proj) {
+      applyProject(proj, { config: true });
+      if (!proj.moved) toast(proj.note || ("nothing to " + which));
+    }).catch(function (e) {
+      toast(e.message || String(e), true);
+    }).then(function () { stepBusy = false; });
   }
-  function redo() {
-    if (!S.future.length) return;
-    S.history.push(snapshot());
-    restore(S.future.pop());
-  }
+  function undo() { return projectStep("undo"); }
+  function redo() { return projectStep("redo"); }
+
+  /* Undo is possible when HEAD has a parent, redo when HEAD is not the tip of
+   * its branch. Both facts ride along on every project response
+   * (head_commit.parent and head_commit.is_tip), so this costs no extra
+   * request. */
   function updateUndoButtons() {
-    $("undoBtn").disabled = !S.history.length;
-    $("redoBtn").disabled = !S.future.length;
+    var head = S.project && S.project.open && S.project.head_commit;
+    $("undoBtn").disabled = !(head && head.parent);
+    $("redoBtn").disabled = !(head && head.is_tip === false);
   }
 
   function onParamChange(path, value, commit) {
@@ -377,7 +439,7 @@
   function basePayload(extra) {
     var p = {
       clip: S.clip, time: S.time, width: S.width,
-      autorotate: S.autorotate, config: cfg()
+      rotation: S.rotation, config: cfg()
     };
     for (var k in (extra || {})) p[k] = extra[k];
     return p;
@@ -430,7 +492,7 @@
         return whenProxySettled();
       }).then(function () {
         return StudioLive.renderStill({
-          clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
+          clip: S.clip, time: S.time, width: S.width, rotation: S.rotation,
           config: cfg(), sourceWidth: clipSourceWidth()
         });
       }).then(function (r) {
@@ -565,7 +627,7 @@
   // graded render), so this costs one more GPU pass and no network.
   function renderGpuBypass(bcfg) {
     return StudioLive.renderStill({
-      clip: S.clip, time: S.time, width: S.width, autorotate: S.autorotate,
+      clip: S.clip, time: S.time, width: S.width, rotation: S.rotation,
       config: bcfg, sourceWidth: clipSourceWidth()
     }).then(function (r) {
       var src = $("gpuCanvas"), dst = $("bypassCanvas");
@@ -786,7 +848,7 @@
       cell.addEventListener("click", function () { setTime(t); });
       host.appendChild(cell);
       frameRequest("sheet" + i, {
-        clip: S.clip, time: t, width: 700, autorotate: S.autorotate, config: cfg()
+        clip: S.clip, time: t, width: 700, rotation: S.rotation, config: cfg()
       }).then(function (r) { return showBlob("sheet" + i, img, r); })
         .catch(function (e) { showError(e); });
     });
@@ -795,7 +857,31 @@
 
   /* ---- timeline -------------------------------------------------------- */
 
-  function setTime(t) {
+  /* The playhead belongs to the project (contract C4), so leaving the page at
+   * 4.2 s and coming back has to land on 4.2 s. It is written on a 400 ms
+   * debounce rather than per call because a scrub drag calls setTime on every
+   * pointer move, and POST /api/project/time deliberately does NOT bump the
+   * session revision, so this costs one small write and wakes nobody. */
+  var timePushTimer = null;
+  function pushProjectTime() {
+    if (!S.project || !S.project.open || !S.clip) return;
+    clearTimeout(timePushTimer);
+    var wanted = S.time;
+    timePushTimer = setTimeout(function () {
+      timePushTimer = null;
+      fetch("/api/project/time", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ time: wanted })
+      }).then(function (r) {
+        if (r.ok && S.project) S.project.time = wanted;
+      }).catch(function () { /* the playhead is not worth a toast */ });
+    }, 400);
+  }
+
+  /* opts.publish false means "this move came FROM the project", so writing it
+   * back would be a pointless round trip (boot, a clip switch, an outside
+   * agent's patch). Every real interaction leaves it on. */
+  function setTime(t, opts) {
     // Every direct "jump to this time" interaction (scrub, step, playHead,
     // a thumbnail, a mark, selecting a clip) funnels through here, same as
     // scheduleRender is the one place that catches a config change during
@@ -817,6 +903,7 @@
     // asks for the exact 16-bit frame and overwrites it (see whenProxySettled).
     proxyPreview(S.time);
     scheduleRender();
+    if (!opts || opts.publish !== false) pushProjectTime();
   }
 
   function highlightThumb() {
@@ -840,7 +927,7 @@
       im.dataset.t = String(t);
       im.title = t.toFixed(2) + "s";
       im.src = "/api/thumb?clip=" + encodeURIComponent(S.clip)
-        + "&t=" + t.toFixed(3) + "&w=94&rot=" + (S.autorotate ? "1" : "0");
+        + "&t=" + t.toFixed(3) + "&w=94&rotation=" + encodeURIComponent(S.rotation);
       im.addEventListener("click", function (ev) {
         setTime(parseFloat(ev.target.dataset.t));
       });
@@ -1115,7 +1202,7 @@
       // pushHistory (loading a preset is not itself an undoable edit), so it
       // needs its own publish: an outside agent watching the session should
       // see a preset load too, not just the edits made on top of it.
-      if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
+      if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time, "loaded preset " + name);
       // And for the same reason it needs its own autosave. Putting a preset
       // on a clip is a change to that clip's grade, and a user who loads a
       // look and then touches nothing else still expects it to be there when
@@ -1135,54 +1222,55 @@
     });
   }
 
-  // The other half of the session.js contract: an outside agent (the
-  // cinegrade CLI) patched the live config on the server, and this is how
-  // that reaches the open page. Treated exactly like loadPreset above minus
-  // the network fetch: same slot assignment, same pushHistory so undo covers
-  // an outside edit like a local one, same panel refresh and re-render.
-  // session.js itself guards against publishing this straight back out as a
-  // fresh local change (see its `applying` flag), so no loop guard is needed
-  // here. Kept to the small version the direct request asked for: no
-  // dedicated attribution UI, just a toast naming who made the change.
+  /* The other half of the session.js contract, and the single door every
+   * config that did not come from a control in this page walks through: an
+   * outside agent's `cinegrade session patch`, an Undo or a Redo, a checkout
+   * or a fork from the History panel.
+   *
+   * It never publishes. Whatever produced this config is already the
+   * server's HEAD, and re-publishing it would at best be a no-op commit and
+   * at worst a race with whatever the user does next. session.js's own
+   * `applying` flag guards the same thing from the other side.
+   *
+   * The rest of the project state (time, rotation, HEAD, the Undo and Redo
+   * buttons) moves with the config: an agent that checked out an older
+   * commit moved all of it, and showing the new picture under the old
+   * commit id would be exactly the "who edited what" confusion this arc is
+   * here to end. */
   window.applyExternalConfig = function (config, state) {
-    S.slots[S.active] = config;
-    pushHistory();
-    Panels.refresh(cfg(), S.defaults);
-    markStageState(); updateModified(); scheduleRender(0);
+    if (config) applyServerConfig(config);
+    if (state) {
+      if (typeof state.time === "number" && Math.abs(state.time - S.time) > 1e-6
+          && !playbackActive()) {
+        setTime(state.time, { publish: false });
+      }
+      if (state.rotation && state.rotation !== S.rotation) {
+        applyRotation(state.rotation);
+      }
+    }
+    refreshProject();
     toast("config updated externally" + (state && state.by ? " (" + state.by + ")" : ""));
   };
 
-  // The grades.js contract (per clip grades, contract C3): put this clip's
-  // saved config into the active slot, or the engine defaults when it has
-  // none. Deliberately NOT pushHistory: loading a clip is not an edit to the
-  // clip you just left, and routing it through the undo stack would let one
-  // press of undo drag the previous clip's look onto this one.
-  //
-  // The undo stack is per clip and lives here, in memory only, keyed by the
-  // clip's content key. Leaving a clip parks its stack; coming back restores
-  // it, so an undo after switching back still undoes the change you made
-  // before you left. A reload starts every stack empty, which is honest: the
-  // grade is on the server, the history of how you got there is not.
   // grades.js has no toast of its own and should not grow one: this is the
   // page's single notification surface, borrowed rather than duplicated.
-  window.studioToast = function (msg) { toast(msg); };
-  var clipUndo = {};
+  window.studioToast = function (msg, bad) { toast(msg, bad); };
+
+  /* The grades.js contract, all that is left of it after contract C4: the
+   * copy-grade picker fetched another clip's saved grade and this puts it on
+   * this clip. Clip switching does NOT come through here any more (a clip
+   * switch is POST /api/project/open, see selectClip), so there is no per
+   * clip undo stack to swap either: the history is the project's now.
+   *
+   * This one DOES publish, because copying a grade onto a clip is a real
+   * change to that clip, and the server's own /api/grade/copy only writes
+   * the grades row. The publish is what turns it into a commit you can
+   * undo. */
   window.applyClipGrade = function (config, key, prevKey) {
-    if (prevKey) {
-      clipUndo[prevKey] = { history: S.history, future: S.future,
-                            last: lastCommitted };
+    applyServerConfig(config ? config : S.defaults);
+    if (window.StudioSession) {
+      window.StudioSession.publish(cfg(), S.clip, S.time, "copied a grade from another clip");
     }
-    S.slots[S.active] = config ? clone(config) : clone(S.defaults);
-    var kept = key && clipUndo[key];
-    S.history = kept ? kept.history : [];
-    S.future = kept ? kept.future : [];
-    lastCommitted = kept ? kept.last : snapshot();
-    Panels.refresh(cfg(), S.defaults);
-    markStageState();
-    updateModified();
-    updateUndoButtons();
-    scheduleRender(0);
-    if (window.StudioSession) window.StudioSession.publish(cfg(), S.clip, S.time);
   };
 
   function savePreset(name, comment) {
@@ -1260,10 +1348,11 @@
         S.refShow = true;
         $("refShow").checked = true;
         $("refImg").src = "/api/ref?name=" + encodeURIComponent(r.name) + "&w=1100";
-        // A box drawn on the old picture is meaningless on the new one, and
-        // silently reusing its fractions would match the wrong area without
-        // any sign anything changed.
-        setRefCropFrac(null);
+        // A rectangle belongs to the reference it was drawn on, so switching
+        // references swaps in that one's own rectangles (usually none) rather
+        // than reusing fractions from a different picture, which would match
+        // the wrong area with nothing on screen to say so.
+        applyStoredCrops();
         host.querySelectorAll("img").forEach(function (o) { o.classList.remove("active"); });
         im.classList.add("active");
         applyViewerState();
@@ -1272,77 +1361,304 @@
     });
   }
 
-  /* ---- ref crop box ------------------------------------------------------
-     Lets the user drag a box on the reference to say which part of it
-     "Match to reference" should measure, instead of always falling back to
-     the auto content detector. S.refCropFrac holds it as [x, y, w, h]
-     fractions of the reference's own size (0 to 1); that is resize safe on
-     its own, since a fraction of the image means the same thing whatever
-     size the pane is currently drawn at, and is exactly the shape
-     match_reference's crop_frac argument wants server side.
+  /* ---- the picked rectangles (contract C7) --------------------------------
+     "i need to be able to use the rectangle mask tool to pick what i want
+     before I use match reference" (founder, 2026-09-05).
+
+     Two rectangles: one on the REFERENCE in this pane, one on the FRAME in
+     the viewer. Each is [x0, y0, x1, y1] as fractions of its own picture
+     (0 to 1, top left origin), which is what makes it survive a pane
+     resize, a preview width change and a rotation: a fraction of the image
+     means the same region at every size the image is ever drawn at.
+
+     They live on the PROJECT, not in localStorage, keyed by the reference's
+     own name under extras.match_crops:
+
+         {"IMG_2570.PNG": {"ref": [..], "frame": [..]}}
+
+     so they come back after a reload, follow the clip rather than the
+     browser, and an agent can read exactly what the person picked out of
+     GET /api/project without asking. Each reference gets one rectangle of
+     each kind, which is the whole model: "match this part of this picture
+     against this part of my shot".
 
      drawRefCropBox always measures refImg's OWN rendered rect, not
      refImgWrap's: refImgWrap centres the img with max-height/max-width:100%
      (style.css), so a reference whose aspect ratio does not match the wrap
      is letterboxed on one axis, and a box positioned against the wrap's box
-     would drift off the picture on that axis. */
+     would drift off the picture on that axis.
+
+     The frame rectangle is NOT drawn here: window-editor.js draws it into
+     the SVG overlay it already owns, through WindowEditor.setPick, so it
+     reuses that file's picture rect, pointer capture and resize observers
+     instead of growing a second overlay with its own copy of all three.
+     Nothing about the selected layer's power window is touched by picking,
+     and switching the pick off puts the window overlay back as it was. */
+
+  // Which edges each handle moves. Same table as window-editor.js's
+  // PICK_EDGES, and it has to stay the same: the two rectangles are one
+  // feature and a corner that resizes differently in the two panes would be
+  // a bug the user feels before they can name it.
+  var CROP_EDGES = {
+    nw: { x0: 1, y0: 1 }, n: { y0: 1 }, ne: { x1: 1, y0: 1 },
+    e: { x1: 1 }, se: { x1: 1, y1: 1 }, s: { y1: 1 },
+    sw: { x0: 1, y1: 1 }, w: { x0: 1 }
+  };
+  // A little over the 1% of an axis the matcher refuses outright, so a
+  // handle dragged past itself stops at something that can still be
+  // measured rather than at an error.
+  var MIN_CROP = 0.02;
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  function normCrop(b) {
+    var x0 = Math.min(b[0], b[2]), x1 = Math.max(b[0], b[2]);
+    var y0 = Math.min(b[1], b[3]), y1 = Math.max(b[1], b[3]);
+    var c;
+    if (x1 - x0 < MIN_CROP) {
+      c = (x0 + x1) / 2;
+      x0 = clamp01(Math.min(c - MIN_CROP / 2, 1 - MIN_CROP)); x1 = x0 + MIN_CROP;
+    }
+    if (y1 - y0 < MIN_CROP) {
+      c = (y0 + y1) / 2;
+      y0 = clamp01(Math.min(c - MIN_CROP / 2, 1 - MIN_CROP)); y1 = y0 + MIN_CROP;
+    }
+    return [clamp01(x0), clamp01(y0), clamp01(x1), clamp01(y1)];
+  }
+
+  // Anything stored on the server has been through JSON and may have been
+  // written by an agent, so it is checked rather than trusted: four finite
+  // numbers or nothing.
+  function validCrop(v) {
+    return Array.isArray(v) && v.length === 4 && v.every(function (n) {
+      return typeof n === "number" && isFinite(n);
+    });
+  }
+
+  function round4(v) { return Math.round(v * 10000) / 10000; }
+
+  function cropHandles() {
+    var box = $("refCropBox");
+    if (box.firstChild) return;
+    Object.keys(CROP_EDGES).forEach(function (role) {
+      var h = document.createElement("div");
+      h.className = "crophandle";
+      h.dataset.role = role;
+      box.appendChild(h);
+    });
+  }
 
   function drawRefCropBox() {
     var box = $("refCropBox");
-    var f = S.refCropFrac;
+    var f = S.refCrop;
     if (!f) { box.classList.remove("on"); return; }
     var ir = $("refImg").getBoundingClientRect();
     var wr = $("refImgWrap").getBoundingClientRect();
     if (!ir.width || !ir.height) { box.classList.remove("on"); return; }
-    box.style.left = (ir.left - wr.left + f[0] * ir.width) + "px";
-    box.style.top = (ir.top - wr.top + f[1] * ir.height) + "px";
-    box.style.width = (f[2] * ir.width) + "px";
-    box.style.height = (f[3] * ir.height) + "px";
+    var x = ir.left - wr.left + f[0] * ir.width;
+    var y = ir.top - wr.top + f[1] * ir.height;
+    var w = (f[2] - f[0]) * ir.width;
+    var h = (f[3] - f[1]) * ir.height;
+    box.style.left = x + "px";
+    box.style.top = y + "px";
+    box.style.width = w + "px";
+    box.style.height = h + "px";
+    cropHandles();
+    var at = {
+      nw: [0, 0], n: [w / 2, 0], ne: [w, 0], e: [w, h / 2],
+      se: [w, h], s: [w / 2, h], sw: [0, h], w: [0, h / 2]
+    };
+    box.querySelectorAll(".crophandle").forEach(function (el) {
+      var p = at[el.dataset.role];
+      el.style.left = p[0] + "px";
+      el.style.top = p[1] + "px";
+    });
     box.classList.add("on");
   }
 
-  function setRefCropFrac(frac) {
-    S.refCropFrac = frac;
-    $("clearRefCropBtn").disabled = !frac;
-    drawRefCropBox();
+  function cropText(label, box) {
+    if (!box) return label + " whole image";
+    var pct = Math.round(100 * (box[2] - box[0]) * (box[3] - box[1]));
+    return label + " " + box.map(function (v) { return v.toFixed(2); }).join(" ")
+      + " (" + pct + "% of the image)";
   }
 
-  // Drag start and end both go through this: given a mouse event and the
-  // reference image's current rendered rect, it is the [x, y] fraction of
-  // the image under the cursor, clamped so a drag that runs past the image
-  // edge (or off the whole window) still ends exactly at that edge instead
-  // of producing an out of range fraction.
+  function updateCropUi() {
+    var has = !!S.refName;
+    $("pickRefBtn").disabled = !has;
+    $("pickFrameBtn").disabled = !has;
+    $("clearRefCropBtn").disabled = !S.refCrop;
+    $("clearFrameCropBtn").disabled = !S.frameCrop;
+    ["pickRefBtn", "pickFrameBtn"].forEach(function (id, i) {
+      var on = i === 0 ? S.pickRef : S.pickFrame;
+      $(id).classList.toggle("active", !!on);
+      $(id).setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    $("refImgWrap").classList.toggle("picking", !!S.pickRef);
+    $("matchCropReadout").textContent = has
+      ? cropText("reference", S.refCrop) + "\n" + cropText("frame", S.frameCrop)
+      : "";
+  }
+
+  /* Both rectangles for the current reference, written to the project in one
+     call. Called once per drag, on release, never per pointermove: the live
+     rectangle is already on screen, and a POST per frame of a drag would be
+     a commit storm for something nobody is reading mid drag. */
+  function saveMatchCrops() {
+    if (!S.refName || !S.clip) return Promise.resolve();
+    var entry = {};
+    if (S.refCrop) entry.ref = S.refCrop.map(round4);
+    if (S.frameCrop) entry.frame = S.frameCrop.map(round4);
+    if (entry.ref || entry.frame) S.matchCrops[S.refName] = entry;
+    else delete S.matchCrops[S.refName];
+    var body = { clip: S.clip, name: "match_crops", value: S.matchCrops };
+    return postJSON("/api/project/extra", body).then(function (r) {
+      if (r.ok) return r;
+      // A project row only exists once something has opened it. Opening this
+      // clip's project is what the app does on a clip switch anyway, so this
+      // creates it and retries rather than telling the user their rectangle
+      // could not be saved for a reason they cannot act on.
+      return postJSON("/api/project/open", { clip: S.clip })
+        .then(function () { return postJSON("/api/project/extra", body); });
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          throw new Error(j.error || ("HTTP " + r.status));
+        });
+      }
+      return r;
+    }).catch(function (e) {
+      toast("the rectangle is on screen but was not saved: " + e.message, true);
+    });
+  }
+
+  /* The stored rectangles for whichever reference is selected now. Called on
+     boot, on a clip switch and whenever a different reference is clicked. */
+  function applyStoredCrops() {
+    var e = (S.refName && S.matchCrops[S.refName]) || {};
+    S.refCrop = validCrop(e.ref) ? normCrop(e.ref.slice()) : null;
+    S.frameCrop = validCrop(e.frame) ? normCrop(e.frame.slice()) : null;
+    drawRefCropBox();
+    if (S.pickFrame && window.WindowEditor) {
+      window.WindowEditor.setPick({ crop: S.frameCrop, onChange: onFramePick });
+    }
+    updateCropUi();
+  }
+
+  function loadMatchCrops() {
+    if (!S.clip) return Promise.resolve();
+    return api("/api/project?clip=" + encodeURIComponent(S.clip))
+      .then(function (p) {
+        var bag = p && p.extras && p.extras.match_crops;
+        S.matchCrops = (bag && typeof bag === "object" && !Array.isArray(bag))
+          ? bag : {};
+        applyStoredCrops();
+      })
+      .catch(function () {
+        // No project for this clip yet means no rectangles for it yet. Not
+        // an error, and not worth a toast on every boot.
+        S.matchCrops = {};
+        applyStoredCrops();
+      });
+  }
+
+  function setRefCrop(box, commit) {
+    S.refCrop = box;
+    drawRefCropBox();
+    updateCropUi();
+    if (commit) saveMatchCrops();
+  }
+
+  function onFramePick(box, commit) {
+    S.frameCrop = box;
+    updateCropUi();
+    if (commit) saveMatchCrops();
+  }
+
+  function setPickFrame(on) {
+    S.pickFrame = !!on && !!S.refName;
+    if (window.WindowEditor) {
+      if (S.pickFrame) {
+        window.WindowEditor.setPick({ crop: S.frameCrop, onChange: onFramePick });
+      } else {
+        window.WindowEditor.setPick(null);
+      }
+    }
+    updateCropUi();
+  }
+
+  // Given a mouse event and the reference image's current rendered rect,
+  // the [x, y] fraction of the image under the cursor, clamped so a drag
+  // that runs past the image edge (or off the whole window) still ends
+  // exactly at that edge instead of producing an out of range fraction.
   function refPointFrac(ev, r) {
-    return [
-      Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width)),
-      Math.max(0, Math.min(1, (ev.clientY - r.top) / r.height))
-    ];
+    return [clamp01((ev.clientX - r.left) / r.width),
+            clamp01((ev.clientY - r.top) / r.height)];
+  }
+
+  /* One drag, either kind: a fresh rectangle dragged out on the picture, or
+     one edge or corner moved by a handle. Both compute from the pointer's
+     CURRENT position against the rectangle as it was at mousedown, never
+     accumulated frame to frame, for the same reason window-editor.js does:
+     an accumulated drag drifts and a dropped mousemove loses the difference
+     for good. */
+  function startRefDrag(ev, role) {
+    var r = $("refImg").getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    ev.preventDefault();
+    var start = refPointFrac(ev, r);
+    var from = S.refCrop ? S.refCrop.slice() : null;
+    var moved = false;
+    function at(e) {
+      var p = refPointFrac(e, r);
+      if (role === "new" || !from) {
+        return normCrop([start[0], start[1], p[0], p[1]]);
+      }
+      var edges = CROP_EDGES[role] || {};
+      var b = from.slice();
+      if (edges.x0) b[0] = p[0];
+      if (edges.x1) b[2] = p[0];
+      if (edges.y0) b[1] = p[1];
+      if (edges.y1) b[3] = p[1];
+      return normCrop(b);
+    }
+    function move(e) { moved = true; setRefCrop(at(e), false); }
+    function up(e) {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      // A plain click with no mousemove between down and up is not a
+      // rectangle: whatever was drawn stays exactly as it was, and nothing
+      // is written to the project.
+      if (moved) setRefCrop(at(e), true);
+    }
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
   }
 
   function bindRefCrop() {
     $("refImgWrap").addEventListener("mousedown", function (ev) {
-      if (!S.refName) return;
-      var r = $("refImg").getBoundingClientRect();
-      if (!r.width || !r.height) return;
-      ev.preventDefault();
-      var start = refPointFrac(ev, r);
-      function move(e) {
-        var p = refPointFrac(e, r);
-        var x0 = Math.min(start[0], p[0]), x1 = Math.max(start[0], p[0]);
-        var y0 = Math.min(start[1], p[1]), y1 = Math.max(start[1], p[1]);
-        setRefCropFrac([x0, y0, x1 - x0, y1 - y0]);
-      }
-      function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
-      }
-      // A plain click with no mousemove between down and up never calls
-      // move(), so S.refCropFrac (and whatever box was already drawn) is
-      // left exactly as it was: a click is not a zero size box.
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      if (!S.refName || !S.pickRef) return;
+      var role = (ev.target && ev.target.dataset && ev.target.dataset.role) || "new";
+      startRefDrag(ev, role);
     });
-    $("clearRefCropBtn").addEventListener("click", function () { setRefCropFrac(null); });
+    $("pickRefBtn").addEventListener("click", function () {
+      S.pickRef = !S.pickRef && !!S.refName;
+      updateCropUi();
+    });
+    $("pickFrameBtn").addEventListener("click", function () {
+      setPickFrame(!S.pickFrame);
+    });
+    $("clearRefCropBtn").addEventListener("click", function () {
+      setRefCrop(null, true);
+    });
+    $("clearFrameCropBtn").addEventListener("click", function () {
+      S.frameCrop = null;
+      if (S.pickFrame && window.WindowEditor) {
+        window.WindowEditor.setPick({ crop: null, onChange: onFramePick });
+      }
+      updateCropUi();
+      saveMatchCrops();
+    });
   }
 
   /* ---- match reference ---------------------------------------------------
@@ -1426,16 +1742,21 @@
       ref: S.refName,
       clip: S.clip,
       time: S.time,
-      autorotate: S.autorotate,
+      rotation: S.rotation,
       config: cfg(),
       method: $("matchMethod").value,
       strength: parseFloat($("matchStrength").value),
       luma_preserve: $("matchLumaPreserve").checked
     };
-    // Only sent when the user drew a box: server.py turns auto_crop off the
-    // moment crop_frac is present, so a box always wins over the auto
-    // content detector rather than the two stacking or racing.
-    if (S.refCropFrac) body.crop_frac = S.refCropFrac.join(",");
+    // The picked rectangles (contract C7), always both, always explicit.
+    // A null is the tab saying "whole image, and do not fall back to what
+    // the project has saved": the tab is the thing that wrote those saved
+    // rectangles and is showing the user which ones are in force right now,
+    // so the request must say exactly what the readout says. The server's
+    // fall back to the stored rectangle is for callers with no screen (the
+    // CLI, an agent), which send neither field.
+    body.ref_crop = S.refCrop || null;
+    body.frame_crop = S.frameCrop || null;
 
     api("/api/match", {
       method: "POST",
@@ -1489,6 +1810,25 @@
     head.className = "matchhead " + (result.ok ? "ok" : "bad");
     head.textContent = result.ok ? "applied: " + result.name : "not applied: failed its own health check";
     host.appendChild(head);
+
+    /* Which part of which picture this cube was actually fitted from
+       (contract C7), read back from the server's answer rather than from
+       the controls, so it cannot claim a rectangle the fit did not use.
+       result.crops.ref / .frame are null for a whole image match, and the
+       *_source fields say whether the rectangle came from this request or
+       from what the project had saved. */
+    var crops = result.crops || {};
+    var line = document.createElement("div");
+    line.className = "mono muted";
+    line.textContent = "measured: " + ["ref", "frame"].map(function (k) {
+      var p = crops[k];
+      var label = k === "ref" ? "reference" : "frame";
+      if (!p || !p.box) return label + " whole image";
+      var src = crops[k + "_source"] === "project" ? ", saved on the project" : "";
+      return label + " " + p.box.map(function (v) { return v.toFixed(2); }).join(" ")
+        + " (" + p.area_pct + "% of the image" + src + ")";
+    }).join(", ");
+    host.appendChild(line);
 
     // The one warning called out by name as worth surfacing prominently:
     // above 0.35 the reference and this shot are different enough content
@@ -1597,20 +1937,197 @@
     });
   }
 
+  /* ---- project (contract C4) -------------------------------------------
+     A project is one clip's whole state on the server: its rotation, its
+     playhead, its loaded preset name, its extras and its commit tree. It is
+     keyed by the clip's content, so it survives a rename, and it is shared by
+     every account, so an agent and a person looking at the same clip see one
+     history.
+
+     This block is the tab's whole side of it, and the rule it follows is
+     short: the server owns the project, this page reflects it. Every function
+     here takes a project record the server just handed back and puts it on
+     screen. None of them writes a config back out. */
+
+  /* Put a project record on screen.
+     opts.config  also load HEAD's config into the active slot (a clip switch,
+                  an undo, a checkout). Left off for a plain refresh, where
+                  the config on screen is already the one the user is editing
+                  and replacing it would fight their typing.
+     opts.select  also switch the viewer to the project's clip and put the
+                  playhead where the project left it (boot and clip switch). */
+  function applyProject(proj, opts) {
+    opts = opts || {};
+    if (!proj || !proj.open) { S.project = null; updateUndoButtons(); return; }
+    var clipChanged = proj.name && proj.name !== S.clip;
+    S.project = proj;
+    if (proj.rotation && proj.rotation !== S.rotation) {
+      applyRotation(proj.rotation, { redraw: !opts.select });
+    } else {
+      syncRotationButtons();
+    }
+    if (opts.select && proj.name) {
+      if (clipChanged || !S.clip) {
+        // The playhead the project was left at, set BEFORE showClip so its own
+        // clamp to this clip's duration is the only thing that moves it.
+        S.time = typeof proj.time === "number" ? proj.time : 0;
+        showClip(proj.name);
+      }
+      if (!clipChanged && typeof proj.time === "number"
+          && Math.abs(proj.time - S.time) > 1e-6 && !playbackActive()) {
+        setTime(proj.time, { publish: false });
+      }
+    }
+    if (opts.config && proj.config) applyServerConfig(proj.config);
+    if (proj.preset) S.presetName = proj.preset;
+    updateUndoButtons();
+    updateHeadLabel();
+  }
+
+  /* Re read the open project WITHOUT touching the config on screen. Called
+     whenever the server says the revision moved (our own commit or somebody
+     else's), because a commit changes what Undo and Redo can do and which
+     short id the page should be showing. One small JSON GET; the clip probe
+     it reads is cached server side. */
+  var projectRefreshing = false;
+  function refreshProject() {
+    if (projectRefreshing) return Promise.resolve(S.project);
+    projectRefreshing = true;
+    return api("/api/project").then(function (proj) {
+      applyProject(proj, {});
+      return proj;
+    }).catch(function () {
+      return S.project;
+    }).then(function (p) { projectRefreshing = false; return p; });
+  }
+
+  // The short commit id in the save-state pill, so "is my work saved" has a
+  // literal answer: the id of the commit the picture on screen is.
+  function updateHeadLabel() {
+    var el = $("gradeSaveState");
+    if (!el) return;
+    var head = S.project && S.project.open && S.project.head;
+    el.textContent = head ? "committed " + head : "";
+    el.style.visibility = head ? "visible" : "hidden";
+    el.style.color = "var(--text-dim)";
+    el.style.borderColor = "var(--text-dim)";
+    el.title = head
+      ? "Every committed change is a commit on this clip's project. This is the "
+        + "one the picture on screen is. Undo and the History panel move it."
+      : "";
+  }
+
+  /* ---- rotation --------------------------------------------------------- */
+
+  // The five the engine, the server and the CLI all spell the same way.
+  var ROTATIONS = ["auto", "0", "90", "180", "270"];
+
+  // Put a rotation on screen. Does not talk to the server: setRotation below
+  // does that and calls this with the answer, and applyProject calls it with
+  // whatever the server already said.
+  function applyRotation(value, opts) {
+    opts = opts || {};
+    var next = String(value || "auto");
+    if (ROTATIONS.indexOf(next) < 0) next = "auto";
+    var changed = next !== S.rotation;
+    S.rotation = next;
+    syncRotationButtons();
+    if (!changed || opts.redraw === false) return;
+    // Rotation changes the clip's own upright dimensions, which the loop's
+    // decoded range and the proxy's encode were both made at, so anything
+    // already moving has to stop rather than keep showing frames from the
+    // orientation that was current when it was prepared.
+    if (S.looping || S.loopPreparing) stopLoop();
+    stopAnyPlayback();
+    StudioLive.stopProxy();
+    S.proxyReady = false;
+    S.proxyDesc = null;
+    var entry = S.state && S.state.clips.filter(function (c) { return c.name === S.clip; })[0];
+    if (entry) drawClipInfo(entry);
+    buildThumbs();
+    warmProxy();
+    scheduleRender(0);
+  }
+
+  function syncRotationButtons() {
+    var host = $("rotSeg");
+    if (!host) return;
+    var btns = host.querySelectorAll("button[data-rotation]");
+    for (var i = 0; i < btns.length; i++) {
+      var on = btns[i].getAttribute("data-rotation") === S.rotation;
+      btns[i].classList.toggle("active", on);
+      btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  // The only writer of the project's rotation. The server answers with the
+  // whole project record, so the picture, the dimensions readout and the
+  // History panel all move off one response.
+  function setRotation(value) {
+    if (!S.project || !S.project.open) { applyRotation(value); return Promise.resolve(); }
+    if (value === S.rotation) return Promise.resolve();
+    return api("/api/project/rotation", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rotation: String(value), by: "studio" })
+    }).then(function (proj) {
+      applyProject(proj, {});
+    }).catch(function (e) {
+      toast(e.message || String(e), true);
+      syncRotationButtons();
+    });
+  }
+
+  function bindRotationControl() {
+    var host = $("rotSeg");
+    if (!host) return;
+    host.addEventListener("click", function (ev) {
+      var btn = ev.target.closest ? ev.target.closest("button[data-rotation]") : null;
+      if (!btn) return;
+      setRotation(btn.getAttribute("data-rotation"));
+    });
+    syncRotationButtons();
+  }
+
   /* ---- clip ------------------------------------------------------------ */
 
-  function rotKey(name) { return "studio.rot." + name; }
-
+  /* Opening a clip IS opening its project (contract C4). One POST does the
+   * whole thing: the server resolves the clip to its content key, creates the
+   * project on first sight (root commit from the old saved grade if there was
+   * one, else the engine defaults), makes it this account's open project, and
+   * answers with rotation, playhead, HEAD and HEAD's config.
+   *
+   * So the tab publishes NOTHING on a clip switch. The old path fetched the
+   * saved grade, or stamped the engine defaults when there was none, and
+   * published either one straight back out, which is how a clip switch could
+   * land on top of an edit an agent had just made.
+   *
+   * Errors are shown rather than swallowed: a clip that has gone off disk is
+   * the usual cause, and silently staying on the previous one would leave the
+   * clip list and the picture disagreeing. */
   function selectClip(name) {
+    if (!name) return Promise.resolve(null);
+    return api("/api/project/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clip: name, by: "studio" })
+    }).then(function (proj) {
+      applyProject(proj, { config: true, select: true });
+      return proj;
+    }).catch(function (e) {
+      toast("could not open " + name + ": " + (e.message || e), true);
+      return null;
+    });
+  }
+
+  /* Everything that follows from "this clip is the one on screen now", with
+   * no server call of its own. Split out of selectClip so applyProject can
+   * run it for a project restored at boot as well as for a clip the user just
+   * clicked. */
+  function showClip(name) {
     S.clip = name;
     var entry = S.state.clips.filter(function (c) { return c.name === name; })[0];
     if (!entry) return;
-    var stored = localStorage.getItem(rotKey(name));
-    S.autorotate = stored === null ? true : stored === "1";
     S.duration = entry.duration || 0;
     S.fps = entry.fps || 24;
-    $("rotBtn").classList.toggle("active", S.autorotate);
-    $("rotBtn").textContent = S.autorotate ? "autorotate" : "no-autorotate";
     drawClipInfo(entry);
     // Redraws whichever folder is currently browsed so its row for this clip
     // (if it has one) picks up the .active highlight, mirroring what
@@ -1626,14 +2143,17 @@
     StudioLive.stopProxy();
     S.proxyReady = false;
     S.proxyDesc = null;
-    setTime(Math.min(S.time, Math.max(0, S.duration - 0.1)));
+    setTime(Math.min(S.time, Math.max(0, S.duration - 0.1)), { publish: false });
     warmProxy();
     scheduleRender(0);
-    // Per clip grades (contract C3). Until this line, switching clips carried
-    // the previous clip's grade across silently. grades.js fetches this
-    // clip's saved grade and hands it back through window.applyClipGrade
-    // above, or the engine defaults when it has none.
-    if (window.StudioGrades) window.StudioGrades.clipChanged(name);
+    // grades.js keeps the copy-from picker, and the picker needs to know which
+    // clip it must not offer to copy from. It no longer fetches or applies
+    // anything on a clip switch: the project's HEAD is the grade now.
+    if (window.StudioGrades) window.StudioGrades.clipChanged(name, entry.key);
+    // The picked match rectangles (contract C7) belong to the clip's project,
+    // so they are re-read here for the same reason the grade is: a rectangle
+    // drawn against the previous shot means nothing on this one.
+    loadMatchCrops();
   }
 
   function drawClipInfo(entry) {
@@ -1646,11 +2166,11 @@
       d.appendChild(a); d.appendChild(b);
       host.appendChild(d);
     }
-    var cur = S.autorotate ? entry.autorotate : entry.raw;
+    var cur = clipDims(entry) || entry.autorotate;
     kv("file", entry.name);
-    kv("graph sees", cur.width + " x " + cur.height);
-    kv("autorotate", entry.autorotate.width + " x " + entry.autorotate.height);
-    kv("no-autorotate", entry.raw.width + " x " + entry.raw.height);
+    kv("graph sees", cur.width + " x " + cur.height + "  (rotation " + S.rotation + ")");
+    kv("auto", entry.autorotate.width + " x " + entry.autorotate.height);
+    kv("no rotation", entry.raw.width + " x " + entry.raw.height);
     kv("rotation tag", entry.rotation + " deg");
     kv("duration", (entry.duration || 0).toFixed(2) + " s");
     kv("fps", (entry.fps || 0).toFixed(3));
@@ -1662,9 +2182,11 @@
     var n = document.createElement("div");
     n.className = "note warn";
     n.textContent = "Rotation metadata on this footage is not reliable. If the "
-      + "frame is sideways, flip the autorotate button in the top bar and look "
-      + "again. Getting it wrong also puts the blur and mask geometry on the "
-      + "wrong axis, so check it before a long render.";
+      + "frame is sideways, pick another rotation above the clip list and look "
+      + "again. It is saved on this clip's project, so a render started from "
+      + "the command line comes out the same way up. Getting it wrong also "
+      + "puts the blur and mask geometry on the wrong axis, so check it "
+      + "before a long render.";
     host.appendChild(n);
   }
 
@@ -2027,12 +2549,21 @@
 
   function auditCoverage() {
     var covered = {};
+    // A "fold" control (Tetra, Window, Key, Correct) is a group, not a field:
+    // its own path/paths/wheels are all absent and the fields live one level
+    // down in its own `controls` array. The walk below used to stop at that
+    // first level, so it never recursed into a fold's controls and reported
+    // every path inside one (slice.tetra.enabled, slice.tetra.r and friends
+    // among them) as having no control at all, even though schema.js
+    // declares each of them (a CHK and five "trio" controls for Tetra).
+    function markControl(c) {
+      if (c.path) covered[c.path.join(".")] = true;
+      if (c.paths) c.paths.forEach(function (p) { covered[p.join(".")] = true; });
+      if (c.wheels) c.wheels.forEach(function (w) { covered[w.path.join(".")] = true; });
+      if (c.controls) c.controls.forEach(markControl);
+    }
     SCHEMA.forEach(function (stage) {
-      stage.controls.forEach(function (c) {
-        if (c.path) covered[c.path.join(".")] = true;
-        if (c.paths) c.paths.forEach(function (p) { covered[p.join(".")] = true; });
-        if (c.wheels) c.wheels.forEach(function (w) { covered[w.path.join(".")] = true; });
-      });
+      stage.controls.forEach(markControl);
     });
     var missing = [];
     (function walk(obj, prefix) {
@@ -2156,20 +2687,20 @@
     bindSidebarToggle("sidebarLeftToggle", "left");
     bindSidebarToggle("sidebarRightToggle", "right");
 
-    $("rotBtn").addEventListener("click", function () {
-      // Rotation changes the clip's own upright dimensions, which the loop's
-      // decoded range was fetched at, so a stale loop has to stop rather
-      // than keep showing frames from the orientation that was current when
-      // it was prepared.
-      if (S.looping || S.loopPreparing) stopLoop();
-      S.autorotate = !S.autorotate;
-      localStorage.setItem(rotKey(S.clip), S.autorotate ? "1" : "0");
-      $("rotBtn").classList.toggle("active", S.autorotate);
-      $("rotBtn").textContent = S.autorotate ? "autorotate" : "no-autorotate";
-      var entry = S.state.clips.filter(function (c) { return c.name === S.clip; })[0];
-      if (entry) drawClipInfo(entry);
-      buildThumbs();
-      scheduleRender(0);
+    bindRotationControl();
+
+    /* session.js fires this on every revision this tab learns about, its own
+     * commits included. A commit is what changes whether Undo and Redo can do
+     * anything and which short id the page is standing on, so this is where
+     * the project record is refreshed. It reads the project and never writes
+     * it, and it deliberately does not touch the config: an outside config
+     * arrives through applyExternalConfig, and this tab's own edits are
+     * already on screen. */
+    window.addEventListener("studio:session", function (ev) {
+      var st = ev && ev.detail;
+      var head = S.project && S.project.head;
+      if (st && st.head && head && st.head === head && st.by === "studio") return;
+      refreshProject();
     });
 
     $("previewWidth").addEventListener("change", function (e) {
@@ -2423,6 +2954,10 @@
     });
     $("matchRefBtn").addEventListener("click", matchReference);
     bindRefCrop();
+    // Starts the pick controls in the state the app is actually in: no
+    // reference selected yet, so both tools are off and disabled and the
+    // readout is empty rather than claiming a whole image match of nothing.
+    updateCropUi();
     bindMatchControls();
 
     // LUTs
@@ -2639,7 +3174,7 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         clip: S.clip, time: startTime, duration: duration, width: S.width,
-        autorotate: S.autorotate, config: cfg()
+        rotation: S.rotation, config: cfg()
       })
     }).then(function (j) {
       if (myToken !== playToken) return;
@@ -2741,7 +3276,7 @@
   // proxy is encoded at the preview width, so changing that select makes the
   // existing proxy the wrong size to compare against the still path.
   function proxyDesc() {
-    return S.clip + "|" + S.width + "|" + S.autorotate;
+    return S.clip + "|" + S.width + "|" + S.rotation;
   }
 
   function whenProxySettled() {
@@ -2762,7 +3297,7 @@
     S.proxyDesc = desc;
     S.proxyReady = false;
     return StudioLive.prepareProxy({
-      clip: S.clip, width: S.width, autorotate: S.autorotate
+      clip: S.clip, width: S.width, rotation: S.rotation
     }, { onProgress: onProgress }).then(function (info) {
       if (proxyDesc() !== desc) {
         throw new Error("the clip changed while its proxy was preparing");
@@ -3012,7 +3547,7 @@
 
     StudioLive.prepareLoop({
       clip: S.clip, time: range.start, duration: range.duration,
-      width: S.width, autorotate: S.autorotate
+      width: S.width, rotation: S.rotation
     }).then(function (info) {
       S.loopPreparing = false;
       if (!S.clip) return;
@@ -3063,7 +3598,7 @@
     var name = ($("renderName").value || "").trim();
     if (!name) { toast("give the render a name", true); return; }
     var body = {
-      clip: S.clip, config: cfg(), autorotate: S.autorotate, name: name,
+      clip: S.clip, config: cfg(), rotation: S.rotation, name: name,
       start: parseFloat($("renderStart").value) || 0,
       duration: parseFloat($("renderDur").value) || null,
       scale: $("renderScale").value ? parseInt($("renderScale").value, 10) : null,
@@ -3708,6 +4243,58 @@
 
   /* ---- boot ------------------------------------------------------------ */
 
+  /* What a reload has to bring back (contract C4, the founder's words: "if i
+   * reload it shouldnt break or reset the whole application").
+   *
+   * One GET decides everything. If this account has a project open, the page
+   * comes back to exactly it: the same clip, the same playhead, the same
+   * rotation and the same HEAD config, and it publishes NOTHING, so a reload
+   * cannot create a commit or wake anybody else's long poll. If nothing is
+   * open (a first ever visit, or a fresh data directory) it opens the first
+   * clip, which is the ONE write boot is allowed to make and is what creates
+   * that clip's project.
+   *
+   * The clip may be one opened from outside content/footage. Those live in
+   * memory on the server (EXTERNAL_CLIPS), so a project that outlived a
+   * server restart names a clip the current /api/state does not list; the
+   * project record still carries its path, so it is re registered through
+   * POST /api/open first and the clip list is refreshed from the answer.
+   * Without that, reloading after a restart would silently drop the user on
+   * a different clip, which is the exact complaint this contract is here to
+   * answer. */
+  function restoreOpenProject(state) {
+    function fallback() {
+      if (state.clips.length) return selectClip(state.clips[0].name);
+      showError(new Error("no clips in content/footage"));
+      return Promise.resolve(null);
+    }
+    return api("/api/project").then(function (proj) {
+      if (!proj || !proj.open || !proj.name) return fallback();
+      var listed = state.clips.some(function (c) { return c.name === proj.name; });
+      if (listed) {
+        applyProject(proj, { config: true, select: true });
+        return proj;
+      }
+      if (!proj.path) return fallback();
+      return api("/api/open", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: proj.path })
+      }).then(function (j) {
+        S.state.clips = j.clips;
+        state.clips = j.clips;
+        applyProject(proj, { config: true, select: true });
+        return proj;
+      }).catch(function () {
+        toast("the clip this project is on is not reachable any more", true);
+        return fallback();
+      });
+    }).catch(function () {
+      // No project route at all (an older server): behave the way boot did
+      // before this contract rather than showing an empty page.
+      return fallback();
+    });
+  }
+
   function boot() {
     // Fills every static data-icon placeholder (browseUpBtn, the two
     // sidebar toggles, #themeToggle's sun/moon) with a real <svg> from the
@@ -3794,32 +4381,7 @@
       bind();
       Panels.resizeCurves();
 
-      if (state.clips.length) {
-        selectClip(state.clips[0].name);
-      } else {
-        showError(new Error("no clips in content/footage"));
-      }
-
-      // Start on the honest conversion rather than a look, the same way the
-      // grading guide says to: look at the flat frame first, then decide. This
-      // actually loads it, so the modified indicator means something from the
-      // first change onward.
-      // ... but only for a clip that has no saved grade of its own. With per
-      // clip grades (contract C3) selectClip above has already asked the
-      // server for this clip's grade; stamping "flat" over it a moment later
-      // would make a reload silently throw the user's work away.
-      // ifNoSavedGrade waits for that answer and runs this only if there was
-      // none, and holds the autosave off while it does, because opening the
-      // studio is not the user grading anything.
-      var startFlat = function () {
-        if (!state.presets.some(function (p) { return p.name === "flat"; })) {
-          return null;
-        }
-        $("presetSelect").value = "flat";
-        return loadPreset("flat").catch(function () {});
-      };
-      if (window.StudioGrades) window.StudioGrades.ifNoSavedGrade(startFlat);
-      else startFlat();
+      restoreOpenProject(state);
       pollJobs();
       applyViewerState();
       setZoom("fit");

@@ -148,4 +148,148 @@
     WIDTH_MAX: WIDTH_MAX,
     WIDTH_DEFAULT: WIDTH_DEFAULT
   };
+
+  // ---- right sidebar tab strip (contract C3, History panel): Grade |
+  // History. Same pre-paint, no-flash technique as collapsed/width above --
+  // read and paint a data-paramtab attribute on <html> before any CSS or
+  // layout runs, so a reload never flashes the Grade pane before switching
+  // to a History tab somebody left open (see style.css's
+  // html[data-paramtab=...] rules and static/history.js, which is the only
+  // file that calls setParamTab). A plain global preference, not per
+  // project: which pane is open is a UI choice, not project state.
+  var PARAMTAB_KEY = "fixxr-studio-paramtab";
+  var paramTab = "grade";
+
+  function readParamTab() {
+    try {
+      return window.localStorage.getItem(PARAMTAB_KEY) === "history" ? "history" : "grade";
+    } catch (e) {
+      return "grade";
+    }
+  }
+
+  function applyParamTab(tab) {
+    document.documentElement.setAttribute("data-paramtab", tab);
+  }
+
+  paramTab = readParamTab();
+  applyParamTab(paramTab);
+
+  function setParamTab(tab) {
+    paramTab = tab === "history" ? "history" : "grade";
+    applyParamTab(paramTab);
+    try {
+      window.localStorage.setItem(PARAMTAB_KEY, paramTab);
+    } catch (e) {
+      // Non-fatal: the tab just will not persist across reloads.
+    }
+    return paramTab;
+  }
+
+  window.fixxrSidebars.paramTab = function () { return paramTab; };
+  window.fixxrSidebars.setParamTab = setParamTab;
+
+  // ---- mobile mode (contract C8) -----------------------------------------
+  //
+  // Direct request: "make a mobile mode too where those are buttons at the top
+  // and the widgets are scrolling. the sidebars are basically new pages."
+  //
+  // Two attributes on <html>, both written here for the same reason the three
+  // above are: this file is a blocking script in <head>, so the very first
+  // paint already knows whether this is a phone and which page was left open.
+  // Deciding either of those from app.js instead would render the desktop
+  // three-column shell first and snap to the phone layout a frame later.
+  //
+  // data-mobile="on"    : this viewport gets the one-page-at-a-time layout.
+  // data-mobilepage=... : which page that is, "clips" | "preview" | "params".
+  //
+  // "params" is one page carrying BOTH right sidebar tabs; which of them is
+  // showing is still data-paramtab, exactly as on desktop, so the Grade and
+  // History buttons in the mobile bar are two buttons onto one page rather
+  // than a second, parallel notion of the same state. Both attributes are
+  // painted on every viewport, phone or not, so nothing has to be re-written
+  // when the window is resized across the breakpoint; only data-mobile
+  // decides whether the mobile rules in style.css apply at all.
+  //
+  // The query is the one contract C8 names: under 900px wide, or a coarse
+  // pointer (a finger, not a mouse) on anything under 1100px. The second half
+  // is what catches a tablet held in landscape, which is wider than a phone
+  // but has no hover and no precise pointer.
+  var MOBILE_QUERY = "(max-width: 899px), (pointer: coarse) and (max-width: 1100px)";
+  var MOBILE_PAGE_KEY = "fixxr-studio-mobilepage";
+  var MOBILE_PAGES = { clips: true, preview: true, params: true };
+  var mobilePage = "preview";
+  var mobileOn = false;
+  var mobileMq = null;
+
+  function readMobilePage() {
+    try {
+      var raw = window.localStorage.getItem(MOBILE_PAGE_KEY);
+      return MOBILE_PAGES[raw] ? raw : "preview";
+    } catch (e) {
+      return "preview";
+    }
+  }
+
+  function applyMobilePage(page) {
+    document.documentElement.setAttribute("data-mobilepage", page);
+  }
+
+  function applyMobile(on) {
+    var root = document.documentElement;
+    if (on) root.setAttribute("data-mobile", "on");
+    else root.removeAttribute("data-mobile");
+  }
+
+  function announceMobile() {
+    // Fired on <html> rather than window so a listener registered before the
+    // body exists still hears it, and dispatched only after both attributes
+    // are already painted, so a handler reading the DOM sees the new state.
+    try {
+      document.documentElement.dispatchEvent(new CustomEvent("studio:mobile", {
+        bubbles: true,
+        detail: { mobile: mobileOn, page: mobilePage }
+      }));
+    } catch (e) {
+      // CustomEvent is available everywhere this tool runs; a failure here
+      // must not take the boot script down with it.
+    }
+  }
+
+  function setMobilePage(page) {
+    mobilePage = MOBILE_PAGES[page] ? page : "preview";
+    applyMobilePage(mobilePage);
+    try {
+      window.localStorage.setItem(MOBILE_PAGE_KEY, mobilePage);
+    } catch (e) {
+      // Non-fatal: the page just will not persist across reloads.
+    }
+    announceMobile();
+    return mobilePage;
+  }
+
+  mobilePage = readMobilePage();
+  applyMobilePage(mobilePage);
+  try {
+    mobileMq = window.matchMedia(MOBILE_QUERY);
+    mobileOn = !!mobileMq.matches;
+  } catch (e) {
+    mobileOn = false;
+  }
+  applyMobile(mobileOn);
+
+  if (mobileMq && mobileMq.addEventListener) {
+    // Live, not read once: the harness drives this by resizing one page from
+    // a desktop viewport to a phone one and back, and a person dragging a
+    // window narrow should get the same thing.
+    mobileMq.addEventListener("change", function (ev) {
+      mobileOn = !!ev.matches;
+      applyMobile(mobileOn);
+      announceMobile();
+    });
+  }
+
+  window.fixxrSidebars.isMobile = function () { return mobileOn; };
+  window.fixxrSidebars.mobilePage = function () { return mobilePage; };
+  window.fixxrSidebars.setMobilePage = setMobilePage;
 })();

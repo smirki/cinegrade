@@ -51,7 +51,9 @@ if str(STUDIO) not in sys.path:
     sys.path.insert(0, str(STUDIO))
 import db as _db  # noqa: E402  (path has to be set first)
 
-USERS_DIR = STUDIO / "data" / "users"
+# Derived from db.DATA rather than STUDIO so a test data directory
+# (STUDIO_DATA_DIR) moves the per user preset folders with it.
+USERS_DIR = _db.DATA / "users"
 
 # 1 MiB from the head and 1 MiB from the tail. On a file smaller than 2 MiB the
 # two windows overlap and some bytes are hashed twice, which changes nothing

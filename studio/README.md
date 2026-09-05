@@ -414,6 +414,18 @@ Switching clips no longer carries the previous clip's look across silently, and
 two accounts working from the same `footage/` folder never see each other's
 changes.
 
+Since "Projects and history" below (contract C1), this table is the MIGRATION
+SOURCE for a clip's project, not the live grade any more. The first time
+anybody opens a clip, its most recently saved row here becomes the project's
+root commit; from then on the saved grade IS the project's HEAD, and every
+save is a commit. Nothing here is rewritten or deleted by that: `PUT
+/api/grade` still writes this row (so `GET /api/grades` and the copy picker
+below keep working) as well as recording a commit, `GET /api/grade` answers
+from the project's HEAD once one exists and falls back to this table only for
+a clip nobody has opened yet, and `DELETE /api/grade` now commits a reset to
+the engine defaults instead of removing a row, so a shared project's history
+is never destroyed by one account clearing its grade.
+
 A clip's identity is a content hash, not its name or path: the first 32 hex
 characters of `sha256(size || first 1 MiB || last 1 MiB)`. Renaming a file,
 moving it into another folder, or opening it from a different mount all land on
@@ -435,23 +447,49 @@ library, checked into the repository and shared by every account: it is where
 `cinegrade.py`'s own CLI presets live, and a save there would be a shared edit to
 a tracked file. Your own saved presets go to `studio/data/users/<id>/presets/`
 instead (id `0` when logins are off), gitignored the same way the accounts
-database is.
+database is. Overwriting a library preset writes a user copy that shadows it
+rather than editing the shared file, which is the only sane meaning of
+Overwrite on a file every other account is also reading.
+
+### Presets: the comment rule and the Load rule
+
+A preset's `_comment` describes the FILE, not the grade sitting in the editor
+right now. Loading a preset strips `_comment` out of the live config, so it
+never rides along into whatever you save next: Save As with a blank comment
+field writes no comment at all, and Overwrite with a blank comment field
+keeps only that preset's OWN prior comment (read from its file on disk),
+never the comment of some other preset you had loaded earlier. Before this,
+loading `nature_cinema` and then Save-As-ing a new grade with no typed
+comment silently kept describing it as `nature_cinema`, which is what the
+founder saw and reported.
+
+Load always replaces the WHOLE config, not just the fields the preset file
+happens to set: `layers` and the second look slot (`look.lut2`) included.
+The server fills in every field a preset omits with the engine defaults
+(`full_config()`) before the page ever sees it, so loading a plain preset
+after a layered one clears the layers and the second LUT rather than leaving
+them stacked on top.
 
 Routes, one curl example each, run and read back on a real test server:
 
-**`GET /api/grade?clip=NAME`** returns `{exists, key, config, updated_at}`.
-Verified on a clip with no saved grade: `{"exists": false, "key":
-"05fe6fe1e893172ddf254f196a9a121d", "config": null, "updated_at": null}`.
+**`GET /api/grade?clip=NAME`** returns `{exists, key, config, updated_at}`, plus
+`head` and `branch` once a project exists for that clip (the config is then its
+HEAD's, not this table's row). Verified on a clip with no saved grade: `{"exists":
+false, "key": "05fe6fe1e893172ddf254f196a9a121d", "config": null, "updated_at":
+null}`.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:7431/api/grade?clip=A001.MOV"
 ```
 
-**`PUT /api/grade {clip, config}`** returns `{key, updated_at}`. Verified:
-`{"key": "05fe6fe1e893172ddf254f196a9a121d", "updated_at": 1788570771.2311392}`,
-and a follow-up `GET` on the same clip came back `exists: true` with that same
-config.
+**`PUT /api/grade {clip, config, by, message}`** returns `{key, updated_at,
+head}`: `head` is the short id of the commit this save just made (contract C1).
+`by` names who made it (else `cli`) and `message` overrides the generated one
+line description; the default message is `saved grade`. Verified: `{"key":
+"05fe6fe1e893172ddf254f196a9a121d", "updated_at": 1788614339.734303, "head":
+"f054566"}`, and a follow-up `GET` on the same clip came back `{"exists": true,
+"head": "f054566", "branch": "main", ...}`.
 
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -467,8 +505,12 @@ first, without the configs (it feeds a picker, not a bulk export). Verified:
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7431/api/grades
 ```
 
-**`DELETE /api/grade?clip=NAME`** returns `{deleted, key}`. Verified:
-`{"deleted": true, "key": "05fe6fe1e893172ddf254f196a9a121d"}`.
+**`DELETE /api/grade?clip=NAME`** returns `{deleted, key, head}`. Once a
+project exists this commits a reset to the engine defaults rather than
+removing anything (a shared project's history is not one account's to
+destroy), so `head` is the short id of that new commit. Verified:
+`{"deleted": true, "key": "05fe6fe1e893172ddf254f196a9a121d", "head":
+"69faa3f"}`.
 
 ```bash
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
@@ -486,6 +528,194 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
   -d '{"from": "A001.MOV", "to": "A002.MOV"}' \
   http://127.0.0.1:7431/api/grade/copy
 ```
+
+## Projects and history
+
+Contract C1. "Per clip grades" above answers "what does this clip look like
+right now"; a PROJECT answers the four things that one saved row cannot: who
+changed it, what it looked like before, whose value a person and an agent
+editing at once are each looking at, and (reload the page) put it back exactly
+as it was. All four are one missing thing: a history with names on it, git
+style, so this section borrows git's words on purpose (commit, branch, HEAD,
+fork, checkout) rather than inventing new ones for the same ideas.
+
+A PROJECT is everything the studio knows about one clip: its rotation, its
+playhead, the loaded preset's name, a small bag of extras other tools use (a
+match reference crop is one, contract C7), and a history of COMMITS on
+BRANCHES. It is keyed by the clip's content key (the same 32 hex digest "Per
+clip grades" uses), so a rename or a move keeps the same project, and it is
+SHARED by every account, founder's call: two people and an agent working on
+the same clip see ONE tree, not one each. What is per account is only which
+project that account currently has open (opening a clip opens or creates its
+project and makes it that account's open one).
+
+A COMMIT is one committed change: the whole config after the change (not a
+diff), its parent commit, its branch, an author, a timestamp, the list of
+dotted paths that moved with their old and new values, and a readable, auto
+generated one line message (`saturation 1.00 to 1.20`, `layer "Sky" added`,
+`loaded preset nature_cinema`, `3 changes: contrast, pivot, highlight
+rolloff`) that a caller can override by sending its own. "Committed" is
+whatever the app already treats as committed: a slider release, a checkbox, a
+preset load, a layer add, an outside `POST /api/session` patch. A drag frame
+is never a commit. Publishing the identical config twice in a row is a no op,
+not an empty commit.
+
+HEAD is the commit whose config is live right now. A BRANCH is a named line
+of commits with a tip; every project starts with `main`. Editing from HEAD
+when HEAD is already the tip of its branch just extends that branch. Editing
+from an older HEAD (after a checkout, or after somebody else moved the tip
+without you noticing) automatically FORKS a new branch (`fork-1`, `fork-2`,
+...) so the newer work you did not build on is never lost underneath yours.
+
+- **Undo** steps HEAD back to its parent, along the branch you are standing
+  on. The branch's tip is left alone, which is what makes **redo** possible:
+  it steps HEAD forward again, toward that tip. Both are no ops at either end
+  of the line and say so in plain text rather than silently doing nothing.
+- **Checkout** moves HEAD to any commit, on any branch. Non destructive:
+  nothing is deleted or rewritten, so looking at an old point and coming back
+  costs nothing.
+- **Fork** explicitly branches off HEAD, or off a given commit, under a new
+  name (auto named `fork-N` when none is given). This is the same thing an
+  edit from a non tip HEAD does automatically; `fork` is for doing it on
+  purpose, before making the edit.
+
+The right sidebar's `History` tab (beside `Grade`, contract C3) draws the
+WHOLE tree, every branch, newest first, with `Go here` and `Fork from here` on
+every row, and refreshes the moment an outside commit lands so a person
+watches an agent's edits arrive with a name on each one. This is the direct
+answer to "the agent doesnt need to have anxiety on whos editing what and what
+preset the person has selected" (the founder's framing for this arc): there
+is one project, one HEAD, one history, and the tab, a second person's tab, and
+an agent are three views of the exact same thing, told apart only by the
+`author` on each commit they wrote.
+
+### Identity
+
+Every write names an author. A browser tab signs as the account name (or
+`studio` with logins off); `grade/cinegrade.py` signs as `--by` if given, else
+the `CINEGRADE_AGENT` environment variable, else `cli` (`resolve_by()` in
+`cinegrade.py`, used by `session patch` and every `project` command the same
+way). Nothing on the server adds an `agent:` prefix for you: an agent that
+wants to read as one spells it out itself, `--by agent:colorbot-3` or
+`CINEGRADE_AGENT=agent:colorbot-3`, the same convention "The `by` field" below
+already uses for `POST /api/session`. `GET /api/whoami` (`{"user", "by",
+"auth", "project"}`) answers what account is signed in, whether logins are on
+at all, and which project this account currently has open; with logins on the
+account name always wins regardless of what a caller sends, since a signed in
+browser cannot sign somebody else's name to a commit by editing a JSON body.
+
+One rule matters more than the others: **the edit path is `POST
+/api/session`, never `PUT /api/grade`.** `PUT /api/grade` still works and
+still records a commit ("Per clip grades" above), but it deliberately does
+NOT bump the live revision, so a browser tab open on that clip is not handed
+back its own autosave as if it were somebody else's edit. An agent that wants
+its change to appear live, the instant it lands, the way a person's slider
+does, patches through `POST /api/session` exactly as "The routes an agent
+actually needs" below describes; `PUT /api/grade` is for a save that nobody
+needs to watch happen.
+
+### The routes
+
+All plain JSON, all under the same auth and CSRF rules as `/api/session`
+("Getting a token" below).
+
+| Route | Body | Answers |
+| --- | --- | --- |
+| `GET /api/project` | (`?clip=` optional, else the open one) | the open project: key, name, path, rotation, time, preset, `head`/`head_full`/`head_commit`, branch, `branches`, `extras`, `config` (HEAD's), `dims` |
+| `POST /api/project/open` | `{"clip": NAME}` | opens or creates that clip's project and makes it this account's open one; same body as `GET` |
+| `POST /api/project/rotation` | `{"rotation": "auto"\|"0"\|"90"\|"180"\|"270"}` | sets the project's rotation (a field, not a commit) |
+| `POST /api/project/time` | `{"time": SECONDS}` | sets the playhead (a field, not a commit; no revision bump) |
+| `POST /api/project/checkout` | `{"commit": ID}` (full or a unique short prefix) | moves HEAD, non destructive |
+| `POST /api/project/fork` | `{"commit": optional, "name": optional}` | branches off HEAD or `commit`, under `name` or an auto `fork-N` |
+| `POST /api/project/undo` / `.../redo` | `{}` | steps HEAD; the answer carries `moved` (bool) and, at either end, a `note` explaining why nothing moved |
+| `POST /api/project/extra` | `{"name": ..., "value": ...}` | a small JSON bag of per project settings other tools use, read back under `extras` |
+| `GET /api/project/log` | `?limit=N` (default 200, max 2000) | `{key, name, head, branch, branches[{name, tip, short, commits, is_current}], commits[{id, short, parent, branch, author, ts, message, changes[{path, label, old, new}], is_head, is_tip}], total, limit}`, the WHOLE tree, every branch, newest first |
+| `GET /api/whoami` | none | `{user, by, auth, project}` |
+
+`extras` is a small per project bag other tools read and write through
+`POST /api/project/extra`; today's only entry is `match_crops` (contract C7,
+Match Reference above), keyed by reference name with an optional `ref` and an
+optional `frame` rectangle each: `POST /api/match` uses `ref_crop`/
+`frame_crop` from the request when given, falls back to the matching
+rectangle saved here when either is ABSENT from the request, and an explicit
+`null` means the whole image even when one is saved; `grade/tools/match_ref.py`
+takes the same two rectangles on the command line as `--ref-crop X0 Y0 X1 Y1`
+and `--frame-crop X0 Y0 X1 Y1`.
+
+Every write above (`open`, `rotation`, `checkout`, `fork`, `undo`, `redo`)
+takes an optional `"by"` the same way `POST /api/session` does, and wakes any
+browser tab long polling `GET /api/session/wait` the same instant a session
+patch does, since all of them move what that tab has to show.
+
+Verified against a real server on a random port with a temporary `--data-dir`
+(the same server `grade/tests/cases_cli_project.py` starts and stops by its
+own captured process id): opening a clip returns a root commit on `main` at
+`auto` rotation; a `session patch` with `"by": "lane"` and `"message": "warm
+it"` shows up in the very next `GET /api/project/log` as `lane ... warm it`;
+checking out that root commit and patching again creates `fork-1` and the
+log marks the root as the point it forked from; undo returns to the root
+(`moved: true`), a second undo says `already at the first commit of this
+project` and reports `moved: false`.
+
+### The CLI
+
+`grade/cinegrade.py` has the same routes as commands, so a shell script needs
+no HTTP client. Every one of them takes `--port` (default 7431), `--by`, and
+`--json` (the server's raw JSON instead of a table); `session patch` also
+takes `--by` and `--message`, sent as `by` and `message` on the wire.
+
+```
+cinegrade.py whoami
+cinegrade.py project open CLIP [--rotation auto|0|90|180|270]
+cinegrade.py project show
+cinegrade.py project log [--limit N] [--all]
+cinegrade.py project checkout ID
+cinegrade.py project fork [NAME] [--from ID]
+cinegrade.py project undo
+cinegrade.py project redo
+cinegrade.py project rotate auto|0|90|180|270
+cinegrade.py project time SECONDS
+```
+
+A real transcript against a running server, in order (identity, then a
+history):
+
+```
+$ cinegrade.py whoami
+user     (no account, logins are off)
+by       cli
+logins   off
+project  (none open)
+
+$ CINEGRADE_AGENT=agent:colorbot-3 cinegrade.py whoami
+by       agent:colorbot-3
+
+$ cinegrade.py project open A001_09011336_C002.MOV --by studio
+opened A001_09011336_C002.MOV
+key       05fe6fe1e893172ddf254f196a9a121d
+branch    main
+head      eea98e8
+rotation  auto
+
+$ cinegrade.py session patch '{"primaries": {"saturation": 1.2}}' \
+    --by lane --message "warm it"
+{"config": {...}, "by": "lane", "head": "ea22e17", "branch": "main", ...}
+
+$ cinegrade.py project log
+project 05fe6fe1e893172ddf254f196a9a121d  A001_09011336_C002.MOV
+branches  main (tip ea22e17, 2 commits, current)
+
+ea22e17  main       lane               just now       HEAD  warm it
+eea98e8  main       server             just now             root
+
+2 commits total
+```
+
+`whoami`'s `by` line is the CLI's own answer, not the server's: the route has
+no write to attach one to, so it always reports its quiet default (`cli`);
+what actually signs the next commit is `resolve_by()` above, which is what
+`whoami` shows instead. `--json` on any of these prints the server's answer
+verbatim, unmodified, for a script that wants to parse it rather than read it.
 
 ## Layers
 
@@ -835,6 +1065,22 @@ there is no GPU to hand either job to, which is slower and has no live knobs, bu
 plays. The same fallback also fires mid session if a config turns on a stage the
 GPU path cannot render.
 
+The proxy is encoded already turned to the project's rotation, not always the
+file's own tag: the cache key under `studio/cache/proxy/` carries the rotation
+string, so there is one proxy file per clip per rotation, and switching a
+project's rotation builds a fresh one rather than replaying the wrong turn.
+This and every other route in this section (`play/prepare`, `thumb`, the
+`range`/`limit` scrub reads) read rotation the same way `frame` and every
+render path do (contract C2, see "Render engines" and `grade/README.md`
+`--rotate`): a request may send `"rotation": "auto"|"0"|"90"|"180"|"270"` (or
+`?rotation=` on a GET); when that is absent the legacy `"autorotate":
+true|false` is still honoured (`true` means `auto`, `false` means `0`); only
+when NEITHER is sent does the server fall back to the open project's own
+rotation. A caller that keeps sending `autorotate` therefore pins itself to
+`auto` or `0` forever, because a boolean cannot say `90`, `180` or `270`: it
+will never see the project's rotation take effect. `studio/static/live.js`
+and the CLI's `project rotate` both send `rotation` and never `autorotate`.
+
 ## Upload
 
 The Upload button (`#uploadClipBtn`) sends the raw file body, not a multipart
@@ -893,6 +1139,16 @@ Grain is still applied by ffmpeg either way. When a clip's grain is on, the GPU
 engine hands off to the same grain, detail and letterbox stages the ffmpeg path
 uses, in the same order, rather than reimplementing ffmpeg's noise generator in
 a shader.
+
+Rotation (contract C2) is a decode and encode time argument on both engines,
+not a filter either one could disagree about: `studio/render_gpu.py` passes
+the same `rotation` string to ffmpeg's own decode and encode stages that the
+ffmpeg engine uses for the whole render, so a render request that leaves
+`rotation` unset picks up the open project's rotation on either engine the
+same way. `POST /api/render` and the GPU render route both take `rotation`
+(`auto|0|90|180|270`) and the legacy `autorotate` boolean, with the same
+"absent `rotation` falls back to `autorotate`, absent both falls back to the
+project" order as every other route in this file.
 
 The GPU engine needs Chrome and node on the machine it runs on, and checks for
 both, plus the worker script and `puppeteer-core`, before a render starts:
@@ -970,7 +1226,7 @@ cookie authenticated write has to pass, because that check exists to stop a
 browser from being tricked into a request it did not mean to send, and a
 script sending its own Authorization header was never at risk of that.
 
-### The `by` field
+### The `by` field, and the project it now writes to
 
 `POST /api/session` and the config it returns carry a `by` field: a short,
 free text label saying who made this change. A human dragging a slider in the
@@ -980,6 +1236,22 @@ agents at once should use something more specific, like `"agent:colorbot-3"`).
 It costs nothing to set and it is the only way anything watching the session
 (a person's open tab, `GET /api/session`, another agent) can tell an outside
 patch apart from a local one.
+
+Since contract C1 ("Projects and history" above), every session patch that
+carries a `config` is also a COMMIT: `by` is the commit's author, and an
+optional `message` (also on the wire, also read by `grade/cinegrade.py`
+`session patch --message`) becomes its readable one line description instead
+of the auto generated one. This is the whole answer to "the agent doesnt need
+to have anxiety on whos editing what and what preset the person has
+selected" (the founder's framing for this arc): an agent opens the project
+(`POST /api/project/open`), reads HEAD's config off the response instead of
+guessing what a person last loaded, and commits under its own name; the
+person's tab shows that commit land, with the agent's name on it, over the
+same long poll it already watches. `POST /api/session` is the edit path for
+this reason; `PUT /api/grade` still records a commit too but deliberately
+does not wake that long poll, so it is for a save nobody needs to watch
+happen, never for an edit meant to be seen live. `GET /api/whoami` and the
+CLI's `project` commands are documented in full there.
 
 ### The routes an agent actually needs
 
@@ -1057,20 +1329,32 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 **`PUT /api/grade`** (contract C3, per clip saves) or **`POST /api/preset`**
 (a shared, named grade): `PUT /api/grade` takes `{"clip": NAME, "config":
-CONFIG}` and returns `{"key", "updated_at"}`, read back with
-`GET /api/grade?clip=NAME` (`{"exists", "key", "config", "updated_at"}`).
-`POST /api/preset` takes `{"name": NAME, "config": CONFIG, "comment": TEXT}`
-and returns `{"saved", "path", "presets"}`, read back with
-`GET /api/preset?name=NAME`. An agent talking to an older build that has not
-shipped `PUT /api/grade` yet should fall back to a preset save; either way,
-follow the write with the matching plain `GET` so the agent is not just
-trusting its own POST or PUT, it is confirming the save actually landed.
+CONFIG, "by": NAME, "message": TEXT}` and returns `{"key", "updated_at",
+"head"}` (`head` is the commit this save just made, contract C1), read back
+with `GET /api/grade?clip=NAME` (`{"exists", "key", "config", "updated_at",
+"head", "branch"}`). `POST /api/preset` takes `{"name": NAME, "config":
+CONFIG, "comment": TEXT}` and returns `{"saved", "path", "presets"}`, read
+back with `GET /api/preset?name=NAME`. An agent talking to an older build
+that has not shipped `PUT /api/grade` yet should fall back to a preset save;
+either way, follow the write with the matching plain `GET` so the agent is
+not just trusting its own POST or PUT, it is confirming the save actually
+landed. Remember this route does not wake a watching tab ("The `by` field,
+and the project it now writes to" above): for a change meant to be seen live,
+`POST /api/session` is the one to use.
 
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"clip": "A001.MOV", "config": {"primaries": {"contrast": 1.1}}}' \
   http://127.0.0.1:7431/api/grade
 ```
+
+**Projects and history** ("Projects and history" above has the full route
+table and a real transcript): `POST /api/project/open {"clip": NAME}` opens
+or creates the project and is the read an agent should do first, instead of
+guessing what config is live; `GET /api/project/log` is the whole commit
+tree; `POST /api/project/checkout|fork|undo|redo` move or branch HEAD;
+`GET /api/whoami` answers who a write from this agent currently counts as.
+All of them take the same `by` this section already describes.
 
 ### The proof
 

@@ -90,8 +90,32 @@
    * states with whatever layer is now sitting at its old row. */
   var foldState = {};
 
+  /* One layer, one string, whatever order its keys happen to be in.
+   *
+   * Plain JSON.stringify was not enough once undo became the project's undo
+   * (contract C4): a restored layer now arrives from the server, and the
+   * server stores every commit with its keys SORTED (projects.py's _canon,
+   * which is also what the commit id is derived from). So the same layer,
+   * byte for byte the same content, stringifies differently coming back than
+   * it did going out, no signature in sigHistory matches, the layer is given
+   * a brand new id, and the selection marker lands on nothing. Sorting here
+   * makes the signature about the CONTENT only, which is what every comment
+   * around it already claims it is. */
+  function canonSig(v) {
+    if (v === null || typeof v !== "object") {
+      var s = JSON.stringify(v);          // undefined for a function or undefined
+      return s === undefined ? "undefined" : s;
+    }
+    if (Array.isArray(v)) {
+      return "[" + v.map(canonSig).join(",") + "]";
+    }
+    return "{" + Object.keys(v).sort().map(function (k) {
+      return JSON.stringify(k) + ":" + canonSig(v[k]);
+    }).join(",") + "}";
+  }
+
   function layerSig(layer) {
-    try { return JSON.stringify(layer); } catch (e) { return null; }
+    try { return canonSig(layer); } catch (e) { return null; }
   }
 
   // Resolves a stable id for every layer in the CURRENT effective array,
