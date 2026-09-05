@@ -488,6 +488,12 @@
                 <option value="1280">1280</option>
               </select>
             </label>
+            <label class="tb" title="ffmpeg runs the whole grade in one filter graph and is the reference. GPU decodes with ffmpeg, grades every frame through gpu.js in a headless Chrome, and encodes with ffmpeg: same codec and colour tags, needs Chrome and node on this machine.">engine
+              <select id="renderEngine">
+                <option value="ffmpeg">ffmpeg</option>
+                <option value="gpu">GPU (headless Chrome)</option>
+              </select>
+            </label>
             <button class="btn accent" id="renderBtn">Render</button>
           </div>
           <!-- Live loop (job: live GPU viewer, mode 2). Its own row, its own

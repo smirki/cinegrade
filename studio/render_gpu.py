@@ -12,12 +12,20 @@ reference; engine "gpu" is this file.
 Three things decide whether the output is honest, and all three were measured
 rather than assumed (numbers in studio/static/limits.js):
 
-1. The pipe format is gbrp16le, PLANAR, not packed rgb48le. swscale reaches
-   yuv422p10le by a different path from a packed 16 bit RGB input than from a
-   planar one: measured on the cinematic preset at 640 wide, planar reproduces
-   the single process render exactly (max 0.000 of 255) and packed is off by
-   up to 17.4 of 255 on 3.7 percent of channels. So the browser reads back
-   planar GBR and this module pipes those bytes straight in.
+1. The frames coming back from the browser are in the format ffmpeg's own
+   graph is carrying at the point this path cuts it, which is not one format
+   but three (_chain_cut below, read out of `ffmpeg -v debug` on the engine's
+   real graph): gbrp16le when the chain never leaves 16 bit, yuv444p when a
+   vignette and a detail stage make ffmpeg drop to 8 bit YUV, rgb24 when a
+   vignette alone makes it drop to 8 bit RGB. Two measurements force this:
+   - PLANAR, not packed. swscale reaches yuv422p10le by a different path from
+     a packed 16 bit RGB input than from a planar one: on the cinematic preset
+     at 640 wide, planar reproduces the single process render exactly (max
+     0.000 of 255) and packed is off by up to 17.4 of 255 on 3.7 percent of
+     channels.
+   - the right DEPTH. Handing the encoder 16 bit RGB where ffmpeg had an 8 bit
+     buffer makes the finished file about 3.5 of 1023 brighter in luma, a
+     systematic offset rather than noise.
 
 2. The final RGB to YUV conversion is a whole graph negotiation in ffmpeg, not
    a per link one (the same effect f_log_stage's docstring documents for
@@ -172,7 +180,20 @@ def worker_authorised(handler, route: str, method: str) -> bool:
 
 
 def _is_loopback(addr: str) -> bool:
+    """Same rule the reveal route uses: local, and provably local.
+
+    trusted_loopback rather than is_loopback because with
+    --behind-https-proxy a reverse proxy on this machine makes every request
+    from every device arrive from 127.0.0.1, so the peer address stops
+    proving anything. Under a proxy this returns False for everyone and the
+    GPU render worker (which is a child of this process and could otherwise
+    connect) is refused along with the rest: a render that cannot start is
+    the right failure, an open frame route is not. The per render token is
+    checked as well, never instead.
+    """
     try:
+        return SRV.AUTH.trusted_loopback(addr)
+    except AttributeError:
         return SRV.AUTH.is_loopback(addr)
     except Exception:                                         # noqa: BLE001
         return addr in ("127.0.0.1", "::1", "localhost")
@@ -203,6 +224,26 @@ def _tail_stamp(cfg: dict, info: dict) -> str:
         return ""
     cs = str((info or {}).get("color_space") or "").lower()
     return f"setparams=colorspace={cs}," if cs in SETPARAMS_COLORSPACES else ""
+
+
+# What ffmpeg's own graph is carrying at the point this path cuts it, which
+# is what the browser has to hand back. Mirrors chainPlan() in gpu.js, and
+# both were checked against `ffmpeg -v debug` on the engine's real graph:
+#   vignette and detail -> yuv444p, full range, 8 bit
+#   vignette alone      -> rgb24, 8 bit
+#   otherwise           -> gbrp16le, and the chain never left 16 bit
+# The two sides compute this independently. If they ever disagree the frame
+# size check in handle() below refuses the frame rather than writing a
+# misinterpreted buffer into the encoder.
+def _chain_cut(gpu_cfg: dict) -> dict:
+    vignette = bool(gpu_cfg["fx"]["vignette"]["enabled"])
+    detail = (float(gpu_cfg["detail"].get("soften", 0)) > 1e-6
+              or float(gpu_cfg["detail"].get("sharpen", 0)) > 1e-6)
+    if vignette and detail:
+        return {"format": "yuv444p", "bytes": 3, "yuv": True}
+    if vignette:
+        return {"format": "rgb24", "bytes": 3, "yuv": False}
+    return {"format": "gbrp16le", "bytes": 6, "yuv": False}
 
 
 def _decode_args(clip_file: str, cfg: dict, info: dict, rinfo: dict,
@@ -244,7 +285,8 @@ def _decode_args(clip_file: str, cfg: dict, info: dict, rinfo: dict,
 
 def _encode_args(out_path: Path, clip_file: str, cfg: dict, rcfg: dict,
                  info: dict, rinfo: dict, start: float | None,
-                 duration: float | None, fps: float, no_audio: bool) -> list[str]:
+                 duration: float | None, fps: float, no_audio: bool,
+                 cut: dict) -> list[str]:
     """ffmpeg encode: graded frames in over stdin, the finished file out.
 
     Same codec, profile, pixel format, colour tags and audio mapping as
@@ -257,8 +299,18 @@ def _encode_args(out_path: Path, clip_file: str, cfg: dict, rcfg: dict,
     o = cfg["output"]
     codec = o["codec"]
     args = ["ffmpeg", "-v", "error", "-y",
-            "-f", "rawvideo", "-pix_fmt", "gbrp16le",
-            "-s", f"{W}x{H}", "-r", f"{fps:.6f}", "-i", "-"]
+            "-f", "rawvideo", "-pix_fmt", cut["format"],
+            "-s", f"{W}x{H}", "-r", f"{fps:.6f}"]
+    if cut["yuv"]:
+        # The 8 bit YUV ffmpeg hands vignette and unsharp is FULL range, and
+        # the encoder wants limited, so the pipe has to say which one it is or
+        # the picture arrives with its contrast stretched. The matrix tag
+        # comes along for the same reason the RGB branch stamps one below.
+        args += ["-color_range", "pc"]
+        cs = str((info or {}).get("color_space") or "").lower()
+        if cs in SETPARAMS_COLORSPACES:
+            args += ["-colorspace", cs]
+    args += ["-i", "-"]
 
     grain = bool(cfg["grain"]["enabled"])
     if grain:
@@ -287,7 +339,8 @@ def _encode_args(out_path: Path, clip_file: str, cfg: dict, rcfg: dict,
                     f":all_opacity={float(rcfg['grain'].get('opacity', 0.5)):.4f}[gx]")
         cur = "gx"
     else:
-        segs.append(f"[0:v]{_tail_stamp(cfg, info)}null[gx]")
+        stamp = "" if cut["yuv"] else _tail_stamp(cfg, info)
+        segs.append(f"[0:v]{stamp}null[gx]")
         cur = "gx"
     segs.append(f"[{cur}]{','.join(tail)}[vout]")
 
@@ -351,7 +404,10 @@ def _read_pipe(stream, size: int) -> bytes | None:
         if not n:
             return None
         got += n
-    return bytes(buf)
+    # The bytearray itself, not a bytes() copy of it: at 4K that copy is
+    # another 50 MB memcpy per frame for nothing. Nobody mutates it after
+    # this point.
+    return buf
 
 
 class _Session:
@@ -378,7 +434,8 @@ class _Session:
         self.renderer = ""
         self.started = time.time()
         self.first_frame_at = None
-        window = int(INFLIGHT_BYTES // max(1, plan["frame_bytes"]))
+        window = int(INFLIGHT_BYTES
+                     // max(1, plan["src_bytes"] + plan["out_bytes"]))
         self.window = max(INFLIGHT_MIN, min(INFLIGHT_MAX, window))
 
     # --- the frame queue ---------------------------------------------
@@ -421,7 +478,7 @@ class _Session:
     # --- threads -----------------------------------------------------
 
     def _read_decode(self) -> None:
-        size = self.plan["frame_bytes"]
+        size = self.plan["src_bytes"]
         idx = 0
         try:
             while True:
@@ -670,23 +727,27 @@ def start_gpu_render(payload: dict, base_url: str = ""):
         return job
 
     W, H = rinfo["width"], rinfo["height"]
+    gpu_cfg = _gpu_config(cfg)
+    cut = _chain_cut(gpu_cfg)
     fps = SRV._proxy_fps(clip, info)
     span = duration if duration else max(0.0, info["duration"] - start)
     expected = max(1, int(round(span * fps))) if span else 1
     plan = {
         "clip": clip,
         "width": W, "height": H,
-        "frame_bytes": W * H * 3 * 2,
+        "src_bytes": W * H * 3 * 2,          # rgb48le, into the browser
+        "out_bytes": W * H * cut["bytes"],   # cut["format"], back out of it
+        "out_format": cut["format"],
         "expected": expected,
         "pixel_scale": W / float(info["width"]),
-        "config": _gpu_config(cfg),
+        "config": gpu_cfg,
         "defaults": SRV.CG.DEFAULTS,
         "decode_args": _decode_args(str(SRV.clip_path(clip)), cfg, info, rinfo,
                                     start if start else None, duration, scaled),
         "encode_args": _encode_args(out_path, str(SRV.clip_path(clip)), cfg,
                                     rcfg, info, rinfo,
                                     start if start else None, duration, fps,
-                                    bool(payload.get("no_audio"))),
+                                    bool(payload.get("no_audio")), cut),
     }
     sess = _Session(job, plan)
     port = getattr(SRV, "SERVER_PORT", 0) or int(payload.get("port") or 0)
@@ -728,7 +789,9 @@ def handle(handler, method: str, route: str, query: dict) -> bool:
         handler._json({
             "job": sess.job.id,
             "width": plan["width"], "height": plan["height"],
-            "frameBytes": plan["frame_bytes"],
+            "frameBytes": plan["src_bytes"],
+            "outBytes": plan["out_bytes"],
+            "outFormat": plan["out_format"],
             "expected": plan["expected"],
             "pixelScale": plan["pixel_scale"],
             "config": plan["config"],
@@ -755,13 +818,15 @@ def handle(handler, method: str, route: str, query: dict) -> bool:
         except ValueError:
             index = -1
         length = int(handler.headers.get("Content-Length") or 0)
-        want = sess.plan["frame_bytes"]
-        if index < 0 or length != want:
+        want = sess.plan["out_bytes"]
+        sent_format = handler.headers.get("X-Frame-Format", "")
+        if index < 0 or length != want or sent_format != sess.plan["out_format"]:
             # Read and drop the body first: leaving it on the socket would
             # make the next request start reading half a frame.
             _drain_body(handler, length)
-            handler._json({"error": f"frame {index} should be {want} bytes, "
-                                    f"got {length}"}, 400)
+            handler._json({"error": f"frame {index} should be {want} bytes of "
+                                    f"{sess.plan['out_format']}, got {length} "
+                                    f"bytes of {sent_format or 'no format'}"}, 400)
             return True
         data = _read_exact(handler, length)
         if data is None:

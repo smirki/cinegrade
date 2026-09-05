@@ -49,8 +49,12 @@
   <p class="muted" style="margin:6px 0">
     Every configuration is rendered twice, once by gpu.js on the card and once by
     ffmpeg on the server, and the two 8 bit pictures are differenced pixel by
-    pixel. Grain is off everywhere on purpose: ffmpeg's noise filter is seeded
-    from the clock, so it does not even match itself between runs.
+    pixel. Grain is off everywhere on purpose: gpu.js has no grain stage at all
+    (it has never been ported), so there is nothing on the GPU side to compare
+    against ffmpeg's noise filter. This used to say the filter reseeds itself
+    from the clock and cannot match itself between runs; on this machine it
+    measurably does match itself run to run (see the Limits panel), so that is
+    not the reason grain is left out here.
   </p>
   <button id="go">Run the sweep</button>
   <span id="prog" class="muted"></span>

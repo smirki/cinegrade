@@ -3057,7 +3057,10 @@
       clip: S.clip, config: cfg(), autorotate: S.autorotate, name: name,
       start: parseFloat($("renderStart").value) || 0,
       duration: parseFloat($("renderDur").value) || null,
-      scale: $("renderScale").value ? parseInt($("renderScale").value, 10) : null
+      scale: $("renderScale").value ? parseInt($("renderScale").value, 10) : null,
+      // ffmpeg unless the user picked otherwise. The server dispatches on
+      // this in start_render; every other field means the same to both.
+      engine: ($("renderEngine") && $("renderEngine").value) || "ffmpeg"
     };
     api("/api/render", {
       method: "POST", headers: { "Content-Type": "application/json" },

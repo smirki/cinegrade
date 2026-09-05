@@ -133,6 +133,26 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def trusted_loopback(addr: str) -> bool:
+    """is_loopback, but also False whenever a proxy could be lying about it.
+
+    A route gated as "loopback only" (reveal-in-Finder today) is trusting the
+    socket's peer address to mean "this is the same computer". That trust is
+    correct with no proxy in front, because only a process on this machine
+    can open a TCP connection whose source is 127.0.0.1. It stops being
+    correct the moment --behind-https-proxy is set: a reverse proxy on this
+    same machine, forwarding to this loopback bind, makes every request from
+    every device on the network arrive with THAT peer address too, since the
+    proxy is what actually opened the socket. At that point the server
+    cannot tell a caller on this machine from one on the internet, so a
+    loopback-gated route has to refuse everyone rather than trust an address
+    it can no longer interpret.
+    """
+    if behind_https_proxy():
+        return False
+    return is_loopback(addr)
+
+
 # --------------------------------------------------------------------------
 # passwords
 # --------------------------------------------------------------------------

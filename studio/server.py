@@ -3306,8 +3306,13 @@ class Handler(BaseHTTPRequestHandler):
             # Over a network that is somebody else's desktop, so it answers
             # only a browser on this same machine. With logins off the server
             # is bound to 127.0.0.1 and every caller is loopback, so this
-            # changes nothing for local use.
-            if not AUTH.is_loopback(
+            # changes nothing for local use. trusted_loopback (not
+            # is_loopback) also refuses everyone when --behind-https-proxy is
+            # set: a same-machine proxy forwarding to this loopback bind
+            # makes every request, including one relayed from the internet,
+            # arrive with a loopback peer address, so the address alone can
+            # no longer prove the caller is local.
+            if not AUTH.trusted_loopback(
                     self.client_address[0] if self.client_address else ""):
                 raise AUTH.AuthError(403, "Reveal opens a Finder window on the "
                                           "computer running the studio, so it "

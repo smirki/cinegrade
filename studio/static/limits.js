@@ -23,8 +23,9 @@
      "filtered, ducked or synced. A colour tool has no business owning the mix."],
     ["No motion tools.",
      "No stabilisation, no optical flow, no retime, no motion blur, no lens " +
-     "distortion correction. These need multi frame analysis, and this engine " +
-     "renders each frame as an independent ffmpeg graph."],
+     "distortion correction. These need multi frame analysis, and both render " +
+     "engines treat every frame as an independent graph, ffmpeg's filter " +
+     "chain or gpu.js's, with nothing carried from one frame to the next."],
     ["No tracking.",
      "Nothing can follow a subject across a shot. Same reason: a tracker needs " +
      "to carry state from frame to frame, and there is no place in a stateless " +
@@ -139,42 +140,38 @@
      "does not reliably drain the queue on Metal, so the worst case is the " +
      "one to quote.) Scaling the 1080p figure by pixel count puts a 4K GPU " +
      "pass near 16ms a frame, an extrapolation from the measured 1080p " +
-     "number, not a measured 4K number. A backend render on the GPU would " +
-     "still pay a per frame GPU to CPU readback (about 33MB a frame at 4K) " +
-     "to hand pixels to the encoder, and running gpu.js on the server means " +
-     "running headless Chrome as a render process, because Node has no " +
-     "WebGL2."],
-    ["GPU accelerated preview exists, but only on test pages.",
-     "gpu.js is a complete WebGL2 port of the render chain, and it has been " +
-     "checked, not just built. " +
-     "<span id=\"parityClaim\">Parity numbers are read from the last harness " +
-     "run when this panel opens.</span> " +
-     "Some of it is honestly not " +
-     "fixable: grain can never match, because ffmpeg's noise filter seeds " +
-     "from the clock and does not reproduce itself run to run, and the 8 " +
-     "bit yuv lane is CLOSE rather than EXACT because of swscale dithering, " +
-     "worst case 4 of 255 on 0.43 percent of channels. It currently only " +
-     "runs on gpupreview.html and parity.html. The main viewer still goes " +
-     "through the server for every knob turn, which is the difference " +
-     "between a knob costing 0.40s and costing about 4ms."],
-    ["Real time playback.",
-     "Measured end to end today, and it works. One ffmpeg pass at preview " +
-     "size (4K Apple Log ProRes decode, scale to 960, the full cinematic " +
-     "preset with every FX: halation, bloom, radial blur, rgb split, " +
-     "vignette, grain, sharpen, then h264_videotoolbox encode to a playable " +
-     "mp4) ran 120 frames (5 seconds of footage) in 3.32s, 36 fps, 1.5x " +
-     "realtime. Decode and scale alone, no grade and no encode, ran the " +
-     "same 120 frames in 2.17s, 55 fps. So at preview size the grade is not " +
-     "the bottleneck, decoding is: if the grade cost nothing you would go " +
-     "from 36 fps to 55 fps and stop. Realtime graded playback at preview " +
-     "size is available today with the existing pipeline, it just is not " +
-     "wired to a play button yet."],
-    ["Auto shot match.",
-     "Already built, and it is why this line moved out of the impossible group. " +
-     "Match Reference fits a transform from a reference image and writes a look " +
-     "cube. It does not extract the reference's LUT, because a JPEG does not " +
-     "contain one; it moves the source's colour statistics toward the " +
-     "reference's, and it reports how far it got and where it is unreliable."],
+     "number, not a measured 4K number. That backend route has since been " +
+     "built rather than argued about, and it does run gpu.js in a headless " +
+     "Chrome as a render process, because Node still has no WebGL2. It pays " +
+     "the per frame GPU to CPU readback this entry predicted (about 33MB a " +
+     "frame at 4K) and that readback, plus moving the frame to the encoder, " +
+     "turns out to cost more than ffmpeg's whole filter chain: the GPU " +
+     "engine is measurably SLOWER, not faster. So the 2.3 fps above is no " +
+     "longer the only option, but it is still the faster one. What the GPU " +
+     "engine buys is a second, independent render of the same grade at 10 " +
+     "bit. See the fixed entry for what it is, and the two broken entries " +
+     "for the speed and the parity numbers."],
+    ["A GPU render worth choosing for speed.",
+     "Possible, and not close yet. The GPU engine spends about 1.13s a frame " +
+     "at 1920 wide while the same shaders were measured at a worst case of " +
+     "3.8ms a frame, so almost none of that second is the grade. It is the " +
+     "frame moving: a 16 bit readback out of WebGL, an HTTP POST back to the " +
+     "server, and a raw pipe into the encoder. Where inside that the time " +
+     "actually goes was NOT measured, so the fix is not known, only the " +
+     "shape of it. The obvious candidates are reading back into a pixel " +
+     "buffer object asynchronously instead of a blocking readPixels, and " +
+     "cutting the byte count by packing to 10 bit rather than 16. Neither " +
+     "was tried, so neither is promised."],
+    ["Grain, detail and letterbox on the GPU path.",
+     "Deliberately not, for now. With grain off the whole chain runs in " +
+     "gpu.js. With grain on, the grain plate is generated and blended by " +
+     "ffmpeg on the way to the encoder exactly as the ffmpeg engine does it, " +
+     "and detail and letterbox go with it, because ffmpeg's own graph " +
+     "applies those two after the blend and the point of this path is to " +
+     "produce the same file. So a grain on GPU render is honestly a hybrid, " +
+     "not a GPU render. Moving grain into gpu.js means matching ffmpeg's " +
+     "noise generator pixel for pixel, which is a separate piece of work " +
+     "with its own parity question."],
     ["Grade versions, and a reference still per clip.",
      "The storage half is already there and is the easy half: per clip grades " +
      "sit in grades(user_id, clip_key, clip_name, config_json, updated_at) " +
@@ -364,8 +361,9 @@
      "subtracted from each other, or given different corrections. It is also " +
      "fixed for the length of the shot: nothing tracks a subject and nothing " +
      "keyframes the shape, for the same reason the tracking entry above " +
-     "gives, which is that every frame is an independent ffmpeg graph with " +
-     "no state carried between frames. On a moving subject the window has to " +
+     "gives, which is that every frame is an independent graph on either " +
+     "render engine, with no state carried between frames. On a moving " +
+     "subject the window has to " +
      "be drawn wide enough to hold the subject for the whole range."],
     ["The window matte is 8 bit, like the radial blur ramp.",
      "works, at 256 levels",
@@ -539,6 +537,52 @@
      "closest shape available, and it now reads more like a scatter chart " +
      "because of that frame line. The engine's own grain effect is unaffected; " +
      "this is a labelling glyph only."],
+    ["The GPU render engine is slower than the ffmpeg one.",
+     "works, and costs you time",
+     "Measured on A001_09011832_C003.MOV, 72 frames, both engines on the same " +
+     "machine, wall clock from POST /api/render to the job reaching done. At " +
+     "1920 wide: ffmpeg 29.4s (2.45 fps), GPU 81.3s (0.89 fps). At the clip's " +
+     "native width: ffmpeg 31.3s (2.30 fps), GPU 101.1s (0.71 fps). That is " +
+     "2.8x slower at 1920 and 3.2x slower at native width. This is not a " +
+     "software renderer being reported as a GPU: the unmasked renderer string " +
+     "read out of WEBGL_debug_renderer_info in the worker page is ANGLE " +
+     "(Apple, ANGLE Metal Renderer: Apple M5, Unspecified Version), and the " +
+     "worker prints it into the job message so every render says which GPU " +
+     "did it. Both engines run the same decoder and the same encoder, so the " +
+     "whole difference is the cost of moving each frame out to the browser " +
+     "and back, and that cost is larger than ffmpeg's entire filter chain. " +
+     "It ships anyway, because it is the only way to get gpu.js's own picture " +
+     "into a 10 bit file, and because ffmpeg stays the default. No speedup is " +
+     "claimed anywhere in this tool for it, because none was measured."],
+    ["The GPU render does not match the ffmpeg render pixel for pixel.",
+     "known difference, larger at larger sizes",
+     "Compared on the ENCODED outputs (not on anything in memory): the same 3s " +
+     "range at 1920 wide through both engines, 5 frames each decoded back to " +
+     "raw 16 bit, differences quoted in 8 bit code values against the parity " +
+     "harness's own thresholds (EXACT at max 1, CLOSE at max 16 with at most " +
+     "0.5% of pixels over 1 and 0.02% over 4). The cinematic preset with " +
+     "grain off: max 36.0, mean 2.26 to 2.31, 62.6 to 64.5% of pixels over 1, " +
+     "17.2 to 17.7% over 4. A natural preset with a power window and a " +
+     "secondary: max 21.4, mean 1.49 to 1.60, 49.6 to 54.0% over 1, 7.96 to " +
+     "8.53% over 4. Both are FAILED by those thresholds and calling them " +
+     "anything else would be a lie. Two things are worth knowing about that " +
+     "number. It is not the render path: an ffmpeg only split at the same cut " +
+     "point, out to a raw pipe and back into the encoder, is byte identical " +
+     "(max 0.000), so the transport and the encode add nothing. It is gpu.js's " +
+     "own error against ffmpeg's filters, and it grows with the picture " +
+     "because the blur radii scale with it. The same comparison at 640 wide: " +
+     "no vignette and no sharpen, mean 0.11 and max 5.7; vignette only, mean " +
+     "0.45; sharpen only, mean 0.76; both, mean 1.24 to 1.34. The shipped " +
+     "test (studio/tests/specs/15-gpu-render.mjs) renders 640 wide with " +
+     "halation on and gets max 3.498, mean 0.0911, 0.274% over 1 and 0.0000% " +
+     "over 4, which passes CLOSE. So the honest summary is: at preview sizes " +
+     "the two engines agree, at delivery sizes they visibly do not, and the " +
+     "existing parity harness cannot see it because it compares at preview " +
+     "size in 8 bit. With grain on, where only a statistical comparison is " +
+     "meaningful, the per frame numbers are the same size as with grain off " +
+     "(signed mean 1.42 to 1.44 of 255, sd 2.75 to 2.92, largest absolute " +
+     "difference 35.1 to 39.7), which is indirect evidence that ffmpeg's " +
+     "noise reproduced itself across the two runs rather than reseeding."],
   ];
 
   var FIXED = [
@@ -778,6 +822,87 @@
      "with both radial stage rows EXACT at max 1 of 255 and 0% of pixels off " +
      "by more than 1. Four regression tests now pin it (grade/tests/" +
      "cases_radial.py) so it cannot come back quietly."],
+    ["GPU accelerated preview", "was confined to test pages, now the " +
+     "default in the main viewer",
+     "gpu.js is a complete WebGL2 port of the render chain, and it has been " +
+     "checked, not just built. " +
+     "<span id=\"parityClaim\">Parity numbers are read from the last harness " +
+     "run when this panel opens.</span> " +
+     "Some of it is honestly not " +
+     "done: grain has not been ported to gpu.js at all (see the possible " +
+     "entry on grain, detail and letterbox on the GPU path), and matching " +
+     "it turns out to be tractable rather than hopeless. This entry used to " +
+     "say grain can never match because ffmpeg's noise filter seeds itself " +
+     "from the clock and does not reproduce between runs. That was a " +
+     "prediction, not a measurement, and it was wrong on this machine: " +
+     "rendering the same single frame twice through cinegrade.py with grain " +
+     "on (cinematic preset, -frames:v 1, A001_09011336_C002.MOV at 2.0s) " +
+     "gave byte identical output both times (max absolute difference 0), " +
+     "and the bare ffmpeg noise filter on its own gives byte identical " +
+     "output across two separate process runs a few seconds apart too, " +
+     "while still varying frame to frame inside one run, which is real " +
+     "temporal noise, not a frozen plate. ffmpeg's default seed of -1 " +
+     "(\"unset\") is not actually drawn from the wall clock on this build: " +
+     "it is reproducible, so a GPU grain stage could in principle be parity " +
+     "checked exactly like every other stage. Nobody has written that " +
+     "shader yet, which is the real reason grain stays off the parity list, " +
+     "not an inherent impossibility. The 8 bit yuv lane is CLOSE rather " +
+     "than EXACT for an unrelated reason, swscale dithering: worst case 2 " +
+     "of 255 on 0.0009 percent of channels. It used to run only " +
+     "on gpupreview.html and parity.html while the main viewer went through " +
+     "the server for every knob turn. It is wired into the main viewer now " +
+     "too: StudioLive.init() runs against the real canvas at boot in app.js, " +
+     "the #gpuToggle button defaults on whenever that finds a usable WebGL2 " +
+     "context, and #rendererBadge prints \"GPU\" for a still frame, the live " +
+     "loop or proxy playback whenever it is grading on the card, falling " +
+     "back to \"server\" only when no WebGL2 context was found or the toggle " +
+     "is switched off by hand. The difference between the two paths is " +
+     "still what it always was, a network round trip against a local " +
+     "recompute: a knob turn was measured at about 0.40s through the server " +
+     "against about 4ms on the GPU. That pair of numbers came from the test " +
+     "pages before the main viewer wiring landed and has not been re-timed " +
+     "there directly, so it describes the shape of the win, not a " +
+     "main-viewer measurement."],
+    ["Auto shot match", "was assumed impossible, now built and used",
+     "Match Reference (POST /api/match, match_ref.py) fits a transform from " +
+     "a reference image and writes a look cube. It does not extract the " +
+     "reference's own LUT, because a JPEG does not contain one; it moves " +
+     "the source's colour statistics toward the reference's and reports how " +
+     "far it got and where it is unreliable. Measured on " +
+     "A001_09011832_C003.MOV against IMG_2570.PNG: method reinhard passed " +
+     "its own health check (probes_ok true, skin probe hue shift 6.3 " +
+     "degrees, mid grey channel spread 0.028) and closed the fit distance " +
+     "from 0.0993 to 0.0737, the same run the primaries loop in " +
+     "agent_grade.py then converged the rest of the way from. See the " +
+     "broken entries for where the same tool's histogram method fails that " +
+     "health check on the identical shot, and for how far the primaries " +
+     "loop alone can close a reference match on its own."],
+    ["The final render", "was ffmpeg only, now the GPU can render it too",
+     "The render dialog has an Engine choice. ffmpeg is still the default and " +
+     "is untouched. GPU (headless Chrome) decodes the clip with ffmpeg, hands " +
+     "every frame to the same gpu.js the preview uses running in a headless " +
+     "Chrome, and encodes what comes back with exactly the same codec, " +
+     "profile, pixel format, colour tags and audio mapping as the ffmpeg " +
+     "path, so it is the same kind of file and not a lesser one. It really is " +
+     "10 bit, and that was measured rather than assumed: counting distinct " +
+     "luma code values inside a smooth gradient patch of the same rendered " +
+     "frame gives 390 for the GPU engine against 394 for ffmpeg over a span " +
+     "of about 502 codes, where the same patch pushed through 8 bit holds " +
+     "only 123. That depends on the frames leaving Chrome at 16 bits per " +
+     "channel, which needed a new readback (the picture is packed into a " +
+     "render target of its own and read as unsigned integers); the 8 bit " +
+     "readPixels the preview uses was deliberately left alone. Frames never " +
+     "travel through page.evaluate: the worker page fetches raw frames over " +
+     "HTTP and POSTs the graded ones back, because turning a 12MB frame into " +
+     "a JSON array of numbers would cost more than the grade. The frame " +
+     "routes are open only to the worker and only for the life of one render, " +
+     "on a random per render token plus the same trusted loopback check the " +
+     "rest of the local only routes use. Progress and Cancel are the existing " +
+     "job machinery, so a GPU render stops the same way any other one does, " +
+     "and if Chrome or node is missing the render fails immediately with a " +
+     "message saying which. It is slower than ffmpeg and it does not match " +
+     "ffmpeg exactly; both are measured, both are under Broken, and neither " +
+     "is hidden behind this entry."],
   ];
 
   function rows(items) {

@@ -65,9 +65,10 @@
     });
   }
 
-  function sendFrame(index, u16) {
-    return post("/api/render/gpu/frame?i=" + index, u16,
-                { "Content-Type": "application/octet-stream" })
+  function sendFrame(index, out) {
+    return post("/api/render/gpu/frame?i=" + index, out.data,
+                { "Content-Type": "application/octet-stream",
+                  "X-Frame-Format": out.format })
       .then(function (r) {
         if (!r.ok) return r.text().then(function (t) { throw new Error("frame " + index + ": " + t); });
         return true;
@@ -94,10 +95,8 @@
     info.renderer = rendererString(inst.gl);
     info.width = plan.width;
     info.height = plan.height;
-    info.readback = inst.readPlanar16 ? "float target, quantised to 16 bit"
-                                      : "MISSING readPlanar16";
-    if (!inst.readPlanar16 || !inst.setSource16) {
-      throw new Error("this gpu.js has no 16 bit readback (readPlanar16)");
+    if (!inst.readOutput || !inst.setSource16) {
+      throw new Error("this gpu.js has no final render readback (readOutput)");
     }
     if (window.console && console.log) {
       console.log(JSON.stringify({ renderer: info.renderer,
@@ -120,7 +119,8 @@
         if (!t0) t0 = performance.now();
         inst.setSource16(got.data, plan.width, plan.height);
         inst.render(plan.config, { pixelScale: plan.pixelScale, want16: true });
-        var out = inst.readPlanar16();
+        var out = inst.readOutput();
+        info.readback = out.format;
         // let, not var: the callback below closes over THIS iteration's
         // promise. With var it would delete whichever promise the last
         // iteration happened to leave in the variable and the window would

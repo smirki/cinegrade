@@ -6,11 +6,14 @@
  * preview which lies is worse than a slow preview, so every claim gpu.js makes
  * in StudioGPU.stageReport has to be backed by a number measured here.
  *
- * Grain is disabled in every configuration below, deliberately. ffmpeg's noise
- * filter seeds its generator from the wall clock, so two ffmpeg runs of the
- * same grain config do not match each other. There is no ground truth to
- * compare against, so any grain parity number would be theatre. gpu.js reports
- * grain as "unsupported" and callers are expected to fall back to ffmpeg.
+ * Grain is disabled in every configuration below, deliberately. gpu.js has no
+ * grain stage at all, it has never been ported, so there is nothing on the
+ * GPU side to compare against ffmpeg's noise filter. This used to say ffmpeg's
+ * noise filter reseeds from the wall clock and cannot match itself run to
+ * run; measured on this build it does reproduce run to run (see the Limits
+ * panel), so that was never the real reason grain is left out here. gpu.js
+ * reports grain as "unsupported" and callers are expected to fall back to
+ * ffmpeg.
  *
  * Loads with no build step, no modules and no network beyond this machine.
  */
@@ -282,8 +285,8 @@
         .concat(laneConfigs())
         .concat(spaceAndTonemapConfigs())
         .concat(combinedConfigs());
-      /* Grain off everywhere. See the file header: ffmpeg's noise filter is
-       * clock seeded, so there is no stable ground truth to measure against. */
+      /* Grain off everywhere. See the file header: gpu.js has never ported
+       * grain, so there is nothing on the GPU side to compare it against. */
       all.forEach(function (e) {
         e.config = StudioGPU.fullConfig(e.config);
         e.config.grain.enabled = false;
@@ -661,9 +664,12 @@
         stages: stageRollup(S.rows),
         rows: S.rows,
         notes: [
-          "Grain is disabled in every configuration. ffmpeg's noise filter seeds "
-          + "from the wall clock, so two ffmpeg runs of the same grain config do "
-          + "not agree with each other and there is no ground truth to measure.",
+          "Grain is disabled in every configuration. gpu.js has no grain stage "
+          + "at all, it has never been ported, so there is nothing on the GPU "
+          + "side to compare against ffmpeg's noise filter. This used to say the "
+          + "filter reseeds from the wall clock and cannot match itself between "
+          + "runs; on this build it was measured reproducible run to run (see "
+          + "the Limits panel), so that was never the real reason.",
           "ffmpeg times include the HTTP round trip and the server's own decode, "
           + "and the server caches by config, so a repeated config is much faster "
           + "than a fresh one. The median below is over first-time renders in this "

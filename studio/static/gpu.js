@@ -568,9 +568,11 @@
             + "drops to 8 bit, because vignette has no 16 bit pixel format. On "
             + "its own it measures exact: no channel of any pixel off by more "
             + "than 1.",
-    grain: "NOT PORTED. ffmpeg's noise filter seeds itself from the clock, so "
-         + "two ffmpeg runs of the same config do not match each other either. "
-         + "Pixel parity with it is impossible in principle, not just here.",
+    grain: "NOT PORTED. ffmpeg's noise filter was measured reproducible run "
+         + "to run on this build, not clock seeded as this used to say, so "
+         + "grain could in principle be parity checked like every other "
+         + "stage. Nobody has written that shader yet, which is why it stays "
+         + "unsupported here.",
     detail: "gblur then unsharp. unsharp is YUV only, so the picture takes an "
           + "RGB to YUV round trip and only Y is sharpened. Sharpen on its own "
           + "runs at 16 bit, where ffmpeg's own scaling makes it 256 times "
@@ -2401,6 +2403,16 @@
     if (plan.detail) cur = this.detailPass(cur, cfg, plan, W, H, codeMax);
     if (cfg.letterbox.enabled) cur = this.letterboxPass(cur, cfg, W, H, codeMax, yuv);
 
+    // An 8 bit chain is captured HERE, in code space, before the conversion
+    // back to normalised RGB. ffmpeg's own graph never makes that conversion:
+    // when a config drops to 8 bit its link stays rgb24 (vignette alone) or
+    // yuv444p (vignette with detail) all the way into the encoder, and going
+    // RGB -> YUV from a 16 bit buffer instead lands about 3.5 of 1023 brighter
+    // in luma. Measured with ffmpeg -v debug on this engine's own graph.
+    if (opts.want16 && codeMax === 255) {
+      this.keepOutput(cur, W, H, yuv ? "yuv444p" : "rgb24");
+    }
+
     if (codeMax) cur = this.fromCode(cur, W, H, codeMax, yuv);
 
     // The finished 8 bit picture. When the tail never left 16 bit this is the
@@ -2420,12 +2432,12 @@
     gl.uniform1i(G.loc(prog, "uDirect"), codeMax === 255 ? 1 : 0);
     gl.uniform2i(G.loc(prog, "uSize"), W, H);
     G.draw(this.out);
-    // opts.want16 keeps the 16 bit picture as well as the 8 bit one. `cur` is
-    // the float target holding the value ffmpeg's own graph would hand the
-    // encoder, BEFORE the closing format=rgb24 table above, which is the only
-    // place a final render can read without banding. See keep16 below; the
-    // pass is skipped entirely for every existing caller.
-    if (opts.want16) this.keep16(cur, W, H);
+    // opts.want16 keeps the render's own picture as well as the 8 bit preview
+    // one. `cur` here is what ffmpeg's graph holds BEFORE the closing
+    // format=rgb24, which is the only place a final render can read without
+    // banding. When the chain already dropped to 8 bit the capture happened
+    // higher up, in code space, for the reason in keepOutput's comment.
+    if (opts.want16 && codeMax !== 255) this.keepOutput(cur, W, H, "gbrp16le");
     G.release(cur);
     this.passCount++;
 
@@ -2467,58 +2479,79 @@
     return rgb;
   };
 
-  // --- 16 bit output, for the GPU final render ----------------------
+  // --- the final render's own readback ------------------------------
 
-  /* Pack the finished float picture into one R16UI target laid out exactly
-   * like ffmpeg's gbrp16le: the G plane first, then B, then R, each W by H,
-   * stacked into a W by 3H texture.
+  /* Pack the finished picture into one integer target laid out exactly like
+   * the raw frame ffmpeg wants, so the CPU never touches a pixel.
    *
-   * Planar rather than packed is a measured requirement, not tidiness.
-   * swscale reaches yuv422p10le from a PACKED 16 bit RGB input by a different
-   * path than from a planar one: feeding the encoder rgb48le differs from the
-   * single process ffmpeg render by up to 17.4 of 255 on 3.7 percent of
-   * channels, and feeding it gbrp16le reproduces that render exactly (max
-   * 0.000). Doing the interleave here in a shader also means the CPU never
-   * touches the pixels: no per pixel JavaScript on an 8 megapixel frame.
+   * Three layouts, and which one is right is not a preference: it is the
+   * format ffmpeg's own graph is carrying at the point this port cuts it,
+   * read out of `ffmpeg -v debug` on the engine's real graph.
+   *   gbrp16le  16 bit planar G, B, R, stacked as a W by 3H target. The
+   *             chain never left 16 bit (no vignette).
+   *   yuv444p   8 bit planar Y, U, V, same stacking. vignette with detail:
+   *             ffmpeg runs both in yuv444p full range.
+   *   rgb24     8 bit packed R, G, B as a 3W by H target. vignette alone.
+   * Handing the encoder a packed 16 bit RGB frame instead of the planar one
+   * differs from the single process render by up to 17.4 of 255; handing it a
+   * 16 bit frame where ffmpeg had an 8 bit one costs about 3.5 of 1023 of
+   * luma. Both were measured on this project's own footage.
    *
-   * The quantisation is floor(v * 65535 + 0.5), the same rounding FS_TAIL8
-   * applies before its 8 bit table, so the 16 bit output and the 8 bit
-   * preview agree about what code a value is. */
-  var FS_PACK16 = src([
+   * The 16 bit quantisation is floor(v * 65535 + 0.5), the same rounding
+   * FS_TAIL8 applies before its 8 bit table, so the render and the preview
+   * agree about what code a value is. */
+  var FS_PACK = src([
     "#version 300 es",
     "precision highp float;",
     "precision highp int;",
     "uniform sampler2D uTex;",
-    "uniform int uHeight;",
+    "uniform int uHeight;",       // frame height, so plane = y / uHeight
+    "uniform int uPacked;",       // 1: R,G,B triples along x. 0: stacked planes
+    "uniform float uScale;",      // 65535 for normalised input, 1 for codes
+    "uniform float uMax;",        // 65535 or 255
+    "uniform ivec3 uOrder;",      // which channel each plane comes from
     "out uvec4 oCol;",
     "void main() {",
     "  ivec2 p = ivec2(gl_FragCoord.xy);",
-    "  int plane = p.y / uHeight;",
-    "  vec3 c = texelFetch(uTex, ivec2(p.x, p.y - plane * uHeight), 0).rgb;",
-    // gbrp: plane 0 is green, plane 1 is blue, plane 2 is red.
-    "  float v = plane == 0 ? c.g : (plane == 1 ? c.b : c.r);",
-    "  oCol = uvec4(uint(clamp(floor(v * 65535.0 + 0.5), 0.0, 65535.0)), 0u, 0u, 0u);",
+    "  int plane, x, y;",
+    "  if (uPacked == 1) { plane = p.x % 3; x = p.x / 3; y = p.y; }",
+    "  else { plane = p.y / uHeight; x = p.x; y = p.y - plane * uHeight; }",
+    "  vec3 c = texelFetch(uTex, ivec2(x, y), 0).rgb;",
+    "  int ch = plane == 0 ? uOrder.x : (plane == 1 ? uOrder.y : uOrder.z);",
+    "  float v = ch == 0 ? c.r : (ch == 1 ? c.g : c.b);",
+    "  oCol = uvec4(uint(clamp(floor(v * uScale + 0.5), 0.0, uMax)), 0u, 0u, 0u);",
     "}"
   ]);
 
-  Instance.prototype.keep16 = function (cur, W, H) {
+  var PACK_LAYOUTS = {
+    gbrp16le: { bytes: 2, packed: 0, scale: 65535, max: 65535, order: [1, 2, 0] },
+    yuv444p:  { bytes: 1, packed: 0, scale: 1, max: 255, order: [0, 1, 2] },
+    rgb24:    { bytes: 1, packed: 1, scale: 1, max: 255, order: [0, 1, 2] }
+  };
+
+  Instance.prototype.keepOutput = function (cur, W, H, format) {
     var gl = this.gl, G = this.G;
-    var need = 3 * H;
+    var lay = PACK_LAYOUTS[format];
+    if (!lay) throw new Error("StudioGPU: no readback layout for " + format);
+    var tw = lay.packed ? W * 3 : W;
+    var th = lay.packed ? H : H * 3;
     var max = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    if (need > max) {
+    if (tw > max || th > max) {
       throw new Error("StudioGPU: a " + W + "x" + H + " frame needs a "
-        + need + " tall readback target and this GPU stops at " + max);
+        + tw + "x" + th + " readback target and this GPU stops at " + max);
     }
-    if (!this.out16 || this.out16.w !== W || this.out16.h !== need) {
-      if (this.out16) {
-        gl.deleteTexture(this.out16.tex);
-        gl.deleteFramebuffer(this.out16.fbo);
+    if (!this.outRaw || this.outRaw.w !== tw || this.outRaw.h !== th
+        || this.outRaw.format !== format) {
+      if (this.outRaw) {
+        gl.deleteTexture(this.outRaw.tex);
+        gl.deleteFramebuffer(this.outRaw.fbo);
       }
       G.scratch();
       var tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, W, need, 0,
-                    gl.RED_INTEGER, gl.UNSIGNED_SHORT, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, lay.bytes === 2 ? gl.R16UI : gl.R8UI,
+                    tw, th, 0, gl.RED_INTEGER,
+                    lay.bytes === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_BYTE, null);
       nearest(gl, gl.TEXTURE_2D);
       var fbo = gl.createFramebuffer();
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -2526,37 +2559,47 @@
                               gl.TEXTURE_2D, tex, 0);
       var st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
       if (st !== gl.FRAMEBUFFER_COMPLETE) {
-        throw new Error("StudioGPU: no R16UI render target (status " + st + ")");
+        throw new Error("StudioGPU: no integer render target for " + format
+                        + " (status " + st + ")");
       }
-      this.out16 = { tex: tex, fbo: fbo, w: W, h: need, frameH: H };
+      this.outRaw = { tex: tex, fbo: fbo, w: tw, h: th, format: format,
+                      bytes: lay.bytes };
     }
-    var prog = G.program("pack16", FS_PACK16);
+    var prog = G.program("pack", FS_PACK);
     gl.useProgram(prog);
     G.bindTex(prog, "uTex", 0, cur.tex);
     gl.uniform1i(G.loc(prog, "uHeight"), H);
-    G.draw(this.out16);
+    gl.uniform1i(G.loc(prog, "uPacked"), lay.packed);
+    gl.uniform1f(G.loc(prog, "uScale"), lay.scale);
+    gl.uniform1f(G.loc(prog, "uMax"), lay.max);
+    gl.uniform3i(G.loc(prog, "uOrder"), lay.order[0], lay.order[1], lay.order[2]);
+    G.draw(this.outRaw);
     this.passCount++;
-    return this.out16;
+    return this.outRaw;
   };
 
-  /* The last render's picture as gbrp16le bytes, ready to hand to ffmpeg.
+  /* The last render's picture as the exact bytes ffmpeg's rawvideo demuxer
+   * wants, with the name of the format it is in.
    *
    * Only valid after render(config, {want16: true}); readPixels() above stays
-   * exactly as it was, 8 bit, for the preview and the parity harness. */
-  Instance.prototype.readPlanar16 = function () {
-    if (!this.out16) {
-      throw new Error("StudioGPU: render with {want16: true} before readPlanar16");
+   * exactly as it was, 8 bit RGB, for the preview and the parity harness. */
+  Instance.prototype.readOutput = function () {
+    var t = this.outRaw;
+    if (!t) {
+      throw new Error("StudioGPU: render with {want16: true} before readOutput");
     }
-    var gl = this.gl, t = this.out16;
-    var buf = new Uint16Array(t.w * t.h);
+    var gl = this.gl;
+    var buf = t.bytes === 2 ? new Uint16Array(t.w * t.h)
+                            : new Uint8Array(t.w * t.h);
     gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
-    // 16 bit rows: the default 4 byte pack alignment is right for an even
-    // width and wrong for an odd one, and this is the only place the buffer
-    // layout has to be exact.
-    gl.pixelStorei(gl.PACK_ALIGNMENT, 2);
-    gl.readPixels(0, 0, t.w, t.h, gl.RED_INTEGER, gl.UNSIGNED_SHORT, buf);
+    // The default 4 byte row alignment is right for some widths and silently
+    // wrong for others, and this is the one place the byte layout has to be
+    // exact.
+    gl.pixelStorei(gl.PACK_ALIGNMENT, t.bytes);
+    gl.readPixels(0, 0, t.w, t.h, gl.RED_INTEGER,
+                  t.bytes === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_BYTE, buf);
     gl.pixelStorei(gl.PACK_ALIGNMENT, 4);
-    return buf;
+    return { data: buf, format: t.format };
   };
 
   /* Upload an rgb48le source frame without touching it on the CPU.

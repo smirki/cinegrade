@@ -39,6 +39,7 @@ const SPEC_FILES = [
   "12-per-clip-grades.mjs",
   "13-window-editor.mjs",
   "14-proxy-playback.mjs",
+  "15-gpu-render.mjs",
 ];
 
 /* The one place every spec waits for "the app finished its first boot":
