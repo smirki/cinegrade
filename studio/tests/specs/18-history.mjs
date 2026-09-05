@@ -100,6 +100,32 @@ export default async function run(ctx) {
     });
   }
 
+  // How many characters of a row's message are actually ON SCREEN, not just
+  // present in the DOM (.hmsg's textContent is always the full string; only
+  // CSS clips it). Walks a Range over the message's own text node one
+  // character at a time and stops at the first offset whose bounding box
+  // crosses the visible box's own right edge, so this is the real rendered
+  // width doing the measuring, not a guess from font metrics.
+  async function visibleMsgChars(rowIndex) {
+    return page.evaluate((idx) => {
+      var rows = document.querySelectorAll("#historyRows .historyrow");
+      var row = rows[idx];
+      var msgEl = row && row.querySelector(".hmsg");
+      var textNode = msgEl && msgEl.firstChild;
+      if (!textNode || textNode.nodeType !== 3) return { visible: 0, boxWidth: msgEl ? msgEl.getBoundingClientRect().width : 0 };
+      var boxRight = msgEl.getBoundingClientRect().right;
+      var range = document.createRange();
+      var visible = 0;
+      for (var i = 1; i <= textNode.length; i++) {
+        range.setStart(textNode, 0);
+        range.setEnd(textNode, i);
+        if (range.getBoundingClientRect().right > boxRight + 0.5) break;
+        visible = i;
+      }
+      return { visible: visible, boxWidth: msgEl.getBoundingClientRect().width };
+    }, rowIndex);
+  }
+
   async function branchOptions() {
     return page.evaluate(() => {
       var sel = document.getElementById("histBranch");
@@ -228,6 +254,16 @@ export default async function run(ctx) {
     return fail('GET /api/project/log\'s own top commit message reads "' + topCommitMsg + '", expected it to name "exposure" too, not just the row shown on screen');
   }
   notes.push('slider edit added a "studio" row on top: "' + editRow.msg + '" (GET /api/project/log agrees: "' + topCommitMsg + '")');
+
+  // At the sidebar's default width, the message must not be crushed down to
+  // a couple of letters ("lay...") the way the id/time/branch pill used to
+  // starve it: GitKraken drops its OWN secondary columns first, so the
+  // message keeps a real, readable amount of text on screen even at 300px.
+  const editRowVisible = await visibleMsgChars(0);
+  if (editRowVisible.visible < 12) {
+    return fail("at the sidebar's default width, the exposure row's message shows only " + editRowVisible.visible + " visible character(s) (box " + editRowVisible.boxWidth.toFixed(1) + "px wide), expected at least 12");
+  }
+  notes.push("at the default sidebar width, the exposure row's message shows " + editRowVisible.visible + " visible character(s) (box " + editRowVisible.boxWidth.toFixed(1) + "px wide)");
   const headAfterEdit = await head();
 
   // --- 3. Undo: HEAD moves back, slider value reverts ---------------------

@@ -442,7 +442,13 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
   scrollbar-width: thin; scrollbar-color: var(--line2) var(--panel);
 }
 #historyGraph { flex: none; display: block; }
-.historyrows { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+/* container-type here (not on the whole History pane) means the query below
+   reads exactly the width a row's own content has to work with -- the
+   sidebar's width minus the graph column beside it -- the same box that
+   would otherwise crush the message down to a few letters ("lay...") on a
+   sidebar the user has not dragged wider, the way GitKraken drops its own
+   secondary columns first instead. */
+.historyrows { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; container-type: inline-size; container-name: historyrows; }
 
 /* One compact GitKraken style line, about 28px: avatar, the message taking
    whatever space is left (the only flexible thing on the row), branch pill
@@ -460,12 +466,24 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 .historyrow.head { background: var(--accent-wash); }
 .historyrow .hid { flex: none; color: var(--text-dim); }
 .historyrow .hmsg {
-  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  flex: 1 1 auto; min-width: 140px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; color: var(--text-hi); font-weight: 500;
 }
 /* Expanded: the full message, not just what fit on one line, alongside the
    already expanded change list below it. */
 .historyrow.expanded .hmsg { white-space: normal; overflow: visible; text-overflow: clip; }
+/* Below about 380px of actual row width (see .historyrows' container-type
+   above), the short id and the relative time are the first things to go,
+   the same priority order GitKraken's own row uses: the message keeps its
+   140px floor and everything spare, the branch pill stays (it is already
+   just the branch name, nothing left to trim), and id/time are still one
+   hover away on the row's own title (history.js) or, expanded, right back
+   in the row like normal -- .expanded is excluded from this rule on
+   purpose. */
+@container historyrows (max-width: 380px) {
+  .historyrow:not(.expanded) .hid,
+  .historyrow:not(.expanded) .htime { display: none; }
+}
 /* Branch pill: filled in the tip's own lane colour (--lane-hue, set inline
    in history.js), the same colour as that lane's nodes and edges in the
    graph column, so a glance ties a row to its place in the tree. */

@@ -304,6 +304,14 @@
     row.className = "historyrow" + (c.is_head ? " head" : "") + (state.expanded[c.id] ? " expanded" : "");
     row.dataset.commit = c.id;
     row.tabIndex = 0;
+    // A narrow sidebar hides .hid/.htime by container query (see style.css)
+    // rather than crushing the message down to a few letters, the way
+    // GitKraken drops its own secondary columns first; this single title on
+    // the row itself (not a second one on .hmsg, which would otherwise win
+    // the tooltip whenever the pointer sits over the message, the row's
+    // biggest area) keeps the short id and the exact time one hover away
+    // regardless of width, on top of the always visible expanded view.
+    row.title = c.short + " · " + absoluteTime(c.ts) + "\n" + (c.message || "");
 
     // One compact GitKraken style line: avatar, then the message (the
     // answer to "what changed", the founder's own framing: "like if i move
@@ -320,7 +328,10 @@
     var msg = document.createElement("span");
     msg.className = "hmsg";
     msg.textContent = c.message || "";
-    msg.title = c.message || ""; // the full text on hover even before expanding
+    // No title of its own: the row's own title above already carries the
+    // full message (plus the id/time this element's neighbours show when
+    // there is room), and a title here would shadow it for every pointer
+    // position that matters most, over the message text itself.
     row.appendChild(msg);
 
     if (c.is_tip) {
