@@ -85,13 +85,23 @@ def patch(cfg: dict, *patches: dict) -> dict:
 
 
 def set_path(cfg: dict, dotted: str, value):
-    """Set 'fx.halation.strength' style paths, returning a new config."""
+    """Set 'fx.halation.strength' style paths, returning a new config.
+
+    An all-digits component indexes a list, so 'layers.0.correct.exposure'
+    reaches into the layer stack. That is the only way a per-parameter sweep
+    can address a layer field at all, since `layers` is a list where every
+    other config path is a chain of dict keys.
+    """
     out = deepcopy(cfg)
     node = out
     keys = dotted.split(".")
     for k in keys[:-1]:
-        node = node[k]
-    node[keys[-1]] = value
+        node = node[int(k)] if k.isdigit() and isinstance(node, list) else node[k]
+    last = keys[-1]
+    if last.isdigit() and isinstance(node, list):
+        node[int(last)] = value
+    else:
+        node[last] = value
     return out
 
 
@@ -119,7 +129,8 @@ _STATS = {"renders": 0, "cache_hits": 0, "ffmpeg_seconds": 0.0}
 # one-off combinations, so the run records exactly which of those files it
 # referenced and cleans up only those. Deleting by "appeared during the run"
 # instead would also delete anything the studio server baked at the same time.
-CACHE_DIRS = [GRADE / "luts" / "secondary", GRADE / "luts" / "masks"]
+CACHE_DIRS = [GRADE / "luts" / "layers", GRADE / "luts" / "masks",
+              GRADE / "luts" / "slice"]
 _TOUCHED_CACHE: set[str] = set()
 
 

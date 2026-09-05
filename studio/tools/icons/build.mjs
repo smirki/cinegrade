@@ -43,7 +43,12 @@ const ICON_NAMES = [
   "LayoutAlignLeftIcon",
   "LayoutAlignRightIcon",
   "Sun03Icon",
-  "Moon02Icon"
+  "Moon02Icon",
+  "Layers01Icon",
+  "Add01Icon",
+  "Copy01Icon",
+  "ArrowDown01Icon",
+  "Delete01Icon"
 ];
 
 const pkgJsonPath = require.resolve("@hugeicons/core-free-icons/package.json");

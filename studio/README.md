@@ -226,8 +226,13 @@ content/
       index.html            layout, no logic
       style.css             flat dark theme, one accent colour
       controls.js           drag-scrub numbers, sliders, colour wheels, curve editor
+      huecurve.js            the Hue vs Hue/Sat/Lum, Lum vs Sat, Sat vs Sat editor
       schema.js             one entry per parameter in the engine defaults
       panels.js             builds the right hand panels from that schema
+      layers.js              the layers list: add, duplicate, move, remove, rename,
+                             select, the migration fallback for old presets
+      gpu.js                 WebGL2 re-implementation of the ffmpeg filter chain,
+                             used for the live preview
       app.js               state, requests, viewer, timeline, presets, keyboard
       login.html, login.css the login page, served instead of index.html with
                              no valid session
@@ -235,7 +240,7 @@ content/
                              the login page on any 401 from /api/
       grades.js             client half of per clip grades: autosave, the
                              saved indicator, the copy-grade picker
-      window-editor.js      the power window drawn and dragged on the picture
+      window-editor.js      the selected layer's window, drawn and dragged on the picture
       live.js               GPU still preview, the live loop, proxy playback
     tools/
       agent_grade.py         the Agent API proof: measure, patch, save, on a loop
@@ -244,15 +249,45 @@ content/
   grade/
     presets/*.json          shared with the CLI, this is where Save writes
     luts/looks/*.cube       the look list, this is where Import writes
-    luts/secondary/         qualifier cubes baked from the HSL panel (gitignored)
+    luts/layers/            layer correction cubes, one 33 point cube per layer (gitignored)
+    luts/slice/             Color Slice / Tetra cubes, 33 point (gitignored)
     out/                    finished renders
 ```
 
 The layout follows the pipeline. Panels on the right are in node order (Convert,
-Primaries, Curves, Secondary, Window, Look, FX, Grain, Detail, Letterbox, Output),
-which is also the order ffmpeg applies them, so reading top to bottom tells you what
-happened to the picture in what order. Window sits directly under Secondary because
-it is the shape half of the same node: it gates the qualifier and nothing else.
+Primaries, Curves, Hue curves, Color Slice, Layers, Look, FX, Grain, Detail,
+Letterbox, Output), which is also the order ffmpeg applies them, so reading top
+to bottom tells you what happened to the picture in what order. See "Pipeline
+order" below for the exact stage list as `build_graph` actually assembles it,
+including the one place it does not match this reading order.
+
+## Pipeline order
+
+This is the order `build_graph` in `grade/cinegrade.py` actually assembles the
+ffmpeg filter chain in, read straight from the code rather than copied from the
+plan (the plan and the code disagreed on one step, see below):
+
+```
+LOG -> PREP -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> SLICE
+     -> LAYERS(before_look) -> LOOK -> LAYERS(after_look)
+     -> FX -> GRAIN -> DETAIL -> LETTERBOX -> OUT
+```
+
+LOG is decode-normalise and exposure (`f_log_stage`). PREP is `prep.denoise`
+(hqdn3d): it runs right after LOG and before the CST in, not before LOG. The
+panel order in "Where things are" above (Convert, Primaries, Curves, Hue
+curves, Color Slice, Layers, Look, FX, Grain, Detail, Letterbox, Output) does
+not show Prep or Log as their own rows because they sit ahead of Convert and
+have no panel of their own; everything from Convert onward in that list is in
+the same order the graph runs it in. DETAIL is soften, sharpen, then
+mid_detail (a split, blur, blend local contrast pass), in that order.
+
+The one disagreement found writing this: an earlier draft of the
+`build_graph` docstring's own summary line said `PREP -> LOG`, while the code
+and the rest of that same docstring's prose (which says PREP runs "after
+f_log_stage's decode-normalise and exposure") both put LOG first. Code and the
+matching prose win; the summary line was wrong and has been corrected in
+place, not moved.
 
 ## What the numbers mean
 
@@ -304,7 +339,8 @@ defaults, so a partial config is legal everywhere.
 | `reveal` | POST | open a Finder window on the machine running the server; answers only that same machine, see Running it on the network below |
 | `match` | POST | fit a look cube toward a reference image, see Match Reference below |
 | `source` | POST | the decoded, downscaled source frame as raw rgb48le |
-| `lut` | POST | a technical, look or secondary cube as float32, for the GPU preview |
+| `lut` | POST | a technical, look, layer or slice (Color Slice / Tetra) cube as float32, for the GPU preview |
+| `grain/plate` | GET | a raw rgb48le grain plate for one stock/size/strength/seed/softness/color, for the GPU preview |
 | `session` | GET / POST | read or change the live config of the open page |
 | `session/wait` | GET | long poll, returns as soon as the live config moves |
 | `parity/report` | GET / POST | the GPU versus ffmpeg parity numbers |
@@ -334,21 +370,11 @@ for byte the same as before.
 
 - **Curves**, wired to ffmpeg's `curves` filter with `interp=pchip`. The editor uses
   the same monotone cubic the filter uses, so the line you drag is the line you get.
-- **HSL qualifier** (`secondary`), a hue / saturation / luma key with softness on each
-  window, correcting hue, saturation, luma and tint. It is baked into a 33-cube and
-  cached by hash. That makes it a table lookup at render time rather than a per pixel
-  expression, at the cost of being exact only to the resolution of that cube. The
-  Matte button shows the key.
-- **Power window** (`window`), one ellipse or rectangle that gates the qualifier, so
-  a correction lands only where the colour key and the shape agree. Centre, extent,
-  rotation and feather are all fractions of the frame, which is why the same window
-  means the same shape in a 960 wide preview and in the finished render. The matte is
-  baked to an 8-bit grey PNG by a `geq` expression and merged with `maskedmerge`, the
-  same technique the radial blur ramp uses. Both mattes take the same route into the
-  16-bit merge (`format=gray16le,format=gbrp16le`, a multiply by exactly 257), so
-  matte code 255 means the whole correction rather than 99.61% of it. The Matte button
-  shows the qualifier multiplied by the window, because that is what the grade
-  actually selects.
+- **Layers** (`layers`), any number of masked correction layers, each a hue /
+  saturation / luma key and/or a window gating where a correction lands. This
+  replaced the old single HSL qualifier plus one power window pair; see Layers
+  below for the full shape, the UI, the migration rule for old presets, and why a
+  layer's exposure, contrast, temperature and tint differ from the primaries panel's.
 
 While wiring the primaries panel a real bug turned up in the engine: `lift` and
 `gain` were implemented with `colorlevels`, whose output points are capped at 1.0, so
@@ -366,10 +392,11 @@ fell from 0.332 to 0.238 and mean saturation rose from 0.33 to 0.59, giving neon
 colour and blown skin.
 
 Set `convert.working_space` to `rec709` for that footage. It skips the log stage,
-CST IN and CST OUT and grades in place, while primaries, curves, the secondary,
-the look LUT, FX, grain, detail and letterbox all still run. Exposure, temperature
-and tint keep working and keep meaning stops; on this path a stop is a code
-multiply rather than a log offset, because there is no log curve to offset.
+CST IN and CST OUT and grades in place, while primaries, curves, hue curves,
+Color Slice, layers, the look LUT, FX, grain, detail and letterbox all still run.
+Exposure, temperature and tint keep working and keep meaning stops; on this path
+a stop is a code multiply rather than a log offset, because there is no log
+curve to offset.
 
 The two are not interchangeable and picking the wrong one is now refused with a
 message naming the right mode, rather than rendered wrong. The test is the clip's
@@ -460,42 +487,327 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
   http://127.0.0.1:7431/api/grade/copy
 ```
 
-## Power windows
+## Layers
 
-A window here is one shape, ellipse or rectangle, with a soft feather at its edge,
-and it does exactly one job: it limits WHERE the secondary correction (the HSL
-qualifier) applies, so "the orange only inside this oval" is one grade rather than
-two. Centre, extent, rotation and feather are all fractions of the frame, which is
-why the same numbers draw the same shape in a 960 wide preview and in the finished
-4K render.
+Layers (`layers`, an array) replace the old single `secondary` HSL qualifier
+plus one `window` shape pair with any number of masked correction layers.
+Each entry in the array is one layer: a mask that decides WHERE a correction
+lands, and a `correct` block that says what the correction actually is.
+Layers apply serially in array order, so re-ordering the list is the only way
+to re-order the maths (the engine test `layers.two_layers_apply_in_order`
+renders the same two layers in both orders and requires the pictures to
+differ).
 
-Draw one with the Window button (`#windowBtn`) in the toolbar: it shows the shape
-overlaid on the picture even before the window is switched on, so it can be
-positioned first and turned on once it is where it should be
-(`studio/static/window-editor.js`). Drag the centre to move it, the four edge
-handles to resize it, the small grip above it to rotate, and the ring around it to
-feather; arrow keys nudge by a fraction of a pixel, shift-arrow by ten. Dragging
-any handle auto-enables the window and ticks its checkbox, the same auto-enable a
-slider drag gets everywhere else in the app.
+### Mask: window and/or key
 
-It does not track and it does not keyframe: one shape, fixed for the whole clip.
-Following a moving subject, or animating the shape over time, is not built (see
-the Limits page).
+A layer's mask is the product of two independent parts, either of which can
+be on, off, or both together:
 
-Config keys, all under `"window"` in a clip's config:
+- **Window** (`mask.window`), one shape, ellipse or rectangle: `shape`
+  (`ellipse` or `rect`), `cx`/`cy` (centre, fraction of the frame), `w`/`h`
+  (full extent, not the half axis, fraction of the frame), `rotation`
+  (degrees clockwise on screen), `softness` (feather width as a fraction of
+  the shape's own radius), and its own `invert` (grades outside the shape
+  instead of inside).
+- **Key** (`mask.key`), the HSL qualifier: `hue_center`/`hue_width`/
+  `hue_soft` (degrees), `sat_low`/`sat_high`/`sat_soft` and `lum_low`/
+  `lum_high`/`lum_soft` (0 to 1), and its own `invert`.
+
+`mask.invert` inverts the COMBINED matte (window times key) as a whole, after
+both halves are computed, rather than either half on its own. With neither
+window nor key on, the matte is open everywhere and the layer is a global
+grade. All geometry is a fraction of the frame, never a pixel count, which is
+what lets a 960 wide preview and a 3840 wide render agree on the same shape
+with no special case in the preview scaler.
+
+`mask.show` stores "show this layer's matte" in the preset; for a quick look
+without touching the config, use the Matte button (`#maskBtn`) over the
+viewer instead, which shows the SELECTED layer's mask, not merely the first
+enabled one.
+
+### Correct
+
+All fields below are under a layer's `correct` block:
+
+| Field | Range | Unit |
+| --- | --- | --- |
+| `exposure` | -4 to 4 | stops |
+| `contrast` | 0.3 to 2.5 | pivots on `pivot`, or mid grey in the layer's own domain when `pivot` is null |
+| `saturation` | 0 to 2.5 | multiplier |
+| `temperature` | -0.5 to 0.5 | stops, positive is warmer |
+| `tint` | -0.5 to 0.5 | stops, positive is greener |
+| `hue_shift` | -180 to 180 | degrees |
+| `sat_gain` | 0 to 3 | multiplier |
+| `lum_gain` | 0 to 3 | multiplier |
+| `offset` | -0.4 to 0.4 each | an R, G, B push |
+| `blur` | 0 to 40 (a UI convenience, not an engine limit) | gaussian sigma in pixels, quoted at a 1920 wide frame |
+| `strength` | 0 to 1 | overall blend of the correction |
+
+`blur` runs on the corrected branch only, before the matte merge, so it stays
+inside the mask: a blur under a window softens inside the shape and leaves
+every pixel outside it byte identical. Because it is quoted at 1920 wide and
+resolved against the frame's real width (`layer_blur_sigma` in
+`grade/cinegrade.py`), a grade dialled on a 640 preview renders the same
+relative softness at delivery size instead of several times sharper.
+
+### Placement, and why a layer's exposure differs from the primaries panel's
+
+`placement` is `"before_look"` (between the curves/Color Slice node and the
+look LUT, where the old secondary always ran) or `"after_look"` (between the
+look and FX, correcting the graded picture). Either way, a layer runs after
+CST OUT: it always sees display referred Rec.709 code, never the log or
+working space signal primaries sees. A layer's exposure, contrast,
+temperature and tint are display side, and that changes two formulas, not
+just two controls: a layer's stop is a code multiply (2 to the power of
+stops divided by 2.4) rather than an offset on a log curve, because there is
+no log curve left to offset at that point in the graph, and contrast pivots
+on 0.4587 (Rec.709 mid grey) where primaries pivots on the mid grey of
+whatever working space it is in (0.3360 on the DaVinci Wide Gamut path). The
+same number typed into the two nodes is the same intent, not the same
+arithmetic; matching a primaries move with a layer has to be dialled by eye.
+
+### Cost
+
+Layers apply serially, and any number are allowed: nothing in the code caps
+the count. Each active layer costs about the same again: measured through
+the ffmpeg engine at 1920 wide, timed render (second run of each case, to
+exclude bake time): 0 layers 6.07s, 1 layer 9.30s, 2 layers 11.87s, 4 layers
+22.45s, each layer adding one `lut3d`, and, only when it carries a window,
+one `gblur` and one `maskedmerge`. Nothing amortises across layers, so four
+masked layers is roughly a three times longer render than none.
+
+### The UI
+
+The Layers panel (`studio/static/layers.js`) has an Add layer button, and
+each layer row has duplicate, move up, move down and remove buttons plus a
+rename field. Exactly one layer is selected at a time (tracked by a stable
+id, not by array index, so an undo cannot leave the marker on the wrong
+row); clicking a row's header selects it. The Window button (`#windowBtn`)
+over the picture targets the selected layer: with no layers at all it
+creates one and selects it, otherwise it just makes sure a real layer is
+selected, the same as clicking that layer's own header would.
+
+### Migrating an old preset or grade
+
+A config that still carries `secondary` and/or `window` and no `layers` key
+is rewritten into one layer on READ (`migrate_layers` in
+`grade/cinegrade.py`): the qualifier becomes `mask.key`, the shape becomes
+`mask.window`, and the new layer is enabled exactly when the old secondary
+was, which reproduces the old rule that a window switched on over a
+secondary switched off rendered no change at all. Files on disk are never
+rewritten; saving from the app writes the new shape. A config that somehow
+carries both `layers` and the old keys keeps only `layers`, the old keys are
+dropped as residue from a client that has not caught up.
+
+### A rendered example
+
+This two-layer config (`layers[0]` a colour key with no window, before the
+look; `layers[1]` an inverted window with a blur, after the look) was
+rendered through `./cinegrade still` end to end, not just written by hand and
+assumed to work:
 
 ```json
 {
-  "enabled": false, "shape": "ellipse",
-  "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
-  "rotation": 0.0, "softness": 0.15, "invert": false
+  "layers": [
+    {
+      "name": "Cool shadows",
+      "placement": "before_look",
+      "mask": {
+        "key": {
+          "enabled": true,
+          "hue_center": 210.0, "hue_width": 60.0, "hue_soft": 20.0,
+          "lum_low": 0.0, "lum_high": 0.35, "lum_soft": 0.1
+        }
+      },
+      "correct": {"temperature": -0.15, "lum_gain": 0.9, "strength": 1.0}
+    },
+    {
+      "name": "Edge warmth",
+      "placement": "after_look",
+      "mask": {
+        "window": {
+          "enabled": true, "shape": "ellipse",
+          "cx": 0.5, "cy": 0.5, "w": 0.7, "h": 0.7,
+          "softness": 0.3, "invert": true
+        }
+      },
+      "correct": {"temperature": 0.2, "exposure": -0.2, "blur": 40.0}
+    }
+  ]
 }
 ```
 
-`shape` is `"ellipse"` or `"rect"`; `cx`/`cy` are the centre; `w`/`h` are the FULL
-extent, not the half axis; `rotation` is degrees clockwise on screen; `softness`
-is the feather width as a fraction of the shape's own radius; `invert` swaps which
-side of the edge the correction lands on.
+```bash
+./cinegrade still footage/A001_09011336_C002.MOV --preset two-layer.json \
+  --time 2 --width 640 -o out.png
+```
+
+Verified: a 640 wide PNG rendered without error, and the ffmpeg filter graph
+it printed showed exactly what the config asks for. "Cool shadows" (key only,
+no window) baked as a single `lut3d` appended straight into the existing
+chain. "Edge warmth" (window only, inverted) came out as a `split`, a
+`lut3d` on one branch, a `gblur` on that branch, and a `maskedmerge` back
+together under the window matte. The source is a 2160 wide portrait clip,
+and the blur sigma in that printed graph was 45.000, matching `40 * 2160 /
+1920` exactly.
+
+## Hue curves, Color Slice and Tetra
+
+Two stages, baked into the same kind of cube as Layers:
+
+**Hue curves** (`hue_curves`), five curves against the picture's own hue
+wheel: Hue vs Hue, Hue vs Sat, Hue vs Lum, Lum vs Sat, Sat vs Sat. The
+neutral is a flat olive line, not a diagonal: a point on Hue vs Hue is an
+offset in turns of the wheel, a point on any of the other four is a
+multiplier around 1.0, and no points at all is the identity. The three hue
+axes wrap, so a point near the left edge and one near the right edge are
+neighbours.
+
+**Color Slice** (`slice`), six hue vectors (red, yellow, green, cyan, blue,
+magenta) plus a measured skin vector, each with its own `hue` (degrees of
+rotation, -60 to 60), `sat` (multiplier, 0 to 2) and `density` (-1 to 1,
+darkens; negative brightens), plus one global `density` (-1 to 1) that acts
+on every pixel at once regardless of hue. A pixel's weight for a vector is a
+raised cosine of its hue distance from that vector's centre, zero at 60
+degrees and scaled by the pixel's own saturation, so a grey pixel never
+moves; the six chromatic weights sum to exactly 1 at every hue. Density is
+`L' = L * (1 - density * S)` for the global control and
+`L' = L * (1 - density * S * weight)` for a vector, and because a vector's
+weight already carries the pixel's saturation, a vector carries saturation
+twice where the global carries it once: measured on real footage at 640
+wide, all six vector densities at 1 darken mean luma by 0.01369, the global
+density at 1 by 0.06414, 4.68 times stronger at the same number over the
+same pixels.
+
+The skin vector's centre is measured, not chosen: 20.8696 degrees, the hue of
+the engine's own skin probe (`grade/tools/match_ref.py`,
+`PROBES["skin"] = (0.55, 0.40, 0.32)`), the same colour `match_ref` already
+refuses to let a match break.
+
+**Tetra**, a fold inside Color Slice, moves the six RGB cube corners (red,
+yellow, green, cyan, blue, magenta), each an R/G/B trio from -1 to 1, with
+black and white pinned so the whole neutral axis stays fixed, interpolated
+tetrahedrally over the cube.
+
+Both stages are pure functions of one pixel's RGB, so the whole of Hue
+curves, the seven Color Slice vectors, the global density and Tetra collapse
+into a single 33 point `.cube` (`grade/slice.py`, cached under
+`grade/luts/slice/`), read with `lut3d=interp=tetrahedral` in ffmpeg and the
+same tetrahedral maths on the GPU. That is what keeps the cost flat no
+matter how many of these controls are on, and the price is quantisation:
+baking the same worst case hue sweep at three cube sizes gave a max code
+difference of 4.222 at 17 points, 2.216 at 33 (the size this engine uses),
+and 0.689 at 65.
+
+This is not Resolve's Color Slice, and Tetra here is not the Tetra DCTL: no
+comparison against either was run, because neither is installed on this
+machine, and the names are borrowed only because they describe what the
+controls are for.
+
+## Grain
+
+New fields on `grain`: `stock` (`custom`, `16mm`, `35mm`, `65mm`),
+`softness`, `response` (`flat` or `film`), `color`, `seed`.
+
+A stock preset REPLACES `size`, `strength` and `softness` outright rather
+than nudging them; `opacity`, `response`, `color` and `seed` are unaffected.
+Measured on real footage at 1920 wide: `65mm` is size 2, strength 20,
+softness 0.0 (finest, lightest); `35mm` is size 3, strength 40, softness 0.0
+(this panel's old default, unchanged); `16mm` is size 6, strength 55,
+softness 0.35 (coarsest, heaviest).
+
+`response: "film"` weights the grain's amplitude by the pixel's own
+luminance after the look and FX have already run: full strength at and below
+mid grey, easing on a smoothstep to a quarter strength at white. `color` is
+0 (one grey plate, identical on red, green and blue) to 1 (three independent
+plates, one per channel), mixing between them in between. `seed` 0
+reproduces the exact plate this panel has always rendered; any other value
+reseeds ffmpeg's noise generator to a different plate with the same
+statistics.
+
+The GPU preview renders grain from a real server-baked plate rather than
+approximating it: `GET /api/grain/plate` returns the same build_graph text
+ffmpeg's own grain block runs, as raw rgb48le, so the two cannot drift
+apart. Parity against ffmpeg on a rendered still, across four grain configs
+(the defaults, the 35mm stock, `response: "film"`, `color: 1`) at 640 and
+1280 wide: mean channel difference 0.006 of 255, max 1, 0 percent of
+channels over 1. That is for a still only: the plate is one frame's worth,
+cached, not one plate per output frame, so a playing or looping preview
+reuses that plate on every frame. A multi-frame render (`render_gpu.py`)
+still routes grain to ffmpeg on purpose, which is what gives every output
+frame ffmpeg's own per-frame noise instead of one frozen plate repeated.
+
+## Detail and denoise
+
+`detail.mid_detail` (-1 to 1) is local contrast: the same split, blur, blend
+idea as sharpen, but on a wide gaussian, sigma 2 percent of the frame width
+(with a 1.0 pixel floor) rather than a fixed radius, so it moves midtone
+texture instead of edges. Measured on real footage at 1920 wide: +1.0 moves
+the whole frame by a mean of 6.7 of 255, -1.0 by 6.8, roughly the same
+either way; a hard edge already in the shot can still swing far more than
+that at that one edge. It is one radius only, not Resolve's multi-scale
+midtone detail tool.
+
+GPU parity for mid_detail was FAILING, up to 1.10 percent of channel samples
+off by the full code range, until a fix landed on `f_mid_detail_segment`:
+ffmpeg's `blend` filter does not clip an out of range `all_expr` result, it
+casts the float to the plane's integer type, so a value like -242 wraps to
+65294 (16 bit) instead of clamping to 0. Wrapping `clip(...,0,65535)` around
+the same blend expression made both engines clamp at the same point. All six
+mid_detail parity rows (0.5, 1.0 and -0.5, at 640 and 1280 wide) now measure
+EXACT: max 1 code value, 0 percent of channel samples off by more than 1,
+mean 0.0056 to 0.0060 of 255.
+
+`prep.denoise` maps `spatial` and `temporal` (each 0 to 1) onto ffmpeg's
+hqdn3d, both scaled 0 to 8 (0.5 lands near hqdn3d's own no-argument default
+of 4.0), luma and chroma set equal since there is no separate split on this
+RGB buffer. It runs right after the log stage and before the CST in, not
+before the log stage (see Pipeline order above). Denoise is not part of the
+GPU preview: turning it on always falls back to a server render, though
+hqdn3d itself is not what makes that slow (measured 0.513s with denoise on
+against 0.515s off, rendering the same still five times each way at 1920
+wide); the server round trip, not hqdn3d, is the cost.
+
+Temporal denoise cannot show properly on a still: it needs real motion
+between frames to do anything. Measured max difference on a single still is
+4.15 of 255, mean 0.95, which is hqdn3d's own rounding on its first frame,
+not a bug; on an actual render it moves a mid frame by a mean of 2.52 of 255
+and a max of 24.45, several times the still's residual.
+
+## Two look slots
+
+`look` now has a second slot, `lut2`/`mix2`, blended against the first with
+`balance`, not stacked in series: `A = lerp(base, lut1(base), mix)`,
+`B = lerp(base, lut2(base), mix2)`, `out = lerp(A, B, balance)`. Both slots
+read the same pre-look signal and never see each other's output.
+
+With `lut2` unset, the graph text is unchanged, not merely close: 0 of 255
+max difference against today's single-slot output on both test clips, even
+with `balance` and `mix2` pushed away from their defaults. At `balance` 1.0
+with `mix2` 1.0 the output is 0 of 255 max difference against `lut2` applied
+alone. At `balance` 0.5 the output matches the pixel average of the two
+branches to within 0.50 of 65535, read back at 16 bit. The GPU shader port
+renders the same parallel blend: both new parity rows (`balance` 0.5,
+`balance` 1.0 with `mix2` 1.0) measure EXACT at 640 and 1280 wide.
+
+## Apple Log 2
+
+Not shipped. The rule for adding a new transfer function is that only
+Apple's own published document counts as a source for the curve, the
+primaries chromaticities and the sample values, never a third party page
+quoting constants, and Apple's own document could not be fetched: its Apple
+Log 2 page (avfoundation/avcapturecolorspace/applelog2) is real but prose
+only, "an Apple defined Log curve" with no formula or numbers, and
+developer.apple.com's downloads search for the white paper redirects to an
+Apple ID sign-in wall; guessed direct PDF URLs following the existing Apple
+Log white paper's naming pattern also redirect to an unauthorized page.
+Nothing was invented to fill the gap: no `apple_log2` value exists for
+`convert.working_space`, no code claims to decode it, and neither clip in
+`footage/` is shot on it.
+
+What would unblock it: Apple's own Apple Log 2 white paper PDF, placed
+somewhere this engine can read it, since that download is gated behind an
+Apple developer login the founder would have to use.
 
 ## Playback
 
@@ -694,6 +1006,17 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   http://127.0.0.1:7431/api/session
 ```
 
+`deep_merge` only recurses into dict values: a list-valued field, `layers`
+being the one an agent is most likely to touch, is REPLACED WHOLE by whatever
+list the patch sends, not merged entry by entry. Verified against a real
+running server: seeding two layers (`layers: [{"name": "L1"}, {"name":
+"L2"}]`) and then patching with one (`layers: [{"name": "OnlyOne"}]`) left
+the live config with exactly one layer, `OnlyOne`, not three and not the
+first patch's two layers with the second's appended. An agent that wants to
+add or remove one layer has to read the current `layers` array first
+(`GET /api/session` or the `config` a prior response already carries), edit
+it in Python or JS, and send the whole array back.
+
 **`POST /api/stats`**: `{"clip": NAME, "time": SECONDS, "width": 480,
 "config": CONFIG}` renders that one frame and returns
 `{"key", "stats", "size"}`. This is how an agent measures whether a patch
@@ -781,13 +1104,19 @@ report, and this file is prose written about a moment in time.
 
 The Limits button splits this into three answers that used to be run together:
 what is genuinely not possible here (editing, audio, tracking, motion,
-compositing), what is possible but not built yet (keyframes via `sendcmd`,
-several secondaries, HDR, and node reordering), and what is still broken or
-approximate. Drawn, draggable power windows and GPU proxy playback both moved out
-of "not built yet" during this arc: see "Power windows" and "Playback" above for
-what shipped and what each still leaves out (one shape with no tracking or
-keyframes for a window; an 8-bit proxy rather than the 16-bit still path for
-playback). Each claim in there was measured on this build. Notably, hardware
-accelerated final render is possible but only worth about 16%, because the
-filters are roughly 80% of the time and VideoToolbox does not accelerate filters
-at all.
+compositing), what is possible but not built yet (keyframes via `sendcmd`, HDR,
+and node reordering), and what is still broken or approximate. Drawn, draggable
+windows, the layer stack that replaced the single secondary, hue curves, Color
+Slice, grain stocks, and GPU proxy playback all moved out of "not built yet"
+during this arc: see "Layers", "Hue curves, Color Slice and Tetra", "Grain" and
+"Playback" above for what shipped and what each still leaves out (one shape per
+layer with no tracking or keyframes for a window; an 8-bit proxy rather than the
+16-bit still path for playback). Each claim in there was measured on this
+build. `studio/static/limits.js` still has one stale line of its own from
+before this arc closed: its "Several look slots." entry (in the "possible but
+not built" list) says "Several LOOK slots is still not built", which a later
+entry in the same file ("Look now has two slots, but they blend in parallel,
+not a stack.") contradicts and cross-references directly; see Two look slots
+below for what actually shipped. Notably, hardware accelerated final render is
+possible but only worth about 16%, because the filters are roughly 80% of the
+time and VideoToolbox does not accelerate filters at all.

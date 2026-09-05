@@ -323,11 +323,21 @@ def ramp_response(filters: list[str], width: int = 640, height: int = 4,
 
 
 # --------------------------------------------------------------------------
-# secondary qualifier: reproduce cinegrade.secondary_lut's own math, but
+# the colour key: reproduce cinegrade.layer_lut's own qualifier math, but
 # evaluated on the ACTUAL rendered frame's pixels rather than an identity
 # grid, so it can be used to partition real pixels into "inside the key" and
 # "outside the key" for a real pixel-diff measurement.
+#
+# The engine used to carry one `secondary` block; it now carries a list of
+# layers, and the qualifier is layers[i].mask.key. sec_cfg() below turns the
+# old spelling this audit is written in into the shape the engine reads, using
+# the engine's own migration rather than a second copy of the mapping.
 # --------------------------------------------------------------------------
+
+
+def sec_cfg(s: dict) -> dict:
+    """An old-style secondary block, as the layers config the engine now reads."""
+    return CG.migrate_layers({"secondary": dict(s)})
 
 def soft_window(x: np.ndarray, low: float, high: float, soft: float) -> np.ndarray:
     s = max(1e-6, float(soft))
@@ -917,7 +927,7 @@ def test_secondary() -> None:
     log("secondary: inside vs outside key")
     mask = secondary_mask(off_rgb, s_def)
     push = dict(s_def, hue_shift=60.0, sat_gain=1.8)
-    on_rgb, _ = render(MAIN_CLIP, base({"secondary": dict(push, enabled=True)}))
+    on_rgb, _ = render(MAIN_CLIP, base(sec_cfg(dict(push, enabled=True))))
     pd = pop_diff(off_rgb, on_rgb, mask)
     isolated = pd["inside_mean_abs_diff"] > pd["outside_mean_abs_diff"] * 3.0
     record("secondary (key isolation)", "works" if isolated else "partially works",
@@ -930,8 +940,8 @@ def test_secondary() -> None:
                     f"outside={pd['outside_mean_abs_diff']:.2f}")
 
     log("secondary: invert")
-    sm_off, _ = render(MAIN_CLIP, base({"secondary": dict(s_def, show_mask=True, invert=False, enabled=True)}))
-    sm_inv, _ = render(MAIN_CLIP, base({"secondary": dict(s_def, show_mask=True, invert=True, enabled=True)}))
+    sm_off, _ = render(MAIN_CLIP, base(sec_cfg(dict(s_def, show_mask=True, invert=False, enabled=True))))
+    sm_inv, _ = render(MAIN_CLIP, base(sec_cfg(dict(s_def, show_mask=True, invert=True, enabled=True))))
     pct_off, pct_inv = keyed_pct(sm_off), keyed_pct(sm_inv)
     complementary = abs((pct_off + pct_inv) - 100.0) < 5.0
     record("secondary.invert", "works" if complementary else "partially works",
@@ -942,7 +952,7 @@ def test_secondary() -> None:
                     f"{pct_off + pct_inv:.2f}%")
 
     log("secondary.show_mask")
-    corrected_rgb, _ = render(MAIN_CLIP, base({"secondary": dict(push, enabled=True, show_mask=False)}))
+    corrected_rgb, _ = render(MAIN_CLIP, base(sec_cfg(dict(push, enabled=True, show_mask=False))))
     matte_looks_grey = bool(np.abs(sm_off[..., 0].astype(np.int16) - sm_off[..., 1].astype(np.int16)).mean() < 1.0)
     record("secondary.show_mask", "works" if matte_looks_grey else "partially works",
           f"show_mask renders a greyscale matte (r/g/b cross-channel gap {np.abs(sm_off[..., 0].astype(np.int16) - sm_off[..., 1].astype(np.int16)).mean():.2f}) "
@@ -953,8 +963,8 @@ def test_secondary() -> None:
           direction="claim: show_mask displays a matte, not the graded image; confirmed by cross-channel gap and diff from corrected render")
 
     log("secondary.strength")
-    half_rgb, _ = render(MAIN_CLIP, base({"secondary": dict(push, enabled=True, strength=0.5)}))
-    full_rgb, _ = render(MAIN_CLIP, base({"secondary": dict(push, enabled=True, strength=1.0)}))
+    half_rgb, _ = render(MAIN_CLIP, base(sec_cfg(dict(push, enabled=True, strength=0.5))))
+    full_rgb, _ = render(MAIN_CLIP, base(sec_cfg(dict(push, enabled=True, strength=1.0))))
     pd_half = pop_diff(off_rgb, half_rgb, mask)
     pd_full = pop_diff(off_rgb, full_rgb, mask)
     ratio = pd_half["inside_mean_abs_diff"] / pd_full["inside_mean_abs_diff"] if pd_full["inside_mean_abs_diff"] else float("nan")
@@ -981,7 +991,7 @@ def test_secondary() -> None:
     for pname, (pushed_val, note) in sweeps.items():
         cfg = dict(s_def, show_mask=True, enabled=True)
         cfg[pname] = pushed_val
-        arr, _ = render(MAIN_CLIP, base({"secondary": cfg}))
+        arr, _ = render(MAIN_CLIP, base(sec_cfg(cfg)))
         pct = keyed_pct(arr)
         moved = pct != base_pct
         sweep_rows[pname] = {"pushed_value": pushed_val, "default_pct_keyed": base_pct,
@@ -1001,7 +1011,7 @@ def test_secondary() -> None:
     # gets its own overlap measurement rather than reusing the sweep loop.
     moved_center = (hue_center + 90.0) % 360.0
     moved_cfg = dict(s_def, hue_center=moved_center, show_mask=True, enabled=True)
-    moved_arr, _ = render(MAIN_CLIP, base({"secondary": moved_cfg}))
+    moved_arr, _ = render(MAIN_CLIP, base(sec_cfg(moved_cfg)))
     moved_pct = keyed_pct(moved_arr)
     mask_default = sm_off[..., 0] >= 128
     mask_moved = moved_arr[..., 0] >= 128
@@ -1024,12 +1034,12 @@ def test_secondary() -> None:
     # defaults, and with the window narrowed so there is an edge for softness
     # to act on.
     ls_default_cfg = dict(s_def, show_mask=True, enabled=True, lum_soft=0.4)
-    ls_default_arr, _ = render(MAIN_CLIP, base({"secondary": ls_default_cfg}))
+    ls_default_arr, _ = render(MAIN_CLIP, base(sec_cfg(ls_default_cfg)))
     ls_default_pct = keyed_pct(ls_default_arr)
     narrow = dict(s_def, lum_low=0.2, lum_high=0.8)
-    narrow_base_arr, _ = render(MAIN_CLIP, base({"secondary": dict(narrow, show_mask=True, enabled=True)}))
+    narrow_base_arr, _ = render(MAIN_CLIP, base(sec_cfg(dict(narrow, show_mask=True, enabled=True))))
     narrow_base_pct = keyed_pct(narrow_base_arr)
-    narrow_soft_arr, _ = render(MAIN_CLIP, base({"secondary": dict(narrow, show_mask=True, enabled=True, lum_soft=0.4)}))
+    narrow_soft_arr, _ = render(MAIN_CLIP, base(sec_cfg(dict(narrow, show_mask=True, enabled=True, lum_soft=0.4))))
     narrow_soft_pct = keyed_pct(narrow_soft_arr)
     narrow_moved = narrow_soft_pct != narrow_base_pct
     verdict = "partially works" if (base_pct == ls_default_pct and narrow_moved) else ("works" if narrow_moved else "inert")
@@ -1053,7 +1063,7 @@ def test_secondary() -> None:
         "tint": dict(s_def, tint=[0.25, -0.1, 0.2]),
     }
     for pname, cfg in solo_pushes.items():
-        arr, _ = render(MAIN_CLIP, base({"secondary": dict(cfg, enabled=True)}))
+        arr, _ = render(MAIN_CLIP, base(sec_cfg(dict(cfg, enabled=True))))
         pd_solo = pop_diff(off_rgb, arr, mask)
         isolated = pd_solo["inside_mean_abs_diff"] > pd_solo["outside_mean_abs_diff"] * 3.0
         record(f"secondary.{pname}", "works" if isolated else "partially works",

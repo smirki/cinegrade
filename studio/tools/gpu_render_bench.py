@@ -182,15 +182,19 @@ def preset_grain_off(name: str) -> dict:
     return cfg
 
 
-def preset_window_secondary(name: str) -> dict:
-    """A preset plus a real power window gating a real secondary."""
+def preset_window_layer(name: str) -> dict:
+    """A preset plus one layer: a real power window gating a real colour key."""
     cfg = preset_grain_off(name)
-    cfg["secondary"] = dict(CG.DEFAULTS["secondary"], enabled=True,
-                            hue_center=210.0, hue_width=70.0, hue_soft=20.0,
-                            sat_low=0.05, sat_gain=1.25, hue_shift=-8.0,
-                            lum_gain=1.05)
-    cfg["window"] = dict(CG.DEFAULTS["window"], enabled=True, cx=0.45, cy=0.42,
-                         w=0.55, h=0.5, rotation=12.0, softness=0.25)
+    cfg["layers"] = [CG.deep_merge(CG.LAYER_DEFAULTS, {
+        "mask": {
+            "key": {"enabled": True, "hue_center": 210.0, "hue_width": 70.0,
+                    "hue_soft": 20.0, "sat_low": 0.05},
+            "window": {"enabled": True, "cx": 0.45, "cy": 0.42,
+                       "w": 0.55, "h": 0.5, "rotation": 12.0,
+                       "softness": 0.25},
+        },
+        "correct": {"sat_gain": 1.25, "hue_shift": -8.0, "lum_gain": 1.05},
+    })]
     return cfg
 
 
@@ -198,7 +202,7 @@ def run_parity(args) -> list:
     results = []
     cases = [
         ("cinematic-grainoff", preset_grain_off("cinematic")),
-        ("natural-window-sec", preset_window_secondary("natural")),
+        ("natural-window-layer", preset_window_layer("natural")),
     ]
     for tag, cfg in cases:
         ff = render(args.base, "ffmpeg", args.clip, cfg, f"w3b-{tag}-ffmpeg",

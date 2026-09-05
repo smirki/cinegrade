@@ -114,7 +114,7 @@ NO_BLOOM = {"fx": {"bloom": {"enabled": False}}}
 NO_SPLIT = {"fx": {"rgb_split": {"enabled": False}}}
 NO_RADIAL = {"fx": {"radial_blur": {"enabled": False}}}
 NO_GRAIN = {"grain": {"enabled": False}}
-NO_SEC = {"secondary": {"enabled": False}}
+NO_LAYER = {"layers": []}
 NO_LOOK = {"look": {"lut": None}}
 
 HAL = {"fx": {"halation": {"enabled": True}}}
@@ -130,20 +130,65 @@ CURVE_ON = {"curves": {"enabled": True,
 # overshoot; pchip cannot, which is why the engine defaults to it.
 CURVE_SPARSE = {"curves": {"enabled": True,
                            "master": [[0.0, 0.0], [0.12, 0.42], [1.0, 1.0]]}}
+def _layer(mask=None, correct=None):
+    """One masked layer, LAYER_DEFAULTS plus patches, wrapped as a case base.
+
+    A layer base cannot be a sparse patch the way every other base in this file
+    is. `layers` is a list, so H.patch replaces it whole instead of merging key
+    by key, and a half written layer would quietly render with whatever the
+    engine defaults the missing halves to.
+    """
+    return {"layers": [cg.deep_merge(
+        cg.LAYER_DEFAULTS, {"mask": mask or {}, "correct": correct or {}})]}
+
+
 # Clip A is 35% orange by area, so the default 30 degree hue centre keys a
 # large, real part of the frame rather than a handful of stray pixels.
-SEC_ON = {"secondary": {"enabled": True, "hue_center": 30.0,
-                        "sat_gain": 2.2, "lum_gain": 1.25}}
+SEC_ON = _layer(mask={"key": {"enabled": True, "hue_center": 30.0}},
+                correct={"sat_gain": 2.2, "lum_gain": 1.25})
 CONTRASTED = {"primaries": {"contrast": 1.45}}
+
+# The hue curves and Color Slice stage. Both bases are the stage ENABLED with
+# every control still at neutral, which the engine treats as identity and
+# leaves out of the graph entirely, so the "lo" render of each sweep below is
+# the ungraded frame and the delta metric reads as the tool's whole effect.
+SLICE_ON = {"slice": {"enabled": True}}
+NO_SLICE = {"slice": {"enabled": False}}
+TETRA_ON = {"slice": {"enabled": True, "tetra": {"enabled": True}}}
+HC_ON = {"hue_curves": {"enabled": True}}
+NO_HC = {"hue_curves": {"enabled": False}}
+
+
+# Which half of a layer each keyword handed to _sec belongs to. The
+# qualifier's field names and the correction's are disjoint, so the routing is
+# unambiguous rather than a guess.
+KEY_FIELDS = set(cg.LAYER_DEFAULTS["mask"]["key"])
 
 
 def _sec(**kw):
-    base = {"secondary": dict(SEC_ON["secondary"])}
-    base["secondary"].update(kw)
-    return base
+    """SEC_ON with fields overridden, each routed to the key or the correction."""
+    key = dict(SEC_ON["layers"][0]["mask"]["key"])
+    correct = dict(SEC_ON["layers"][0]["correct"])
+    for k, v in kw.items():
+        (key if k in KEY_FIELDS else correct)[k] = v
+    return _layer(mask={"key": key}, correct=correct)
 
 
 CASES = [
+    # --- prep --------------------------------------------------------------
+    # Runs first, right after decode, before the CST. spatial is not swept
+    # here: hqdn3d is edge-preserving, so on a whole busy real frame it is
+    # not the simple monotone "less high-frequency energy" story soften is.
+    # Measured directly: spatial 0.0 -> 1.0 at 320 wide RAISED whole-frame hf
+    # energy (0.003968 -> 0.005002), the opposite of what a naive blur would
+    # do, while still lowering the spread of a flat patch, which is the
+    # actually-meaningful claim for a denoiser and is what cases_detail.py
+    # tests (see COVERED_ELSEWHERE below).
+    P("prep.denoise.enabled", False, True, "delta", "up",
+      base={"prep": {"denoise": {"spatial": 0.5, "temporal": 0.0}}},
+      ref={"prep": {"denoise": {"enabled": False}}},
+      doc="the toggle must change pixels once spatial is non-zero"),
+
     # --- convert ---------------------------------------------------------
     P("convert.tonemap", "aces", "none", "clip_high", "up",
       base={"convert": {"exposure": 1.5, "working_space": "direct"}},
@@ -195,6 +240,8 @@ CASES = [
     # --- detail ----------------------------------------------------------
     P("detail.soften", 0.0, 3.0, "hf", "down", doc="soften removes detail"),
     P("detail.sharpen", 0.0, 1.5, "hf", "up", doc="sharpen adds edge energy"),
+    P("detail.mid_detail", -1.0, 1.0, "hf", "up",
+      doc="mid_detail is local contrast: negative softens, positive adds detail"),
 
     # --- fx.halation -----------------------------------------------------
     P("fx.halation.enabled", False, True, "delta", "up", ref=NO_HAL,
@@ -263,6 +310,10 @@ CASES = [
     P("grain.size", 1, 8, "hf", "down", base=GRAIN,
       doc="size is the plate's downscale factor, so bigger grain is coarser "
           "and carries less per-pixel energy"),
+    P("grain.softness", 0.0, 1.5, "effect_hf", "down", base=GRAIN, ref=NO_GRAIN,
+      doc="softness blurs the plate before it is blended in, so the grain's "
+          "own high-frequency content falls even though the picture still "
+          "has grain on it"),
     P("grain.opacity", 0.10, 0.90, "delta", "up", base=GRAIN,
       ref={"grain": {"enabled": False}},
       doc="opacity is the overlay blend weight"),
@@ -292,49 +343,115 @@ CASES = [
       "b_mean", "up", base={"curves": {"enabled": True}},
       doc="the blue curve moves blue"),
 
-    # --- secondary -------------------------------------------------------
-    P("secondary.enabled", False, True, "delta", "up", base=SEC_ON, ref=NO_SEC,
-      doc="the qualifier must apply its correction"),
-    P("secondary.hue_center", 30.0, 210.0, None, None, base=SEC_ON,
+    # --- layers ----------------------------------------------------------
+    # One masked layer, which is what the old single secondary and its single
+    # window became. Every path here is layers.0.*, addressing the first layer
+    # of the stack the case's base installed.
+    P("layers.0.enabled", False, True, "delta", "up", base=SEC_ON, ref=NO_LAYER,
+      doc="a disabled layer renders the ungraded frame, an enabled one corrects"),
+    P("layers.0.mask.key.enabled", False, True, "changed", "down",
+      base=SEC_ON, ref=NO_LAYER,
+      doc="with the key off the correction is global, with it on it is keyed"),
+    P("layers.0.mask.key.hue_center", 30.0, 210.0, None, None, base=SEC_ON,
       doc="moving the key to a different hue keys different pixels"),
-    P("secondary.hue_width", 20.0, 200.0, "changed", "up", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.hue_width", 20.0, 200.0, "changed", "up",
+      base=SEC_ON, ref=NO_LAYER,
       doc="a wider hue window keys more of the frame"),
-    P("secondary.hue_soft", 2.0, 70.0, "changed", "up", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.hue_soft", 2.0, 70.0, "changed", "up",
+      base=SEC_ON, ref=NO_LAYER,
       doc="softness grows the selection outward, per _soft_window's docstring"),
-    P("secondary.sat_low", 0.0, 0.65, "changed", "down", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.sat_low", 0.0, 0.65, "changed", "down",
+      base=SEC_ON, ref=NO_LAYER,
       doc="raising the saturation floor keys fewer pixels"),
-    P("secondary.sat_high", 1.0, 0.25, "changed", "down", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.sat_high", 1.0, 0.25, "changed", "down",
+      base=SEC_ON, ref=NO_LAYER,
       doc="lowering the saturation ceiling keys fewer pixels"),
-    P("secondary.sat_soft", 0.02, 0.45, "changed", "up",
-      base=_sec(sat_low=0.25), ref=NO_SEC,
+    P("layers.0.mask.key.sat_soft", 0.02, 0.45, "changed", "up",
+      base=_sec(sat_low=0.25), ref=NO_LAYER,
       doc="softness grows the saturation window outward"),
-    P("secondary.lum_low", 0.0, 0.55, "changed", "down", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.lum_low", 0.0, 0.55, "changed", "down",
+      base=SEC_ON, ref=NO_LAYER,
       doc="raising the luma floor keys fewer pixels"),
-    P("secondary.lum_high", 1.0, 0.30, "changed", "down", base=SEC_ON, ref=NO_SEC,
+    P("layers.0.mask.key.lum_high", 1.0, 0.30, "changed", "down",
+      base=SEC_ON, ref=NO_LAYER,
       doc="lowering the luma ceiling keys fewer pixels"),
-    P("secondary.lum_soft", 0.02, 0.45, "changed", "up",
-      base=_sec(lum_low=0.30), ref=NO_SEC,
+    P("layers.0.mask.key.lum_soft", 0.02, 0.45, "changed", "up",
+      base=_sec(lum_low=0.30), ref=NO_LAYER,
       doc="softness grows the luma window outward"),
-    P("secondary.hue_shift", 0.0, 90.0, "delta", "up",
-      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0), ref=NO_SEC,
-      doc="hue shift rotates the keyed hue"),
-    P("secondary.sat_gain", 1.0, 2.5, "sat_mean", "up",
-      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
-      doc="saturation gain on the keyed range"),
-    P("secondary.lum_gain", 1.0, 1.8, "luma_mean", "up",
-      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
-      doc="luma gain on the keyed range"),
-    P("secondary.tint", [0.0, 0.0, 0.0], [0.25, 0.0, 0.0], "r_mean", "up",
-      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
-      doc="tint adds a flat colour to the keyed range"),
-    P("secondary.strength", 0.2, 1.0, "delta", "up",
-      base=_sec(hue_width=90.0), ref=NO_SEC,
-      doc="strength mixes the correction back toward the original"),
-    P("secondary.invert", False, True, None, None,
+    P("layers.0.mask.key.invert", False, True, None, None,
       base=_sec(hue_width=90.0),
       doc="invert keys the complement of the selection"),
-    P("secondary.show_mask", False, True, None, None, base=SEC_ON,
-      doc="show_mask replaces the picture with the greyscale matte"),
+    P("layers.0.mask.show", False, True, None, None, base=SEC_ON,
+      doc="mask show replaces the picture with the greyscale matte"),
+    P("layers.0.correct.exposure", 0.0, 0.5, "luma_mean", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0),
+      doc="exposure lifts the keyed range, a stop being a display code multiply"),
+    P("layers.0.correct.contrast", 1.0, 1.6, "luma_std", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0),
+      doc="contrast widens the keyed range's luma spread about the pivot"),
+    P("layers.0.correct.pivot", None, 0.8, "luma_mean", "down",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0, contrast=1.6),
+      doc="a higher contrast pivot pushes more of the keyed range down"),
+    P("layers.0.correct.saturation", 1.0, 1.8, "sat_mean", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0),
+      doc="saturation on the keyed range, luma preserving"),
+    P("layers.0.correct.temperature", 0.0, 0.5, "warmth", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0),
+      doc="temperature up adds red and takes blue away"),
+    P("layers.0.correct.tint", 0.0, 0.5, "greenness", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=200.0),
+      doc="tint up adds green"),
+    P("layers.0.correct.hue_shift", 0.0, 90.0, "delta", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0), ref=NO_LAYER,
+      doc="hue shift rotates the keyed hue"),
+    P("layers.0.correct.sat_gain", 1.0, 2.5, "sat_mean", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
+      doc="saturation gain on the keyed range"),
+    P("layers.0.correct.lum_gain", 1.0, 1.8, "luma_mean", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
+      doc="luma gain on the keyed range"),
+    P("layers.0.correct.offset", [0.0, 0.0, 0.0], [0.25, 0.0, 0.0], "r_mean", "up",
+      base=_sec(sat_gain=1.0, lum_gain=1.0, hue_width=90.0),
+      doc="offset adds a flat colour to the keyed range"),
+    P("layers.0.correct.strength", 0.2, 1.0, "delta", "up",
+      base=_sec(hue_width=90.0), ref=NO_LAYER,
+      doc="strength mixes the correction back toward the original"),
+
+    # --- hue curves ------------------------------------------------------
+    # y is an offset (hue_hue, in turns) or a multiplier (the other four)
+    # around the neutral, and an empty list is the identity, which is why
+    # every "lo" here is [].
+    P("hue_curves.hue_hue", [], [[0.0, 0.06], [0.5, 0.0]], "delta", "up",
+      base=HC_ON, ref=NO_HC,
+      doc="Hue vs Hue rotates the hues the curve lifts"),
+    P("hue_curves.hue_sat", [], [[0.0, 1.8], [0.5, 1.0]], "sat_mean", "up",
+      base=HC_ON,
+      doc="Hue vs Sat multiplies saturation per hue"),
+    P("hue_curves.hue_lum", [], [[0.0, 1.5], [0.5, 1.0]], "luma_mean", "up",
+      base=HC_ON,
+      doc="Hue vs Lum multiplies brightness per hue"),
+    P("hue_curves.lum_sat", [], [[0.0, 1.0], [1.0, 2.0]], "sat_mean", "up",
+      base=HC_ON,
+      doc="Lum vs Sat multiplies saturation by how bright the pixel is"),
+    P("hue_curves.sat_sat", [], [[0.0, 1.0], [1.0, 2.2]], "sat_mean", "up",
+      base=HC_ON,
+      doc="Sat vs Sat multiplies saturation by how saturated the pixel already is"),
+
+    # --- color slice and tetra -------------------------------------------
+    # Clip A is 35% orange by area, so the red vector (centre 0 degrees, zero
+    # at 60) covers a large, real part of the frame rather than stray pixels.
+    P("slice.density", 0.0, 1.0, "luma_mean", "down", base=SLICE_ON,
+      doc="global density darkens in proportion to saturation"),
+    P("slice.vectors.red.hue", 0.0, 60.0, "delta", "up",
+      base=SLICE_ON, ref=NO_SLICE,
+      doc="a vector's hue rotates the hues inside its support"),
+    P("slice.vectors.red.sat", 1.0, 2.5, "sat_mean", "up", base=SLICE_ON,
+      doc="a vector's sat multiplies saturation inside its support"),
+    P("slice.vectors.red.density", 0.0, 1.0, "luma_mean", "down", base=SLICE_ON,
+      doc="a vector's density darkens the saturated pixels it covers"),
+    P("slice.tetra.r", [0.0, 0.0, 0.0], [0.0, 0.25, 0.0], "delta", "up",
+      base=TETRA_ON, ref=NO_SLICE,
+      doc="moving the red cube corner drags the colours around it"),
 ]
 
 # Parameters asserted in another group instead of by a lo/hi sweep here.
@@ -342,19 +459,88 @@ CASES = [
 # one geometry, so sweeping them one at a time would say much less than the
 # window group's own matte and gating assertions do.
 COVERED_ELSEWHERE = {
+    # temporal denoise is close to a no-op on a single still (measured, not
+    # exactly zero) and only really moves the picture once there is real
+    # motion between frames, so a lo/hi sweep against one static test frame
+    # would either assert a false "no effect" or need a change threshold
+    # this file has no other case like. cases_detail.py renders an actual
+    # multi-frame sequence and compares a mid frame instead.
+    "prep.denoise.temporal": "detail.temporal_denoise_needs_motion",
+    # hqdn3d is edge-preserving, so whole-frame high-frequency energy is not
+    # guaranteed to fall with more spatial denoise on a busy real frame
+    # (measured: it rose). The meaningful claim, that it lowers the spread
+    # of a flat patch, is what cases_detail.py tests directly.
+    "prep.denoise.spatial": "detail.spatial_denoise_lowers_a_flat_patch_std",
+
+    # The hue curves and Color Slice. The five curves and the red vector are
+    # swept above; the remaining six vectors and five Tetra corners are the
+    # same code with a different centre or corner, so the slice group asserts
+    # them on synthetic colours where a two degree rotation is measurable,
+    # which an 8-bit render of real footage cannot resolve.
+    "hue_curves.enabled": "slice.disabled_is_byte_identical",
+    "slice.enabled": "slice.disabled_is_byte_identical",
+    "slice.tetra.enabled": "slice.disabled_is_byte_identical",
+    "slice.vectors.yellow.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.green.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.cyan.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.blue.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.magenta.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.skin.hue": "slice.vector_hue_rotation_is_local",
+    "slice.vectors.yellow.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.green.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.cyan.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.blue.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.magenta.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.skin.sat": "slice.vector_saturation_is_local",
+    "slice.vectors.yellow.density": "slice.density_darkens_saturated",
+    "slice.vectors.green.density": "slice.density_darkens_saturated",
+    "slice.vectors.cyan.density": "slice.density_darkens_saturated",
+    "slice.vectors.blue.density": "slice.density_darkens_saturated",
+    "slice.vectors.magenta.density": "slice.density_darkens_saturated",
+    "slice.vectors.skin.density": "slice.density_darkens_saturated",
+    "slice.tetra.g": "slice.tetra_pins_black_and_white",
+    "slice.tetra.b": "slice.tetra_pins_black_and_white",
+    "slice.tetra.c": "slice.tetra_pins_black_and_white",
+    "slice.tetra.m": "slice.tetra_pins_black_and_white",
+    "slice.tetra.y": "slice.tetra_pins_black_and_white",
     "output.codec": "output.codec_and_profile",
     "output.profile": "output.codec_and_profile",
     "output.crf": "output.crf_and_preset",
     "output.preset": "output.crf_and_preset",
-    "window.enabled": "window.disabled_is_byte_identical",
-    "window.shape": "window.rect_rotated_45_moves_the_corners",
-    "window.cx": "window.matte_scales_with_the_frame",
-    "window.cy": "window.matte_scales_with_the_frame",
-    "window.w": "window.geq_matte_matches_numpy",
-    "window.h": "window.geq_matte_matches_numpy",
-    "window.rotation": "window.rect_rotated_45_moves_the_corners",
-    "window.softness": "window.softness_zero_is_binary",
-    "window.invert": "window.invert_swaps_inside_and_outside",
+    "layers.0.mask.window.enabled": "window.disabled_is_byte_identical",
+    "layers.0.mask.window.shape": "window.rect_rotated_45_moves_the_corners",
+    "layers.0.mask.window.cx": "window.matte_scales_with_the_frame",
+    "layers.0.mask.window.cy": "window.matte_scales_with_the_frame",
+    "layers.0.mask.window.w": "window.geq_matte_matches_numpy",
+    "layers.0.mask.window.h": "window.geq_matte_matches_numpy",
+    "layers.0.mask.window.rotation": "window.rect_rotated_45_moves_the_corners",
+    "layers.0.mask.window.softness": "window.softness_zero_is_binary",
+    "layers.0.mask.window.invert": "window.invert_swaps_inside_and_outside",
+    # Grain fields whose effect is not a monotone scalar on a whole real
+    # frame: a stock swap, a per-channel colour split, a seed change and a
+    # luminance-dependent response weight all need a purpose-built check
+    # (synthetic patches or per-channel readback), which is what cases_grain
+    # does instead of a lo/hi sweep here.
+    "grain.stock": "grain.stock_overrides_raw_fields",
+    "grain.response": "grain.film_response_is_weaker_in_the_highlights",
+    "grain.color": "grain.color_makes_channels_differ",
+    "grain.seed": "grain.seed_changes_the_plate_not_its_statistics",
+    # The rest of a layer. These four are about how a layer combines with
+    # another layer, with the look, or with its own matte, which one parameter
+    # swept between two values cannot show; the layers group renders them
+    # against each other instead. The name is not read by the engine at all.
+    "layers.0.name": "not rendered: the layer's label, carried for the UI",
+    "layers.0.placement": "layers.after_look_differs_from_before_look",
+    "layers.0.mask.invert": "layers.mask_invert_flips_which_pixels_change",
+    "layers.0.correct.blur": "layers.blur_under_a_window_stays_inside_it",
+    # look's second slot (C5). balance blends two independently chosen LUTs
+    # in parallel (out = lerp(A, B, balance)), not a scalar sweep against a
+    # fixed reference the way look.mix is above: the meaningful assertions
+    # are the byte-identical ends and the balance=0.5 average, which is
+    # exactly what the look group's own tests check.
+    "look.lut2": "look.balance_one_is_lut2_alone",
+    "look.mix2": "look.balance_one_is_lut2_alone",
+    "look.balance": "look.balance_half_is_the_average",
 }
 
 
@@ -365,7 +551,7 @@ COVERED_ELSEWHERE = {
 def _extra_show_mask(ctx, lo, hi, ref):
     f = hi.astype(np.int16)
     spread = int(np.abs(f - f[..., :1]).max())
-    ctx.expect_le("show_mask output is greyscale (max channel spread, 8-bit)",
+    ctx.expect_le("mask show output is greyscale (max channel spread, 8-bit)",
                   float(spread), 1.0)
 
 
@@ -386,8 +572,8 @@ def _extra_gain_above_one(ctx, lo, hi, ref):
 
 
 EXTRAS = {
-    "secondary.show_mask": _extra_show_mask,
-    "secondary.invert": _extra_invert,
+    "layers.0.mask.show": _extra_show_mask,
+    "layers.0.mask.key.invert": _extra_invert,
     "primaries.gain": _extra_gain_above_one,
 }
 
@@ -431,9 +617,26 @@ def _make_test(case: P):
     return run
 
 
+def _declared_paths():
+    """Every leaf in DEFAULTS, with `layers` expanded through LAYER_DEFAULTS.
+
+    `layers` is a list, so leaf_paths stops at it and reports one path where
+    the layer stack really carries a whole tree of parameters. Expanding it
+    against LAYER_DEFAULTS is what keeps a new layer field from being added to
+    the engine untested, which is the only job this coverage test has.
+    """
+    out = []
+    for p in H.leaf_paths(cg.DEFAULTS):
+        if p == "layers":
+            out += [f"layers.0.{q}" for q in H.leaf_paths(cg.LAYER_DEFAULTS)]
+        else:
+            out.append(p)
+    return out
+
+
 def test_every_default_is_covered(ctx):
     """A parameter added to DEFAULTS without a test is a hole in this suite."""
-    declared = set(H.leaf_paths(cg.DEFAULTS))
+    declared = set(_declared_paths())
     covered = {c.path for c in CASES} | set(COVERED_ELSEWHERE)
     missing = sorted(declared - covered)
     stale = sorted(covered - declared)

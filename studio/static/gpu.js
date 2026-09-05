@@ -31,6 +31,17 @@
   var MID_GREY_CODE = { dwg: 0.3360, direct: 0.4883 };
   var VIGNETTE_RADIUS_NEUTRAL = 0.85;
 
+  /* mid_detail: local contrast at a wide gaussian radius. Mirrors
+   * MID_DETAIL_SIGMA_FRAC / MID_DETAIL_SIGMA_MIN / MID_DETAIL_K in
+   * cinegrade.py. Sigma is a FRACTION of the actual rendered width, so it is
+   * computed from the source texture's own width at render time (see
+   * detailPass) rather than needing a scaleForPreview entry: a preview
+   * texture is genuinely fewer real pixels, so 2% of ITS width is already the
+   * proportionally correct radius. */
+  var MID_DETAIL_SIGMA_FRAC = 0.02;
+  var MID_DETAIL_SIGMA_MIN = 1.0;
+  var MID_DETAIL_K = 1.0;
+
   /* The power window block, mirrored from cinegrade.DEFAULTS["window"].
    *
    * It is a named constant as well as a member of DEFAULTS below because
@@ -50,6 +61,45 @@
     rotation: 0.0, softness: 0.15, invert: false
   };
 
+  /* One layer, mirrored from cinegrade.LAYER_DEFAULTS.
+   *
+   * A named constant for the same reason WINDOW_DEFAULTS is one: a layer
+   * arriving from an older server, or straight out of a preset file, carries
+   * only the fields somebody touched, and a missing one has to resolve to the
+   * engine's own number rather than to NaN. Every layer read out of a config
+   * goes through configLayers, which merges onto this.
+   *
+   * A layer is a mask (a power window and a colour key, either or both, with
+   * one invert over the pair) and a correction. The correction is baked to a
+   * 33 cube BY THE SERVER, from the same cinegrade.layer_lut the render
+   * calls, so none of the colour maths is reimplemented here. */
+  var LAYER_DEFAULTS = {
+    enabled: true, name: "Layer 1", placement: "before_look",
+    mask: {
+      show: false, invert: false,
+      window: WINDOW_DEFAULTS,
+      key: {
+        enabled: false, invert: false,
+        hue_center: 30.0, hue_width: 40.0, hue_soft: 15.0,
+        sat_low: 0.10, sat_high: 1.0, sat_soft: 0.10,
+        lum_low: 0.0, lum_high: 1.0, lum_soft: 0.10
+      }
+    },
+    correct: {
+      exposure: 0.0, contrast: 1.0, pivot: null, saturation: 1.0,
+      temperature: 0.0, tint: 0.0,
+      hue_shift: 0.0, sat_gain: 1.0, lum_gain: 1.0,
+      offset: [0.0, 0.0, 0.0], blur: 0.0, strength: 1.0
+    }
+  };
+
+  /* correct.blur is quoted in pixels at 1920 wide and resolved against the
+   * width the render is actually running at, exactly the way every window
+   * parameter is a fraction of the frame. That is what keeps a 640 wide
+   * preview showing the blur the full render will have without
+   * scaleForPreview needing a case for it. Mirrors layer_blur_sigma. */
+  var LAYER_BLUR_REF_WIDTH = 1920.0;
+
   // A local copy of cinegrade.DEFAULTS. It is a mirror, not the source of
   // truth: setDefaults() lets a caller hand over the copy the server sent so
   // an engine change cannot silently leave this file behind.
@@ -61,8 +111,12 @@
       lift: 0.0, gamma: 1.0, gain: 1.0,
       black_lift: 0.0, highlight_rolloff: 0.0
     },
-    look: { lut: null, mix: 1.0 },
-    detail: { soften: 0.0, sharpen: 0.0 },
+    look: { lut: null, mix: 1.0, lut2: null, mix2: 1.0, balance: 0.0 },
+    detail: { soften: 0.0, sharpen: 0.0, mid_detail: 0.0 },
+    // prep.denoise (hqdn3d) cannot run in this shader: reported unsupported
+    // in stageReport whenever active, so the caller falls back to the ffmpeg
+    // still. Mirrored here only so fullConfig never resolves it to NaN.
+    prep: { denoise: { enabled: false, spatial: 0.0, temporal: 0.0 } },
     fx: {
       halation: { enabled: false, threshold: 0.62, sigma: 26, strength: 0.55, tint: [1.0, 0.34, 0.16] },
       bloom: { enabled: false, threshold: 0.72, sigma: 70, strength: 0.28, tint: [1.0, 0.97, 0.92] },
@@ -70,22 +124,42 @@
       radial_blur: { enabled: false, sigma: 9, start: 0.55, end: 1.0 },
       vignette: { enabled: false, amount: 0.45, radius: 0.85 }
     },
-    grain: { enabled: false, strength: 40, size: 3, opacity: 0.5 },
+    grain: { enabled: false, strength: 40, size: 3, opacity: 0.5,
+             stock: "custom", softness: 0.0, response: "flat",
+             color: 0.0, seed: 0 },
     letterbox: { enabled: false, aspect: 2.39 },
     curves: {
       enabled: false, interp: "pchip",
       master: [[0.0, 0.0], [1.0, 1.0]], r: [[0.0, 0.0], [1.0, 1.0]],
       g: [[0.0, 0.0], [1.0, 1.0]], b: [[0.0, 0.0], [1.0, 1.0]]
     },
-    secondary: {
-      enabled: false, show_mask: false, invert: false,
-      hue_center: 30.0, hue_width: 40.0, hue_soft: 15.0,
-      sat_low: 0.10, sat_high: 1.0, sat_soft: 0.10,
-      lum_low: 0.0, lum_high: 1.0, lum_soft: 0.10,
-      hue_shift: 0.0, sat_gain: 1.0, lum_gain: 1.0,
-      tint: [0.0, 0.0, 0.0], strength: 1.0
+    hue_curves: {
+      enabled: false,
+      hue_hue: [], hue_sat: [], hue_lum: [], lum_sat: [], sat_sat: []
     },
-    window: WINDOW_DEFAULTS,
+    slice: {
+      enabled: false, density: 0.0,
+      vectors: {
+        red: { hue: 0.0, sat: 1.0, density: 0.0 },
+        yellow: { hue: 0.0, sat: 1.0, density: 0.0 },
+        green: { hue: 0.0, sat: 1.0, density: 0.0 },
+        cyan: { hue: 0.0, sat: 1.0, density: 0.0 },
+        blue: { hue: 0.0, sat: 1.0, density: 0.0 },
+        magenta: { hue: 0.0, sat: 1.0, density: 0.0 },
+        skin: { hue: 0.0, sat: 1.0, density: 0.0 }
+      },
+      tetra: {
+        enabled: false,
+        r: [0.0, 0.0, 0.0], g: [0.0, 0.0, 0.0], b: [0.0, 0.0, 0.0],
+        c: [0.0, 0.0, 0.0], m: [0.0, 0.0, 0.0], y: [0.0, 0.0, 0.0]
+      }
+    },
+    /* A list of masked correction layers, applied in order. This replaces
+     * the single `secondary` block and the single `window` block. Empty is
+     * the default and builds exactly the chain that shipped before layers
+     * existed, so an old config is not merely equivalent, it is identical.
+     * See LAYER_DEFAULTS and migrateLayers. */
+    layers: [],
     output: { codec: "prores_ks", profile: 3, crf: 16, preset: "slow" }
   };
 
@@ -110,7 +184,14 @@
     if (isPlain(v)) return deepMerge(v, {});
     return v;
   }
-  function fullConfig(cfg) { return deepMerge(DEFAULTS, cfg || {}); }
+  /* The engine's own read path: migrate FIRST, then merge the defaults.
+   *
+   * The order is not cosmetic. DEFAULTS always supplies an empty `layers`, so
+   * merging first would make every pre-layers config look like a config that
+   * already has a (empty) stack, and its secondary and window would be
+   * dropped without a word. Mirrors cinegrade.load_preset and server.py's
+   * full_config, which had to learn the same lesson. */
+  function fullConfig(cfg) { return deepMerge(DEFAULTS, migrateLayers(cfg || {})); }
 
   /* Round the way cinegrade's format strings round.
    *
@@ -133,6 +214,60 @@
       if (Math.abs(+pts[i][0] - +pts[i][1]) >= 1e-6) return false;
     }
     return true;
+  }
+
+  /* The hue curves + Color Slice + Tetra stage: is it doing anything?
+   *
+   * A port of grade/slice.py is_identity, and the ONLY thing this file ports:
+   * the cube itself is baked by the engine and fetched over /api/lut, so the
+   * preview cannot drift from the render by re-deriving the colour maths in
+   * JavaScript. This predicate exists so a neutral stage costs no request and
+   * no lut3d, which is exactly what build_graph does with f_slice returning [].
+   *
+   * The neutral of a hue curve is a FLAT line, not the diagonal: y is an
+   * offset (hue_hue, 0) or a multiplier (the other four, 1). An empty list is
+   * the identity.
+   */
+  var SLICE_CURVE_NEUTRAL = {
+    hue_hue: 0, hue_sat: 1, hue_lum: 1, lum_sat: 1, sat_sat: 1
+  };
+  var SLICE_VECTORS = ["red", "yellow", "green", "cyan", "blue", "magenta", "skin"];
+  var TETRA_CORNERS = ["r", "g", "b", "c", "m", "y"];
+
+  function hueCurvesActive(hc) {
+    if (!hc || !hc.enabled) return false;
+    for (var key in SLICE_CURVE_NEUTRAL) {
+      if (!Object.prototype.hasOwnProperty.call(SLICE_CURVE_NEUTRAL, key)) continue;
+      var pts = hc[key] || [];
+      for (var i = 0; i < pts.length; i++) {
+        if (Math.abs(+pts[i][1] - SLICE_CURVE_NEUTRAL[key]) > 1e-9) return true;
+      }
+    }
+    return false;
+  }
+
+  function sliceBlockActive(sl) {
+    if (!sl || !sl.enabled) return false;
+    if (Math.abs(+sl.density || 0) > 1e-9) return true;
+    var vecs = sl.vectors || {}, i, j;
+    for (i = 0; i < SLICE_VECTORS.length; i++) {
+      var v = vecs[SLICE_VECTORS[i]] || {};
+      if (Math.abs(+(v.hue || 0)) > 1e-9) return true;
+      if (Math.abs((v.sat === undefined ? 1 : +v.sat) - 1) > 1e-9) return true;
+      if (Math.abs(+(v.density || 0)) > 1e-9) return true;
+    }
+    var te = sl.tetra || {};
+    if (te.enabled) {
+      for (i = 0; i < TETRA_CORNERS.length; i++) {
+        var d = te[TETRA_CORNERS[i]] || [0, 0, 0];
+        for (j = 0; j < 3; j++) if (Math.abs(+d[j] || 0) > 1e-9) return true;
+      }
+    }
+    return false;
+  }
+
+  function sliceActive(cfg) {
+    return hueCurvesActive(cfg.hue_curves) || sliceBlockActive(cfg.slice);
   }
 
   // ------------------------------------------------------------------
@@ -456,9 +591,14 @@
     var vignette = !!cfg.fx.vignette.enabled;
     var soften = +cfg.detail.soften > 1e-6;
     var sharpen = +cfg.detail.sharpen > 1e-6;
-    var detail = soften || sharpen;
+    var midDetail = Math.abs(+cfg.detail.mid_detail) > 1e-6;
+    var detail = soften || sharpen || midDetail;
+    var dn = (cfg.prep && cfg.prep.denoise) || {};
+    var denoiseActive = !!dn.enabled
+      && (+dn.spatial > 1e-6 || +dn.temporal > 1e-6);
     var plan = {
-      vignette: vignette, soften: soften, sharpen: sharpen, detail: detail,
+      vignette: vignette, soften: soften, sharpen: sharpen,
+      midDetail: midDetail, detail: detail, denoise: denoiseActive,
       grain: !!cfg.grain.enabled,
       // where the picture stops being 16 bit RGB
       quantise: "none",   // none | rgb8 | yuv8 | yuv16
@@ -474,22 +614,158 @@
     return plan;
   }
 
-  /* The power window: the shape half of a secondary, ported from
-   * cinegrade.py's window_matte / _window_geometry / window_active.
+  /* The layer stack, ported from cinegrade.py's config_layers, layer_active,
+   * layer_window, layer_branches and layer_blur_sigma.
    *
-   * The window gates the SECONDARY and only the secondary. With the qualifier
-   * off there is nothing for a shape to gate, and the engine drops the stage
-   * out of the graph entirely rather than leaving an inert filter in it, so
-   * this preview has to make the same call from the same rule or it shows a
-   * shape the render does not have. */
-  function windowActive(cfg) {
-    var win = (cfg && cfg.window) || {};
-    var sec = (cfg && cfg.secondary) || {};
-    return !!win.enabled && !!sec.enabled;
+   * Every one of these decides what the ENGINE would put in the graph, not
+   * what looks reasonable here. A layer the engine drops (disabled, or a mask
+   * whose matte is zero everywhere) has to be dropped here too, or the
+   * preview shows a correction the render does not have. */
+  function windowBlock(win) {
+    return deepMerge(WINDOW_DEFAULTS, win || {});
   }
 
-  function windowBlock(cfg) {
-    return deepMerge(WINDOW_DEFAULTS, (cfg && cfg.window) || {});
+  function configLayers(cfg) {
+    var list = (cfg && cfg.layers) || [];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      out.push(deepMerge(LAYER_DEFAULTS, list[i] || {}));
+    }
+    return out;
+  }
+
+  /* True when the layer has anything to contribute.
+   *
+   * A disabled layer is absent, and so is a layer whose combined matte is
+   * zero everywhere: the matte of a layer with no mask is 1, mask.invert
+   * makes that 0, and a correction merged under a matte of 0 is the picture. */
+  function layerActive(layer) {
+    if (!layer.enabled) return false;
+    var m = layer.mask;
+    if (m.invert && !m.window.enabled && !m.key.enabled) return false;
+    return true;
+  }
+
+  /* The window matte this layer needs, with mask.invert folded in, or null.
+   *
+   * null means no spatial matte at all, which is what keeps a key only or a
+   * global layer down to a single cube pass. The combined matte is
+   * window * key, inverted as a whole by mask.invert. A product cannot be
+   * inverted inside either half, but it does factor:
+   * 1 - w*k = (1 - w) * 1 + w * (1 - k). With the key OFF that collapses to
+   * 1 - w, which is the window with its own invert flipped, so one branch is
+   * enough; with the key ON as well, layerBranches grades two branches and
+   * the window matte itself is left alone. */
+  function layerWindow(layer) {
+    var m = layer.mask, win = m.window;
+    if (!win.enabled) return null;
+    if (m.invert && !m.key.enabled) {
+      return deepMerge(win, { invert: !win.invert });
+    }
+    return windowBlock(win);
+  }
+
+  /* Which baked cubes this layer needs, in merge input order.
+   *
+   * One entry is one graded branch, merged against the untouched picture
+   * under the window matte. Two entries is mask.invert with BOTH a window and
+   * a key: branch A carries the full correction and wins where the window is
+   * closed, branch B carries the correction under the inverted key and wins
+   * where it is open, which is the factorisation above, exactly. */
+  function layerBranches(layer) {
+    var m = layer.mask;
+    if (!m.invert) return [m.key.enabled ? "key" : "one"];
+    if (m.window.enabled && m.key.enabled) return ["one", "inv"];
+    return m.window.enabled ? ["one"] : ["inv"];
+  }
+
+  /* The layer's blur sigma in pixels at THIS render's width. */
+  function layerBlurSigma(layer, width) {
+    var sigma = +layer.correct.blur;
+    if (!(sigma > 0)) return 0;
+    return sigma * width / LAYER_BLUR_REF_WIDTH;
+  }
+
+  /* The active layers at one placement point, each with its array index, so a
+   * LUT slot name can be built from the index the config really uses rather
+   * than from a running counter. */
+  function activeLayers(cfg, placement) {
+    var all = configLayers(cfg), out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (layerActive(all[i]) && all[i].placement === placement) {
+        out.push({ index: i, layer: all[i] });
+      }
+    }
+    return out;
+  }
+
+  function lookActive(cfg) {
+    return !!cfg.look.lut
+      || (!!cfg.look.lut2 && +(cfg.look.balance || 0) > 1e-6);
+  }
+
+  /* The two blocks a config written before layers existed carried. Kept only
+   * as the merge base migrateLayers fills a partial block in from; nothing
+   * else reads them. */
+  var LEGACY_SECONDARY = {
+    enabled: false, show_mask: false, invert: false,
+    hue_center: 30.0, hue_width: 40.0, hue_soft: 15.0,
+    sat_low: 0.10, sat_high: 1.0, sat_soft: 0.10,
+    lum_low: 0.0, lum_high: 1.0, lum_soft: 0.10,
+    hue_shift: 0.0, sat_gain: 1.0, lum_gain: 1.0,
+    tint: [0.0, 0.0, 0.0], strength: 1.0
+  };
+  var LEGACY_WINDOW = {
+    enabled: false, shape: "ellipse",
+    cx: 0.5, cy: 0.5, w: 0.6, h: 0.6,
+    rotation: 0.0, softness: 0.15, invert: false
+  };
+
+  /* Rewrite a pre-layers config into the layers shape, on read.
+   *
+   * A config carrying `secondary` and/or `window` and no `layers` becomes one
+   * layer: the qualifier moves to mask.key, the shape to mask.window,
+   * show_mask to mask.show, the HSV controls and the tint push and the
+   * strength to correct, and the layer is enabled exactly when the SECONDARY
+   * was. That last detail is the whole of the old window_active rule: a
+   * window switched on over a secondary switched off rendered nothing at all,
+   * because a shape with nothing to gate was dropped from the graph.
+   *
+   * Byte for byte the same as cinegrade.migrate_layers, which is what lets a
+   * preset load into the studio and the CLI and produce one picture. */
+  function migrateLayers(cfg) {
+    if (!cfg || (!cfg.secondary && !cfg.window)) return cfg || {};
+    var out = {}, k;
+    for (k in cfg) {
+      if (!Object.prototype.hasOwnProperty.call(cfg, k)) continue;
+      if (k === "secondary" || k === "window") continue;
+      out[k] = cfg[k];
+    }
+    // A config that already has a stack keeps it: the two old blocks are
+    // dropped rather than turned into a second, duplicate layer.
+    if (cfg.layers) return out;
+    var sec = deepMerge(LEGACY_SECONDARY, cfg.secondary || {});
+    var win = deepMerge(LEGACY_WINDOW, cfg.window || {});
+    var layer = clone(LAYER_DEFAULTS);
+    layer.enabled = !!sec.enabled;
+    layer.placement = "before_look";
+    layer.mask.show = !!sec.show_mask;
+    layer.mask.invert = false;
+    layer.mask.window = win;
+    layer.mask.key = {
+      enabled: !!sec.enabled, invert: !!sec.invert,
+      hue_center: sec.hue_center, hue_width: sec.hue_width,
+      hue_soft: sec.hue_soft,
+      sat_low: sec.sat_low, sat_high: sec.sat_high, sat_soft: sec.sat_soft,
+      lum_low: sec.lum_low, lum_high: sec.lum_high, lum_soft: sec.lum_soft
+    };
+    layer.correct.hue_shift = sec.hue_shift;
+    layer.correct.sat_gain = sec.sat_gain;
+    layer.correct.lum_gain = sec.lum_gain;
+    layer.correct.offset = sec.tint;
+    layer.correct.strength = sec.strength;
+    out.layers = [layer];
+    return out;
   }
 
   /* Python's float(f"{x:.Nf}"), which is how cinegrade rounds the geometry.
@@ -528,6 +804,13 @@
   }
 
   var STAGE_NOTES = {
+    prep_denoise: "NOT PORTED. hqdn3d has no WebGL2 equivalent here, so an "
+                + "enabled denoise always falls back to the ffmpeg-rendered "
+                + "still, the same way grain falls back today, except this "
+                + "one is NOT exempted from blocking the GPU preview: it "
+                + "changes the picture materially (see limits.js), so a "
+                + "silent GPU preview that ignored it would be worse than no "
+                + "preview at all.",
     log: "Exposure and white balance as a log domain offset, one clamped add "
        + "per channel. Pure arithmetic, no resampling, no quantisation.",
     cst_in: "3D LUT, real tetrahedral interpolation on texelFetch of the eight "
@@ -542,16 +825,27 @@
     curves: "ffmpeg's own 65536 entry table, built here with the same natural "
           + "and pchip code paths, composed in ffmpeg's order (channel first, "
           + "then master).",
-    secondary: "The server bakes the qualifier to a 33 cube and the GPU applies "
-             + "it tetrahedrally, so this is the same table ffmpeg reads.",
-    window: "The engine's own matte formula evaluated per pixel in the "
-          + "shader rather than baked to a PNG, quantised the same way with "
-          + "floor(m*255+0.5) and scaled into the 16 bit merge by 257, then "
-          + "maskedmerge against the un-graded branch. The window gates the "
-          + "secondary and nothing else, which is what build_graph's split "
-          + "does. The matte is 8 bit in both paths.",
+    slice: "Hue curves, Color Slice and Tetra bake to one 33 cube on the "
+         + "server, from the same grade/slice.py the render calls, and the GPU "
+         + "applies it tetrahedrally. Nothing about the colour maths is "
+         + "reimplemented here, so the preview cannot drift from the render.",
+    layers: "One masked correction. The server bakes the colour half (the "
+          + "key and every colour control) to a 33 cube with the same "
+          + "cinegrade.layer_lut the render calls, and the GPU applies it "
+          + "tetrahedrally, so this is the same table ffmpeg reads. The power "
+          + "window is the engine's own matte formula evaluated per pixel in "
+          + "the shader rather than baked to a PNG, quantised the same way "
+          + "with floor(m*255+0.5) and scaled into the 16 bit merge by 257, "
+          + "then merged against the un-graded branch exactly as maskedmerge "
+          + "does. The matte is 8 bit in both paths. Layers are applied one "
+          + "after another in array order, each as its own pass, so a stack "
+          + "of any length costs passes but no accuracy: every pass lands on "
+          + "the same 16 bit lattice the fused chain lands on.",
     look: "3D LUT, tetrahedral, then blend=normal, which is dst = lut*mix + "
-        + "pre_lut*(1-mix).",
+        + "pre_lut*(1-mix). A second slot blends in PARALLEL: both slots read "
+        + "the same pre-look signal, then balance crossfades slot 1's result "
+        + "against slot 2's the same truncated way. Slot 2 off (no lut2, or "
+        + "balance 0) is byte identical to the single-slot path above.",
     halation: "Highlight pass, swscale bilinear downscale to a quarter, gblur, "
             + "swscale bicubic upscale, tint, then screen at strength. The "
             + "gblur is ffmpeg's IIR recursion, not a convolution.",
@@ -568,15 +862,31 @@
             + "drops to 8 bit, because vignette has no 16 bit pixel format. On "
             + "its own it measures exact: no channel of any pixel off by more "
             + "than 1.",
-    grain: "NOT PORTED. ffmpeg's noise filter was measured reproducible run "
-         + "to run on this build, not clock seeded as this used to say, so "
-         + "grain could in principle be parity checked like every other "
-         + "stage. Nobody has written that shader yet, which is why it stays "
-         + "unsupported here.",
-    detail: "gblur then unsharp. unsharp is YUV only, so the picture takes an "
-          + "RGB to YUV round trip and only Y is sharpened. Sharpen on its own "
-          + "runs at 16 bit, where ffmpeg's own scaling makes it 256 times "
-          + "weaker, so that lane barely moves the picture and measures exact.",
+    grain: "Overlay blend against a plate the server renders (the "
+         + "/api/grain/plate route, a slice of the same build_graph text "
+         + "ffmpeg's own grain block runs, so the two can never drift "
+         + "apart), plus an optional response=film weight computed the "
+         + "same colorchannelmixer plus smoothstep formula cinegrade.py's "
+         + "blend all_expr does. A stock preset is three numbers (size, "
+         + "strength, softness measured on a real frame), not a scan of "
+         + "real film.",
+    detail: "gblur then unsharp then mid_detail. unsharp is YUV only, so the "
+          + "picture takes an RGB to YUV round trip and only Y is sharpened. "
+          + "Sharpen on its own runs at 16 bit, where ffmpeg's own scaling "
+          + "makes it 256 times weaker, so that lane barely moves the "
+          + "picture and measures exact. mid_detail is a plain gblur plus a "
+          + "blend=all_expr, both format-agnostic in ffmpeg, so it runs "
+          + "wherever the chain already is (16 bit RGB, or YUV if sharpen or "
+          + "vignette already forced that) with no format change of its own, "
+          + "and applies the SAME formula to every plane, which is why it "
+          + "also touches chroma when it happens to land in YUV. Pushed "
+          + "positive on a real hard edge it does overshoot the valid range, "
+          + "so both engines clamp the finished expression to that range at "
+          + "the same point: this shader clamps to 0..uMax and the engine "
+          + "wraps its blend in clip(...,0,65535). ffmpeg's blend does not "
+          + "clamp by itself, it wraps modulo 65536, which is what the "
+          + "mid_detail parity rows were catching until 2026-09-05. All "
+          + "three mid_detail rows now measure exact at both widths.",
     letterbox: "Crop to an even height and pad back with black."
   };
 
@@ -603,6 +913,8 @@
       });
     }
 
+    add("prep_denoise", "Prep denoise", plan.denoise, "unsupported");
+
     var offR = fmt(+cv.exposure + +p.temperature, 12);
     var offG = fmt(+cv.exposure + +p.tint, 12);
     var offB = fmt(+cv.exposure - +p.temperature, 12);
@@ -627,9 +939,37 @@
           + "controls.js Ctl.pchipEval now uses ffmpeg's end slope, measured "
           + "within 1/65535 of the filter on a 65536 entry ramp."
           : "");
-    add("secondary", "Secondary", !!(cfg.secondary && cfg.secondary.enabled), "exact");
-    add("window", "Power window", windowActive(cfg), "exact");
-    add("look", "Look", !!cfg.look.lut, "exact");
+    add("slice", "Hue curves, Slice, Tetra", sliceActive(cfg), "exact");
+    /* One row per layer, not one row for the stage. A stack is a list of
+     * independent corrections and "layers: exact" would say nothing about
+     * which one the user is looking at, so each row names its placement and
+     * what its mask is made of. A config with no layers still gets a single
+     * inactive row, so the report has a stable shape. */
+    var lys = configLayers(cfg);
+    if (!lys.length) {
+      add("layers", "Layers", false, "exact");
+    } else {
+      lys.forEach(function (L, li) {
+        var bits = [];
+        if (L.mask.window.enabled) bits.push("power window");
+        if (L.mask.key.enabled) bits.push("colour key");
+        if (!bits.length) bits.push("no mask, so the whole frame");
+        if (L.mask.invert) bits.push("mask inverted");
+        if (+L.correct.blur > 0) bits.push("blur " + fmt(+L.correct.blur, 3));
+        if (L.mask.show) bits.push("matte view");
+        var on = layerActive(L);
+        rows.push({
+          id: "layer" + li,
+          name: "Layer " + (li + 1) + (L.name ? " (" + L.name + ")" : ""),
+          active: on, status: on ? "exact" : "off",
+          note: STAGE_NOTES.layers + " This one runs " + L.placement
+              + ": " + bits.join(", ") + "."
+        });
+      });
+    }
+    add("look", "Look",
+        !!cfg.look.lut || (!!cfg.look.lut2 && +(cfg.look.balance || 0) > 1e-6),
+        "exact");
 
     /* These three were expected to be approximations because they involve
      * swscale resampling and ffmpeg's IIR blur. They measure exact (no channel
@@ -651,7 +991,17 @@
           + "the shipped presets: at most 4 code values out, 0.2 to 0.4 percent "
           + "of channels off by more than 1, none off by more than 4."
           : "");
-    add("grain", "Grain", plan.grain, "unsupported");
+    add("grain", "Grain", plan.grain, "exact",
+        "Measured exact on a rendered still across grain defaults, the "
+      + "35mm stock, response=film and color=1 (parity.js, 8 rows at 640 "
+      + "and 1280 wide): mean channel difference 0.006 of 255, max 1 code "
+      + "value, 0 percent of channels over 1. That is for a STILL: the "
+      + "plate this preview fetches is one frame's worth (ffmpeg's noise "
+      + "generator's own frame 0, cached per config and size), not one "
+      + "plate per output frame the way a real multi frame export "
+      + "advances it, so a looping or playing preview reuses the same "
+      + "plate on every frame while a real export's grain keeps changing. "
+      + "See the Limits panel.");
     add("detail", "Detail", plan.detail,
         plan.quantise === "yuv8" ? "close" : "exact",
         plan.quantise === "yuv8"
@@ -663,6 +1013,13 @@
           + "regardless, so at 16 bit the sharpen is 256 times weaker than the "
           + "same number at 8 bit. That is the engine's behaviour and it is what "
           + "the GPU reproduces."
+          : plan.midDetail
+          ? "mid_detail does overshoot the valid range at a real hard edge, "
+          + "and both engines now clamp the finished expression the same way: "
+          + "this shader to 0..uMax, the engine with clip(...,0,65535) inside "
+          + "its blend. Measured on the parity clip at mid_detail 0.5, 1.0 "
+          + "and -0.5, at 640 and 1280 wide: max 1 code value, 0 percent of "
+          + "channel samples off by more than 1, all six rows exact."
           : "");
     add("letterbox", "Letterbox", !!cfg.letterbox.enabled, "exact");
 
@@ -706,6 +1063,11 @@
       split >= 0.5 ? Math.max(1.0, split * factor) : split * factor;
     out.detail.soften = +out.detail.soften * factor;
     out.grain.size = Math.max(1, Math.round(+out.grain.size * factor));
+    // detail.mid_detail is deliberately NOT scaled here: its sigma is defined
+    // as a FRACTION of the actual rendered width (2%), not a fixed pixel
+    // count like soften/halation/bloom/radial_blur above, so detailPass
+    // already computes the right radius from the real source width at
+    // render time. Scaling it again here would double-correct it.
     return out;
   }
 
@@ -770,7 +1132,18 @@
   ];
 
   /* The whole colour head in one pass: log, CST in, primaries, CST out,
-   * curves, secondary and the look mix.
+   * curves, the slice cube and the look mix.
+   *
+   * The layer stack is NOT here. A stack can be any length and each layer can
+   * need a window matte and a blur, neither of which fits a fused per-pixel
+   * pass, so layers run as their own passes and this shader is invoked twice
+   * when there are any: once with the look held back (opts.lookOff) for the
+   * head, and once with everything but the look held back (opts.lookOnly)
+   * after the before_look layers have run. Every stage is already guarded by
+   * its own uniform, so the second invocation executes only the look block
+   * and the split is arithmetically identical to the fused pass: the render
+   * targets are RGBA32F, so a value handed from one pass to the next comes
+   * back bit for bit.
    *
    * Every `lut` stage here is written the way vf_lut BEHAVES on gbrp16le,
    * which is not what the filter string reads like. vf_lut's `maxval` for
@@ -792,14 +1165,19 @@
     "uniform sampler2D uSrc;",
     "uniform sampler3D uCstIn;",
     "uniform sampler3D uCstOut;",
-    "uniform sampler3D uSec;",
+    "uniform sampler3D uSlice;",
     "uniform sampler3D uLook;",
+    "uniform sampler3D uLook2;",
     "uniform sampler2D uCurve;",
     "uniform sampler2D uBlc;",
-    "uniform ivec4 uSizes;",          // cstIn, cstOut, secondary, look; 0 = off
+    "uniform ivec4 uSizes;",          // cstIn, cstOut, spare, look; 0 = off
+    "uniform int uSliceSize;",       // hue curves + slice + tetra cube; 0 = off
+    "uniform int uLook2Size;",        // second look slot; 0 = off, ivec4 is full
     "uniform int uHasCurve;",
     "uniform int uHasBlc;",
     "uniform float uLookMix;",
+    "uniform float uLookMix2;",
+    "uniform float uLookBalance;",
     "uniform vec3 uLogOff;",
     "uniform int uHasLog;",
     "uniform vec3 uLiftA;",
@@ -817,14 +1195,6 @@
     "uniform int uHasSat;",
     "uniform float uVib;",
     "uniform int uHasVib;",
-    "uniform int uWinOn;",
-    "uniform int uWinRect;",
-    "uniform int uWinInvert;",
-    "uniform int uWinBlack;",
-    "uniform vec2 uWinCentre;",     // cx*W, cy*H in pixels
-    "uniform vec2 uWinAxis;",       // the two half axes in pixels
-    "uniform vec2 uWinRot;",        // (cos, sin) of the rotation
-    "uniform vec2 uWinFeather;",    // (1+softness, 2*softness); y 0 is a hard edge
     "out vec4 oCol;"
   ].concat(LIB_LUT3D).concat([
     "const float CODE = 65535.0;",
@@ -846,35 +1216,6 @@
     "float mixrow(vec3 code, vec3 k) {",
     "  vec3 t = roundEven(code * k);",
     "  return t.r + t.g + t.b;",
-    "}",
-    /* The power window matte, C4's formula on integer pixel indices with no
-     * half pixel offset, which is what geq's X and Y are. The rounding is
-     * floor(x + 0.5) and not roundEven: numpy's rint and ffmpeg's expression
-     * language disagree on halves, so the engine pinned both of its
-     * references to floor(x + 0.5) and this is the third one. */
-    "float winMatte(ivec2 q) {",
-    "  float dx = float(q.x) - uWinCentre.x;",
-    "  float dy = float(q.y) - uWinCentre.y;",
-    "  float ux = dx * uWinRot.x + dy * uWinRot.y;",
-    "  float uy = dy * uWinRot.x - dx * uWinRot.y;",
-    "  float a = ux / uWinAxis.x;",
-    "  float b = uy / uWinAxis.y;",
-    "  float d = uWinRect == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
-    "  float m = uWinFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
-    "          : clamp((uWinFeather.x - d) / uWinFeather.y, 0.0, 1.0);",
-    "  if (uWinInvert == 1) m = 1.0 - m;",
-    "  return floor(m * 255.0 + 0.5);",
-    "}",
-    /* maskedmerge on gbrp16le. The 8 bit matte is scaled by 257, not by a
-     * left shift of 8: the engine routes it through format=gray16le for
-     * exactly this reason, because a shift tops the matte out at 65280 and a
-     * fully open window would then apply 99.61% of the correction. */
-    "vec3 winMerge(vec3 base, vec3 over, float m8) {",
-    "  uint m = uint(m8) * 257u;",
-    "  uvec3 bs = uvec3(floor(base * CODE + 0.5));",
-    "  uvec3 os = uvec3(floor(over * CODE + 0.5));",
-    "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
-    "  return vec3(r) / CODE;",
     "}",
     "void main() {",
     "  ivec2 p = ivec2(gl_FragCoord.xy);",
@@ -906,20 +1247,12 @@
     "  if (uHasBlc == 1) c = vec3(blcAt(c.r), blcAt(c.g), blcAt(c.b));",
     "  if (uSizes.y > 0) c = q16(tetra(uCstOut, uSizes.y, c));",
     "  if (uHasCurve == 1) c = vec3(curve1(c, 0), curve1(c, 1), curve1(c, 2));",
-    "  if (uSizes.z > 0) {",
-    "    vec3 pre = c;",
-    "    c = q16(tetra(uSec, uSizes.z, c));",
-    /* The window gates the secondary: build_graph splits the tree just before
-     * the qualifier cube, grades one branch and merges the two back through
-     * the matte, with the UN-graded branch first because maskedmerge returns
-     * its first input where the mask is 0. In matte view the graded branch IS
-     * the qualifier matte, so the base branch goes black and the merge reads
-     * as qualifier times window rather than as picture outside the shape. */
-    "    if (uWinOn == 1) {",
-    "      vec3 wbase = uWinBlack == 1 ? vec3(0.0) : pre;",
-    "      c = winMerge(wbase, c, winMatte(p));",
-    "    }",
-    "  }",
+    /* Hue curves, Color Slice and Tetra: one cube, baked by the server
+     * from grade/slice.py and applied here exactly the way a layer's cube
+     * is, so this is the same table lut3d reads. It sits after the curves
+     * and before the layer stack, matching build_graph. */
+    "  if (uSliceSize > 0) c = q16(tetra(uSlice, uSliceSize, c));",
+    "  vec3 preLook = c;",
     "  if (uSizes.w > 0) {",
     "    vec3 lk = q16(tetra(uLook, uSizes.w, c));",
     // blend=normal is dst = top*opacity + bottom*(1-opacity) in float,
@@ -927,7 +1260,116 @@
     "    vec3 lc = floor(lk * CODE + 0.5), pc = floor(c * CODE + 0.5);",
     "    c = floor(lc * uLookMix + pc * (1.0 - uLookMix)) / CODE;",
     "  }",
+    /* Slot 2 blends in PARALLEL with slot 1, mirroring build_graph: it grades
+     * preLook (the same pre-look signal slot 1 saw), never slot 1's output.
+     * A is c above (slot 1's result, or preLook itself with no slot 1 LUT).
+     * B is slot 2's own mix blend against preLook. balance then crossfades
+     * A and B the same truncated way blend=normal does. balance <= 0 or no
+     * slot 2 LUT skips this whole block, so the slot-1-only path above is
+     * untouched and the output is byte identical to before slot 2 existed. */
+    "  if (uLook2Size > 0 && uLookBalance > 0.0) {",
+    "    vec3 aC = floor(c * CODE + 0.5);",
+    "    vec3 lk2 = q16(tetra(uLook2, uLook2Size, preLook));",
+    "    vec3 l2c = floor(lk2 * CODE + 0.5), p2c = floor(preLook * CODE + 0.5);",
+    "    vec3 bC = floor(l2c * uLookMix2 + p2c * (1.0 - uLookMix2));",
+    "    c = floor(bC * uLookBalance + aC * (1.0 - uLookBalance)) / CODE;",
+    "  }",
     "  oCol = vec4(c, 1.0);",
+    "}"
+  ]));
+
+  /* The power window matte and the 16 bit masked merge, shared by every layer
+   * pass. Both were inside the colour shader when there was one secondary
+   * with one window; they moved out unchanged when the stack arrived, so
+   * there is still exactly one copy of the formula on this side.
+   *
+   * The matte is C4's formula on integer pixel indices with no half pixel
+   * offset, which is what geq's X and Y are. The rounding is floor(x + 0.5)
+   * and not roundEven: numpy's rint and ffmpeg's expression language disagree
+   * on halves, so the engine pinned both of its references to floor(x + 0.5)
+   * and this is the third one.
+   *
+   * The merge is maskedmerge on gbrp16le. The 8 bit matte is scaled by 257,
+   * not by a left shift of 8: the engine routes it through format=gray16le
+   * for exactly this reason, because a shift tops the matte out at 65280 and
+   * a fully open window would then apply 99.61% of the correction. */
+  var LIB_WINDOW = [
+    "uniform int uWinRect;",
+    "uniform int uWinInvert;",
+    "uniform vec2 uWinCentre;",     // cx*W, cy*H in pixels
+    "uniform vec2 uWinAxis;",       // the two half axes in pixels
+    "uniform vec2 uWinRot;",        // (cos, sin) of the rotation
+    "uniform vec2 uWinFeather;",    // (1+softness, 2*softness); y 0 is a hard edge
+    "const float WCODE = 65535.0;",
+    "float winMatte(ivec2 q) {",
+    "  float dx = float(q.x) - uWinCentre.x;",
+    "  float dy = float(q.y) - uWinCentre.y;",
+    "  float ux = dx * uWinRot.x + dy * uWinRot.y;",
+    "  float uy = dy * uWinRot.x - dx * uWinRot.y;",
+    "  float a = ux / uWinAxis.x;",
+    "  float b = uy / uWinAxis.y;",
+    "  float d = uWinRect == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
+    "  float m = uWinFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
+    "          : clamp((uWinFeather.x - d) / uWinFeather.y, 0.0, 1.0);",
+    "  if (uWinInvert == 1) m = 1.0 - m;",
+    "  return floor(m * 255.0 + 0.5);",
+    "}",
+    "vec3 winMerge(vec3 base, vec3 over, float m8) {",
+    "  uint m = uint(m8) * 257u;",
+    "  uvec3 bs = uvec3(floor(base * WCODE + 0.5));",
+    "  uvec3 os = uvec3(floor(over * WCODE + 0.5));",
+    "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
+    "  return vec3(r) / WCODE;",
+    "}"
+  ];
+
+  /* One layer's baked cube, applied on its own.
+   *
+   * A stack can be any length, so the cube cannot live in the fused colour
+   * shader the way the single secondary's did: there is no fixed number of
+   * texture units to give it. lut3d's own quantisation is kept (q16), so a
+   * layer pass lands on the same 16 bit lattice every other stage lands on
+   * and a stack of four costs four passes and no accuracy. */
+  var FS_LAYER_LUT = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "precision highp sampler3D;",
+    "uniform sampler2D uSrc;",
+    "uniform sampler3D uLut;",
+    "uniform int uSize;",
+    "out vec4 oCol;"
+  ].concat(LIB_LUT3D).concat([
+    "vec3 q16(vec3 v) { return clamp(floor(v * 65535.0), 0.0, 65535.0) / 65535.0; }",
+    "void main() {",
+    "  vec3 c = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0).rgb;",
+    "  if (uSize > 0) c = q16(tetra(uLut, uSize, c));",
+    "  oCol = vec4(c, 1.0);",
+    "}"
+  ]));
+
+  /* The merge under a layer's window matte.
+   *
+   * uBase is the branch that wins where the matte is 0 and uOver the one that
+   * wins where it is 255, because maskedmerge returns its FIRST input where
+   * the mask is 0. In matte view the graded branch IS the colour matte, so
+   * the base goes black (the engine puts a colorchannelmixer rr=0:gg=0:bb=0
+   * there) and the merge reads as colour matte times window matte rather than
+   * as picture outside the shape. */
+  var FS_LAYER_MERGE = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uBase;",
+    "uniform sampler2D uOver;",
+    "uniform int uWinBlack;",
+    "out vec4 oCol;"
+  ].concat(LIB_WINDOW).concat([
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  vec3 base = uWinBlack == 1 ? vec3(0.0) : texelFetch(uBase, p, 0).rgb;",
+    "  vec3 over = texelFetch(uOver, p, 0).rgb;",
+    "  oCol = vec4(winMerge(base, over, winMatte(p)), 1.0);",
     "}"
   ]));
 
@@ -1470,6 +1912,95 @@
     "}"
   ]);
 
+  /* mid_detail: out = A*(1+coeff) - B*coeff, A the sharp branch, B the
+   * blurred one. Mirrors cinegrade.py's f_mid_detail_segment blend, which is
+   * written the same way (not "A + coeff*(A-B)") specifically so no maxval
+   * constant is needed: ffmpeg's blend filter has none in its expr language,
+   * confirmed against `ffmpeg -h filter=blend`. This shader runs on whatever
+   * is in uA/uB (normalised float RGB when uMax is 1, raw YUV or RGB code
+   * values when uMax is 255 or 65535, exactly like FS_UNSHARP above), and
+   * clamps the finished expression to 0..uMax. ffmpeg's blend does NOT clamp
+   * on its own: an out-of-range all_expr result wraps modulo 65536 at 16 bit
+   * (measured, ffmpeg 8.1.1), which is why f_mid_detail_segment now writes
+   * clip(...,0,65535) around the same expression. The clamp therefore sits at
+   * the same point in both engines: after the whole expression, in the
+   * working range. All three channels get the same expression, matching the
+   * engine's all_expr, which is why mid_detail also touches chroma when the
+   * chain happens to be in YUV at this point: that is what ffmpeg really
+   * does too. */
+  var FS_MIDDETAIL = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uA;",
+    "uniform sampler2D uB;",
+    "uniform float uCoeff;",
+    "uniform float uMax;",
+    "out vec4 oCol;",
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  vec3 a = texelFetch(uA, p, 0).rgb;",
+    "  vec3 b = texelFetch(uB, p, 0).rgb;",
+    "  vec3 o = a * (1.0 + uCoeff) - b * uCoeff;",
+    "  oCol = vec4(clamp(o, 0.0, uMax), 1.0);",
+    "}"
+  ]);
+
+  /* Film grain (C3). Overlay blend against the plate the server rendered
+   * (grain/plate route, itself a slice of the real build_graph text), plus
+   * an optional response=film weight computed the same way cinegrade.py's
+   * blend all_expr does: colorchannelmixer's rr/rg/rb=0.2126/0.7152/0.0722
+   * mix applied to whichever three components uTex currently holds, exactly
+   * once, with no special case for a YUV stage. That is deliberate, not an
+   * oversight: cinegrade.py's own grain block runs that same colorchannelmixer
+   * and blend on `cur` without ever asking what pixel format it is in, so
+   * matching it verbatim (rather than branching on uYuv the way FS_VIGNETTE
+   * does) is what FS_MIDDETAIL's own comment already established is the
+   * right call for this codebase: "All three channels get the same
+   * expression... that is what ffmpeg really does too."
+   *
+   * uMax is codeMax||1, the same convention detailPass uses, so this runs
+   * in whatever range uTex currently is (normalised float when nothing has
+   * quantised yet, 255 or 65535 code values when vignette or sharpen has).
+   * uPlate is always uploaded normalised 0..1 (see uploadGrainPlate) and is
+   * rescaled up to uMax here so the response weight's 0.5*uMax midpoint
+   * lines up with uTex's own range.
+   *
+   * The final overlay+opacity step normalises to 0..1 first (ffmpeg's
+   * standard blend modes, unlike all_expr, work in normalised float
+   * regardless of bit depth), matching the formula measured against
+   * ffmpeg's own integer blend in cinegrade.py (max |predicted-actual| 1.49
+   * of 65535, mean 0.57, at opacity 0.5 over 2000 random 16-bit pairs). */
+  var FS_GRAIN = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uTex;",
+    "uniform sampler2D uPlate;",
+    "uniform float uOpacity;",
+    "uniform float uMax;",
+    "uniform int uFilm;",
+    "out vec4 oCol;",
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  vec3 cur = texelFetch(uTex, p, 0).rgb;",
+    "  vec3 plate = texelFetch(uPlate, p, 0).rgb * uMax;",
+    "  if (uFilm == 1) {",
+    "    float L = 0.2126 * cur.r + 0.7152 * cur.g + 0.0722 * cur.b;",
+    "    float t = clamp((L / uMax - 0.5) * 2.0, 0.0, 1.0);",
+    "    float w = 1.0 - 0.75 * (3.0 * t * t - 2.0 * t * t * t);",
+    "    plate = 0.5 * uMax + w * (plate - 0.5 * uMax);",
+    "  }",
+    "  vec3 a = cur / uMax;",
+    "  vec3 b = plate / uMax;",
+    "  vec3 lo = 2.0 * a * b;",
+    "  vec3 hi = 1.0 - 2.0 * (1.0 - a) * (1.0 - b);",
+    "  vec3 ov = mix(lo, hi, step(0.5, a));",
+    "  vec3 dst = a * (1.0 - uOpacity) + ov * uOpacity;",
+    "  oCol = vec4(clamp(dst, 0.0, 1.0) * uMax, 1.0);",
+    "}"
+  ]);
+
   var FS_LETTERBOX = src([
     "#version 300 es",
     "precision highp float;",
@@ -1618,6 +2149,7 @@
     this.G = new Gl(gl);
     this.src = null;             // { tex, w, h }
     this.luts = {};              // content key -> { size, tex } or a pending promise
+    this.grainPlates = {};       // plate key -> { tex, w, h } or a pending promise
     this.curveTex = null;
     this.tapCache = {};
     this.out = null;             // RGBA8 target the final picture lands in
@@ -1633,6 +2165,11 @@
       if (self.luts[k] && self.luts[k].tex) gl.deleteTexture(self.luts[k].tex);
     });
     this.luts = {};
+    Object.keys(this.grainPlates).forEach(function (k) {
+      var p = self.grainPlates[k];
+      if (p && p.tex) gl.deleteTexture(p.tex);
+    });
+    this.grainPlates = {};
   };
 
   Instance.prototype.setSource = function (u16, w, h) {
@@ -1680,15 +2217,53 @@
       var d = "AppleLog_to_Rec709_" + cv.tonemap + "_" + cv.encode + ".cube";
       reqs.push({ slot: "cstOut", key: "tech:" + d, body: { kind: "technical", name: d } });
     }
-    if (cfg.secondary && cfg.secondary.enabled) {
-      reqs.push({ slot: "secondary", key: "sec:" + stableJson(cfg.secondary),
-                  body: { kind: "secondary", config: cfg.secondary } });
+    /* One cube per layer, or two for the one case that needs two branches.
+     * The slot name carries the layer's ARRAY index so a pass can find its
+     * own cube without replaying the stack's control flow, and the cache key
+     * carries only what the cube depends on. */
+    configLayers(cfg).forEach(function (L, i) {
+      if (!layerActive(L)) return;
+      layerBranches(L).forEach(function (v) {
+        reqs.push({ slot: "layer" + i + ":" + v,
+                    key: "layer:" + stableJson(layerCubeKey(L, v)),
+                    body: { kind: "layer", config: L, variant: v } });
+      });
+    });
+    /* The hue curves + slice + tetra cube. Asked for only when something is
+     * actually set, so a neutral stage costs no round trip, and keyed on both
+     * blocks together because they bake into one table. */
+    if (sliceActive(cfg)) {
+      var sliceCfg = { hue_curves: cfg.hue_curves, slice: cfg.slice };
+      reqs.push({ slot: "slice", key: "slice:" + stableJson(sliceCfg),
+                  body: { kind: "slice", config: sliceCfg } });
     }
     if (cfg.look.lut) {
       reqs.push({ slot: "look", key: "look:" + cfg.look.lut,
                   body: { kind: "look", name: cfg.look.lut } });
     }
+    // Slot 2 only costs a fetch when it can actually show: no LUT, or
+    // balance at 0, mirrors the engine's own build_graph gate exactly.
+    if (cfg.look.lut2 && +(cfg.look.balance || 0) > 1e-6) {
+      reqs.push({ slot: "look2", key: "look:" + cfg.look.lut2,
+                  body: { kind: "look", name: cfg.look.lut2 } });
+    }
     return reqs;
+  }
+
+  /* Everything the baked cube depends on, and nothing else. Mirrors
+   * cinegrade._layer_cube_key: the name, the enabled flag, the placement, the
+   * window and the blur cannot change a single cube entry, so folding them
+   * into the cache key would refetch an identical table every time a layer is
+   * renamed or dragged up the stack. */
+  var LAYER_CUBE_FIELDS = ["exposure", "contrast", "pivot", "saturation",
+    "temperature", "tint", "hue_shift", "sat_gain", "lum_gain", "offset",
+    "strength"];
+
+  function layerCubeKey(layer, variant) {
+    var cor = {};
+    LAYER_CUBE_FIELDS.forEach(function (k) { cor[k] = layer.correct[k]; });
+    return { variant: variant, show: !!layer.mask.show,
+             key: layer.mask.key, correct: cor };
   }
 
   function stableJson(o) {
@@ -1705,8 +2280,25 @@
     var self = this;
     var cfg = this.prepareConfig(config, opts);
     var reqs = lutRequests(cfg);
-    return Promise.all(reqs.map(function (r) { return self.lut(r.key, r.body); }))
-      .then(function () { return true; });
+    var work = reqs.map(function (r) { return self.lut(r.key, r.body); });
+    // Grain plate prefetch (C3). width/height come from opts when the
+    // caller has not called setSource yet (render.js's worker loop calls
+    // ready() before setSource16, so this.src is still null there) and fall
+    // back to the already-uploaded source size otherwise (live.js and
+    // parity.js both call setSource before ready, so this.src is already
+    // valid for them). If neither is known yet, grain is silently skipped
+    // here and render() throws its own clear error instead of guessing a
+    // size to prefetch at.
+    if (cfg.grain.enabled) {
+      var gw = (opts && opts.width) || (this.src && this.src.w);
+      var gh = (opts && opts.height) || (this.src && this.src.h);
+      if (gw && gh) {
+        var gkey = grainPlateKey(cfg.grain, gw, gh);
+        var gqs = grainPlateQuery(cfg.grain, gw, gh);
+        work.push(this.grainPlate(gkey, gqs, gw, gh));
+      }
+    }
+    return Promise.all(work).then(function () { return true; });
   };
 
   Instance.prototype.lut = function (key, body) {
@@ -1760,6 +2352,89 @@
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    return tex;
+  };
+
+  // --- grain plate (C3) ----------------------------------------------
+
+  /* Every field the server's /api/grain/plate route reads, always sent in
+   * full (never a partial query), so the same config always produces the
+   * same query string and the same cache key: the server keys its own disk
+   * cache on the raw request dict it receives, not on the config it resolves
+   * that dict into, so a partial request here would be a second, wasted
+   * cache entry rather than a correctness problem, but sending everything
+   * every time avoids that waste. response is deliberately never included:
+   * the plate itself never depends on it (see grainPass and the FS_GRAIN
+   * comment), only the picture's own live luminance does. */
+  function grainPlateFields(g) {
+    return {
+      stock: g.stock || "custom",
+      size: +g.size,
+      strength: +g.strength,
+      softness: +(g.softness || 0),
+      color: +(g.color || 0),
+      seed: +(g.seed || 0)
+    };
+  }
+
+  function grainPlateKey(g, w, h) {
+    var f = grainPlateFields(g);
+    f.w = w; f.h = h;
+    return "grain:" + stableJson(f);
+  }
+
+  function grainPlateQuery(g, w, h) {
+    var f = grainPlateFields(g);
+    return "width=" + w + "&height=" + h +
+      "&stock=" + encodeURIComponent(f.stock) +
+      "&size=" + encodeURIComponent(f.size) +
+      "&strength=" + encodeURIComponent(f.strength) +
+      "&softness=" + encodeURIComponent(f.softness) +
+      "&color=" + encodeURIComponent(f.color) +
+      "&seed=" + encodeURIComponent(f.seed);
+  }
+
+  Instance.prototype.grainPlate = function (key, qs, w, h) {
+    var self = this;
+    var hit = this.grainPlates[key];
+    if (hit && hit.tex) return Promise.resolve(hit);
+    if (hit && hit.pending) return hit.pending;
+    var pending = fetch(this.apiBase + "/api/grain/plate?" + qs)
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) {
+          throw new Error("grain plate " + key + ": " + t);
+        });
+        return r.arrayBuffer();
+      }).then(function (buf) {
+        var entry = { w: w, h: h, tex: self.uploadGrainPlate(new Uint16Array(buf), w, h) };
+        self.grainPlates[key] = entry;
+        return entry;
+      });
+    this.grainPlates[key] = { pending: pending };
+    return pending;
+  };
+
+  /* Same normalise-by-65535 shape as setSource, minus the alpha channel and
+   * minus its update-in-place branch: a grain plate texture is never
+   * resized after upload, it is cached forever under its own content key
+   * and a new size just gets a new key. */
+  Instance.prototype.uploadGrainPlate = function (u16, w, h) {
+    var gl = this.gl;
+    this.G.scratch();
+    var f = new Float32Array(w * h * 4);
+    for (var i = 0, j = 0; i < w * h; i++, j += 3) {
+      f[i * 4] = u16[j] / 65535;
+      f[i * 4 + 1] = u16[j + 1] / 65535;
+      f[i * 4 + 2] = u16[j + 2] / 65535;
+      f[i * 4 + 3] = 1;
+    }
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return tex;
   };
 
@@ -2090,8 +2765,24 @@
     return this.blcTex;
   };
 
-  Instance.prototype.colourPass = function (cfg, W, H) {
+  /* The fused colour head.
+   *
+   * opts.srcTex   read this texture instead of the loaded source.
+   * opts.lookOff  build the head but hold the look back, so the before_look
+   *               layers can run between them.
+   * opts.lookOnly build ONLY the look: every head stage is guarded by its own
+   *               uniform, so turning all of them off leaves exactly the look
+   *               block and nothing else. That is what lets a layer stack run
+   *               in the middle of this chain without a second copy of the
+   *               look's arithmetic living somewhere else.
+   *
+   * With no layers at all, render() calls this once with no options and the
+   * pass is byte for byte the one that shipped before layers existed. */
+  Instance.prototype.colourPass = function (cfg, W, H, opts) {
     var gl = this.gl, G = this.G, self = this;
+    opts = opts || {};
+    var head = !opts.lookOnly;      // run log, CST, primaries, curves, slice
+    var wantLook = !opts.lookOff;   // run the look block
     var p = cfg.primaries, cv = cfg.convert;
     var LM = 65280 / 65535;
     var prog = G.program("color", FS_COLOR);
@@ -2109,17 +2800,31 @@
       G.bindTex(prog, name, unit, e ? e.tex : ident, "3d");
       return e ? e.size : 0;
     }
-    G.bindTex(prog, "uSrc", 0, this.src.tex);
+    G.bindTex(prog, "uSrc", 0, opts.srcTex || this.src.tex);
+    // uSizes.z is spare: the layer cubes left this shader when the single
+    // secondary became a stack. Every sampler is still bound (to the identity
+    // cube when its slot is empty) because an unbound sampler is undefined
+    // behaviour; the size is what switches a stage off.
     var sizes = [bindLut("uCstIn", 1, "cstIn"), bindLut("uCstOut", 2, "cstOut"),
-                 bindLut("uSec", 3, "secondary"), bindLut("uLook", 4, "look")];
+                 0, bindLut("uLook", 4, "look")];
+    if (!head) { sizes[0] = 0; sizes[1] = 0; }
+    if (!wantLook) sizes[3] = 0;
     gl.uniform4i(G.loc(prog, "uSizes"), sizes[0], sizes[1], sizes[2], sizes[3]);
+    var sliceSize = bindLut("uSlice", 7, "slice");
+    gl.uniform1i(G.loc(prog, "uSliceSize"), head ? sliceSize : 0);
     gl.uniform1f(G.loc(prog, "uLookMix"), fmt(+cfg.look.mix, 4));
+    // Second look slot: a separate int uniform because uSizes (ivec4) is
+    // full. Unit 8, the next free texture unit in this pass (0..7 taken).
+    var look2Size = bindLut("uLook2", 8, "look2");
+    gl.uniform1i(G.loc(prog, "uLook2Size"), wantLook ? look2Size : 0);
+    gl.uniform1f(G.loc(prog, "uLookMix2"), fmt(+cfg.look.mix2, 4));
+    gl.uniform1f(G.loc(prog, "uLookBalance"), fmt(+(cfg.look.balance || 0), 4));
 
     var offR = +cv.exposure + +p.temperature;
     var offG = +cv.exposure + +p.tint;
     var offB = +cv.exposure - +p.temperature;
     var hasLog = Math.abs(offR) > 1e-6 || Math.abs(offG) > 1e-6 || Math.abs(offB) > 1e-6;
-    gl.uniform1i(G.loc(prog, "uHasLog"), hasLog ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasLog"), (head && hasLog) ? 1 : 0);
     gl.uniform3f(G.loc(prog, "uLogOff"),
                  fmt(offR * APPLE_LOG_STOP, 6) * LM,
                  fmt(offG * APPLE_LOG_STOP, 6) * LM,
@@ -2127,7 +2832,7 @@
 
     var lift = triplet(p.lift, 0), gain = triplet(p.gain, 1);
     var hasLift = lift.some(nz) || gain.some(function (v) { return Math.abs(v - 1) > 1e-6; });
-    gl.uniform1i(G.loc(prog, "uHasLift"), hasLift ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasLift"), (head && hasLift) ? 1 : 0);
     gl.uniform3f(G.loc(prog, "uLiftA"), fmt(lift[0], 4) * LM, fmt(lift[1], 4) * LM,
                  fmt(lift[2], 4) * LM);
     gl.uniform3f(G.loc(prog, "uLiftB"), fmt(gain[0] - lift[0], 4),
@@ -2136,57 +2841,150 @@
     var pivot = (p.pivot === null || p.pivot === undefined)
       ? MID_GREY_CODE[cv.working_space] : +p.pivot;
     var contrast = +p.contrast;
-    gl.uniform1i(G.loc(prog, "uHasContrast"), Math.abs(contrast - 1) > 1e-6 ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasContrast"),
+                 (head && Math.abs(contrast - 1) > 1e-6) ? 1 : 0);
     gl.uniform2f(G.loc(prog, "uContrast"), fmt(contrast, 4), fmt(pivot, 4) * LM);
 
     var bright = triplet(p.brightness, 0);
-    gl.uniform1i(G.loc(prog, "uHasBright"), bright.some(nz) ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasBright"), (head && bright.some(nz)) ? 1 : 0);
     gl.uniform3f(G.loc(prog, "uBright"), fmt(bright[0], 4) * LM,
                  fmt(bright[1], 4) * LM, fmt(bright[2], 4) * LM);
 
     var gamma = triplet(p.gamma, 1);
     var hasGamma = gamma.some(function (v) { return Math.abs(v - 1) > 1e-6; });
-    gl.uniform1i(G.loc(prog, "uHasGamma"), hasGamma ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasGamma"), (head && hasGamma) ? 1 : 0);
     gl.uniform3f(G.loc(prog, "uInvGamma"), fmt(1 / gamma[0], 4), fmt(1 / gamma[1], 4),
                  fmt(1 / gamma[2], 4));
 
     var sat = +p.saturation, lr = 0.2126, lg = 0.7152, lb = 0.0722, iv = 1 - sat;
-    gl.uniform1i(G.loc(prog, "uHasSat"), Math.abs(sat - 1) > 1e-6 ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasSat"), (head && Math.abs(sat - 1) > 1e-6) ? 1 : 0);
     gl.uniform3f(G.loc(prog, "uSatR"), fmt(iv * lr + sat, 5), fmt(iv * lg, 5), fmt(iv * lb, 5));
     gl.uniform3f(G.loc(prog, "uSatG"), fmt(iv * lr, 5), fmt(iv * lg + sat, 5), fmt(iv * lb, 5));
     gl.uniform3f(G.loc(prog, "uSatB"), fmt(iv * lr, 5), fmt(iv * lg, 5), fmt(iv * lb + sat, 5));
 
-    gl.uniform1i(G.loc(prog, "uHasVib"), Math.abs(+p.vibrance) > 1e-6 ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasVib"),
+                 (head && Math.abs(+p.vibrance) > 1e-6) ? 1 : 0);
     gl.uniform1f(G.loc(prog, "uVib"), fmt(+p.vibrance, 4));
-
-    /* The power window. Every parameter is a fraction of the frame, so the
-     * geometry is resolved against the size this render is actually running
-     * at and no preview scaling is needed. */
-    var wg = windowGeometry(windowBlock(cfg), W, H);
-    gl.uniform1i(G.loc(prog, "uWinOn"), windowActive(cfg) ? 1 : 0);
-    gl.uniform1i(G.loc(prog, "uWinRect"), wg.rect ? 1 : 0);
-    gl.uniform1i(G.loc(prog, "uWinInvert"), wg.invert ? 1 : 0);
-    gl.uniform1i(G.loc(prog, "uWinBlack"),
-                 (cfg.secondary && cfg.secondary.show_mask) ? 1 : 0);
-    gl.uniform2f(G.loc(prog, "uWinCentre"), wg.cxp, wg.cyp);
-    gl.uniform2f(G.loc(prog, "uWinAxis"), wg.ax, wg.ay);
-    gl.uniform2f(G.loc(prog, "uWinRot"), wg.cr, wg.sr);
-    gl.uniform2f(G.loc(prog, "uWinFeather"), wg.hi, wg.den);
 
     var bl = +p.black_lift, hr = +p.highlight_rolloff;
     var hasBlc = Math.abs(bl) > 1e-6 || Math.abs(hr) > 1e-6;
     // Built first, bound second, because building one binds it somewhere.
     var blcTex = hasBlc ? this.blcTexture(bl, hr, pivot) : this.blcTexture(0, 0, 0.5);
     var curve = this.curveState(cfg);
-    gl.uniform1i(G.loc(prog, "uHasBlc"), hasBlc ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasBlc"), (head && hasBlc) ? 1 : 0);
     G.bindTex(prog, "uBlc", 5, blcTex);
-    gl.uniform1i(G.loc(prog, "uHasCurve"), curve.has ? 1 : 0);
+    gl.uniform1i(G.loc(prog, "uHasCurve"), (head && curve.has) ? 1 : 0);
     G.bindTex(prog, "uCurve", 6, curve.tex);
 
     var out = G.acquire(W, H);
     G.draw(out);
     this.passCount++;
     return out;
+  };
+
+  // --- layers -------------------------------------------------------
+
+  /* Which baked cube belongs to which layer branch, keyed "index:variant".
+   *
+   * Read back out of lutRequests rather than rebuilt, so the pass and the
+   * fetch cannot disagree about what a layer's cube is keyed on. */
+  Instance.prototype.layerSlots = function (cfg) {
+    var self = this, out = {};
+    lutRequests(cfg).forEach(function (r) {
+      if (r.slot.indexOf("layer") !== 0) return;
+      var e = self.luts[r.key];
+      if (!e || !e.tex) throw new Error("LUT not loaded: " + r.key);
+      out[r.slot.slice(5)] = e;
+    });
+    return out;
+  };
+
+  /* One layer's baked cube, applied to a texture. */
+  Instance.prototype.layerLutPass = function (tex, entry, W, H) {
+    var gl = this.gl, ident = this.identity();
+    var out = this.simple("layerlut", FS_LAYER_LUT, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uSrc", 0, tex);
+      G2.bindTex(pr, "uLut", 1, entry ? entry.tex : ident, "3d");
+      gl.uniform1i(G2.loc(pr, "uSize"), entry ? entry.size : 0);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  /* The masked merge of a graded branch back over the picture.
+   *
+   * Every window parameter is a fraction of the frame, so the geometry is
+   * resolved against the size this render is actually running at and no
+   * preview scaling is needed. */
+  Instance.prototype.layerMerge = function (base, over, win, black, W, H) {
+    var gl = this.gl;
+    var wg = windowGeometry(win, W, H);
+    var out = this.simple("layermerge", FS_LAYER_MERGE, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uBase", 0, base);
+      G2.bindTex(pr, "uOver", 1, over);
+      gl.uniform1i(G2.loc(pr, "uWinBlack"), black ? 1 : 0);
+      gl.uniform1i(G2.loc(pr, "uWinRect"), wg.rect ? 1 : 0);
+      gl.uniform1i(G2.loc(pr, "uWinInvert"), wg.invert ? 1 : 0);
+      gl.uniform2f(G2.loc(pr, "uWinCentre"), wg.cxp, wg.cyp);
+      gl.uniform2f(G2.loc(pr, "uWinAxis"), wg.ax, wg.ay);
+      gl.uniform2f(G2.loc(pr, "uWinRot"), wg.cr, wg.sr);
+      gl.uniform2f(G2.loc(pr, "uWinFeather"), wg.hi, wg.den);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  /* One layer: cube, optional blur, optional merge under the window matte.
+   *
+   * Mirrors build_layers filter for filter. A layer with no window is a
+   * single cube on the running picture, which is what keeps a migrated
+   * secondary the same one-chain graph it always was. A layer WITH a window
+   * grades a branch and merges it back, un-graded branch first, because
+   * maskedmerge returns its first input where the matte is 0. */
+  Instance.prototype.layerPass = function (cur, entry, slots, W, H) {
+    var G = this.G, self = this;
+    var layer = entry.layer, idx = entry.index;
+    var win = layerWindow(layer);
+    var show = !!layer.mask.show;
+    /* The blur is a picture operation. In matte view there is no picture,
+     * only the selection, and blurring that would misreport how soft the mask
+     * really is, so the engine leaves it out of that branch and so does this. */
+    var sigma = show ? 0 : layerBlurSigma(layer, W);
+    var branches = layerBranches(layer);
+
+    function graded(variant) {
+      var t = self.layerLutPass(cur.tex, slots[idx + ":" + variant], W, H);
+      if (sigma > 0) {
+        var b = self.gblur(t.tex, W, H, fmt(sigma, 3), 1, 65535);
+        G.release(t);
+        t = b;
+      }
+      return t;
+    }
+
+    var over = graded(branches[branches.length - 1]);
+    if (!win) { G.release(cur); return over; }
+
+    // Two branches is mask.invert over a window AND a key: the first branch
+    // is the full correction and wins where the window is closed. One branch
+    // in matte view puts black there instead, so the merge reads as colour
+    // matte times window matte rather than as picture outside the shape.
+    var base = branches.length > 1 ? graded(branches[0]) : null;
+    var out = this.layerMerge(base ? base.tex : cur.tex, over.tex,
+                              win, show, W, H);
+    if (base) G.release(base);
+    G.release(over);
+    G.release(cur);
+    return out;
+  };
+
+  Instance.prototype.layerStack = function (cur, cfg, list, W, H) {
+    if (!list.length) return cur;
+    var slots = this.layerSlots(cfg);
+    for (var i = 0; i < list.length; i++) {
+      cur = this.layerPass(cur, list[i], slots, W, H);
+    }
+    return cur;
   };
 
   // --- FX -----------------------------------------------------------
@@ -2358,7 +3156,54 @@
       this.passCount++;
       cur = out;
     }
+    if (plan.midDetail) {
+      // sigma is a FRACTION of the actual width being rendered (2%), so using
+      // W here (the real source texture width, already at preview size when
+      // this is a preview) already agrees with the engine's info["width"] at
+      // any size: no scaleForPreview entry needed, see MID_DETAIL_SIGMA_FRAC.
+      var sigma = Math.max(MID_DETAIL_SIGMA_FRAC * W, MID_DETAIL_SIGMA_MIN);
+      var coeff = fmt(+cfg.detail.mid_detail, 3) * MID_DETAIL_K;
+      var blurred = this.gblur(cur.tex, W, H, fmt(sigma, 3), maxVal, quant);
+      var mixed = this.simple("middetail", FS_MIDDETAIL, W, H, function (pr, G2) {
+        G2.bindTex(pr, "uA", 0, cur.tex);
+        G2.bindTex(pr, "uB", 1, blurred.tex);
+        gl.uniform1f(G2.loc(pr, "uCoeff"), coeff);
+        gl.uniform1f(G2.loc(pr, "uMax"), maxVal);
+      });
+      G.release(blurred);
+      G.release(cur);
+      this.passCount++;
+      cur = mixed;
+    }
     return cur;
+  };
+
+  // --- grain (C3) -----------------------------------------------------
+
+  /* The plate itself was already fetched and uploaded by ready(); this pass
+   * only ever looks it up by key. Throwing when it is missing (rather than
+   * skipping the effect) matches colourPass's own "LUT not loaded" contract,
+   * so a config that turns grain on always either grades with grain or fails
+   * loudly, never silently grades without it. */
+  Instance.prototype.grainPass = function (cur, cfg, W, H, codeMax) {
+    var gl = this.gl, G = this.G;
+    var g = cfg.grain;
+    var key = grainPlateKey(g, W, H);
+    var plate = this.grainPlates[key];
+    if (!plate || !plate.tex) {
+      throw new Error("grain plate not loaded (call ready() first): " + key);
+    }
+    var maxVal = codeMax || 1;
+    var out = this.simple("grain", FS_GRAIN, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uTex", 0, cur.tex);
+      G2.bindTex(pr, "uPlate", 1, plate.tex);
+      gl.uniform1f(G2.loc(pr, "uOpacity"), fmt(+g.opacity, 4));
+      gl.uniform1f(G2.loc(pr, "uMax"), maxVal);
+      gl.uniform1i(G2.loc(pr, "uFilm"), g.response === "film" ? 1 : 0);
+    });
+    G.release(cur);
+    this.passCount++;
+    return out;
   };
 
   // --- the whole render ---------------------------------------------
@@ -2382,7 +3227,30 @@
     this.passCount = 0;
     var t0 = now();
 
-    var cur = this.colourPass(cfg, W, H);
+    /* The colour head, the layer stack and the look.
+     *
+     * With no layers this is ONE fused pass, exactly the pass that shipped
+     * before layers existed, so every config that has no stack renders the
+     * bytes it always did. With a stack the same shader is invoked twice, the
+     * layers running in between, which is arithmetically identical: every
+     * head stage is guarded by its own uniform and an RGBA32F render target
+     * hands a value to the next pass bit for bit. */
+    var before = activeLayers(cfg, "before_look");
+    var after = activeLayers(cfg, "after_look");
+    var cur;
+    if (!before.length && !after.length) {
+      cur = this.colourPass(cfg, W, H);
+    } else {
+      cur = this.colourPass(cfg, W, H, { lookOff: true });
+      cur = this.layerStack(cur, cfg, before, W, H);
+      if (lookActive(cfg)) {
+        var looked = this.colourPass(cfg, W, H,
+                                     { lookOnly: true, srcTex: cur.tex });
+        G.release(cur);
+        cur = looked;
+      }
+      cur = this.layerStack(cur, cfg, after, W, H);
+    }
 
     if (cfg.fx.halation.enabled) cur = this.glowPass(cur, cfg.fx.halation, 4, W, H);
     if (cfg.fx.bloom.enabled) cur = this.glowPass(cur, cfg.fx.bloom, 8, W, H);
@@ -2399,7 +3267,10 @@
     if (plan.vignette) cur = this.vignettePass(cur, cfg.fx.vignette, W, H, codeMax, yuv);
     if (plan.quantiseAt === "detail") cur = this.toCode(cur, W, H, codeMax, yuv);
 
-    // Grain is deliberately absent. See STAGE_NOTES.grain.
+    // Grain (C3): the plate is whatever /api/grain/plate served for this
+    // exact config and size, prefetched by ready(). If it is missing this
+    // throws, the same contract colourPass already uses for a LUT slot.
+    if (plan.grain) cur = this.grainPass(cur, cfg, W, H, codeMax);
     if (plan.detail) cur = this.detailPass(cur, cfg, plan, W, H, codeMax);
     if (cfg.letterbox.enabled) cur = this.letterboxPass(cur, cfg, W, H, codeMax, yuv);
 
@@ -2700,6 +3571,17 @@
     defaults: function () { return clone(DEFAULTS); },
     fullConfig: fullConfig,
     chainPlan: chainPlan,
+
+    /* The layer stack, exposed for the UI and for anything that has to read a
+     * config the same way the engine reads it. migrateLayers is the pre-layers
+     * rewrite (run it BEFORE merging the defaults, or an empty `layers` from
+     * DEFAULTS makes an old config look new and its secondary is dropped);
+     * LAYER_DEFAULTS is the merge base for one layer, which the window editor
+     * needs so a half written layer never resolves to NaN. */
+    migrateLayers: migrateLayers,
+    LAYER_DEFAULTS: LAYER_DEFAULTS,
+    configLayers: configLayers,
+    layerActive: layerActive,
 
     // Exposed for the parity harness, which reports what it compared.
     notes: STAGE_NOTES,

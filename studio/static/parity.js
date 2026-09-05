@@ -6,14 +6,21 @@
  * preview which lies is worse than a slow preview, so every claim gpu.js makes
  * in StudioGPU.stageReport has to be backed by a number measured here.
  *
- * Grain is disabled in every configuration below, deliberately. gpu.js has no
- * grain stage at all, it has never been ported, so there is nothing on the
- * GPU side to compare against ffmpeg's noise filter. This used to say ffmpeg's
- * noise filter reseeds from the wall clock and cannot match itself run to
- * run; measured on this build it does reproduce run to run (see the Limits
- * panel), so that was never the real reason grain is left out here. gpu.js
- * reports grain as "unsupported" and callers are expected to fall back to
- * ffmpeg.
+ * Grain is off in every configuration below EXCEPT grainConfigs' own four
+ * rows (group "stage", stage "grain"): those are the only rows that turn it
+ * on, on purpose, because every other row here is measuring something else
+ * and grain-on would just add noise to that measurement. gpu.js now has a
+ * real grain shader (an overlay blend against a plate the server renders,
+ * plus an optional response=film weight), and grainConfigs' four rows
+ * measured it exact against ffmpeg on a rendered still: mean channel
+ * difference 0.006 of 255, max 1, 0 percent of channels over 1, at both 640
+ * and 1280 wide. That is for a STILL. The plate this preview fetches is one
+ * frame's worth, not one plate per output frame the way a real multi frame
+ * export advances it, so this harness (which only ever renders one frame per
+ * config) cannot and does not say anything about a playing or looping
+ * preview, where the same static plate would show on every frame while a
+ * real export's grain keeps changing. See STAGE_NOTES.grain in gpu.js and
+ * the Limits panel.
  *
  * Loads with no build step, no modules and no network beyond this machine.
  */
@@ -118,6 +125,51 @@
                 master: [[0, 0], [0.4, 0.34], [1, 1]],
                 b: [[0, 0.03], [1, 0.96]] } });
 
+    /* Hue curves, Color Slice and Tetra. All three bake into one 33 cube on
+     * the server and the GPU applies that same cube, so these rows are really
+     * asking one question: does the shader's tetrahedral lookup on the fetched
+     * table agree with ffmpeg's lut3d on the same file. Each tool gets a row
+     * alone so a failure names a tool, and the last row runs all of them at
+     * once because they compose into a single table and a composition error
+     * would hide in the isolated rows.
+     *
+     * The moves are deliberately large. A two degree hue rotation is invisible
+     * at 8 bit, so a row carrying one would measure exact while proving that
+     * two identity tables agree. */
+    add("slice_vector_hue", "slice", {
+      slice: { enabled: true, vectors: { red: { hue: 35.0 } } } });
+    add("slice_vector_density", "slice", {
+      slice: { enabled: true, vectors: { blue: { density: 0.85 } } } });
+    add("slice_global_density", "slice", { slice: { enabled: true, density: 0.7 } });
+    add("slice_tetra_corner", "slice", {
+      slice: { enabled: true,
+               tetra: { enabled: true, r: [0.0, 0.22, -0.12] } } });
+    add("hue_curve_hue_hue", "slice", {
+      hue_curves: { enabled: true, hue_hue: [[0.0, 0.07], [0.5, -0.05]] } });
+    add("hue_curve_hue_sat", "slice", {
+      hue_curves: { enabled: true, hue_sat: [[0.05, 1.7], [0.55, 0.4]] } });
+    add("hue_curve_hue_lum", "slice", {
+      hue_curves: { enabled: true, hue_lum: [[0.1, 1.35], [0.6, 0.7]] } });
+    add("hue_curve_lum_sat", "slice", {
+      hue_curves: { enabled: true, lum_sat: [[0.0, 1.6], [1.0, 0.5]] } });
+    add("hue_curve_sat_sat", "slice", {
+      hue_curves: { enabled: true, sat_sat: [[0.0, 1.0], [0.5, 1.5], [1.0, 0.6]] } });
+    add("slice_all_combined", "slice", {
+      hue_curves: { enabled: true,
+                    hue_hue: [[0.0, 0.03], [0.35, -0.02], [0.7, 0.01]],
+                    hue_sat: [[0.05, 1.3], [0.5, 0.8]],
+                    hue_lum: [[0.1, 1.15], [0.6, 0.9]],
+                    lum_sat: [[0.0, 1.25], [1.0, 0.75]],
+                    sat_sat: [[0.0, 1.1], [0.5, 1.0], [1.0, 0.85]] },
+      slice: { enabled: true, density: 0.12,
+               vectors: { red: { hue: 8.0, sat: 1.2, density: 0.2 },
+                          green: { hue: -6.0, sat: 0.7 },
+                          blue: { hue: 4.0, sat: 1.15, density: -0.1 },
+                          skin: { hue: -3.0, sat: 1.1, density: 0.05 } },
+               tetra: { enabled: true, r: [0.0, 0.06, -0.03],
+                        g: [-0.04, 0.0, 0.02], b: [0.02, -0.02, 0.0],
+                        m: [0.03, 0.0, -0.01], y: [0.0, -0.03, 0.02] } } });
+
     add("sec_sat_gain", "secondary", {
       secondary: { enabled: true, hue_center: 30, hue_width: 40, sat_gain: 1.6 } });
     add("sec_hue_shift_tint", "secondary", {
@@ -160,10 +212,88 @@
       window: { enabled: true, cx: 0.46, cy: 0.53, w: 0.55, h: 0.4,
                 rotation: 21.0, softness: 0.22 } });
 
+    /* The layer stack (C1). One layer is what the secondary and its window
+     * became, so the rows above are deliberately left in the PRE-layers
+     * spelling: both sides migrate on read, so those rows now measure the
+     * migration as well as the shader, and their verdicts have to hold.
+     *
+     * These rows are written in the new shape and cover what the old one
+     * could not express. Partial layers on purpose: both the engine's
+     * config_layers and gpu.js's configLayers merge each entry onto
+     * LAYER_DEFAULTS, so a row names only what it changes, exactly like every
+     * other config here.
+     *
+     * The corrections are deliberately loud for the same reason the window
+     * rows are: a matte that is right under a correction that barely moves
+     * the picture would measure exact while proving nothing. */
+    var LKEY = { enabled: true, hue_center: 30, hue_width: 50, hue_soft: 20 };
+    var LCORR = { hue_shift: -25, sat_gain: 1.45, lum_gain: 1.12,
+                  offset: [0.05, -0.02, -0.04] };
+
+    add("layer_window_only", "layers", {
+      layers: [{ mask: { window: { enabled: true, cx: 0.44, cy: 0.52,
+                                   w: 0.5, h: 0.55, rotation: 14.0,
+                                   softness: 0.2 } },
+                 correct: LCORR }] });
+    add("layer_key_only", "layers", {
+      layers: [{ mask: { key: LKEY }, correct: LCORR }] });
+    add("layer_window_and_key", "layers", {
+      layers: [{ mask: { window: { enabled: true, shape: "rect",
+                                   rotation: 37.0, softness: 0.0 },
+                         key: LKEY },
+                 correct: LCORR }] });
+    /* Two layers, applied one after the other. The pair does not commute: the
+     * first takes all the saturation out of the frame and the second pushes
+     * red back in, so an implementation that ran them in the other order (or
+     * in parallel) lands somewhere else entirely. */
+    add("layer_two_stacked", "layers", {
+      layers: [{ name: "desaturate", correct: { saturation: 0.0 } },
+                { name: "push red",
+                  mask: { window: { enabled: true, softness: 0.35 } },
+                  correct: { offset: [0.22, 0.0, -0.05] } }] });
+    /* A layer after a real look LUT. The look has to be a real cube or the
+     * two placements are the same picture and the row proves nothing. */
+    add("layer_after_look", "layers", {
+      look: { lut: "blockbuster", mix: 1.0 },
+      layers: [{ placement: "after_look", mask: { key: LKEY },
+                 correct: LCORR }] });
+    /* A blur inside a window. gblur reads its neighbours, so this is the row
+     * that catches a graph that blurred before the merge instead of inside
+     * the graded branch: the blur would then leak past the matte. The sigma
+     * is quoted at 1920 wide and resolved against the width each run uses. */
+    add("layer_blur_window", "layers", {
+      layers: [{ mask: { window: { enabled: true, cx: 0.5, cy: 0.5,
+                                   w: 0.45, h: 0.5, softness: 0.1 } },
+                 correct: { blur: 24.0, lum_gain: 1.05 } }] });
+    /* mask.invert over BOTH a window and a key, the one case the old shape
+     * could not express at all. The combined matte 1 - w*k does not factor
+     * into a colour times a position, so the engine grades two branches and
+     * merges them under the untouched window matte; if this row and the
+     * engine disagree, that factorisation is wrong somewhere. */
+    add("layer_mask_invert", "layers", {
+      layers: [{ mask: { invert: true, key: LKEY,
+                         window: { enabled: true, w: 0.5, h: 0.5,
+                                   softness: 0.25 } },
+                 correct: LCORR }] });
+    /* A global layer: no mask at all, and only the display domain controls a
+     * layer added on top of the old secondary's HSV ones. Exposure on a
+     * display signal is a code multiply of 2**(stops/2.4), and contrast,
+     * saturation, temperature and tint all run in the same cube. */
+    add("layer_global_exposure", "layers", {
+      layers: [{ correct: { exposure: 0.45, contrast: 1.2, saturation: 1.25,
+                            temperature: 0.15, tint: -0.08 } }] });
+
     add("look_natural_full", "look", { look: { lut: "natural", mix: 1.0 } });
     add("look_natural_half", "look", { look: { lut: "natural", mix: 0.5 } });
     add("look_silverblue", "look", { look: { lut: "silverblue", mix: 1.0 } });
     add("look_blockbuster_mix", "look", { look: { lut: "blockbuster_max", mix: 0.35 } });
+
+    /* Two look slots blended in parallel (C5). Two different real looks so a
+     * failure cannot hide behind slot 2 silently being a copy of slot 1. */
+    add("look_two_slots_balance_half", "look", {
+      look: { lut: "natural", mix: 1.0, lut2: "teal_orange", mix2: 1.0, balance: 0.5 } });
+    add("look_two_slots_balance_full_mix2", "look", {
+      look: { lut: "natural", mix: 1.0, lut2: "teal_orange", mix2: 0.5, balance: 1.0 } });
 
     add("fx_halation", "halation", { fx: { halation: { enabled: true } } });
     add("fx_halation_strong", "halation", {
@@ -183,6 +313,9 @@
     add("detail_soften", "detail", { detail: { soften: 1.4 } });
     add("detail_sharpen", "detail", { detail: { sharpen: 0.9 } });
     add("detail_both", "detail", { detail: { soften: 0.8, sharpen: 0.6 } });
+    add("detail_mid_detail_up", "detail", { detail: { mid_detail: 0.5 } });
+    add("detail_mid_detail_down", "detail", { detail: { mid_detail: -0.5 } });
+    add("detail_mid_detail_max", "detail", { detail: { mid_detail: 1.0 } });
 
     add("letterbox_239", "letterbox", { letterbox: { enabled: true, aspect: 2.39 } });
     add("letterbox_185", "letterbox", { letterbox: { enabled: true, aspect: 1.85 } });
@@ -262,6 +395,29 @@
     ];
   }
 
+  /* Film grain (C3). group is "stage" like isolatedConfigs' rows, not a
+   * separate group, so grain folds into the same per-stage rollup table as
+   * log/primaries/curves/slice instead of needing its own display path.
+   * Four rows: engine defaults with grain simply switched on, the coarsest
+   * stock preset (the one furthest from a bare strength/size/opacity grade,
+   * so a stock mismatch cannot hide as a rounding error), response=film
+   * (the only field that reads the picture's own luminance rather than
+   * just the plate), and color=1 (independent per-channel plate instead of
+   * one plate mono-replicated). softness and seed are not separate rows:
+   * softness only changes the plate's own blur, which the plate route
+   * builds identically on both sides by construction (see grain_input and
+   * _grain_plate_command), and seed only changes which bytes the noise
+   * generator emits, not any per-pixel math either side has to agree on. */
+  function grainConfigs() {
+    var c = [];
+    function add(id, cfg) { c.push({ id: id, group: "stage", stage: "grain", config: cfg }); }
+    add("grain_defaults", { grain: { enabled: true } });
+    add("grain_stock_35mm", { grain: { enabled: true, stock: "35mm" } });
+    add("grain_response_film", { grain: { enabled: true, response: "film" } });
+    add("grain_color", { grain: { enabled: true, color: 1.0 } });
+    return c;
+  }
+
   /* The shipped presets are pulled from the server rather than copied here, so
    * this harness tests what the app actually ships and cannot go stale. */
   function presetConfigs() {
@@ -284,12 +440,15 @@
         .concat(isolatedConfigs())
         .concat(laneConfigs())
         .concat(spaceAndTonemapConfigs())
-        .concat(combinedConfigs());
-      /* Grain off everywhere. See the file header: gpu.js has never ported
-       * grain, so there is nothing on the GPU side to compare it against. */
+        .concat(combinedConfigs())
+        .concat(grainConfigs());
+      /* Grain off everywhere except the grain rows themselves (C3): every
+       * other row measures something else, and grain-on there would only
+       * add noise to that measurement, but the grain rows exist to measure
+       * grain, so forcing it off on them would defeat the point. */
       all.forEach(function (e) {
         e.config = StudioGPU.fullConfig(e.config);
-        e.config.grain.enabled = false;
+        if (e.stage !== "grain") e.config.grain.enabled = false;
       });
       return all;
     });
@@ -664,12 +823,14 @@
         stages: stageRollup(S.rows),
         rows: S.rows,
         notes: [
-          "Grain is disabled in every configuration. gpu.js has no grain stage "
-          + "at all, it has never been ported, so there is nothing on the GPU "
-          + "side to compare against ffmpeg's noise filter. This used to say the "
-          + "filter reseeds from the wall clock and cannot match itself between "
-          + "runs; on this build it was measured reproducible run to run (see "
-          + "the Limits panel), so that was never the real reason.",
+          "Grain is on only in the four \"grain\" stage rows (grain_defaults, "
+          + "grain_stock_35mm, grain_response_film, grain_color); every other "
+          + "row still forces it off so grain cannot add noise to a "
+          + "measurement of something else. gpu.js now has a real grain shader "
+          + "and those four rows measure it exact against ffmpeg, but only for "
+          + "a rendered STILL: the plate is one frame's worth, not one plate "
+          + "per output frame, so this says nothing about a playing or "
+          + "looping preview (see STAGE_NOTES.grain in gpu.js).",
           "ffmpeg times include the HTTP round trip and the server's own decode, "
           + "and the server caches by config, so a repeated config is much faster "
           + "than a fresh one. The median below is over first-time renders in this "

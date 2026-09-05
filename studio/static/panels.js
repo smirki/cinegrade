@@ -38,6 +38,7 @@
   var host = null;
   var api = null;
   var curveWidget = null;
+  var hueCurveWidget = null;
   var lutSelects = [];
   // The live config itself, cached from the last refresh() call. Panels
   // otherwise holds no state (see the file header) -- this is read-only,
@@ -55,7 +56,8 @@
   // build.mjs) -- no path data lives in this file.
   var STAGE_ICON = {
     convert: "RefreshCwIcon", primaries: "FilterHorizontalIcon", curves: "EaseCurveControlPointsIcon",
-    secondary: "ColorPickerIcon", window: "EllipseSelectionIcon", look: "Film01Icon", fx: "SparklesIcon",
+    hue_curves: "EaseCurveControlPointsIcon", slice: "ColorPickerIcon",
+    layers: "Layers01Icon", look: "Film01Icon", fx: "SparklesIcon",
     grain: "ChartScatterIcon", detail: "FocusIcon", letterbox: "AspectRatioIcon",
     output: "Download01Icon"
   };
@@ -88,6 +90,7 @@
     widgets = [];
     lutSelects = [];
     curveWidget = null;
+    hueCurveWidget = null;
     host.innerHTML = "";
 
     SCHEMA.forEach(function (stage) {
@@ -112,6 +115,17 @@
         var el = makeControl(spec);
         if (el) body.appendChild(el);
       });
+
+      // An array-kind stage (currently only "layers") has no fixed control
+      // list of its own: its length depends on config.layers, not on
+      // anything SCHEMA can declare once. Its real body is built by
+      // layers.js (studio/static/layers.js), which owns everything from
+      // here down -- add/remove/duplicate/move, per-layer collapsing, the
+      // selected-layer marker -- the same way window-editor.js owns the
+      // on-picture shape overlay without panels.js knowing its internals.
+      if (stage.kind === "array" && global.Layers) {
+        global.Layers.buildSection(body, stage);
+      }
 
       box.appendChild(head);
       box.appendChild(body);
@@ -184,6 +198,25 @@
 
   function makeControl(spec) {
     if (spec.kind === "sub") return subhead(spec.label);
+
+    /* A collapsed subgroup: a heading you click to open, holding its own
+     * controls. Used for Tetra, which is six RGB triplets nobody wants in
+     * their face until they are reaching for it. <details> rather than a
+     * hand rolled toggle so keyboard and find-in-page work for free. */
+    if (spec.kind === "fold") {
+      var det = document.createElement("details");
+      var sum = document.createElement("summary");
+      sum.className = "stagesub";
+      sum.textContent = spec.label;
+      sum.style.cursor = "pointer";
+      if (spec.title) sum.title = spec.title;
+      det.appendChild(sum);
+      (spec.controls || []).forEach(function (sub) {
+        var e2 = makeControl(sub);
+        if (e2) det.appendChild(e2);
+      });
+      return det;
+    }
 
     if (spec.kind === "slider") {
       var w = Ctl.slider({
@@ -446,6 +479,81 @@
       return wrap2;
     }
 
+    /* The hue curve editor. Its own widget (studio/static/huecurve.js), not
+     * Ctl.curveEditor: the neutral is a flat line rather than the diagonal,
+     * the three hue axes are periodic, and y is an offset or a multiplier on
+     * its own scale rather than an output level in [0, 1]. spec.paths is in
+     * HueCurve.KEYS order, which is what maps a tab back to a config path. */
+    if (spec.kind === "huecurves") {
+      var hwrap = document.createElement("div");
+      hwrap.className = "curvewrap";
+      var htabs = document.createElement("div");
+      htabs.className = "curvetabs";
+      var hcanvas = document.createElement("canvas");
+      hcanvas.id = "hueCurveCanvas";
+      var hlive = {};
+      global.HueCurve.KEYS.forEach(function (k) { hlive[k] = []; });
+
+      var hed = global.HueCurve.editor({
+        canvas: hcanvas, value: hlive,
+        onChange: function (key, pts, commit) {
+          var i = global.HueCurve.KEYS.indexOf(key);
+          emit(spec.paths[i], pts.map(function (p) { return [p[0], p[1]]; }), commit);
+        }
+      });
+      hueCurveWidget = hed;
+
+      global.HueCurve.KEYS.forEach(function (k, i) {
+        var b2 = document.createElement("button");
+        b2.className = "btn" + (i === 0 ? " active" : "");
+        b2.textContent = global.HueCurve.AXES[k].tab;
+        b2.title = global.HueCurve.AXES[k].name + ": y is "
+          + global.HueCurve.AXES[k].yLabel;
+        b2.dataset.curve = k;
+        b2.addEventListener("click", function () {
+          htabs.querySelectorAll(".btn").forEach(function (x) { x.classList.remove("active"); });
+          b2.classList.add("active");
+          hed.setChannel(k);
+        });
+        htabs.appendChild(b2);
+      });
+      var hreset = document.createElement("button");
+      hreset.className = "btn";
+      hreset.textContent = "reset all";
+      hreset.addEventListener("click", function () {
+        global.HueCurve.KEYS.forEach(function (k, i) {
+          hlive[k] = [];
+          emit(spec.paths[i], [], true);
+        });
+        hed.set(hlive);
+      });
+      htabs.appendChild(hreset);
+
+      hwrap.appendChild(htabs);
+      hwrap.appendChild(hcanvas);
+      var hhint = document.createElement("div");
+      hhint.className = "curvehint";
+      hhint.textContent = "click to add a point, drag to move, alt or right "
+        + "click to delete any point, double click the graph to clear this "
+        + "curve back to the identity. The olive line is the neutral.";
+      hwrap.appendChild(hhint);
+
+      widgets.push({
+        paths: spec.paths,
+        set: function (cfg) {
+          var next = {};
+          global.HueCurve.KEYS.forEach(function (k, i) {
+            var pts = getPath(cfg, spec.paths[i]) || [];
+            next[k] = pts.map(function (p) { return [p[0], p[1]]; });
+          });
+          hlive = next;
+          hed.set(hlive);
+        },
+        dirty: function () {}
+      });
+      return hwrap;
+    }
+
     return null;
   }
 
@@ -467,6 +575,13 @@
       var box = host.querySelector('[data-stage="' + stage.id + '"]');
       if (box) box.classList.toggle("off", !getPath(cfg, stage.enable));
     });
+    // Every refresh (a commit, an undo/redo, a preset load, a clip switch, an
+    // outside session patch) may have changed config.layers itself, not just
+    // a value inside it -- an add, remove, duplicate or reorder replaces the
+    // whole array (see layers.js's commitLayers), which the plain widgets
+    // loop above has no entry for at all. Layers.refresh reads the current
+    // array fresh every time rather than diffing against what it last drew.
+    if (global.Layers) global.Layers.refresh(cfg, defaults);
   }
 
   function setLooks(names) {
@@ -479,7 +594,10 @@
     });
   }
 
-  function resizeCurves() { if (curveWidget) curveWidget.resize(); }
+  function resizeCurves() {
+    if (curveWidget) curveWidget.resize();
+    if (hueCurveWidget) hueCurveWidget.resize();
+  }
 
   function collapseAll(on) {
     host.querySelectorAll(".stage").forEach(function (s) {

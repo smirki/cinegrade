@@ -40,6 +40,8 @@ const SPEC_FILES = [
   "13-window-editor.mjs",
   "14-proxy-playback.mjs",
   "15-gpu-render.mjs",
+  "16-layers.mjs",
+  "17-slice.mjs",
 ];
 
 /* The one place every spec waits for "the app finished its first boot":

@@ -24,6 +24,13 @@ it can be driven by a script or an agent.
 | Radial blur, edge defocus | `fx.radial_blur` |
 | RGB split | `fx.rgb_split` |
 | Vignette, grain | `fx.vignette`, `grain` |
+| Power window plus HSL qualifier (secondary correction) | `layers`, any number of masked correction layers |
+| Hue vs Hue / Sat / Lum curves | `hue_curves` stage |
+| Color Warper-style hue vector wheel | `slice` stage (Color Slice), plus `slice.tetra` |
+| Multi-scale midtone detail | `detail.mid_detail`, one radius only |
+| Temporal / spatial noise reduction | `prep.denoise` (ffmpeg's hqdn3d) |
+| A / B look nodes | `look.lut2` / `.mix2` / `.balance`, blended in parallel with `look.lut` / `.mix` |
+| Grain stock choices | `grain.stock` (`16mm`, `35mm`, `65mm`) |
 | Scopes, gallery stills | `scopes`, `stats`, `compare` |
 
 ## Color science
@@ -116,6 +123,8 @@ content/
   refs/                     look references (gitignored)
   grade/
     cinegrade.py            engine
+    slice.py                Color Slice / Tetra: bakes hue_curves plus slice
+                            into the same kind of 33 point cube layers use
     AGENTS.md               operating guide, read this first
     presets/*.json          flat, clean, natural, cinekit, forest,
                             golden_haze, premium, cinematic, reels,
@@ -124,6 +133,9 @@ content/
                             commercial, blue_hour, interior, punch, silverblue
     luts/technical/         generated CSTs (gitignored)
     luts/looks/             looks + the drop-in slot for purchased LUTs
+    luts/layers/            layer correction cubes, one 33 point cube per
+                            layer (gitignored)
+    luts/slice/             Color Slice / Tetra cubes, 33 point (gitignored)
     tools/                  colorlib.py, make_cst.py, make_looks.py
     out/, stills/           renders (gitignored)
 ```

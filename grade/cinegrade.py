@@ -71,8 +71,19 @@ DEFAULTS = {
         "lift": 0.0, "gamma": 1.0, "gain": 1.0,
         "black_lift": 0.0, "highlight_rolloff": 0.0,
     },
-    "look": {"lut": None, "mix": 1.0},
-    "detail": {"soften": 0.0, "sharpen": 0.0},
+    # Two slots blended in parallel, not stacked: A = lerp(base, lut1(base),
+    # mix), B = lerp(base, lut2(base), mix2), out = lerp(A, B, balance).
+    # lut2 null or balance 0 reproduces exactly today's single-slot output.
+    "look": {"lut": None, "mix": 1.0, "lut2": None, "mix2": 1.0, "balance": 0.0},
+    # mid_detail is local contrast at a wide gaussian radius (sigma about 2% of
+    # the frame width): out = in + mid_detail * MID_DETAIL_K * (in - blur(in)).
+    # 0.0 leaves the picture untouched (today's bytes). See f_mid_detail_segment.
+    "detail": {"soften": 0.0, "sharpen": 0.0, "mid_detail": 0.0},
+    # prep runs on the source before any colour transform (right after decode,
+    # before the CST): see f_denoise. Off by default, matching today's bytes.
+    # The GPU preview has no hqdn3d, so an enabled denoise always falls back to
+    # the ffmpeg-rendered still, the same way grain falls back today.
+    "prep": {"denoise": {"enabled": False, "spatial": 0.0, "temporal": 0.0}},
     "fx": {
         "halation": {"enabled": False, "threshold": 0.62, "sigma": 26,
                      "strength": 0.55, "tint": [1.0, 0.34, 0.16]},
@@ -85,7 +96,16 @@ DEFAULTS = {
     # size is the grain plate's downscale factor. Real film grain has a
     # physical size; per-pixel noise at 4K averages away to nothing the moment
     # the clip is viewed at 1080p, which is why it reads as "no grain".
-    "grain": {"enabled": False, "strength": 40, "size": 3, "opacity": 0.5},
+    #
+    # stock/softness/response/color/seed all default to the value that
+    # reproduces today's bytes exactly (see grain_input and build_graph's
+    # grain block): stock "custom" leaves strength/size/softness alone,
+    # softness 0 skips the blur node, response "flat" skips the luminance
+    # weighting node, color 0 skips the independent-channel plate and mixer,
+    # seed 0 omits ffmpeg's noise seed option entirely (its own default).
+    "grain": {"enabled": False, "strength": 40, "size": 3, "opacity": 0.5,
+              "stock": "custom", "softness": 0.0, "response": "flat",
+              "color": 0.0, "seed": 0},
     "letterbox": {"enabled": False, "aspect": 2.39},
     # The curves node. Runs after CST OUT, in Rec.709 display code, because a
     # curve is drawn against what you can see. Drawing it in the DWG working
@@ -98,34 +118,54 @@ DEFAULTS = {
         "g": [[0.0, 0.0], [1.0, 1.0]],
         "b": [[0.0, 0.0], [1.0, 1.0]],
     },
-    # HSL qualifier (Resolve's secondary). Baked to a .cube rather than run as
-    # a per-pixel expression: the key and the correction are both pure
-    # functions of one pixel's RGB, so a 33-cube plus tetrahedral interpolation
-    # is exact enough and costs a table lookup instead of a geq evaluation per
-    # pixel per frame. It is a colour key only, never a shape.
-    "secondary": {
-        "enabled": False, "show_mask": False, "invert": False,
-        "hue_center": 30.0, "hue_width": 40.0, "hue_soft": 15.0,
-        "sat_low": 0.10, "sat_high": 1.0, "sat_soft": 0.10,
-        "lum_low": 0.0, "lum_high": 1.0, "lum_soft": 0.10,
-        "hue_shift": 0.0, "sat_gain": 1.0, "lum_gain": 1.0,
-        "tint": [0.0, 0.0, 0.0], "strength": 1.0,
+    # The hue curves (Hue vs Hue, Hue vs Sat, Hue vs Lum, Lum vs Sat, Sat vs
+    # Sat). Point lists like curves.master, but the neutral is a FLAT line, not
+    # the diagonal: these are corrections, so an empty list is the identity and
+    # y is an offset or a multiplier rather than an output level. The hue axes
+    # are periodic, so a point near 0 and a point near 1 are neighbours.
+    # Units and the full colour model live in grade/slice.py.
+    "hue_curves": {
+        "enabled": False,
+        "hue_hue": [], "hue_sat": [], "hue_lum": [],
+        "lum_sat": [], "sat_sat": [],
     },
-    # Power window: the shape half of a secondary. The qualifier above picks
-    # pixels by colour; this picks them by position, and the two multiply, so
-    # "the orange only inside this oval" is one grade rather than two.
+    # Color Slice (six chromatic vectors plus skin, each with a density) and
+    # Tetra (six cube corner moves with black and white pinned). Baked into the
+    # same cube as the hue curves above, for the same reason the secondary is
+    # baked: all of it is a pure function of one pixel's RGB.
+    "slice": {
+        "enabled": False,
+        "density": 0.0,
+        "vectors": {
+            "red": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "yellow": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "green": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "cyan": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "blue": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "magenta": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+            "skin": {"hue": 0.0, "sat": 1.0, "density": 0.0},
+        },
+        "tetra": {
+            "enabled": False,
+            "r": [0.0, 0.0, 0.0], "g": [0.0, 0.0, 0.0], "b": [0.0, 0.0, 0.0],
+            "c": [0.0, 0.0, 0.0], "m": [0.0, 0.0, 0.0], "y": [0.0, 0.0, 0.0],
+        },
+    },
+    # Masked correction layers, any number of them, applied in array order.
     #
-    # Every geometric value is a FRACTION of the frame, never a pixel count.
-    # That is what lets a 960 wide preview and a 3840 wide render agree without
-    # scale_for_preview needing a case for any of it: the same numbers describe
-    # the same shape at any size. cx/cy are the centre, w/h the FULL extent
-    # (not the half axis), rotation is degrees clockwise on screen, softness is
-    # the feather width as a fraction of the shape's own radius.
-    "window": {
-        "enabled": False, "shape": "ellipse",
-        "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
-        "rotation": 0.0, "softness": 0.15, "invert": False,
-    },
+    # This replaces the single `secondary` (an HSL colour key) plus `window`
+    # (one power window shape) pair the engine used to carry. A layer IS that
+    # pair generalised: a mask (a window, a colour key, either, both or
+    # neither) and a correction that is merged back under the mask. One layer
+    # whose key and window are the old blocks reproduces the old picture byte
+    # for byte, and there can now be as many as the grade needs.
+    #
+    # Empty by default, which is what makes every existing preset render
+    # exactly what it always rendered: an empty list adds no filter, no ffmpeg
+    # input and no change to the graph text. A config written before layers
+    # existed is migrated on read by migrate_layers(). LAYER_DEFAULTS below is
+    # the shape of one layer and the merge base every layer is filled in from.
+    "layers": [],
     "output": {"codec": "prores_ks", "profile": 3, "crf": 16, "preset": "slow"},
 }
 
@@ -150,7 +190,13 @@ def load_preset(name_or_path: str | None) -> dict:
         avail = sorted(x.stem for x in PRESETS.glob("*.json"))
         raise GradeError(
             f"preset not found: {name_or_path}. available: {', '.join(avail)}")
-    return deep_merge(DEFAULTS, json.loads(p.read_text()))
+    # migrate_layers runs on the file's own contents, BEFORE the merge with
+    # DEFAULTS, because DEFAULTS always supplies an empty `layers` and the
+    # migration's rule is "old keys and no layers key". Not because any
+    # shipped preset carries a secondary or a window (none do), but because a
+    # preset on disk is exactly the kind of thing someone saved before layers
+    # existed. The file itself is never rewritten.
+    return deep_merge(DEFAULTS, migrate_layers(json.loads(p.read_text())))
 
 
 # --------------------------------------------------------------------------
@@ -286,6 +332,59 @@ def f_log_stage(cfg, info, normalised=False) -> list[str]:
                 return f"clip(val+{stops * APPLE_LOG_STOP:.6f}*maxval,0,maxval)"
         chain.append(f"lut=r='{ex(off_r)}':g='{ex(off_g)}':b='{ex(off_b)}'")
     return chain
+
+
+# prep.denoise maps its 0..1 spatial/temporal sliders onto hqdn3d's own
+# luma/chroma spatial/temporal strengths. hqdn3d's own defaults (when given no
+# arguments at all) are luma_spatial=4.0, chroma_spatial=3.0, luma_tmp=6.0,
+# chroma_tmp=4.5, so 0.5 landing near ffmpeg's own default spatial strength is
+# the anchor these numbers were picked against. The buffer at this point in the
+# graph is gbrp16le (three RGB planes, not YUV), so there is no real luma vs
+# chroma split to honour: every plane gets the SAME strength rather than
+# guessing which colour channel stands in for "luma".
+DENOISE_SPATIAL_MAX = 8.0
+DENOISE_TEMPORAL_MAX = 8.0
+
+
+def f_denoise(cfg) -> list[str]:
+    """prep.denoise: hqdn3d, right after the source is normalised to RGB and
+    exposure/white balance is applied, and before the CST (f_convert_in).
+
+    Placed after f_log_stage rather than literally before it so the same
+    filter lands at the same point in the graph whether this call is the CLI's
+    single-pass render (f_log_stage's non-normalised branch, decoding straight
+    off the file) or the studio server's cached-source preview
+    (f_log_stage's normalised branch, which is already gbrp16le by the time it
+    reaches this graph): both branches finish f_log_stage in the same gbrp16le,
+    exposure-applied state, so denoise behaves identically in the final render
+    and in the server's fallback still. Exposure is a constant per-channel
+    additive shift, which does not meaningfully interact with a spatial or
+    temporal filter, so running denoise just after it rather than strictly
+    before it does not change what "denoise before the CST" means in practice.
+
+    Temporal denoise (luma_tmp/chroma_tmp) needs a real previous frame to
+    compare against, and a still is the very first frame hqdn3d has ever seen,
+    so it is NEAR enough a no-op: measured on footage/A001_09011336_C002.MOV at
+    1920 wide, temporal 0 vs temporal 1 with spatial 0 differs by a max of
+    1065 of 65535 (4.15 of 255), mean 243 of 65535 (0.95 of 255), on one still.
+    That residual is ffmpeg's own hqdn3d, isolated with no other filter in the
+    chain: max 165 of 65535, mean 12.8 of 65535, so this engine's own graph
+    roughly doubles it rather than introducing it. It is real but small next
+    to what temporal denoise does across actual frames: on a 12-frame bounded
+    render at the same width, frame 6 (temporal 0 vs 1) differs by a mean of
+    648 of 65535 (2.52 of 255), max 6285 of 65535 (24.45 of 255), 2.7x the mean
+    and 5.9x the max of the single-still residual. See limits.js.
+    """
+    dn = (cfg.get("prep") or {}).get("denoise", {})
+    if not dn.get("enabled"):
+        return []
+    spatial = max(0.0, min(1.0, float(dn.get("spatial", 0.0))))
+    temporal = max(0.0, min(1.0, float(dn.get("temporal", 0.0))))
+    if spatial <= 1e-6 and temporal <= 1e-6:
+        return []
+    sp = spatial * DENOISE_SPATIAL_MAX
+    tp = temporal * DENOISE_TEMPORAL_MAX
+    return [f"hqdn3d={sp:.3f}:{sp:.3f}:{tp:.3f}:{tp:.3f}"]
 
 
 # 18% grey lands at a different code value in each working space, and the
@@ -606,8 +705,82 @@ def f_detail(cfg) -> list[str]:
     return chain
 
 
-def f_look(cfg) -> list[str]:
-    lut = cfg["look"]["lut"]
+# mid_detail: local contrast at a wide gaussian radius. sigma is a FRACTION of
+# the frame width (not a fixed pixel count like the FX sigmas scale_for_preview
+# corrects), so computing it from info["width"] at build time already agrees
+# between a full render and a smaller preview without any extra scaling step:
+# a preview genuinely renders at fewer actual pixels (see server.py
+# scale_for_preview's docstring and render_raw's pinfo), so 2% of THAT width is
+# already the proportionally-correct radius.
+MID_DETAIL_SIGMA_FRAC = 0.02
+MID_DETAIL_SIGMA_MIN = 1.0     # pixels; keeps a tiny preview from asking gblur for sigma 0
+# Chosen so mid_detail=1.0 is a strong, still-usable local contrast push. A
+# single hard-edge pixel (a bright window against a dark interior, in the real
+# test footage) already sits near the full 0..65535 swing in (in - blur), so
+# ANY k > 0 drives that one outlier close to full clip; the number that
+# actually scales with k, and the one that matters for "usable", is the mean
+# absolute change over the whole frame. Swept 0.3 to 2.0 on
+# footage/A001_09011336_C002.MOV at 1920 wide, mid_detail=1.0: mean |delta|
+# rose roughly linearly from 490 of 65535 (1.9 of 255) at k=0.3 to 4490 of
+# 65535 (17.5 of 255) at k=2.0. k=2.0 moves the WHOLE frame by an average of
+# 17.5 of 255, which reads as a different picture, not a stronger one; k=1.0
+# (mean |delta| 1942 of 65535, 7.6 of 255) is the strong end of "usable".
+# That sweep ran before the clamp fix below, so it was measuring wrapped
+# samples as well as real ones. Re-measured on the same clip and width with
+# the clamp in place (t=1.0s, 8-bit render): mid_detail 1.0 moves the frame by
+# a mean of 6.7 of 255 and -1.0 by 6.8, where the wrapping build reported 8.8
+# for 1.0 against the same 6.8 for -1.0. So the wrap was inflating the
+# positive half by about a third and the shape of the sweep, not the choice of
+# k=1.0, is what it justified.
+MID_DETAIL_K = 1.0
+
+
+def f_mid_detail_segment(mid: float, info: dict, cur: str, segs: list[str]) -> str:
+    """Append the split/blur/blend sub-graph for mid_detail, return the new
+    running label.
+
+    out = in + mid*K*(in - blur(in)). Written as a `blend` all_expr as
+    `A*(1+coeff) - B*coeff` (A the sharp branch, B the blurred branch) rather
+    than an expression that names `in` and `blur(in)` separately, because that
+    form needs no absolute maxval constant inside the arithmetic: `blend`'s
+    all_expr language has no such constant (unlike `lut` and `geq`, confirmed
+    against `ffmpeg -h filter=blend`).
+
+    The whole expression is wrapped in clip(..., 0, 65535) because ffmpeg's
+    blend does NOT clip an out-of-range all_expr result: it casts the float to
+    the plane's integer type, so the value wraps modulo 65536 at 16 bit.
+    Measured on this build (ffmpeg 8.1.1): a 16-bit ramp blended against a
+    constant with all_expr 'A*3-B*2' returns 65492 where the arithmetic says
+    -44, and 64733 where it says 130269. An earlier version of this docstring
+    read that wrap as a clip, because doubling white (65535*2 = 131070) wraps
+    to 65534, which is indistinguishable from a clip to white. On the parity
+    clip at 640 wide with mid_detail 1.0, 24140 of 2184960 channel samples
+    (1.10 percent) leave the range and every one of them wrapped: pixel
+    (70, 216) green computes -242 and came back as 65294 (white), while the
+    GPU port clamped it to 0. That was the whole of the mid_detail parity
+    failure, and it is 1.10 percent of samples, the exact pctOver1 the harness
+    reported for that row.
+
+    The literal 65535 is used rather than a symbolic maximum because every
+    filter this segment can follow is 16 bit: the working format is gbrp16le
+    (f_log_stage), and the only filter between it and here that changes format
+    is unsharp, which is YUV only and negotiates yuv444p16le out of gbrp16le
+    (checked with `ffmpeg -v 48`). clip() is part of blend's expression
+    evaluator (av_expr), verified on this build.
+    """
+    sigma = max(MID_DETAIL_SIGMA_FRAC * float(info["width"]), MID_DETAIL_SIGMA_MIN)
+    coeff = mid * MID_DETAIL_K
+    a, b, blur, out = "mda", "mdb", "mdblur", "mdout"
+    segs.append(f"[{cur}]split=2[{a}][{b}]")
+    segs.append(f"[{b}]gblur=sigma={sigma:.3f}[{blur}]")
+    segs.append(f"[{a}][{blur}]blend=all_expr="
+                f"'clip(A*{1.0 + coeff:.4f}-B*{coeff:.4f},0,65535)'[{out}]")
+    return out
+
+
+def f_look(cfg, slot="lut") -> list[str]:
+    """Build the lut3d filter for one look slot ("lut" or "lut2")."""
+    lut = cfg["look"].get(slot)
     if not lut:
         return []
     p = Path(lut)
@@ -653,9 +826,126 @@ def f_curves(cfg) -> list[str]:
     return ["curves=" + ":".join(parts) + f":interp={interp}"]
 
 
-# --- secondary (HSL qualifier) --------------------------------------------
+# --- hue curves, Color Slice and Tetra ------------------------------------
+#
+# One stage, one cube. The five hue curves, the seven slice vectors, the global
+# density and the six Tetra corners are all pure functions of a single pixel's
+# RGB, so they collapse into a single 33-cube exactly the way the secondary
+# does, and cost one lut3d between them instead of five expression filters.
+#
+# The maths, the colour model and the units are in grade/slice.py, which is the
+# reference implementation. Nothing here does colour work; it only turns the
+# cached bake into a filter string.
 
-LUT_SECOND = ROOT / "luts" / "secondary"
+def f_slice(cfg) -> list[str]:
+    """The hue curves + Color Slice + Tetra stage, or nothing at all.
+
+    Absent from the graph whenever every control is at its default, so a
+    config that carries the two new blocks renders byte identical to one that
+    has never heard of them. That is the compatibility rule for this arc and
+    it is enforced here rather than trusted to a zeroed LUT.
+    """
+    sys.path.insert(0, str(ROOT))
+    import slice as slice_stage
+    if slice_stage.is_identity(cfg):
+        return []
+    path = slice_stage.slice_lut({"hue_curves": cfg.get("hue_curves") or {},
+                                  "slice": cfg.get("slice") or {}})
+    return [f"lut3d=file={esc(path)}:interp=tetrahedral"]
+
+
+# --- layers (a mask plus a correction, any number of them) -----------------
+#
+# One layer is what used to be the `secondary` block (an HSL colour key and a
+# correction, baked to a .cube) plus the `window` block (one shape, baked to a
+# grey PNG and applied with maskedmerge). Both halves are unchanged in what
+# they compute; what changed is that there can be any number of them, each
+# with its own mask, and that each one can sit before or after the look.
+#
+# The colour half is still baked into a 33-cube rather than run as a per pixel
+# expression, for the reason it always was: the key and the correction are
+# both pure functions of one pixel's RGB, so a table lookup with tetrahedral
+# interpolation is exact enough and costs far less than a geq per pixel per
+# frame. The window half stays a spatial matte, because position is the one
+# thing a colour cube cannot know.
+
+LUT_LAYERS = ROOT / "luts" / "layers"
+
+# The template every layer is filled in from. A layer in a config may name
+# only the fields it changes; config_layers() deep merges each one over this,
+# so nothing downstream ever sees a missing key.
+#
+# The correction runs on the DISPLAY REFERRED Rec.709 signal (after CST OUT
+# and the curves node), which is the same signal the old secondary keyed on.
+# That is why exposure, temperature and tint here are the code multiply form
+# of f_log_stage's rec709 branch rather than the log offset form: there is no
+# log curve left at this point in the tree to add an offset to.
+LAYER_DEFAULTS = {
+    "enabled": True,
+    "name": "Layer 1",
+    # "before_look" runs between the curves node and the look LUT, which is
+    # where the secondary always ran. "after_look" runs between the look and
+    # the FX block, so a correction can be made on the graded picture.
+    "placement": "before_look",
+    "mask": {
+        # Render the matte instead of the picture. The engine composites the
+        # colour matte over black through the window matte, so what comes out
+        # is the product of the two: the selection the layer will really make.
+        "show": False,
+        # Inverts the COMBINED matte (window times key), not either half.
+        "invert": False,
+        # Every geometric value is a FRACTION of the frame, never a pixel
+        # count. That is what lets a 960 wide preview and a 3840 wide render
+        # agree without scale_for_preview needing a case for any of it: the
+        # same numbers describe the same shape at any size. cx/cy are the
+        # centre, w/h the FULL extent (not the half axis), rotation is degrees
+        # clockwise on screen, softness is the feather width as a fraction of
+        # the shape's own radius.
+        "window": {
+            "enabled": False, "shape": "ellipse",
+            "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
+            "rotation": 0.0, "softness": 0.15, "invert": False,
+        },
+        # The HSL qualifier. A colour key only, never a shape.
+        "key": {
+            "enabled": False, "invert": False,
+            "hue_center": 30.0, "hue_width": 40.0, "hue_soft": 15.0,
+            "sat_low": 0.10, "sat_high": 1.0, "sat_soft": 0.10,
+            "lum_low": 0.0, "lum_high": 1.0, "lum_soft": 0.10,
+        },
+    },
+    "correct": {
+        # Stops, the same unit convert.exposure uses. See LAYER_DEFAULTS'
+        # docstring above for why the arithmetic is a multiply here.
+        "exposure": 0.0,
+        # pivot None means mid grey in the layer's own domain, LAYER_PIVOT.
+        "contrast": 1.0, "pivot": None,
+        "saturation": 1.0,
+        "temperature": 0.0, "tint": 0.0,
+        # The old secondary's HSV controls, unchanged.
+        "hue_shift": 0.0, "sat_gain": 1.0, "lum_gain": 1.0,
+        # The old secondary's "tint" rgb array, renamed so it cannot be
+        # confused with the scalar white balance `tint` above it.
+        "offset": [0.0, 0.0, 0.0],
+        # Gaussian sigma in pixels AT 1920 WIDE, resolved to the frame's own
+        # width in layer_blur_sigma(). See that function for why it is a
+        # fraction of the width rather than a raw pixel count.
+        "blur": 0.0,
+        "strength": 1.0,
+    },
+}
+
+# Mid grey in the layer's domain, which is display referred Rec.709, not the
+# working space primaries runs in. MID_GREY_CODE["rec709"] is that number
+# (18% scene linear through the rec709a encoder). It is deliberately NOT
+# MID_GREY_CODE[working_space]: primaries pivots on the mid grey of the signal
+# IT sees, and a layer does the same for the signal it sees. On the dwg path
+# those are 0.3360 and 0.4587 respectively, so the same contrast number in the
+# two nodes pivots on two different codes, which is correct rather than a bug.
+LAYER_PIVOT = MID_GREY_CODE["rec709"]
+
+# The width the `blur` sigma is quoted at. See layer_blur_sigma.
+LAYER_BLUR_REF_WIDTH = 1920.0
 
 
 def _soft_window(x, low, high, soft):
@@ -671,67 +961,355 @@ def _soft_window(x, low, high, soft):
     return np.minimum(up, down)
 
 
-def secondary_lut(s: dict):
-    """Bake the qualifier and its correction into a cached 33-cube."""
+def config_layers(cfg) -> list[dict]:
+    """Every layer in a config, each filled in from LAYER_DEFAULTS."""
+    return [deep_merge(LAYER_DEFAULTS, layer or {})
+            for layer in ((cfg or {}).get("layers") or [])]
+
+
+def layer_active(layer: dict) -> bool:
+    """True when the layer has anything to contribute to the graph.
+
+    A disabled layer is absent, and so is a layer whose combined matte is zero
+    everywhere. That second case is exactly mask.invert on a layer with no
+    mask components: the matte of a layer with no mask is 1, inverting it
+    gives 0, and a correction merged under a matte of 0 is the picture. It
+    drops out rather than costing a cube lookup that cannot change a pixel.
+    """
+    if not layer.get("enabled"):
+        return False
+    mask = layer["mask"]
+    if (mask.get("invert") and not mask["window"].get("enabled")
+            and not mask["key"].get("enabled")):
+        return False
+    return True
+
+
+def layer_window(layer: dict):
+    """The window matte this layer needs, with mask.invert folded in, or None.
+
+    None means the layer needs no spatial matte at all, which is what keeps a
+    key only or a global layer from adding an ffmpeg input or a maskedmerge.
+
+    The combined matte is window * key, inverted as a whole by mask.invert.
+    A product cannot be inverted inside either half, but it does factor:
+    1 - w*k = (1 - w) * 1 + w * (1 - k). With the key OFF that collapses to
+    1 - w, which is the window with its own invert flipped, so this returns
+    the flipped block and one branch is enough. With the key ON as well,
+    layer_branches() grades two branches instead and the window matte itself
+    is left alone.
+    """
+    mask = layer["mask"]
+    win = mask["window"]
+    if not win.get("enabled"):
+        return None
+    if mask.get("invert") and not mask["key"].get("enabled"):
+        return deep_merge(win, {"invert": not bool(win.get("invert"))})
+    return win
+
+
+def layer_branches(layer: dict) -> list[str]:
+    """Which baked cubes this layer needs, in maskedmerge input order.
+
+    One entry is one graded branch: the window matte, if there is one, merges
+    it against the untouched picture, which is what the secondary and its
+    window always did.
+
+    Two entries is mask.invert with BOTH a window and a key, the one case the
+    old shape could not express. The combined matte 1 - w*k factors as
+    (1 - w) * 1 + w * (1 - k), so the first branch carries the full correction
+    and wins where the window is closed and the second carries the correction
+    masked by the inverted key and wins where the window is open. maskedmerge
+    returns its first input where the matte is 0 and its second where it is
+    maxval, which is precisely that arrangement, so the factorisation is exact
+    rather than an approximation of it.
+    """
+    mask = layer["mask"]
+    if not mask.get("invert"):
+        return ["key" if mask["key"].get("enabled") else "one"]
+    if mask["window"].get("enabled") and mask["key"].get("enabled"):
+        return ["one", "inv"]
+    # Window only: the flip lives in layer_window. Key only: in the cube.
+    return ["one"] if mask["window"].get("enabled") else ["inv"]
+
+
+def layer_blur_sigma(layer: dict, info: dict) -> float:
+    """The layer's blur sigma in pixels at THIS frame's width.
+
+    `blur` is quoted at 1920 wide and resolved against the frame's real width
+    here, for the same reason every window parameter is a fraction: the studio
+    grades against a preview that is usually 640 or 960 wide, and a sigma that
+    did not scale would show a blur several times wider than the render will
+    have. Resolving it in the engine rather than in server.scale_for_preview
+    means the CLI render, the studio preview and the GPU port all take it from
+    one rule and cannot drift apart.
+    """
+    sigma = float(layer["correct"].get("blur", 0.0))
+    if sigma <= 0:
+        return 0.0
+    return sigma * float(info["width"]) / LAYER_BLUR_REF_WIDTH
+
+
+def _layer_cube_key(layer: dict, variant: str) -> dict:
+    """Everything the baked cube depends on, and nothing else.
+
+    Spelled out rather than "the whole layer minus a few keys": the name, the
+    enable flag, the placement, the window and the blur cannot change a single
+    cube entry, and folding them into the hash would bake a second identical
+    file every time a layer is renamed or dragged up the stack.
+    """
+    c = layer["correct"]
+    return {
+        "variant": variant,
+        "show": bool(layer["mask"].get("show")),
+        "key": layer["mask"]["key"],
+        "correct": {k: c[k] for k in (
+            "exposure", "contrast", "pivot", "saturation", "temperature",
+            "tint", "hue_shift", "sat_gain", "lum_gain", "offset", "strength")},
+    }
+
+
+def layer_lut(layer: dict, variant: str = "key"):
+    """Bake one layer's colour matte and correction into a cached 33-cube.
+
+    `variant` picks which colour matte is folded in, which is how mask.invert
+    is implemented without a per pixel expression (see layer_branches):
+      "key"  the qualifier matte itself, the ordinary case
+      "one"  a matte of 1 everywhere, the layer's full correction
+      "inv"  1 minus the qualifier matte
+
+    The display domain controls (exposure, contrast, saturation, temperature,
+    tint) are each SKIPPED when they sit at their default rather than applied
+    as an identity. That is not an optimisation: (v - p) * 1.0 + p is not bit
+    for bit v, and a config migrated from the old secondary has to bake the
+    exact cube it always baked or every approved render moves by a code.
+    """
     import numpy as np
     sys.path.insert(0, str(ROOT / "tools"))
     import colorlib as C
-
-    key = json.dumps(s, sort_keys=True)
     import hashlib
-    h = hashlib.sha1(key.encode()).hexdigest()[:16]
-    LUT_SECOND.mkdir(parents=True, exist_ok=True)
-    path = LUT_SECOND / f"sec_{h}.cube"
+
+    layer = deep_merge(LAYER_DEFAULTS, layer or {})
+    h = hashlib.sha1(json.dumps(_layer_cube_key(layer, variant),
+                                sort_keys=True).encode()).hexdigest()[:16]
+    LUT_LAYERS.mkdir(parents=True, exist_ok=True)
+    path = LUT_LAYERS / f"layer_{h}.cube"
     if path.exists():
         return path
 
+    k = layer["mask"]["key"]
+    c = layer["correct"]
     size = 33
     grid = C.identity_grid(size)
     hue, sat, val = C.rgb_to_hsv(grid)
     luma = C.luma709(grid)[..., 0]
 
-    # Hue is circular, so distance has to wrap. Everything else is a plain
-    # range on a bounded quantity.
-    d = np.abs(((hue - float(s["hue_center"]) + 180.0) % 360.0) - 180.0)
-    half = max(1e-6, float(s["hue_width"]) / 2.0)
-    hs = max(1e-6, float(s["hue_soft"]))
-    w_hue = np.clip(((half + hs) - d) / hs, 0.0, 1.0)
-    w_sat = _soft_window(sat, float(s["sat_low"]), float(s["sat_high"]),
-                         float(s["sat_soft"]))
-    w_lum = _soft_window(luma, float(s["lum_low"]), float(s["lum_high"]),
-                         float(s["lum_soft"]))
-    mask = w_hue * w_sat * w_lum
-    if s.get("invert"):
-        mask = 1.0 - mask
+    if not k.get("enabled"):
+        m = np.ones(grid.shape[:-1], dtype=np.float64)
+    else:
+        # Hue is circular, so distance has to wrap. Everything else is a plain
+        # range on a bounded quantity.
+        d = np.abs(((hue - float(k["hue_center"]) + 180.0) % 360.0) - 180.0)
+        half = max(1e-6, float(k["hue_width"]) / 2.0)
+        hs = max(1e-6, float(k["hue_soft"]))
+        w_hue = np.clip(((half + hs) - d) / hs, 0.0, 1.0)
+        w_sat = _soft_window(sat, float(k["sat_low"]), float(k["sat_high"]),
+                             float(k["sat_soft"]))
+        w_lum = _soft_window(luma, float(k["lum_low"]), float(k["lum_high"]),
+                             float(k["lum_soft"]))
+        m = w_hue * w_sat * w_lum
+        if k.get("invert"):
+            m = 1.0 - m
+    if variant == "one":
+        m = np.ones(grid.shape[:-1], dtype=np.float64)
+    elif variant == "inv":
+        m = 1.0 - m
 
-    if s.get("show_mask"):
-        out = np.repeat(mask[..., None], 3, axis=-1)
-        C.write_cube(path, np.clip(out, 0.0, 1.0), size, f"secondary_mask_{h}",
-                     comments=["Generated by cinegrade.secondary_lut",
-                               "Qualifier matte, shown as greyscale."])
+    if layer["mask"].get("show"):
+        out = np.repeat(m[..., None], 3, axis=-1)
+        C.write_cube(path, np.clip(out, 0.0, 1.0), size, f"layer_mask_{h}",
+                     comments=["Generated by cinegrade.layer_lut",
+                               "Colour matte, shown as greyscale."])
         return path
 
-    m = mask
-    hue2 = hue + float(s["hue_shift"]) * m
-    sat2 = sat * (1.0 + (float(s["sat_gain"]) - 1.0) * m)
-    val2 = val * (1.0 + (float(s["lum_gain"]) - 1.0) * m)
+    # The display domain half of the correction. The qualifier modulates every
+    # step the same way it modulates the HSV controls below: each step is
+    # lerped by m, so m = 0 leaves the pixel exactly alone and m = 1 applies
+    # the whole move.
+    cor = grid
+    gains = [float(c["exposure"]) + float(c["temperature"]),
+             float(c["exposure"]) + float(c["tint"]),
+             float(c["exposure"]) - float(c["temperature"])]
+    if any(abs(v) > 1e-6 for v in gains):
+        # f_log_stage's rec709 branch: on a display signal a stop is a code
+        # multiply of 2 ** (stops / gamma), not the log domain offset, and a
+        # layer always sees a display signal.
+        mul = np.asarray([2.0 ** (v / DISPLAY_GAMMA) for v in gains])
+        cor = np.clip(cor * (1.0 + (mul - 1.0) * m[..., None]), 0.0, 1.0)
+    con = float(c["contrast"])
+    if abs(con - 1.0) > 1e-6:
+        pivot = LAYER_PIVOT if c.get("pivot") is None else float(c["pivot"])
+        cor = np.clip(cor + ((cor - pivot) * con + pivot - cor) * m[..., None],
+                      0.0, 1.0)
+    satv = float(c["saturation"])
+    if abs(satv - 1.0) > 1e-6:
+        # The same luma preserving matrix _saturation_matrix builds, written
+        # as the arithmetic it performs rather than as an ffmpeg argument.
+        y = (cor * np.asarray([0.2126, 0.7152, 0.0722])).sum(axis=-1)[..., None]
+        cor = np.clip(cor + ((y + (cor - y) * satv) - cor) * m[..., None],
+                      0.0, 1.0)
+    if cor is not grid:
+        # The HSV controls act on what the display controls produced. When
+        # none of them ran, cor IS grid and this recompute is skipped, so the
+        # numbers below are bit for bit the ones the secondary produced.
+        hue, sat, val = C.rgb_to_hsv(cor)
+
+    hue2 = hue + float(c["hue_shift"]) * m
+    sat2 = sat * (1.0 + (float(c["sat_gain"]) - 1.0) * m)
+    val2 = val * (1.0 + (float(c["lum_gain"]) - 1.0) * m)
     corrected = C.hsv_to_rgb(hue2, np.clip(sat2, 0.0, 1.0), np.clip(val2, 0.0, None))
-    corrected = corrected + np.asarray(s.get("tint", [0.0, 0.0, 0.0])) * m[..., None]
-    strength = float(s.get("strength", 1.0))
+    corrected = corrected + np.asarray(c.get("offset", [0.0, 0.0, 0.0])) * m[..., None]
+    strength = float(c.get("strength", 1.0))
     out = np.clip(grid + (corrected - grid) * strength, 0.0, 1.0)
 
-    C.write_cube(path, out, size, f"secondary_{h}", comments=[
-        "Generated by cinegrade.secondary_lut",
-        "Domain: Rec.709 gamma 2.4. Applied after CURVES, before LOOK.",
+    C.write_cube(path, out, size, f"layer_{h}", comments=[
+        "Generated by cinegrade.layer_lut",
+        "Domain: Rec.709 gamma 2.4. Applied at the layer's placement point.",
     ])
     return path
 
 
-def f_secondary(cfg) -> list[str]:
-    s = cfg.get("secondary") or {}
-    if not s.get("enabled"):
-        return []
-    return [f"lut3d=file={esc(secondary_lut(s))}:interp=tetrahedral"]
+# The two blocks a config written before layers existed carried, kept here as
+# the merge base the migration fills a partial block in from. They are no
+# longer in DEFAULTS: nothing reads them except migrate_layers.
+LEGACY_SECONDARY = {
+    "enabled": False, "show_mask": False, "invert": False,
+    "hue_center": 30.0, "hue_width": 40.0, "hue_soft": 15.0,
+    "sat_low": 0.10, "sat_high": 1.0, "sat_soft": 0.10,
+    "lum_low": 0.0, "lum_high": 1.0, "lum_soft": 0.10,
+    "hue_shift": 0.0, "sat_gain": 1.0, "lum_gain": 1.0,
+    "tint": [0.0, 0.0, 0.0], "strength": 1.0,
+}
+LEGACY_WINDOW = {
+    "enabled": False, "shape": "ellipse",
+    "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
+    "rotation": 0.0, "softness": 0.15, "invert": False,
+}
+
+
+def migrate_layers(cfg: dict) -> dict:
+    """Rewrite a pre-layers config into the layers shape, on read.
+
+    A config carrying `secondary` and/or `window` and no `layers` key becomes
+    one layer: the qualifier goes to mask.key, the shape to mask.window,
+    show_mask to mask.show, the HSV controls and the tint push and the
+    strength to correct, and the layer is enabled exactly when the SECONDARY
+    was. That last detail is the whole of the old window_active rule: a window
+    switched on over a secondary switched off rendered nothing at all, because
+    a shape with no correction to gate has nothing to do, and this keeps it
+    so. Anything else would move renders that are already approved.
+
+    Files on disk are never rewritten. The migration runs where a config is
+    read, and saving writes the new shape.
+
+    Run this on the config as it ARRIVED, before any merge with DEFAULTS:
+    DEFAULTS always carries an empty `layers`, so a merge first would make
+    every old config look like a new one and the secondary would be dropped
+    on the floor instead of migrated.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+    if "secondary" not in cfg and "window" not in cfg:
+        return cfg
+    out = dict(cfg)
+    sec = deep_merge(LEGACY_SECONDARY, out.pop("secondary", None) or {})
+    win = deep_merge(LEGACY_WINDOW, out.pop("window", None) or {})
+    if "layers" in out:
+        # Both shapes present: the new one is the truth and the old keys are
+        # residue from a client that has not caught up. Dropping them is the
+        # migration.
+        return out
+    layer = deepcopy(LAYER_DEFAULTS)
+    layer["enabled"] = bool(sec["enabled"])
+    layer["placement"] = "before_look"
+    layer["mask"]["show"] = bool(sec["show_mask"])
+    layer["mask"]["invert"] = False
+    layer["mask"]["window"] = {k: win[k] for k in LEGACY_WINDOW}
+    layer["mask"]["key"] = dict(
+        {k: sec[k] for k in ("hue_center", "hue_width", "hue_soft",
+                             "sat_low", "sat_high", "sat_soft",
+                             "lum_low", "lum_high", "lum_soft")},
+        enabled=bool(sec["enabled"]), invert=bool(sec["invert"]))
+    layer["correct"]["hue_shift"] = sec["hue_shift"]
+    layer["correct"]["sat_gain"] = sec["sat_gain"]
+    layer["correct"]["lum_gain"] = sec["lum_gain"]
+    layer["correct"]["offset"] = list(sec["tint"])
+    layer["correct"]["strength"] = sec["strength"]
+    out["layers"] = [layer]
+    return out
+
+
+def build_layers(cfg, info, placement, src_label, pending, out_label):
+    """Emit the layer stack for one placement point.
+
+    `pending` is a filter chain nothing has written into a segment yet: the
+    colour head, at the before_look point. A layer that needs no split appends
+    to it, so a config whose only layer is a plain colour correction still
+    produces the ONE chain the engine emitted before layers existed, filter
+    for filter. That is what makes a migrated secondary byte identical rather
+    than merely equivalent.
+
+    Labels are named from the layer's index in the array (`ly3a`, `lw3`),
+    never from a running counter, so graph_with_mask can name the same matte
+    labels without replaying this function's control flow.
+
+    Returns (segments, the label the picture is now on).
+    """
+    segs = []
+    chain = list(pending)
+    cur = src_label
+    for i, layer in enumerate(config_layers(cfg)):
+        if not layer_active(layer) or layer["placement"] != placement:
+            continue
+        show = bool(layer["mask"].get("show"))
+        win = layer_window(layer)
+        # The blur is a picture operation. In matte view there is no picture,
+        # only the selection, and blurring that would misreport how soft the
+        # mask really is, so it is left out of this branch.
+        sigma = 0.0 if show else layer_blur_sigma(layer, info)
+        blur = [f"gblur=sigma={sigma:.3f}"] if sigma > 0 else []
+        cubes = [f"lut3d=file={esc(layer_lut(layer, v))}:interp=tetrahedral"
+                 for v in layer_branches(layer)]
+        if win is None:
+            chain += cubes[:1] + blur
+            continue
+        tag = f"ly{i}"
+        segs.append(f"[{cur}]{','.join(chain) if chain else 'null'}[{tag}i]")
+        chain = []
+        cur = f"{tag}i"
+        segs.append(f"[{cur}]split=2[{tag}a][{tag}b]")
+        if len(cubes) > 1:
+            segs.append(f"[{tag}a]{','.join(cubes[:1] + blur)}[{tag}a2]")
+            base = f"{tag}a2"
+        elif show:
+            # In matte view the graded branch IS the colour matte, so
+            # compositing it over the picture would show the picture wherever
+            # the window is closed. Against black the same merge reads as
+            # colour matte times window matte, which is the selection the
+            # layer will really make.
+            segs.append(f"[{tag}a]colorchannelmixer=rr=0:gg=0:bb=0[{tag}a2]")
+            base = f"{tag}a2"
+        else:
+            base = f"{tag}a"
+        segs.append(f"[{tag}b]{','.join(cubes[-1:] + blur)}[{tag}b2]")
+        # maskedmerge returns the FIRST input where the matte is 0 and the
+        # second where it is maxval, so the un-graded branch has to be first.
+        segs.append(f"[{base}][{tag}b2][lw{i}]maskedmerge[{tag}o]")
+        cur = f"{tag}o"
+    if chain:
+        segs.append(f"[{cur}]{','.join(chain)}[{out_label}]")
+        cur = out_label
+    return segs, cur
 
 
 # --- power window (the shape half of a secondary) --------------------------
@@ -760,15 +1338,26 @@ LUT_MASKS = ROOT / "luts" / "masks"
 WINDOW_MASK_FORMAT = "format=gray16le,format=gbrp16le"
 
 
+WINDOW_TEMPLATE = LAYER_DEFAULTS["mask"]["window"]
+
+
 def _window_block(cfg) -> dict:
-    """Accept either a whole config or the window block on its own."""
+    """Accept a bare window block, a mask block, a layer, or {"window": ...}.
+
+    The window used to be one top level config key, so one shape per grade;
+    it now lives at layers[i].mask.window and there is one per layer. Taking
+    any of those spellings keeps every caller (the matte reference, the geq
+    baker, the tests) able to hand over whichever level it is holding.
+    """
     if not isinstance(cfg, dict):
-        return deepcopy(DEFAULTS["window"])
-    if "window" in cfg:
-        return deep_merge(DEFAULTS["window"], cfg["window"] or {})
-    if "shape" in cfg or "softness" in cfg:
-        return deep_merge(DEFAULTS["window"], cfg)
-    return deepcopy(DEFAULTS["window"])
+        return deepcopy(WINDOW_TEMPLATE)
+    if isinstance(cfg.get("mask"), dict):
+        cfg = cfg["mask"]
+    if isinstance(cfg.get("window"), dict):
+        cfg = cfg["window"]
+    if "shape" in cfg or "softness" in cfg or "enabled" in cfg or "cx" in cfg:
+        return deep_merge(WINDOW_TEMPLATE, cfg)
+    return deepcopy(WINDOW_TEMPLATE)
 
 
 def _window_geometry(win: dict, width: int, height: int) -> dict:
@@ -889,20 +1478,27 @@ def window_mask(cfg, w: int, h: int):
     return p
 
 
-def window_active(cfg) -> bool:
-    """True when the window stage has something to do.
+def window_layers(cfg) -> list[tuple]:
+    """(array index, resolved window block) for every layer that needs a matte.
 
-    The window gates the SECONDARY and only the secondary, so with the
-    qualifier off there is nothing for a shape to gate and the stage drops out
-    entirely: no extra ffmpeg input, no extra filter, no change to the graph
-    text. Three separate places have to agree on that answer (the input list,
-    the graph builder, and the studio server's own input list), and they
-    disagreeing would not raise: ffmpeg would just read the wrong input index
-    and render a wrong picture silently. Hence one function.
+    One function, because three separate places have to agree on the answer
+    (the ffmpeg input list, the graph builder, and the studio server's own
+    input list) and disagreeing would not raise: ffmpeg would simply read the
+    wrong input index and render a wrong picture in silence.
+
+    Array order, not placement order. A before_look and an after_look layer
+    are graded at different points in the tree but their mattes are ordinary
+    inputs, so keeping the input order tied to the array keeps it independent
+    of anything the graph builder decides later.
     """
-    win = (cfg or {}).get("window") or {}
-    sec = (cfg or {}).get("secondary") or {}
-    return bool(win.get("enabled")) and bool(sec.get("enabled"))
+    out = []
+    for i, layer in enumerate(config_layers(cfg)):
+        if not layer_active(layer):
+            continue
+        win = layer_window(layer)
+        if win is not None:
+            out.append((i, win))
+    return out
 
 
 def mask_input_indices(cfg) -> dict:
@@ -910,16 +1506,19 @@ def mask_input_indices(cfg) -> dict:
 
     Input 0 is the picture. Everything after it is appended in this order by
     ffmpeg_inputs, and build_graph and graph_with_mask read the indices back
-    from here rather than counting again by hand.
+    from here rather than counting again by hand. "layers" maps a layer's
+    array index to the input its window matte lands on.
     """
     idx = 1
     out = {}
     if cfg["fx"]["radial_blur"]["enabled"]:
         out["radial"] = idx
         idx += 1
-    if window_active(cfg):
-        out["window"] = idx
+    windows = {}
+    for i, _win in window_layers(cfg):
+        windows[i] = idx
         idx += 1
+    out["layers"] = windows
     out["grain"] = idx
     return out
 
@@ -1095,8 +1694,59 @@ def radial_mask(w, h, start, end):
     return p
 
 
+# Stock presets set size, strength and softness only, and REPLACE those three
+# numbers outright rather than nudging them: see grain_effective. Measured on
+# footage/A001_09011336_C002.MOV (grade/tests/harness.CLIP_A, TIME_A=2.0),
+# rendered at 1920 wide (harness.scaled_info), grain-only configs (everything
+# else at engine defaults), comparing against the same frame with grain off.
+# "diff std" is the std of (graded - ungraded) over the whole 1920x1080 frame;
+# "hf" is the existing 3x3 high-frequency proxy (harness.hf_energy) on the
+# graded frame. Swept size 1..8 at strength 40 and strength 10..70 at size 3
+# first (see grade/tests/cases_grain.py STOCK_SWEEP_NOTES for the full table):
+# hf falls as size grows even where amplitude (diff std) rises, because a
+# bigger downscale factor spreads the same random draw over a bigger block,
+# so pixel-to-pixel high-frequency energy drops while the per-blob amplitude
+# can still be larger. That is genuine film behaviour (coarse grain reads as
+# "big soft blobs", not as more per-pixel noise), so it is what the presets
+# lean on: 35mm reproduces today's shipped default exactly, on purpose (this
+# engine's numbers were already tuned against a 35mm-equivalent scan).
+#   65mm  size 2 strength 20 softness 0.0 -> diff std 1.502, hf 0.00246 (finest, lightest)
+#   35mm  size 3 strength 40 softness 0.0 -> diff std 3.195, hf 0.00281 (today's default, unchanged)
+#   16mm  size 6 strength 55 softness 0.35 -> diff std 4.245, hf 0.00193 (coarsest/heaviest,
+#         blob edges rounded off by the softness so they read as clumps, not squares)
+GRAIN_STOCKS = {
+    "16mm": {"size": 6, "strength": 55, "softness": 0.35},
+    "35mm": {"size": 3, "strength": 40, "softness": 0.0},
+    "65mm": {"size": 2, "strength": 20, "softness": 0.0},
+}
+
+
+def grain_effective(cfg) -> dict:
+    """size, strength and softness after a stock preset override.
+
+    A stock other than "custom" REPLACES these three numbers outright: it is
+    not a starting point the sliders then nudge, it is what the panel's own
+    tooltip says a stock is. "custom" (the default) leaves the raw fields
+    alone, which is what keeps a plain grain.enabled=True config byte
+    identical to before these fields existed.
+    """
+    g = cfg["grain"]
+    stock = g.get("stock", "custom")
+    if stock in GRAIN_STOCKS:
+        p = GRAIN_STOCKS[stock]
+        return {"size": int(p["size"]), "strength": int(p["strength"]),
+                "softness": float(p["softness"])}
+    return {"size": max(1, int(g.get("size", 3))),
+            "strength": int(g.get("strength", 40)),
+            "softness": max(0.0, float(g.get("softness", 0.0)))}
+
+
+def _grain_color_active(g: dict) -> bool:
+    return float(g.get("color", 0.0) or 0.0) > 1e-6
+
+
 def grain_input(cfg, info):
-    """A grey noise plate, generated at reduced size then scaled up.
+    """The grey noise plate, and, with color > 0, a second independent one.
 
     Blending a grey plate in overlay mode is how grain actually works: grey is
     neutral, so the plate modulates the image rather than washing it.
@@ -1106,9 +1756,26 @@ def grain_input(cfg, info):
     difference channels and lands as visible red and blue speckle rather than
     grain. Perturbing luma alone keeps R, G and B equal, so the grain is
     monochrome the way a film grain plate is.
+
+    seed 0 (the default) omits ffmpeg's own seed option entirely, which is
+    what keeps this string byte identical to before the field existed. Any
+    other value adds `all_seed=<seed>`. Measured on this build (ffmpeg 8.1.1):
+    the PER COMPONENT seed option (`c0_seed`) has no effect at all here (seed
+    0 vs 1 vs 999999 on `c0s=...:c0f=t+u:c0_seed=N` were byte identical every
+    time); `all_seed` (the "set every component" option) does change the
+    plate, and the unset default is byte identical to explicit `all_seed=0`,
+    both reproducible run to run across separate ffmpeg processes.
+
+    color > 0 (contract C3) needs a second, independently random plate: noise
+    applied directly on an rgb24 (three real plane) source with c0s/c1s/c2s
+    draws three different values per pixel even from the same seed, because
+    the RNG stream simply advances differently per plane. That second input is
+    added ONLY when color is active, so a color=0 config (today's default)
+    emits exactly the one line it always has.
     """
     g = cfg["grain"]
-    size = max(1, int(g.get("size", 3)))
+    eff = grain_effective(cfg)
+    size = eff["size"]
     w, h = max(2, info["width"] // size), max(2, info["height"] // size)
     # The lavfi source has to be bounded or `cinegrade render` never finishes:
     # blend's frame sync waits for every input to reach EOF, so an endless
@@ -1121,9 +1788,17 @@ def grain_input(cfg, info):
     seconds = float(info.get("duration") or 0.0) + 10.0
     if seconds <= 10.0:
         seconds = 3600.0
-    return ["-f", "lavfi", "-i",
+    seed = int(g.get("seed", 0) or 0)
+    seed_arg = f":all_seed={seed}" if seed != 0 else ""
+    args = ["-f", "lavfi", "-i",
             f"color=c=gray:s={w}x{h}:r=24:d={seconds:.3f},"
-            f"noise=c0s={int(g['strength'])}:c0f=t+u"]
+            f"noise=c0s={eff['strength']}:c0f=t+u{seed_arg}"]
+    if _grain_color_active(g):
+        args += ["-f", "lavfi", "-i",
+                 f"color=c=gray:s={w}x{h}:r=24:d={seconds:.3f},format=rgb24,"
+                 f"noise=c0s={eff['strength']}:c1s={eff['strength']}:"
+                 f"c2s={eff['strength']}:c0f=t+u:c1f=t+u:c2f=t+u{seed_arg}"]
+    return args
 
 
 def f_letterbox(cfg, info) -> list[str]:
@@ -1147,12 +1822,21 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
                 src_label="0:v", src_normalised=False):
     """Assemble the whole node tree into one filter_complex string.
 
-        LOG -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> SECONDARY
-             -> LOOK -> FX -> GRAIN -> DETAIL -> LETTERBOX -> OUT
+        LOG -> PREP -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> SLICE
+             -> LAYERS(before_look) -> LOOK -> LAYERS(after_look)
+             -> FX -> GRAIN -> DETAIL -> LETTERBOX -> OUT
 
-    The power window, when it is on, wraps the SECONDARY only: the tree splits
-    just before it, runs the qualifier cube on one branch, and maskedmerges the
-    two back together through the window matte.
+    PREP is prep.denoise (hqdn3d), which runs on the source before any colour
+    transform: after f_log_stage's decode-normalise and exposure, before
+    f_convert_in (the CST). DETAIL is soften, sharpen, then mid_detail (a
+    split/blur/blend local-contrast pass, see f_mid_detail_segment), in that
+    order.
+
+    A layer with a window splits the tree at its own placement point, grades
+    one branch through its baked cube, and maskedmerges the two back together
+    under the window matte. A layer without one is a single cube in the
+    running chain, which is exactly what the secondary used to be, so the
+    graph text for a migrated grade is the graph text that always shipped.
 
     src_label exists so a caller can feed the tree something other than the
     raw first input. The studio server prepends its own downscale and points
@@ -1167,40 +1851,55 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     # Checked here rather than in each command, because this is the one door
     # every render, still, preview and scope goes through.
     check_source_space(cfg, info)
-    head = (f_log_stage(cfg, info, normalised=src_normalised) + f_convert_in(cfg)
+    head = (f_log_stage(cfg, info, normalised=src_normalised) + f_denoise(cfg)
+            + f_convert_in(cfg)
             + f_primaries(cfg) + f_convert_out(cfg)
-            + f_curves(cfg))
-    sec = f_secondary(cfg)
-    if window_active(cfg):
-        # The window stage. Split before the qualifier cube, grade one branch,
-        # and let the matte decide per pixel which branch survives. maskedmerge
-        # returns the FIRST input where the mask is 0 and the second where it
-        # is maxval, so the ungraded branch has to be first.
-        segs = [f"[{src_label}]{','.join(head) if head else 'null'}[secin]"]
-        segs.append("[secin]split=2[wina][winb]")
-        segs.append(f"[winb]{','.join(sec)}[winb2]")
-        base = "wina"
-        if (cfg.get("secondary") or {}).get("show_mask"):
-            # In matte view the graded branch IS the qualifier matte, so
-            # compositing it over the picture would show the picture wherever
-            # the window is closed. Against black the same merge reads as
-            # qualifier times window, which is what the matte view promises.
-            segs.append("[wina]colorchannelmixer=rr=0:gg=0:bb=0[winbg]")
-            base = "winbg"
-        segs.append(f"[{base}][winb2][wmask]maskedmerge[cst]")
-    else:
-        segs = [f"[{src_label}]{','.join(head + sec)}[cst]"]
-    cur = "cst"
+            + f_curves(cfg) + f_slice(cfg))
+    # The before_look layers. With no layers this is the one head chain the
+    # engine has always emitted, ending on [cst], so nothing already graded
+    # moves; build_layers only splits the tree when a layer needs a matte.
+    segs, cur = build_layers(cfg, info, "before_look", src_label, head, "cst")
+    pre_look = cur
 
     # LOOK, with a real opacity. A creative LUT at full strength is almost
     # always too strong; dialling it to 0.4-0.6 is the normal working state.
-    look = f_look(cfg)
+    #
+    # Two slots blend in PARALLEL, not stacked: both read pre_look (the same
+    # pre-look signal), never each other's output. A = lerp(base, lut1(base),
+    # mix), B = lerp(base, lut2(base), mix2), out = lerp(A, B, balance). Slot
+    # 2 is skipped entirely (lut2 unset or balance ~0) so the graph and the
+    # bytes match today's single-slot output exactly, not merely closely: no
+    # split is inserted at all in that case, so the graph TEXT is unchanged.
+    lut2 = cfg["look"].get("lut2")
+    balance = float(cfg["look"].get("balance", 0.0))
+    look2_active = bool(lut2) and balance > 1e-6
+    # At balance >= 0.999 the output is lut2 alone (same "skip the blend at
+    # the extreme" trick as mix): A is never read, so slot 1 must not be
+    # built at all, not just left unread. ffmpeg treats an output label
+    # nothing reads as a hard error ("Filter ... has output ... unconnected"),
+    # not a harmless no-op, which is what building it and then discarding it
+    # hit before this guard existed.
+    need_slot1 = not (look2_active and balance >= 0.999)
+    if look2_active and need_slot1:
+        # Both slot 1 and slot 2 (and, with no slot 1 LUT, the final balance
+        # blend below) need their own read of pre_look. A bare second
+        # reference to the same output label does NOT fan out in ffmpeg: it
+        # silently rebinds to the raw, unscaled input instead of the same
+        # link. Measured: without this split, the second consumer's branch
+        # reports the source's native resolution (3840x2160 on this footage)
+        # instead of the graph's working size, and blend refuses to run.
+        segs.append(f"[{pre_look}]split=2[pll1][pll2]")
+        look_in, look2_in = "pll1", "pll2"
+    else:
+        look_in = look2_in = pre_look
+
+    look = f_look(cfg) if need_slot1 else []
     if look:
         mix = float(cfg["look"].get("mix", 1.0))
         if mix >= 0.999:
-            segs.append(f"[{cur}]{','.join(look)}[lk]")
+            segs.append(f"[{look_in}]{','.join(look)}[lk]")
         else:
-            segs.append(f"[{cur}]split=2[lka][lkb]")
+            segs.append(f"[{look_in}]split=2[lka][lkb]")
             segs.append(f"[lkb]{','.join(look)}[lkc]")
             # ffmpeg's normal blend is dst = in0*opacity + in1*(1-opacity),
             # so the graded branch has to be in0 for `mix` to mean look
@@ -1209,6 +1908,37 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
             segs.append(
                 f"[lkc][lka]blend=all_mode=normal:all_opacity={mix:.4f}[lk]")
         cur = "lk"
+    else:
+        cur = look_in
+    a_label = cur
+
+    if look2_active:
+        look2 = f_look(cfg, "lut2")
+        mix2 = float(cfg["look"].get("mix2", 1.0))
+        if mix2 >= 0.999:
+            segs.append(f"[{look2_in}]{','.join(look2)}[lk2]")
+        else:
+            segs.append(f"[{look2_in}]split=2[lk2a][lk2b]")
+            segs.append(f"[lk2b]{','.join(look2)}[lk2c]")
+            segs.append(
+                f"[lk2c][lk2a]blend=all_mode=normal:all_opacity={mix2:.4f}[lk2]")
+        if balance >= 0.999:
+            # Same "skip the blend at the extreme" trick as mix above: this
+            # is what makes balance=1 exactly equal to lut2 alone rather than
+            # only close to it.
+            cur = "lk2"
+        else:
+            # out = lerp(A, B, balance): B (lk2) has to be in0 for opacity to
+            # mean "balance is the slot 2 weight", mirroring the mix blend.
+            segs.append(
+                f"[lk2][{a_label}]blend=all_mode=normal:all_opacity={balance:.4f}[lkbal]")
+            cur = "lkbal"
+
+    # The after_look layers. Nothing is pending here (the look wrote its own
+    # segment), so with no after_look layers this adds not one character to
+    # the graph.
+    post_segs, cur = build_layers(cfg, info, "after_look", cur, [], "post")
+    segs += post_segs
 
     fx_segs, cur, _ = build_fx(cfg, info, cur, 0)
     needs_mask = cfg["fx"]["radial_blur"]["enabled"]
@@ -1219,19 +1949,111 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     # the source, and the file ends up claiming a gamut it is not in, which
     # every color-managed player then over-saturates.
     if cfg["grain"]["enabled"]:
+        g = cfg["grain"]
+        eff = grain_effective(cfg)
         idx_g = mask_input_indices(cfg)["grain"]
-        segs.append(f"[{idx_g}:v]scale={info['width']}:{info['height']}"
-                    f":flags=bilinear,format=gbrp16le,setsar=1[grainplate]")
+        color_amt = float(g.get("color", 0.0) or 0.0)
+        color_on = _grain_color_active(g)
+        soft = max(0.0, float(eff["softness"]))
+        response = g.get("response", "flat")
+        # The byte-identical fast path: with softness, color and response all
+        # at their defaults this is the exact two lines that shipped before
+        # any of C3's new fields existed, unchanged character for character.
+        if not (soft > 1e-6 or color_on or response == "film"):
+            segs.append(f"[{idx_g}:v]scale={info['width']}:{info['height']}"
+                        f":flags=bilinear,format=gbrp16le,setsar=1[grainplate]")
+            grain_label = "grainplate"
+        else:
+            # format=gbrp16le FIRST, at the small plate resolution, so gblur
+            # (softness) and the color mix both run in the same working
+            # format as the rest of this chain, before the upscale spreads
+            # one plate sample over `size` output pixels the way it always
+            # has. Blurring at plate resolution is also what makes softness
+            # a sigma "in plate pixels": it does not need to change with the
+            # frame size, only with size (the same thing the un-blurred plate
+            # already does).
+            segs.append(f"[{idx_g}:v]format=gbrp16le[gmono]")
+            plate_pre_scale = "gmono"
+            if color_on:
+                idx_c = idx_g + 1
+                segs.append(f"[{idx_c}:v]format=gbrp16le[gcol]")
+                mono_src, color_src = "gmono", "gcol"
+                if soft > 1e-6:
+                    segs.append(f"[gmono]gblur=sigma={soft:.4f}[gmonob]")
+                    segs.append(f"[gcol]gblur=sigma={soft:.4f}[gcolb]")
+                    mono_src, color_src = "gmonob", "gcolb"
+                # color mixes between the mono plate (color=0) and the
+                # independent RGB plate (color=1): all_mode=normal is a plain
+                # lerp, dst = BOTTOM*(1-opacity) + TOP*opacity, so the
+                # independent plate has to be TOP (in0) for `color` to mean
+                # "how much of the independent plate" and opacity=0 to be
+                # exactly the mono plate. Same convention f_look's mix uses.
+                segs.append(f"[{color_src}][{mono_src}]blend=all_mode=normal"
+                            f":all_opacity={color_amt:.4f}[gmix]")
+                plate_pre_scale = "gmix"
+            elif soft > 1e-6:
+                segs.append(f"[gmono]gblur=sigma={soft:.4f}[gmonob]")
+                plate_pre_scale = "gmonob"
+            segs.append(f"[{plate_pre_scale}]scale={info['width']}:{info['height']}"
+                        f":flags=bilinear,setsar=1[gscaled]")
+            grain_label = "gscaled"
+            if response == "film":
+                # response=film scales the plate's deviation from mid grey by
+                # a weight that is 1 in the shadows and midtones (L <= 0.5)
+                # and eases down to 0.25 by L = 1, measured on the pixel's own
+                # luminance AFTER the look (this stage's `cur`, which by this
+                # point in build_graph already ran curves/slice/layers/
+                # look/fx). W(L) = 1 for L<=0.5, easing with a
+                # smoothstep (3t^2-2t^3, t=clip(2*(L-0.5),0,1)) to 0.25 at
+                # L=1: this exact formula is also in schema.js's tooltip for
+                # grain.response and gpu.js's STAGE_NOTES.grain, so all three
+                # describe the same curve. Computed in ONE blend node using
+                # ffmpeg's st()/ld() scratch registers (confirmed available
+                # in the blend filter's all_expr on this build): A is the
+                # luma-replicated `cur` (top), B is the scaled plate (bottom).
+                segs.append(f"[{cur}]split=2[glumasrc][gcarry]")
+                segs.append(
+                    "[glumasrc]colorchannelmixer="
+                    "rr=0.2126:rg=0.7152:rb=0.0722:"
+                    "gr=0.2126:gg=0.7152:gb=0.0722:"
+                    "br=0.2126:bg=0.7152:bb=0.0722[glumamap]")
+                weight_expr = (
+                    "st(0,clip((A/65535-0.5)*2,0,1));"
+                    "st(1,1-0.75*(3*ld(0)*ld(0)-2*ld(0)*ld(0)*ld(0)));"
+                    "0.5*65535+ld(1)*(B-0.5*65535)"
+                )
+                segs.append(f"[glumamap][gscaled]blend=all_expr='{weight_expr}'"
+                            f":shortest=1[gweighted]")
+                grain_label = "gweighted"
+                cur = "gcarry"
         # shortest=1 is what actually guarantees the render terminates: it ends
         # the blend when the graded stream ends rather than when every input
         # does, so a grain plate that outlives the picture cannot run the
         # output on forever. The picture is input 0 here and the plate is always
         # generated longer, so this can never truncate a render.
-        segs.append(f"[{cur}][grainplate]blend=all_mode=overlay:shortest=1"
-                    f":all_opacity={float(cfg['grain'].get('opacity', 0.5)):.4f}[gx]")
+        #
+        # overlay+opacity: dst = cur*(1-opacity) + overlay(cur,plate)*opacity,
+        # measured against ffmpeg's own integer blend on 2000 random 16-bit
+        # pairs at opacity 0.5 (max |predicted-actual| 1.49 of 65535, mean
+        # 0.57): this is the formula gpu.js's grain pass reproduces.
+        segs.append(f"[{cur}][{grain_label}]blend=all_mode=overlay:shortest=1"
+                    f":all_opacity={float(g.get('opacity', 0.5)):.4f}[gx]")
         cur = "gx"
 
-    tail = f_detail(cfg) + f_letterbox(cfg, info)
+    # mid_detail needs a split/blur/blend sub-graph (real labels), which a
+    # flat comma-joined chain cannot express, so it only enters the graph at
+    # all when non-zero: every existing config (mid_detail defaults to 0.0)
+    # takes the exact original code path below, unchanged graph text included.
+    mid_detail = float((cfg.get("detail") or {}).get("mid_detail", 0.0))
+    if abs(mid_detail) > 1e-6:
+        det_chain = f_detail(cfg)
+        if det_chain:
+            segs.append(f"[{cur}]{','.join(det_chain)}[det1]")
+            cur = "det1"
+        cur = f_mid_detail_segment(mid_detail, info, cur, segs)
+        tail = f_letterbox(cfg, info)
+    else:
+        tail = f_detail(cfg) + f_letterbox(cfg, info)
     if encode_out:
         tail += [
             "format=yuv422p10le",
@@ -1256,8 +2078,8 @@ def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
         rb = cfg["fx"]["radial_blur"]
         m = radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    if window_active(cfg):
-        args += ["-i", str(window_mask(cfg, info["width"], info["height"]))]
+    for _i, win in window_layers(cfg):
+        args += ["-i", str(window_mask(win, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += grain_input(cfg, info)
     return args
@@ -1284,11 +2106,17 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
     # window's hop. That moved approved renders (max 20 of 255 on the ramp
     # region, from the tv-to-full expansion radial_mask also carried), so it
     # was a founder call, taken and approved.
-    if window_active(cfg):
-        graph = (f"[{idxs['window']}:v]{WINDOW_MASK_FORMAT},setsar=1[wmask];"
-                 + graph)
+    #
+    # One matte segment per layer that has a window, labelled from the layer's
+    # array index so build_layers and this function name the same link without
+    # either having to replay the other's control flow.
+    pre = []
     if needs_mask:
-        graph = f"[{idxs['radial']}:v]{WINDOW_MASK_FORMAT},setsar=1[mask];" + graph
+        pre.append(f"[{idxs['radial']}:v]{WINDOW_MASK_FORMAT},setsar=1[mask]")
+    for i, _win in window_layers(cfg):
+        pre.append(f"[{idxs['layers'][i]}:v]{WINDOW_MASK_FORMAT},setsar=1[lw{i}]")
+    if pre:
+        graph = ";".join(pre) + ";" + graph
     if head_extra:
         graph = head_extra + ";" + graph
     return graph

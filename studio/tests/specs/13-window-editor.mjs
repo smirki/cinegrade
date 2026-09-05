@@ -7,18 +7,36 @@
  * the assertion is "the shape followed the pointer across the picture", not
  * "some number changed".
  *
+ * Contract C1 (layers, plan/2026-09-04-studio-layers/PLAN.md) moved the
+ * window from config.window into config.layers[i].mask.window, and the
+ * whole "secondary" plus "window" pair of stages became one "layers" stage
+ * (studio/static/layers.js). This spec was written for the old config.window
+ * shape; it is rewritten here against the new one now that
+ * plan/2026-09-04-studio-layers/checkpoints/L1.md has confirmed the exact
+ * path convention (see its "Config path convention for lane L1u" section).
+ * The shipped "flat" preset carries no secondary or window block, so
+ * loading it gives an EMPTY layers array (config.layers = []), same as
+ * before layers existed at all: this spec still starts from that clean
+ * slate and the Window button still has to create a layer before there is
+ * anything to draw, exactly the "if no layer exists, the Window button
+ * creates one and selects it" line in the contract.
+ *
  * The claims, in order:
- *   1. #windowBtn shows the overlay before the window stage is enabled.
- *   2. Dragging the centre grip 120px right moves window.cx by exactly
- *      120 / (rendered picture width), and auto-enables the stage.
- *   3. That whole drag is ONE undo step: one #undoBtn press restores cx.
- *   4. A real drag on the rotation grip changes window.rotation.
+ *   1. #windowBtn shows the overlay with no layer selected (there is none
+ *      yet), and creates and selects layer 0.
+ *   2. Dragging the centre grip 120px right moves
+ *      layers[0].mask.window.cx by exactly 120 / (rendered picture width),
+ *      and auto-enables layers[0].mask.window.enabled.
+ *   3. That whole drag is ONE undo step: one #undoBtn press restores cx and
+ *      mask.window.enabled, leaving the layer itself (created by step 1, a
+ *      separate commit) in place.
+ *   4. A real drag on the rotation grip changes layers[0].mask.window.rotation.
  *   5. Arrow keys nudge the centre by one screen pixel, ten with shift.
- *   6. Unchecking the panel's enabled box and switching #windowBtn off
- *      hides the overlay again.
+ *   6. Unchecking the layer's own Window-enabled box and switching
+ *      #windowBtn off hides the overlay again.
  */
 
-const WINDOW_STAGE = 'section.stage[data-stage="window"]';
+const LAYERS_STAGE = 'section.stage[data-stage="layers"]';
 
 function fail(evidence) {
   return { status: "FAIL", evidence: evidence };
@@ -48,6 +66,14 @@ export default async function run(ctx) {
       if (o) o.classList.remove("on");
     });
     return JSON.parse(text);
+  }
+
+  function layer0(cfg) {
+    return (cfg && Array.isArray(cfg.layers) && cfg.layers[0]) || null;
+  }
+  function windowOf(cfg) {
+    var l = layer0(cfg);
+    return (l && l.mask && l.mask.window) || {};
   }
 
   /* Mirrors pictureRect() in window-editor.js: whichever of the three
@@ -147,9 +173,9 @@ export default async function run(ctx) {
   /* Start from the shipped "flat" preset, loaded through the app's own
    * preset control. Per-clip grades (spec 12's feature) autosave, so a
    * previous run of THIS spec is saved against this clip and would otherwise
-   * be the starting config: a window already enabled, already off centre.
-   * Resetting through the real control is what makes the run repeatable
-   * without reaching into any private state. */
+   * be the starting config: a layer already there, a window already off
+   * centre. Resetting through the real control is what makes the run
+   * repeatable without reaching into any private state. */
   const hasFlat = await page.$eval("#presetSelect", (el) => {
     return Array.prototype.some.call(el.options, (o) => o.value === "flat");
   });
@@ -158,14 +184,18 @@ export default async function run(ctx) {
   await page.click("#loadPresetBtn");
   await new Promise((r) => setTimeout(r, 700));
 
-  // --- 1. the toolbar button draws before the stage is enabled -------------
+  // --- 1. the toolbar button creates and selects a layer, and shows the
+  //        overlay, when none existed --------------------------------------
   const before = await readConfig();
-  const win0 = (before && before.window) || {};
-  if (win0.enabled) {
-    return fail("window.enabled is true straight after loading the flat preset, so auto-enable cannot be observed");
+  if (!Array.isArray(before.layers) || before.layers.length !== 0) {
+    return fail(
+      'the "flat" preset is expected to carry no layers (config.layers === []); got '
+      + JSON.stringify(before.layers) + ". The rest of this spec assumes a clean slate; "
+      + "if flat now ships a layer this spec needs updating, not the app."
+    );
   }
   if (await overlayOn()) {
-    return fail("#windowOverlay was already showing with window.enabled false and #windowBtn off");
+    return fail("#windowOverlay was already showing with config.layers empty and #windowBtn off");
   }
 
   const hasBtn = await page.$("#windowBtn");
@@ -173,9 +203,13 @@ export default async function run(ctx) {
   await page.click("#windowBtn");
   await new Promise((r) => setTimeout(r, 200));
   if (!(await overlayOn())) {
-    return fail("#windowBtn did not show #windowOverlay (window.enabled is still false, which is the case it exists for)");
+    return fail("#windowBtn did not show #windowOverlay (config.layers was empty, which is the case it exists for)");
   }
-  notes.push("#windowBtn showed the overlay with window.enabled false");
+  const afterBtn = await readConfig();
+  if (!Array.isArray(afterBtn.layers) || afterBtn.layers.length !== 1) {
+    return fail("#windowBtn was clicked with no layers, expected exactly one layer afterwards, got " + JSON.stringify(afterBtn.layers));
+  }
+  notes.push("#windowBtn created layer 0 and showed the overlay with no window enabled yet");
 
   // --- 2. drag the centre grip --------------------------------------------
   const pic = await pictureRect();
@@ -184,6 +218,7 @@ export default async function run(ctx) {
   const grip = await centreOf("#windowOverlay .win-centre");
   if (!grip) return fail("no #windowOverlay .win-centre grip on screen");
 
+  const win0 = windowOf(afterBtn);
   const cx0 = Number(win0.cx === undefined ? 0.5 : win0.cx);
   const DX = 120;
   /* cx is clamped to 0..1 by design, so a drag that would leave the frame
@@ -198,7 +233,7 @@ export default async function run(ctx) {
   await drag(grip, DX, 0);
 
   const afterDrag = await readConfig();
-  const win1 = (afterDrag && afterDrag.window) || {};
+  const win1 = windowOf(afterDrag);
   const cx1 = Number(win1.cx);
   const expected = cx0 + DX / pic.w;
   const err = Math.abs(cx1 - expected);
@@ -209,13 +244,13 @@ export default async function run(ctx) {
     );
   }
   if (win1.enabled !== true) {
-    return fail("the drag moved cx to " + cx1 + " but window.enabled is " + String(win1.enabled) + ", the auto-enable did not fire");
+    return fail("the drag moved cx to " + cx1 + " but layers[0].mask.window.enabled is " + String(win1.enabled) + ", the auto-enable did not fire");
   }
   notes.push(
     "centre drag " + DX + "px right on a " + pic.w.toFixed(1) + "px picture: cx " + cx0
     + " -> " + cx1.toFixed(5) + " (expected " + expected.toFixed(5) + ", off by " + err.toFixed(5) + ")"
   );
-  notes.push("window.enabled auto-enabled false -> true");
+  notes.push("layers[0].mask.window.enabled auto-enabled false -> true");
 
   // --- 3. one drag is one undo step ----------------------------------------
   const undoDisabled = await page.$eval("#undoBtn", (el) => el.disabled);
@@ -223,15 +258,21 @@ export default async function run(ctx) {
   await page.click("#undoBtn");
   await new Promise((r) => setTimeout(r, 200));
   const afterUndo = await readConfig();
-  const win2 = (afterUndo && afterUndo.window) || {};
+  const win2 = windowOf(afterUndo);
   if (Math.abs(Number(win2.cx) - cx0) > 1e-9) {
     return fail("one #undoBtn press left cx at " + win2.cx + ", expected it back at " + cx0 + " (the drag is meant to be one step, not many)");
   }
-  notes.push("one undo restored cx to " + win2.cx);
+  if (win2.enabled !== false) {
+    return fail("one #undoBtn press left layers[0].mask.window.enabled at " + String(win2.enabled) + ", expected the drag's own auto-enable to be undone too");
+  }
+  if (!Array.isArray(afterUndo.layers) || afterUndo.layers.length !== 1) {
+    return fail("undoing the drag also removed layer 0 (got " + JSON.stringify(afterUndo.layers) + "), but the layer was created by a SEPARATE, earlier commit and should still be there");
+  }
+  notes.push("one undo restored cx to " + win2.cx + " and enabled to false, without undoing the layer's own creation");
 
   // --- 4. the rotation grip ------------------------------------------------
-  // The undo above put window.enabled back to false; #windowBtn is still on,
-  // which is exactly why the overlay is still drawable here.
+  // The undo above put mask.window.enabled back to false; #windowBtn is
+  // still on, which is exactly why the overlay is still drawable here.
   if (!(await overlayOn())) {
     return fail("after undo, #windowOverlay went away even though #windowBtn is still on");
   }
@@ -240,10 +281,10 @@ export default async function run(ctx) {
   const rot0 = Number(win2.rotation === undefined ? 0 : win2.rotation);
   await drag(rotGrip, 90, 40);
   const afterRot = await readConfig();
-  const win3 = (afterRot && afterRot.window) || {};
+  const win3 = windowOf(afterRot);
   const rot1 = Number(win3.rotation);
   if (!isFinite(rot1) || Math.abs(rot1 - rot0) < 1) {
-    return fail("a real drag on the rotation grip left window.rotation at " + win3.rotation + " (was " + rot0 + ")");
+    return fail("a real drag on the rotation grip left layers[0].mask.window.rotation at " + win3.rotation + " (was " + rot0 + ")");
   }
   notes.push("rotation grip drag: rotation " + rot0 + " -> " + rot1);
 
@@ -259,7 +300,7 @@ export default async function run(ctx) {
   await focusOverlay();
   await page.keyboard.press("ArrowRight");
   await new Promise((r) => setTimeout(r, 150));
-  const afterKey1 = (await readConfig()).window || {};
+  const afterKey1 = windowOf(await readConfig());
   const step1 = Number(afterKey1.cx) - cxBeforeKeys;
   if (Math.abs(step1 - 1 / pic.w) > 1e-6) {
     return fail("ArrowRight moved cx by " + step1 + ", expected 1 screen pixel = " + (1 / pic.w));
@@ -269,7 +310,7 @@ export default async function run(ctx) {
   await page.keyboard.press("ArrowRight");
   await page.keyboard.up("Shift");
   await new Promise((r) => setTimeout(r, 150));
-  const afterKey2 = (await readConfig()).window || {};
+  const afterKey2 = windowOf(await readConfig());
   const step2 = Number(afterKey2.cx) - Number(afterKey1.cx);
   if (Math.abs(step2 - 10 / pic.w) > 1e-6) {
     return fail("shift+ArrowRight moved cx by " + step2 + ", expected 10 screen pixels = " + (10 / pic.w));
@@ -277,32 +318,51 @@ export default async function run(ctx) {
   notes.push("arrow nudge: +" + step1.toFixed(6) + " (1px), shift +" + step2.toFixed(6) + " (10px) on a " + pic.w.toFixed(1) + "px picture");
 
   // --- 5. hiding it again --------------------------------------------------
-  // The window section's first .ctl-switch is its "enabled" checkbox (the
-  // schema puts it first; the second one is "invert").
-  const enableBox = await page.$(WINDOW_STAGE + " input.ctl-switch");
-  if (!enableBox) return fail("no enabled checkbox found in " + WINDOW_STAGE);
-  const checked = await page.$eval(WINDOW_STAGE + " input.ctl-switch", (el) => el.checked);
-  if (!checked) return fail("the window stage's enabled checkbox is unchecked after a drag auto-enabled it");
+  // layers.js tags every per-layer control's own root with the dotted field
+  // path it edits (see makeItemControl's tagged() in layers.js), which is
+  // what lets this select the WINDOW group's own enabled box specifically:
+  // a layer body repeats the "ctl-switch" class six times over (mask.show,
+  // mask.invert, mask.window.enabled, mask.window.invert, mask.key.enabled,
+  // mask.key.invert), so ordinal position alone would be fragile.
+  const winEnableSel = LAYERS_STAGE + ' .layer-item[data-layer-index="0"] [data-path="mask.window.enabled"] input.ctl-switch';
+  const enableBox = await page.$(winEnableSel);
+  if (!enableBox) return fail("no " + winEnableSel + " found (layer 0's own Window-enabled checkbox)");
+  const checked = await page.$eval(winEnableSel, (el) => el.checked);
+  if (!checked) return fail("layer 0's Window-enabled checkbox is unchecked after a drag auto-enabled it");
+
+  /* Follow-up 1 (collapse by default, plan/2026-09-04-studio-layers) put
+   * mask.window.enabled inside the layer's own Window group, a <details>
+   * collapsed by default: a closed <details> lays its content out at zero
+   * size, so a real click cannot land on the checkbox until the fold is
+   * open, exactly as a person would have to open it first. layers.js tags
+   * that <details> with data-fold="window" for exactly this. */
+  const winFoldSel = LAYERS_STAGE + ' .layer-item[data-layer-index="0"] details[data-fold="window"]';
+  const winFoldOpen = await page.$eval(winFoldSel, (el) => el.open).catch(() => null);
+  if (winFoldOpen === null) return fail("no " + winFoldSel + " found (layer 0's own Window fold)");
+  if (!winFoldOpen) {
+    await page.click(winFoldSel + " > summary");
+    await new Promise((r) => setTimeout(r, 150));
+  }
   await enableBox.click();
   await new Promise((r) => setTimeout(r, 200));
   if (!(await overlayOn())) {
-    return fail("unchecking enabled hid the overlay while #windowBtn is still on, the button is supposed to hold it open");
+    return fail("unchecking Window-enabled hid the overlay while #windowBtn is still on, the button is supposed to hold it open");
   }
   await page.click("#windowBtn");
   await new Promise((r) => setTimeout(r, 200));
   if (await overlayOn()) {
-    return fail("with window.enabled unchecked and #windowBtn off, #windowOverlay is still showing");
+    return fail("with mask.window.enabled unchecked and #windowBtn off, #windowOverlay is still showing");
   }
   const end = await readConfig();
-  if ((end.window || {}).enabled !== false) {
-    return fail("the enabled checkbox click left window.enabled at " + String((end.window || {}).enabled));
+  if (windowOf(end).enabled !== false) {
+    return fail("the enabled checkbox click left layers[0].mask.window.enabled at " + String(windowOf(end).enabled));
   }
-  notes.push("enabled unchecked plus #windowBtn off hides the overlay");
+  notes.push("Window-enabled unchecked plus #windowBtn off hides the overlay");
 
   /* Leave the clip's autosaved grade back on the flat preset. This spec is
-   * the only one that edits the window, and leaving a rotated, off centre
-   * window saved against the only clip in content/footage would be the next
-   * run's starting state (and the next screenshot's). */
+   * the only one that creates and edits a layer, and leaving one behind
+   * (rotated, off centre) saved against the only clip in content/footage
+   * would be the next run's starting state (and the next screenshot's). */
   await page.select("#presetSelect", "flat");
   await page.click("#loadPresetBtn");
   await new Promise((r) => setTimeout(r, 800));

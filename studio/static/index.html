@@ -287,7 +287,7 @@
               <button class="btn" id="storeSlot" title="Copy the live config into the other slot">Store</button>
             </span>
             <span class="sep"></span>
-            <button class="btn toggle" id="maskBtn" title="Show the secondary qualifier matte">Matte</button>
+            <button class="btn toggle" id="maskBtn" title="Show the selected layer's mask">Matte</button>
             <button class="btn toggle" id="sheetBtn" title="Same config across every marked frame (C)">Contact sheet</button>
             <span class="spacer"></span>
             <!-- GPU preview (job: live GPU viewer). #rendererBadge is the
@@ -631,8 +631,18 @@
 <script src="/vendor/hugeicons.js"></script>
 <script src="/icons.js"></script>
 <script src="/controls.js"></script>
+<!-- The hue curve editor (contract C2). A separate widget from
+     Ctl.curveEditor because its neutral is a flat line, its hue axes are
+     periodic and its y is an offset or a multiplier, not an output level.
+     Before panels.js, which builds it for the "huecurves" schema kind. -->
+<script src="/huecurve.js"></script>
 <script src="/schema.js"></script>
 <script src="/panels.js"></script>
+<!-- Layers (contract C1): the dynamic per-layer UI panels.js's "layers"
+     stage delegates to (see the array-kind hook in panels.js's build()).
+     After panels.js and schema.js, which it reads SCHEMA and Ctl/Panels
+     from; before app.js, which calls Layers.init() during boot(). -->
+<script src="/layers.js"></script>
 <script src="/limits.js"></script>
 <script src="/session.js"></script>
 <!-- Per clip grades (contract C3). Before app.js so window.StudioGrades

@@ -339,11 +339,11 @@
 
   function scheduleRender(delay) {
     // The power window's on-picture shape editor (window-editor.js) draws
-    // straight from cfg().window, so it has to redraw wherever the config
-    // moved. This is that one place: every edit, undo, preset load, clip
-    // switch and outside session patch already funnels through here, so
-    // hooking it is what keeps the overlay and the Window panel's sliders
-    // showing the same shape without either one polling the other.
+    // the selected layer's mask.window, so it has to redraw wherever the
+    // config moved. This is that one place: every edit, undo, preset load,
+    // clip switch and outside session patch already funnels through here, so
+    // hooking it is what keeps the overlay and the layer's Window group's
+    // sliders showing the same shape without either one polling the other.
     if (window.WindowEditor) window.WindowEditor.sync();
     // Every codepath that changes the config or the playhead (a slider
     // drag, a preset load, undo/redo, an outside session patch, setTime)
@@ -395,7 +395,7 @@
     // and then hidden, and leaving bypass re-renders it, which on the GPU
     // path is a second pass over a source frame live.js already has cached:
     // no network request at all. The matte view is excluded because it is a
-    // diagnostic of the secondary qualifier, not a picture that a bypass
+    // diagnostic of the selected layer's mask, not a picture that a bypass
     // comparison means anything against.
     if (mode === "graded" && effectiveMode() === MODE_BEFORE) {
       renderBypassOnly(t0);
@@ -416,7 +416,7 @@
 
     // GPU preview (job: live GPU viewer, mode 1). Only the graded picture
     // itself goes through gpu.js; mask mode is a diagnostic view of the
-    // secondary qualifier, not the grade the user is judging, and stays on
+    // selected layer's mask, not the grade the user is judging, and stays on
     // the server path unconditionally. Falls back to doRenderServer on ANY
     // rejection (an unsupported stage, a decode error, no GPU at all): the
     // server path is the one that matches the final render exactly, so a
@@ -470,7 +470,16 @@
   function doRenderServer(mode, t0) {
     inflight++;
     $("renderTime").textContent = "rendering...";
-    frameRequest("main", basePayload({ mode: mode }))
+    // Matte mode (job: layers) shows the SELECTED layer's mask, not merely
+    // "the first enabled one" (server.py's mask_preview_config's own
+    // fallback, kept for a request that sends no mask_layer at all, such as
+    // an old client or nothing selected yet).
+    var extra = { mode: mode };
+    if (mode === "mask" && window.Layers) {
+      var maskIdx = window.Layers.getSelectedIndex();
+      if (maskIdx >= 0) extra.mask_layer = maskIdx;
+    }
+    frameRequest("main", basePayload(extra))
       .then(function (r) { return showBlob("main", $("frameImg"), r); })
       .then(function (ok) {
         if (ok) {
@@ -2090,7 +2099,7 @@
     "<li><kbd>shift 1</kbd> <kbd>shift 2</kbd> copy the live grade into that slot</li>",
     "<li><kbd>f</kbd> fit &nbsp; <kbd>0</kbd> 100 percent</li>",
     "<li><kbd>r</kbd> show or hide the reference image beside the frame</li>",
-    "<li><kbd>k</kbd> show the secondary qualifier matte</li>",
+    "<li><kbd>k</kbd> show the selected layer's mask</li>",
     "<li><kbd>c</kbd> contact sheet: this grade on four marked frames at once</li>",
     "<li><kbd>g</kbd> show or hide the scopes and statistics dock</li>",
     "</ul>",
@@ -3742,6 +3751,21 @@
         $("loopBtn").disabled = true;
         $("loopBtn").title = "GPU preview unavailable: " + live.reason;
         setRendererBadge("server (no GPU: " + live.reason + ")", false);
+      }
+
+      // Layers (contract C1) is handed the same {getConfig, onChange,
+      // refreshPanels} shape WindowEditor gets just below, and for the same
+      // reason: it never reaches into S, so it cannot become a second
+      // source of truth for what a layer's fields are. This has to run
+      // BEFORE Panels.build, not after (unlike WindowEditor): panels.js's
+      // "layers" stage calls Layers.buildSection synchronously while it
+      // builds the sidebar, so Layers needs api set before that happens.
+      if (window.Layers) {
+        window.Layers.init({
+          getConfig: cfg,
+          onChange: onParamChange,
+          refreshPanels: function () { Panels.refresh(cfg(), S.defaults); }
+        });
       }
 
       Panels.build($("params"), { onChange: onParamChange });

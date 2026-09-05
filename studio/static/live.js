@@ -61,25 +61,36 @@
   /* Which stages this config would actually run on the GPU right now, split
    * into "fine" and "the caller should fall back to the server for this".
    *
-   * Grain is the one permanent, documented exception: ffmpeg's noise filter
-   * seeds from the wall clock and does not reproduce itself between two
-   * ffmpeg runs either, so there is no "correct" GPU grain to chase and
-   * stageReport marks it unsupported forever. That is not a reason to bail
-   * out of the GPU path the way a genuinely wrong stage would be; it is a
-   * reason to say so in the UI and let the caller flip to the server render
-   * to check. Anything else stageReport calls unsupported is a real
-   * accuracy gap and has to fall all the way back.
+   * Grain used to be a permanent, documented exception here: gpu.js had no
+   * grain shader at all, and this comment used to justify that on ffmpeg's
+   * noise filter supposedly seeding from the wall clock, which was already
+   * measured false before that shader was written (see STAGE_NOTES.grain).
+   * gpu.js now has a real grain pass and stageReport reports it exact, so
+   * grain no longer needs (or gets) a special case in `blocking` below: it
+   * simply never appears in rep.unsupported any more.
+   *
+   * grainOnly still comes back from here, but it now means something
+   * narrower than "grain is on": the plate this preview fetches is one
+   * frame's worth (ffmpeg's noise generator's own frame 0 for this exact
+   * config and size, cached), not one plate per output frame. A single
+   * still uses exactly one frame either way, which is why renderStill
+   * below does not treat grainOnly as a caveat any more. renderProxyFrame
+   * (the play loop, seeking, frame stepping) renders many frames from one
+   * config and would show that same one plate on every one of them while a
+   * real export's grain keeps changing, so it still surfaces grainOnly as
+   * a caveat for the caller to warn about.
    */
   function checkStages(cfg) {
     var rep = StudioGPU.stageReport(cfg);
-    var blocking = rep.unsupported.filter(function (id) { return id !== "grain"; });
+    var blocking = rep.unsupported;
     // The power window used to be forced into `blocking` here, because it was
     // in the ffmpeg engine only and gpu.js had no window stage to report as
     // unsupported: it would have graded the whole frame and shown a picture
     // that quietly ignored the shape the user just drew. The shader port
-    // landed, stageReport now carries a real "window" row, and the parity
-    // harness measures the four window configs EXACT at both widths, so the
-    // stage report is the only authority again and the override is gone.
+    // landed, and the stage report is the only authority again. Since the
+    // single secondary became the layer stack the rows are one per layer
+    // ("layer0", "layer1", ...), each carrying its own window, and the parity
+    // harness measures the layer configs at both widths.
     return { report: rep, blocking: blocking, grainOnly: !!(cfg.grain && cfg.grain.enabled) };
   }
 
@@ -158,7 +169,10 @@
         var r = inst.render(cfg, { pixelScale: factor });
         return {
           ms: r.ms, passes: r.passes, width: r.width, height: r.height,
-          grain: check.grainOnly, report: check.report
+          // Not check.grainOnly: a still renders exactly one frame, which is
+          // exactly what the grain plate this preview fetched covers, so
+          // there is no caveat left to report here (see checkStages above).
+          grain: false, report: check.report
         };
       });
     });
@@ -276,7 +290,7 @@
       raf = requestAnimationFrame(tick);
       // A render already in flight (waiting on ready()'s LUT promise, which
       // is normally a resolved microtask but is a real fetch the first
-      // time a look or secondary config is seen) is left to finish rather
+      // time a look or layer config is seen) is left to finish rather
       // than starting a second one on top of it: that bounds this to one
       // outstanding render, which is what keeps a slow tick from queueing
       // up a backlog instead of just dropping a frame.

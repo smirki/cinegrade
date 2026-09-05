@@ -1,4 +1,4 @@
-"""Group 8: the power window, the shape half of a secondary.
+"""Group 8: the power window, the shape half of a masked layer.
 
 The window is a matte, and a matte is only worth anything if the same formula
 lands on the same pixels everywhere it is evaluated. It is written three times
@@ -11,7 +11,7 @@ the tests here are mostly about agreement rather than about looks:
               rendered bytes are the ones that shipped before the stage
               existed. A new node that changes an old render is a regression
               however good it looks.
-  gating      inside the shape the secondary is applied in full, outside it is
+  gating      inside the shape the layer is applied in full, outside it is
               not applied at all. Both halves are measured, and "not at all"
               means exactly zero, not nearly zero.
   agreement   the geq matte equals the numpy matte, and the same fractions
@@ -22,6 +22,12 @@ was off by a mean of 0.186 of 255 inside a fully open window, because ffmpeg
 expands an 8-bit matte to 16 bits with a left shift, so matte code 255 reached
 maskedmerge as 65280 of 65535 and the correction landed at 99.61%. Nothing that
 looks at a picture would ever have caught it; asserting exact zero did.
+
+The window used to be a single top level config block gating a single
+secondary. It now lives at layers[i].mask.window, one per layer, so these tests
+address it through a layer. The formula and every assertion below are unchanged
+from the single window build; only the shape of the config that carries them
+moved.
 """
 
 from __future__ import annotations
@@ -40,26 +46,50 @@ T = H.TIME_A
 # A correction big enough that "applied" and "not applied" are never a judgement
 # call: the hue window is wide, saturation is pulled to zero and luma is dropped
 # hard, which moves the frame by a mean of about 55 of 255 where it lands.
-STRONG_SECONDARY = {"secondary": {
-    "enabled": True, "hue_center": 30.0, "hue_width": 300.0, "hue_soft": 30.0,
-    "sat_low": 0.0, "sat_soft": 0.3, "lum_soft": 0.3,
-    "sat_gain": 0.0, "lum_gain": 0.4}}
+STRONG_KEY = {"enabled": True, "hue_center": 30.0, "hue_width": 300.0,
+              "hue_soft": 30.0, "sat_low": 0.0, "sat_soft": 0.3,
+              "lum_soft": 0.3}
+STRONG_CORRECT = {"sat_gain": 0.0, "lum_gain": 0.4}
 
 # Hard edged on purpose: with no feather every pixel is either fully inside or
 # fully outside, so "inside" and "outside" are exact sets and the assertions can
 # be exact too.
-HARD_ELLIPSE = {"window": {"enabled": True, "shape": "ellipse",
-                           "cx": 0.5, "cy": 0.5, "w": 0.5, "h": 0.5,
-                           "rotation": 0.0, "softness": 0.0, "invert": False}}
+HARD_ELLIPSE = {"enabled": True, "shape": "ellipse",
+                "cx": 0.5, "cy": 0.5, "w": 0.5, "h": 0.5,
+                "rotation": 0.0, "softness": 0.0, "invert": False}
+
+
+def _layer(patch=None):
+    """One layer, defaults plus a patch, spelled out the way a config carries it."""
+    return cg.deep_merge(cg.LAYER_DEFAULTS, patch or {})
 
 
 def _sec_base():
-    return H.patch(H.defaults(), STRONG_SECONDARY)
+    """Defaults carrying one strong keyed layer and a window at its defaults."""
+    return H.patch(H.defaults(), {"layers": [
+        _layer({"mask": {"key": STRONG_KEY}, "correct": STRONG_CORRECT})]})
+
+
+def _patch_layer(cfg, patch, index=0):
+    """Deep-merge a patch into one layer.
+
+    H.patch cannot reach inside `layers`: a list is not merged key by key, it
+    is replaced whole, so patching {"layers": [...]} would drop everything the
+    base layer carried.
+    """
+    out = deepcopy(cfg)
+    out["layers"][index] = cg.deep_merge(out["layers"][index], patch)
+    return out
+
+
+def _window_of(cfg, index=0):
+    """The window block of one layer, for the numpy reference."""
+    return cfg["layers"][index]["mask"]["window"]
 
 
 def _regions(cfg, width, height):
     """The boolean inside/outside masks for a config's window, from numpy."""
-    m = cg.window_matte(cfg, width, height)
+    m = cg.window_matte(_window_of(cfg), width, height)
     return m == 255, m == 0
 
 
@@ -77,13 +107,21 @@ def _read_gray_png(path, w, h) -> np.ndarray:
     return np.frombuffer(raw[:w * h], np.uint8).reshape(h, w)
 
 
+def _drop_windows(cfg):
+    """The same config with no window block written anywhere in it."""
+    out = deepcopy(cfg)
+    for layer in out.get("layers", []):
+        layer.get("mask", {}).pop("window", None)
+    return out
+
+
 # --------------------------------------------------------------------------
 # (a) the stage is invisible when it is off
 # --------------------------------------------------------------------------
 
 def test_disabled_window_is_byte_identical(ctx):
-    """A config carrying the window block at its defaults must render exactly
-    what a config that has never heard of a window renders.
+    """A layer carrying the window block at its defaults must render exactly
+    what a layer that has never heard of a window renders.
 
     Three things are compared, because any one of them alone could pass while
     the render still moved: the filter graph text, the ffmpeg input list (a
@@ -97,13 +135,14 @@ def test_disabled_window_is_byte_identical(ctx):
                 c = H.patch(H.defaults(), {
                     "fx": {"radial_blur": {"enabled": radial}},
                     "grain": {"enabled": grain},
-                    "secondary": {"enabled": sec}})
+                    "layers": [_layer({"enabled": sec,
+                                       "mask": {"key": STRONG_KEY},
+                                       "correct": STRONG_CORRECT})]})
                 combos.append((f"radial={radial} grain={grain} sec={sec}", c))
 
     graph_diffs, input_diffs = [], []
     for tag, cfg in combos:
-        without = deepcopy(cfg)
-        without.pop("window")
+        without = _drop_windows(cfg)
         if cg.graph_with_mask(cfg, info) != cg.graph_with_mask(without, info):
             graph_diffs.append(tag)
         if (cg.ffmpeg_inputs(str(CLIP), cfg, info)
@@ -116,8 +155,7 @@ def test_disabled_window_is_byte_identical(ctx):
                     not input_diffs, f"differed: {input_diffs}")
 
     with_block = _sec_base()
-    without_block = deepcopy(with_block)
-    without_block.pop("window")
+    without_block = _drop_windows(with_block)
     a = H.render(CLIP, with_block, T)
     b = H.render(CLIP, without_block, T)
     ha = hashlib.sha1(a.tobytes()).hexdigest()[:16]
@@ -127,14 +165,14 @@ def test_disabled_window_is_byte_identical(ctx):
 
 
 # --------------------------------------------------------------------------
-# (b) the window gates the secondary
+# (b) the window gates the layer
 # --------------------------------------------------------------------------
 
-def test_ellipse_gates_the_secondary(ctx):
+def test_ellipse_gates_the_layer(ctx):
     base = _sec_base()
-    windowed = H.patch(base, HARD_ELLIPSE)
-    plain = H.render(CLIP, H.defaults(), T)          # no secondary at all
-    full = H.render(CLIP, base, T)                   # secondary everywhere
+    windowed = _patch_layer(base, {"mask": {"window": HARD_ELLIPSE}})
+    plain = H.render(CLIP, H.defaults(), T)          # no layer at all
+    full = H.render(CLIP, base, T)                   # the layer everywhere
     got = H.render(CLIP, windowed, T)
     h, w, _ = got.shape
     inside, outside = _regions(windowed, w, h)
@@ -147,7 +185,7 @@ def test_ellipse_gates_the_secondary(ctx):
     out_vs_full = _mean_abs(got, full, outside)
     ctx.note(f"vs the ungraded frame: inside {in_vs_plain:.4f}, "
              f"outside {out_vs_plain:.4f} of 255")
-    ctx.note(f"vs the un-windowed secondary: inside {in_vs_full:.4f}, "
+    ctx.note(f"vs the un-windowed layer: inside {in_vs_full:.4f}, "
              f"outside {out_vs_full:.4f} of 255")
 
     ctx.expect_gt("inside the shape the correction really lands",
@@ -166,8 +204,8 @@ def test_ellipse_gates_the_secondary(ctx):
 
 def test_invert_swaps_inside_and_outside(ctx):
     base = _sec_base()
-    normal = H.patch(base, HARD_ELLIPSE)
-    flipped = H.patch(normal, {"window": {"invert": True}})
+    normal = _patch_layer(base, {"mask": {"window": HARD_ELLIPSE}})
+    flipped = _patch_layer(normal, {"mask": {"window": {"invert": True}}})
     plain = H.render(CLIP, H.defaults(), T)
     n = H.render(CLIP, normal, T)
     f = H.render(CLIP, flipped, T)
@@ -205,11 +243,11 @@ def test_rect_rotated_45_moves_the_corners(ctx):
     sqrt(2) on one of them, which is outside.
     """
     size = 512
-    rect = {"window": {"enabled": True, "shape": "rect", "cx": 0.5, "cy": 0.5,
-                       "w": 0.5, "h": 0.5, "softness": 0.0, "invert": False}}
+    rect = {"enabled": True, "shape": "rect", "cx": 0.5, "cy": 0.5,
+            "w": 0.5, "h": 0.5, "softness": 0.0, "invert": False}
+    turned_rect = dict(rect, rotation=45.0)
     flat = cg.window_matte(rect, size, size)
-    turned = cg.window_matte(H.patch(rect, {"window": {"rotation": 45.0}}),
-                             size, size)
+    turned = cg.window_matte(turned_rect, size, size)
     half = int(0.5 * size / 2) - 2          # just inside the unrotated corner
     c = size // 2
     corners = [(c - half, c - half), (c - half, c + half),
@@ -231,8 +269,8 @@ def test_rect_rotated_45_moves_the_corners(ctx):
 
     # And it has to reach the render, not only the matte.
     base = _sec_base()
-    r0 = H.render(CLIP, H.patch(base, rect), T)
-    r45 = H.render(CLIP, H.patch(base, rect, {"window": {"rotation": 45.0}}), T)
+    r0 = H.render(CLIP, _patch_layer(base, {"mask": {"window": rect}}), T)
+    r45 = H.render(CLIP, _patch_layer(base, {"mask": {"window": turned_rect}}), T)
     moved = H.changed_fraction(r0, r45, thresh=0)
     ctx.note(f"rotating the rendered window moved {moved * 100:.3f}% of pixels")
     ctx.expect_gt("rotation changes the rendered frame", moved, 0.02)
@@ -245,10 +283,8 @@ def test_rect_rotated_45_moves_the_corners(ctx):
 def test_softness_zero_is_binary_and_half_is_a_ramp(ctx):
     size_w, size_h = 960, 540
     hard = cg.window_matte(HARD_ELLIPSE, size_w, size_h)
-    narrow = cg.window_matte(H.patch(HARD_ELLIPSE, {"window": {"softness": 0.15}}),
-                             size_w, size_h)
-    soft = cg.window_matte(H.patch(HARD_ELLIPSE, {"window": {"softness": 0.5}}),
-                           size_w, size_h)
+    narrow = cg.window_matte(dict(HARD_ELLIPSE, softness=0.15), size_w, size_h)
+    soft = cg.window_matte(dict(HARD_ELLIPSE, softness=0.5), size_w, size_h)
     hard_vals = np.unique(hard).tolist()
     soft_levels = int(len(np.unique(soft)))
     total = float(soft.size)
@@ -308,7 +344,7 @@ def test_geq_matte_matches_the_numpy_matte(ctx):
     worst = 0
     for w, h in ((1920, 1080), (320, 568)):
         for label, win in shapes:
-            cfg = {"window": dict(win, enabled=True)}
+            cfg = dict(win, enabled=True)
             ref = cg.window_matte(cfg, w, h)
             png = cg.window_mask(cfg, w, h)
             got = _read_gray_png(png, w, h)
@@ -329,9 +365,9 @@ def test_matte_scales_with_the_frame(ctx):
     pixel count: scale_for_preview has to fix halation sigma and grain size at
     a smaller preview, and it must not need a case for the window.
     """
-    win = {"window": {"enabled": True, "shape": "ellipse", "cx": 0.42,
-                      "cy": 0.55, "w": 0.5, "h": 0.7, "rotation": 17.0,
-                      "softness": 0.25, "invert": False}}
+    win = {"enabled": True, "shape": "ellipse", "cx": 0.42,
+           "cy": 0.55, "w": 0.5, "h": 0.7, "rotation": 17.0,
+           "softness": 0.25, "invert": False}
     big = cg.window_matte(win, 1920, 1080).astype(np.float64)
     small = cg.window_matte(win, 960, 540).astype(np.float64)
 
@@ -363,13 +399,14 @@ def test_mask_view_is_qualifier_times_window(ctx):
     The qualifier matte alone would claim pixels the grade will never touch,
     because the window closes over them. The engine composites the greyscale
     qualifier over black through the window matte, so the view is the product
-    of the two, which is exactly what the secondary now selects.
+    of the two, which is exactly what the layer now selects.
     """
-    base = H.patch(_sec_base(), {"secondary": {"show_mask": True}})
+    base = _patch_layer(_sec_base(), {"mask": {"show": True}})
     qualifier = H.render(CLIP, base, T)
-    windowed = H.render(CLIP, H.patch(base, HARD_ELLIPSE), T)
+    shown = _patch_layer(base, {"mask": {"window": HARD_ELLIPSE}})
+    windowed = H.render(CLIP, shown, T)
     h, w, _ = windowed.shape
-    inside, outside = _regions(H.patch(base, HARD_ELLIPSE), w, h)
+    inside, outside = _regions(shown, w, h)
 
     out_level = float(windowed[outside].max()) if outside.any() else 0.0
     in_diff = _mean_abs(windowed, qualifier, inside)
@@ -388,7 +425,7 @@ def register(suite):
     g = "window"
     suite.add(g, "disabled_is_byte_identical", test_disabled_window_is_byte_identical,
               doc="with the window off the graph, the inputs and the pixels are unchanged")
-    suite.add(g, "ellipse_gates_the_secondary", test_ellipse_gates_the_secondary,
+    suite.add(g, "ellipse_gates_the_layer", test_ellipse_gates_the_layer,
               doc="the correction lands inside the shape and nowhere else")
     suite.add(g, "invert_swaps_inside_and_outside", test_invert_swaps_inside_and_outside,
               doc="invert grades the complement, and the two halves tile the frame")

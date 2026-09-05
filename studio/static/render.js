@@ -104,7 +104,11 @@
                                    expected: plan.expected }));
     }
 
-    var opts = { pixelScale: plan.pixelScale };
+    // width/height explicit: this worker calls ready() before setSource16
+    // ever runs (the loop below fetches the first frame after ready()
+    // resolves), so this.src is still null and the grain plate prefetch in
+    // ready() has nothing to fall back to unless told the size directly.
+    var opts = { pixelScale: plan.pixelScale, width: plan.width, height: plan.height };
     var maxPosts = Math.max(1, Math.min(3, plan.window || 2));
 
     return inst.ready(plan.config, opts).then(async function () {

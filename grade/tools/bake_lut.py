@@ -6,7 +6,7 @@ Studio-only ResolveFX, so a grade built here cannot be rebuilt node for node
 over there. What it CAN do is apply a 3D LUT, and the engine's chain splits
 cleanly at that boundary:
 
-    LOG -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> SECONDARY -> LOOK
+    LOG -> CST IN -> PRIMARIES -> CST OUT -> CURVES -> LAYERS -> LOOK
         every one of those is a pure function of one pixel's RGB, so the whole
         run collapses into a single 3D LUT with no loss beyond interpolation
 
@@ -205,9 +205,15 @@ def rough_stages(cfg: dict) -> list[tuple[str, int, float, float]]:
     if p is not None:
         size, step, curve = cube_roughness(p)
         out.append((f"look {cfg['look']['lut']}", size, step, curve))
-    if (cfg.get("secondary") or {}).get("enabled"):
-        size, step, curve = cube_roughness(cinegrade.secondary_lut(cfg["secondary"]))
-        out.append(("HSL secondary", size, step, curve))
+    for i, layer in enumerate(cinegrade.config_layers(cfg)):
+        if not cinegrade.layer_active(layer):
+            continue
+        variants = cinegrade.layer_branches(layer)
+        for v in variants:
+            size, step, curve = cube_roughness(cinegrade.layer_lut(layer, v))
+            label = f"layer {i + 1} {layer['name']}"
+            out.append((f"{label} ({v})" if len(variants) > 1 else label,
+                        size, step, curve))
     return out
 
 
@@ -239,8 +245,11 @@ def baked_summary(cfg: dict, meta: dict) -> list[str]:
     out.append("primaries: " + (", ".join(prim) if prim else "none, left at identity"))
     if (cfg.get("curves") or {}).get("enabled"):
         out.append("curves")
-    if (cfg.get("secondary") or {}).get("enabled"):
-        out.append("HSL secondary (a colour qualifier, so it is per-pixel and bakes)")
+    for i, layer in enumerate(cinegrade.config_layers(cfg)):
+        if cinegrade.layer_active(layer):
+            out.append(f"layer {i + 1} {layer['name']} at {layer['placement']} "
+                       f"(a colour correction under a colour matte, so it is "
+                       f"per-pixel and bakes)")
     out.append(f"look {meta['look']}" if meta["look"] else "no look LUT")
     return out
 
@@ -267,8 +276,12 @@ def per_pixel_head(cfg: dict, info: dict) -> list[str]:
 
     chain = (body + cinegrade.f_convert_in(cfg) + cinegrade.f_primaries(cfg)
              + cinegrade.f_convert_out(cfg) + cinegrade.f_curves(cfg)
-             + cinegrade.f_secondary(cfg))
+             + layers_chain(cfg, info, "before_look"))
+    return check_bakeable(chain)
 
+
+def check_bakeable(chain: list[str]) -> list[str]:
+    """Refuse a chain that contains anything a cube cannot hold."""
     bad = sorted({filter_name(f) for f in chain} - BAKEABLE_FILTERS)
     if bad:
         raise GradeError(
@@ -278,6 +291,32 @@ def per_pixel_head(cfg: dict, info: dict) -> list[str]:
             "filter to BAKEABLE_FILTERS only after confirming that is what it "
             "is; otherwise this stage has to stay in cinegrade.")
     return chain
+
+
+def layers_chain(cfg: dict, info: dict, placement: str) -> list[str]:
+    """The layer stack at one placement point, as filters, when it is per-pixel.
+
+    A layer with no power window is one lut3d, which a cube holds exactly. A
+    window is a matte that depends on where the pixel is, so no grid size can
+    express it and the bake has to refuse rather than hand back a LUT that is
+    missing a stage. A blur is caught a step later by check_bakeable, which
+    already names it.
+
+    The filters come from the engine's own build_layers, not from a second
+    implementation here: one plain segment in means that segment IS the chain,
+    and anything else means the stack needed a split, which is the window.
+    """
+    segs, _ = cinegrade.build_layers(cfg, info, placement, "in", [], "out")
+    if not segs:
+        return []
+    if len(segs) != 1 or not (segs[0].startswith("[in]")
+                              and segs[0].endswith("[out]")):
+        raise GradeError(
+            f"cannot bake: a {placement} layer uses a power window, and the "
+            "matte it merges under depends on where the pixel is rather than "
+            "on its colour. A 3D LUT holds a function of one pixel's own RGB "
+            "and nothing else, so that layer has to stay in cinegrade.")
+    return segs[0][len("[in]"):-len("[out]")].split(",")
 
 
 # --------------------------------------------------------------------------
@@ -461,6 +500,13 @@ def bake(cfg: dict, domain: str, size: int) -> tuple[np.ndarray, dict]:
         meta["look"] = f"{cfg['look']['lut']} @ mix {mix:.2f}"
     else:
         meta["look"] = None
+
+    # Layers placed after the look run on what the look produced, so they are
+    # baked here rather than folded into the head. They are still per-pixel,
+    # so the cube holds them exactly as it holds the head.
+    post = check_bakeable(layers_chain(cfg, info, "after_look"))
+    if post:
+        out = run_chain(out, post, size)
 
     return np.clip(out, 0.0, 1.0), meta
 

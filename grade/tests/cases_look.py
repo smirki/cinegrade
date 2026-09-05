@@ -15,10 +15,16 @@ from __future__ import annotations
 import numpy as np
 
 import harness as H
+from harness import cg
 
 # The founder-approved look, so this stays pinned to something real rather than
 # to whichever LUT happens to be first in the directory.
 LOOK = "blockbuster"
+
+# A second, distinct real look for the two-slot blend (C5). Distinct from LOOK
+# so a bug that reads the wrong slot's LUT is visible rather than accidentally
+# passing because both slots happened to point at the same file.
+LOOK2 = "teal_orange"
 
 CLIPS = [("clipA", H.CLIP_A, H.TIME_A), ("clipB", H.CLIP_B, H.TIME_B)]
 
@@ -33,6 +39,85 @@ def _frames(clip, t):
 def _mix(clip, t, m):
     return H.render(clip, H.patch(H.defaults(),
                                   {"look": {"lut": LOOK, "mix": m}}), t)
+
+
+def _render16(clip, t, cfg):
+    """One graded frame as (h, w, 3) float64 in 16-bit code values (0..65535).
+
+    build_graph's blend runs at 16 bits and the rest of this file reads it
+    back at 8, which is exactly the rounding the docstring above budgets one
+    code of slack for. "within 1 of 65535" only means what it says if the
+    comparison itself is done at 16 bits, so this mirrors harness.render but
+    keeps the format at rgb48le instead of downconverting to rgb24.
+    """
+    info = H.info_for(clip)
+    w, h = info["width"], info["height"]
+    head = f"[0:v]scale={w}:{h}:flags=bilinear[src]"
+    graph = cg.graph_with_mask(cfg, info, tail_extra=["format=rgb48le"],
+                               encode_out=False, src_label="src",
+                               head_extra=head)
+    args = cg.ffmpeg_inputs(str(clip), cfg, info, seek=t)
+    args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
+             "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
+    raw = H._run_bytes(args)
+    return np.frombuffer(raw, dtype="<u2").reshape(h, w, 3).astype(np.float64)
+
+
+def test_lut2_null_is_byte_identical_to_today(ctx):
+    """The compatibility gate for C5: lut2 unset must match today's single
+    slot output exactly, even when balance and mix2 are pushed away from
+    their defaults, because nothing in build_graph may read them unless
+    lut2 names a real LUT (look2_active is False whenever lut2 is falsy).
+    """
+    for name, clip, t in CLIPS:
+        _, full = _frames(clip, t)
+        cfg = H.patch(H.defaults(), {"look": {
+            "lut": LOOK, "mix": 1.0, "lut2": None, "mix2": 0.3,
+            "balance": 0.7}})
+        got = H.render(clip, cfg, t)
+        delta = int(np.abs(got.astype(np.int16) - full.astype(np.int16)).max())
+        ctx.expect_eq(f"{name}: lut2=None is pixel-identical to today "
+                      f"regardless of balance/mix2", delta, 0)
+
+
+def test_balance_one_is_lut2_alone(ctx):
+    """balance=1.0 with mix2=1.0 must equal lut2 alone: the same "skip the
+    blend at the extreme" trick mix already uses at 0.999, applied to slot 1
+    instead (need_slot1 is False once balance >= 0.999, so A is never built).
+    """
+    for name, clip, t in CLIPS:
+        two_slot = H.render(clip, H.patch(H.defaults(), {"look": {
+            "lut": LOOK, "mix": 1.0, "lut2": LOOK2, "mix2": 1.0,
+            "balance": 1.0}}), t)
+        lut2_alone = H.render(clip, H.patch(H.defaults(),
+                                            {"look": {"lut": LOOK2, "mix": 1.0}}), t)
+        delta = int(np.abs(two_slot.astype(np.int16)
+                           - lut2_alone.astype(np.int16)).max())
+        ctx.expect_eq(f"{name}: balance=1.0, mix2=1.0 is pixel-identical to "
+                      f"lut2 alone", delta, 0)
+
+
+def test_balance_half_is_the_average_of_the_two_branches(ctx):
+    """out = lerp(A, B, balance): at balance=0.5 with both slots at mix 1.0,
+    out must equal (A + B) / 2 to within 1 sixteen-bit code, read back at 16
+    bits so the tolerance is not swamped by the 8-bit test frames' own
+    rounding.
+    """
+    for name, clip, t in CLIPS:
+        cfg_a = H.patch(H.defaults(), {"look": {"lut": LOOK, "mix": 1.0}})
+        cfg_b = H.patch(H.defaults(), {"look": {"lut": LOOK2, "mix": 1.0}})
+        cfg_both = H.patch(H.defaults(), {"look": {
+            "lut": LOOK, "mix": 1.0, "lut2": LOOK2, "mix2": 1.0,
+            "balance": 0.5}})
+        a16 = _render16(clip, t, cfg_a)
+        b16 = _render16(clip, t, cfg_b)
+        got16 = _render16(clip, t, cfg_both)
+        avg16 = (a16 + b16) / 2.0
+        err = np.abs(got16 - avg16)
+        ctx.note(f"{name}: balance=0.5 vs (A+B)/2 max error "
+                 f"{err.max():.2f} of 65535, mean {err.mean():.4f}")
+        ctx.expect_le(f"{name}: balance=0.5 matches the average of the two "
+                      f"branches within 1 of 65535", float(err.max()), 1.0)
 
 
 def test_mix_zero_is_no_look(ctx):
@@ -123,3 +208,11 @@ def register(suite):
               doc="mix=0.5 lies strictly between the two ends")
     suite.add(g, "mix_monotone", test_mix_is_monotone,
               doc="look strength rises with mix, with no reversal")
+    suite.add(g, "lut2_null_is_byte_identical", test_lut2_null_is_byte_identical_to_today,
+              doc="C5: lut2=None must be pixel-identical to today regardless "
+                  "of balance/mix2")
+    suite.add(g, "balance_one_is_lut2_alone", test_balance_one_is_lut2_alone,
+              doc="C5: balance=1.0, mix2=1.0 must be pixel-identical to lut2 alone")
+    suite.add(g, "balance_half_is_the_average", test_balance_half_is_the_average_of_the_two_branches,
+              doc="C5: balance=0.5 must equal the average of the two branches "
+                  "within 1 of 65535")

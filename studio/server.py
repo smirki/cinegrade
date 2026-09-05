@@ -366,8 +366,8 @@ def ensure_dirs() -> None:
     # accounts database and each account's own footage folder live there, and
     # the whole folder is gitignored because it is user owned data.
     for d in (CACHE / "frames", CACHE / "img", CACHE / "thumbs", CACHE / "refs",
-              CACHE / "src", CACHE / "segments", CACHE / "proxy", STUDIO_TOOLS,
-              OUT, PRESETS, LOOKS,
+              CACHE / "src", CACHE / "segments", CACHE / "proxy", CACHE / "grain",
+              STUDIO_TOOLS, OUT, PRESETS, LOOKS,
               DB.DATA, AUTH.USERS_DIR):
         d.mkdir(parents=True, exist_ok=True)
     # Per clip grades keep their own tables in the same SQLite file the
@@ -447,8 +447,17 @@ def _fps(path: str) -> float:
 # --------------------------------------------------------------------------
 
 def full_config(cfg: dict | None) -> dict:
-    """Fill in everything the caller left out, so the graph builders are safe."""
-    return CG.deep_merge(CG.DEFAULTS, cfg or {})
+    """Fill in everything the caller left out, so the graph builders are safe.
+
+    CG.migrate_layers runs FIRST, on the config as it arrived, because that is
+    the shape a pre-layers preset, saved grade or API caller still sends: a
+    `secondary` and a `window` block and no `layers`. Merging with DEFAULTS
+    first would supply an empty `layers` and make every old config look like a
+    new one, and the old grade would silently render as no grade at all. The
+    file or database row is not rewritten; the migration is on read, and the
+    next save writes the new shape.
+    """
+    return CG.deep_merge(CG.DEFAULTS, CG.migrate_layers(cfg or {}))
 
 
 def config_diff(cfg: dict, base: dict | None = None) -> dict:
@@ -524,19 +533,50 @@ def flat_config(cfg: dict, keep_exposure: bool) -> dict:
     return flat
 
 
-def mask_preview_config(cfg: dict) -> dict:
-    """Show the qualifier matte with nothing painted on top of it.
+def mask_preview_config(cfg: dict, index: int | None = None) -> dict:
+    """Show one layer's matte with nothing painted on top of it.
 
-    The power window is deliberately LEFT ON. What the secondary actually
-    selects is the qualifier matte multiplied by the window matte, so a matte
-    view that ignored the shape would show a selection the grade will never
-    make. The engine handles the multiply: in show_mask mode the window's
-    maskedmerge composites the greyscale qualifier over black instead of over
-    the picture, so the two mattes come out multiplied together.
+    `index` is the layer to show, defaulting to the first enabled one. With no
+    layers at all there is no matte to show and the config comes back with
+    only the FX and grain stripped.
+
+    The power window is deliberately LEFT ON. What a layer actually selects is
+    its colour matte multiplied by its window matte, so a matte view that
+    ignored the shape would show a selection the grade will never make. The
+    engine handles the multiply: in mask.show mode the maskedmerge composites
+    the greyscale colour matte over black instead of over the picture, so the
+    two mattes come out multiplied together.
+
+    Layers EARLIER in the pipeline stay on, because they are part of the
+    signal the key really sees and turning them off would show a selection the
+    grade does not make either. Layers later in the pipeline are turned off,
+    since they would paint over the matte. The look is killed for the same
+    reason, unless the shown layer runs after it, in which case the look is
+    part of what the key sees and the layer replaces the picture afterwards.
     """
     out = deepcopy(cfg)
-    out["secondary"]["show_mask"] = True
-    out["look"]["lut"] = None
+    layers = out.get("layers") or []
+    shown = None
+    if layers:
+        if index is None:
+            index = next((i for i, ly in enumerate(layers) if ly.get("enabled")), 0)
+        index = max(0, min(int(index), len(layers) - 1))
+
+        def rank(i):
+            ly = CG.deep_merge(CG.LAYER_DEFAULTS, layers[i] or {})
+            return (1 if ly["placement"] == "after_look" else 0, i)
+
+        here = rank(index)
+        layers[index] = CG.deep_merge(CG.LAYER_DEFAULTS, layers[index] or {})
+        layers[index]["mask"]["show"] = True
+        shown = layers[index]
+        for i, layer in enumerate(layers):
+            if i != index and rank(i) > here:
+                layer["enabled"] = False
+    if not (shown and shown["placement"] == "after_look"):
+        out["look"]["lut"] = None
+        if "lut2" in out["look"]:
+            out["look"]["lut2"] = None
     for name in out["fx"]:
         out["fx"][name]["enabled"] = False
     out["grain"]["enabled"] = False
@@ -670,8 +710,9 @@ def source_frame(clip: str, time_s: float, width: int,
 def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
     """The non-source ffmpeg inputs for the grade-only pass.
 
-    Mirrors cinegrade.ffmpeg_inputs' own tail (radial mask, window matte, then
-    grain) so the extra inputs land at the same index the filter graph expects:
+    Mirrors cinegrade.ffmpeg_inputs' own tail (radial mask, then one window
+    matte per layer that has one, then grain) so the extra inputs land at the
+    same index the filter graph expects:
     input 0 is the normalised source piped in over stdin here instead of ffmpeg
     decoding the clip itself, but everything after it has to stay in the same
     order or the graph reads the wrong input and produces a wrong picture
@@ -683,8 +724,8 @@ def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    if CG.window_active(cfg):
-        args += ["-i", str(CG.window_mask(cfg, info["width"], info["height"]))]
+    for _i, win in CG.window_layers(cfg):
+        args += ["-i", str(CG.window_mask(win, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -783,6 +824,107 @@ def render_raw_legacy(clip: str, time_s: float, width: int, cfg: dict,
 
     data = proc.stdout[:width * height * 3]
     return np.frombuffer(data, np.uint8).reshape(height, width, 3), meta
+
+
+# --------------------------------------------------------------------------
+# grain plate (C3): the GPU preview's own copy of ffmpeg's grain plate
+# --------------------------------------------------------------------------
+
+def _grain_plate_command(g: dict, width: int, height: int) -> tuple[list[str], str]:
+    """The exact ffmpeg command that builds just the grain plate.
+
+    Reuses CG.build_graph itself for the plate-construction segment (format,
+    optional gblur for softness, optional colour mix, final scale), so a
+    change to the engine's own grain block cannot silently drift away from
+    what this route serves: only the input indices are remapped, because this
+    standalone command has no picture input, only the plate's own lavfi
+    source(s) at index 0 (and 1, when a colour plate is generated too).
+
+    response is always left at "flat" here no matter what the caller's own
+    config asks for: response is a weight computed from the PICTURE's own
+    luminance, which this route never sees (it renders a plate, not a
+    frame), so gpu.js applies that weighting itself against its own live
+    picture texture, using the plain plate this route serves.
+    """
+    cfg = deepcopy(CG.DEFAULTS)
+    cfg["grain"] = CG.deep_merge(CG.DEFAULTS["grain"], dict(g, enabled=True, response="flat"))
+    # A stand-in info dict, probe()'s shape: build_graph builds the WHOLE
+    # graph text (every stage, not only grain) before this function extracts
+    # just the plate segment out of it, so every field build_graph's other
+    # stages read has to be present even though none of those stages'
+    # output is ever used or run.
+    # color_space "bt2020nc" (probe()'s own fallback for an untagged camera
+    # log source, the same value harness.py's patch_info uses for its own
+    # synthetic swatch sources) keeps this consistent with DEFAULTS'
+    # working_space "dwg": a bt709-tagged source there trips build_graph's
+    # own log-vs-display guard, since this stand-in picture was never really
+    # shot in any log at all and only exists to make build_graph run.
+    info = {"width": width, "height": height, "rotation": 0,
+            "autorotate": True, "pix_fmt": "rgb48le", "color_range": "full",
+            "color_space": "bt2020nc", "nb_frames": "1", "duration": "1",
+            "codec": None, "profile": None}
+    idx_g = CG.mask_input_indices(cfg)["grain"]
+    full, _ = CG.build_graph(cfg, info, encode_out=False)
+    prefix = f"[{idx_g}:v]"
+    kept: list[str] = []
+    plate_label = None
+    started = False
+    for seg in full.split(";"):
+        if not started:
+            if not seg.startswith(prefix):
+                continue
+            started = True
+        kept.append(seg)
+        if seg.endswith("[grainplate]"):
+            plate_label = "grainplate"
+        elif seg.endswith("[gscaled]"):
+            plate_label = "gscaled"
+        if plate_label:
+            break
+    if not started or plate_label is None:
+        raise StudioError("could not isolate the grain plate segment from "
+                          "build_graph; grain.enabled must have been dropped "
+                          "somewhere above")
+    graph = ";".join(kept).replace(f"[{idx_g}:v]", "[0:v]") \
+                          .replace(f"[{idx_g + 1}:v]", "[1:v]")
+    args = ["ffmpeg", "-v", "error", "-y"] + CG.grain_input(cfg, info)
+    args += ["-filter_complex", graph, "-map", f"[{plate_label}]",
+             "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
+    return args, plate_label
+
+
+def grain_plate(g: dict, width: int, height: int) -> bytes:
+    """The plate ffmpeg's grain block would build at width x height, cached.
+
+    One bounded ffmpeg call (FFMPEG_SLOTS, the same semaphore every other
+    render on this server waits on; -frames:v 1 and an explicit lavfi
+    duration from CG.grain_input bound its length, the same guarantee the
+    real render has). Cached on disk under studio/cache/grain, pruned with
+    the same oldest-mtime helper every other cache on this server uses, so
+    scrubbing the grain controls cannot grow that folder without bound.
+    """
+    width = max(2, min(int(width), 3840))
+    height = max(2, min(int(height), 3840))
+    key = hashlib.sha1(json.dumps(
+        {"g": g, "w": width, "h": height}, sort_keys=True).encode()).hexdigest()
+    path = _cache_path("grain", key, "rgb48")
+    want = width * height * 3 * 2
+    if path.exists():
+        try:
+            os.utime(path, None)
+            return path.read_bytes()
+        except FileNotFoundError:
+            pass  # pruned between exists() and read; fall through and re-render
+    args, _label = _grain_plate_command(g, width, height)
+    with FFMPEG_SLOTS:
+        proc = subprocess.run(args, capture_output=True)
+    if proc.returncode != 0 or len(proc.stdout) < want:
+        raise StudioError("ffmpeg could not render the grain plate:\n"
+                          + proc.stderr.decode("utf-8", "replace")[-1200:])
+    data = proc.stdout[:want]
+    path.write_bytes(data)
+    _prune_cache("grain")
+    return data
 
 
 def encode_jpeg(rgb: np.ndarray, key: str, quality: int = 2) -> bytes:
@@ -1079,8 +1221,9 @@ def _play_params(payload: dict) -> dict:
 def _play_extra_inputs(cfg: dict, info: dict) -> list[str]:
     """The mask/grain -i args for a preview-scaled segment.
 
-    Mirrors _grade_inputs' own tail above: same order (radial mask, window
-    matte, grain), same reason (build_graph fixes those input indices, so the
+    Mirrors _grade_inputs' own tail above: same order (radial mask, the
+    layers' window mattes, grain), same reason (build_graph fixes those input
+    indices, so the
     order here has to match what the filter graph expects). Kept as its own
     small copy rather than shared with _grade_inputs, because that function's
     first input is a rawvideo pipe from an already-decoded source frame and
@@ -1092,8 +1235,8 @@ def _play_extra_inputs(cfg: dict, info: dict) -> list[str]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    if CG.window_active(cfg):
-        args += ["-i", str(CG.window_mask(cfg, info["width"], info["height"]))]
+    for _i, win in CG.window_layers(cfg):
+        args += ["-i", str(CG.window_mask(win, info["width"], info["height"]))]
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -1323,7 +1466,9 @@ def read_preset(name: str, user_id: int = 0) -> dict:
     p, _library = preset_path(name, user_id)
     if not p.exists():
         raise StudioError(f"preset not found: {name}")
-    return CG.deep_merge(CG.DEFAULTS, json.loads(p.read_text()))
+    # full_config, not a bare deep_merge, so a preset saved before layers
+    # existed is migrated on read like every other config that reaches here.
+    return full_config(json.loads(p.read_text()))
 
 
 def write_preset(name: str, cfg: dict, comment: str = "",
@@ -2976,7 +3121,11 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "flat":
                 cfg = flat_config(cfg, bool(payload.get("keep_exposure")))
             elif mode == "mask":
-                cfg = mask_preview_config(cfg)
+                # mask_layer is the layer whose matte to show. Absent means
+                # the first enabled one, which is what a client that has only
+                # ever had one layer will send.
+                ml = payload.get("mask_layer")
+                cfg = mask_preview_config(cfg, None if ml is None else int(ml))
             rgb, meta = render_raw(payload["clip"], float(payload.get("time", 0)),
                                    int(payload.get("width", 960)), cfg,
                                    bool(payload.get("autorotate", True)))
@@ -3036,12 +3185,31 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "look":
                 name = re.sub(r"\.cube$", "", safe_name(payload["name"]), flags=re.I)
                 p = LOOKS / f"{name}.cube"
-            elif kind == "secondary":
-                # deep_merge against the secondary defaults so a caller can
-                # send a partial block, same tolerance every other config
-                # entry point into this server already gives the UI.
-                scfg = CG.deep_merge(CG.DEFAULTS["secondary"], payload.get("config") or {})
-                p = Path(CG.secondary_lut(scfg))
+            elif kind == "layer":
+                # deep_merge against LAYER_DEFAULTS so a caller can send a
+                # partial layer, the same tolerance every other config entry
+                # point into this server already gives the UI. `variant` is
+                # which colour matte to fold in ("key", "one" or "inv"); see
+                # cinegrade.layer_branches for when a layer needs two cubes.
+                lcfg = CG.deep_merge(CG.LAYER_DEFAULTS, payload.get("config") or {})
+                variant = payload.get("variant") or "key"
+                if variant not in ("key", "one", "inv"):
+                    raise StudioError(f"unknown layer lut variant: {variant!r}")
+                p = Path(CG.layer_lut(lcfg, variant))
+            elif kind == "slice":
+                # The hue curves + Color Slice + Tetra stage. The GPU gets the
+                # cube the engine itself would hand ffmpeg, baked by the same
+                # function, so the preview cannot drift from the render by
+                # reimplementing the maths in JavaScript. Same partial-config
+                # tolerance as the layer above.
+                import slice as SLICE_STAGE
+                raw = payload.get("config") or {}
+                p = Path(SLICE_STAGE.slice_lut({
+                    "hue_curves": CG.deep_merge(CG.DEFAULTS["hue_curves"],
+                                                raw.get("hue_curves") or {}),
+                    "slice": CG.deep_merge(CG.DEFAULTS["slice"],
+                                           raw.get("slice") or {}),
+                }))
             else:
                 raise StudioError(f"unknown lut kind: {kind!r}")
             if not p.exists():
@@ -3050,6 +3218,29 @@ class Handler(BaseHTTPRequestHandler):
             body = size.to_bytes(4, "little") + data.tobytes()
             self._send(200, body, "application/octet-stream",
                        {"X-Lut-Size": str(size)})
+            return
+
+        # Film grain (C3): the plate ffmpeg's own grain block would build for
+        # a still at these dimensions, so the GPU preview overlays the same
+        # bytes the render does instead of falling back to the server for
+        # every grain-on config. response is never accepted here: it is a
+        # weight computed from the picture's own luminance, applied by the
+        # caller against its own live texture, not baked into this plate.
+        if route == "grain/plate" and method == "GET":
+            g: dict = {}
+            if q.get("stock"):
+                g["stock"] = q["stock"]
+            for key in ("size", "strength", "seed"):
+                if key in q:
+                    g[key] = int(q[key])
+            for key in ("softness", "color"):
+                if key in q and q[key] not in (None, ""):
+                    g[key] = float(q[key])
+            width = int(q.get("width", 960))
+            height = int(q.get("height", 540))
+            data = grain_plate(g, width, height)
+            self._send(200, data, "application/octet-stream",
+                       {"X-Frame-Size": f"{width}x{height}"})
             return
 
         # The live session is per account (wave 2). The wire shape is

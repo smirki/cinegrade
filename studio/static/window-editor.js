@@ -1,13 +1,19 @@
 /* Power window shape editor: the window drawn and dragged on the picture
-   itself, the way a colourist works, rather than only through the seven
-   sliders in the Window panel.
+   itself, the way a colourist works, rather than only through the sliders in
+   a layer's Window group.
 
-   Every edit here goes out through Panels.emit, which is the SAME function
-   every slider and checkbox in the Window panel calls. That is deliberate
-   and it is the whole design: emit runs the auto-enable (a drag on a window
-   that is switched off switches it on, and ticks the checkbox, exactly as a
-   slider drag does) and then hands the change to app.js's onParamChange,
-   which owns the live config, the undo history, the session publish and the
+   Contract C1 (layers) moved the window from the config's own top level
+   ("window") into the SELECTED layer's mask.window (see selectedLayer/win
+   below); this file draws whichever layer layers.js currently says is
+   selected, never a config-wide singleton.
+
+   Every edit here goes out through global.Layers.emit, the per-layer
+   equivalent of the emit every slider and checkbox in a layer's Window
+   group also calls (see layers.js). That is deliberate and it is the whole
+   design: emit runs the local auto-enable (a drag on a window that is
+   switched off switches it on, and ticks the checkbox, exactly as a slider
+   drag does) and then hands the change to app.js's onParamChange, which
+   owns the live config, the undo history, the session publish and the
    re-render. This file therefore holds no config state of its own and never
    writes cfg() directly: it reads the live config on every redraw and draws
    what it finds, so a slider move, an undo, a preset load, a clip switch and
@@ -61,10 +67,30 @@
 
   /* The window block as this file needs it: every field defaulted, so a
      config saved before the window stage existed (or a half written session
-     patch from an agent) draws the default shape instead of NaN. */
-  function win() {
+     patch from an agent) draws the default shape instead of NaN.
+
+     Contract C1 (layers) moved this from the config's own top level
+     ("window") to the SELECTED layer's mask.window: the overlay always
+     draws whichever layer layers.js says is selected (the last one clicked,
+     or the one a fresh Window button press created -- see
+     ensureSelectedLayer below), never a config-wide singleton any more.
+     global.Layers.getLayers(cfg) is the read-only, migration-aware view
+     (an old secondary+window config with no real "layers" array yet still
+     resolves to one virtual layer here), so this draws correctly even
+     before the user has touched anything that would materialise it for
+     real. */
+  function selectedLayer() {
     var cfg = api && api.getConfig ? api.getConfig() : null;
-    var w = (cfg && cfg.window) || {};
+    if (!cfg || !global.Layers) return null;
+    var layers = global.Layers.getLayers(cfg);
+    var idx = global.Layers.getSelectedIndex();
+    if (idx < 0 || idx >= layers.length) return null;
+    return layers[idx];
+  }
+
+  function win() {
+    var layer = selectedLayer();
+    var w = (layer && layer.mask && layer.mask.window) || {};
     return {
       enabled: !!w.enabled,
       shape: String(w.shape) === "rect" ? "rect" : "ellipse",
@@ -136,18 +162,29 @@
      committed snapshot, so that one commit restores the whole drag,
      including the auto-enable that started it.
 
-     Panels.emit rather than onChange directly: emit is the function the
-     panel's own controls call, and it is where the auto-enable lives. Going
-     round it would leave a drag on a switched-off window doing nothing
-     visible, which is the exact behaviour panels.js was changed to stop. */
+     global.Layers.emit rather than onChange directly: it is the per-layer
+     equivalent of panels.js's own emit (the function every OTHER control in
+     a layer calls), and it is where the local auto-enable lives (touching
+     mask.window while it is off turns it on). Going round it would leave a
+     drag on a switched-off window doing nothing visible, which is the exact
+     behaviour panels.js was changed to stop for every other stage, and
+     layers.js's own version exists so a dynamic ["layers", i, ...] path
+     gets the same treatment (see autoEnableLocal in layers.js: panels.js's
+     own auto-enable table is built once from SCHEMA and cannot know about a
+     layer index at all). Falls back to a raw onChange (no auto-enable) only
+     if layers.js somehow is not loaded, so a drag is never silently a
+     no-op. */
   function emit(pairs, commit) {
     if (!pairs || !pairs.length) return;
-    var send = (global.Panels && global.Panels.emit)
-      ? global.Panels.emit
-      : (api && api.onChange);
-    if (!send) return;
+    var idx = global.Layers ? global.Layers.getSelectedIndex() : -1;
+    if (idx < 0) return; // nothing selected: sync() would not have drawn a shape to drag in the first place
     for (var i = 0; i < pairs.length; i++) {
-      send(["window", pairs[i][0]], pairs[i][1], !!commit && i === pairs.length - 1);
+      var commitThis = !!commit && i === pairs.length - 1;
+      if (global.Layers && global.Layers.emit) {
+        global.Layers.emit(idx, ["mask", "window", pairs[i][0]], pairs[i][1], commitThis);
+      } else if (api && api.onChange) {
+        api.onChange(["layers", idx, "mask", "window", pairs[i][0]], pairs[i][1], commitThis);
+      }
     }
   }
 
@@ -235,6 +272,11 @@
     if (btn) {
       btn.addEventListener("click", function () {
         forced = !forced;
+        // "If no layer exists, the Window button creates one and selects
+        // it" (contract C1). Only on the way ON: switching the button back
+        // off never removes a layer, it only hides the overlay again (see
+        // sync()'s own "on" test below, which also checks window.enabled).
+        if (forced && global.Layers) global.Layers.ensureLayerAndSelect();
         sync();
         if (forced && svg && svg.focus) svg.focus();
       });
