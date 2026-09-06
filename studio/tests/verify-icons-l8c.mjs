@@ -23,8 +23,9 @@
 import puppeteer from "puppeteer-core";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, statSync, symlinkSync, rmSync } from "node:fs";
 import { findFreePort, waitForHttp200, sleep } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -59,8 +60,27 @@ async function main() {
   const baseUrl = "http://127.0.0.1:" + port;
   console.log("[verify] port " + port);
 
+  // studio/data/studio.db and content/footage are somebody's real accounts,
+  // grades and shared clip library, not test fixtures. --data-dir and
+  // --footage (server.py, also STUDIO_DATA_DIR / STUDIO_FOOTAGE) are the
+  // escape hatch server.py documents for this, the same one run.mjs uses: a
+  // fresh temp folder for the database, and a temp folder of symlinks to the
+  // real clips (never copies, so content keys still match) for the footage
+  // library, so this run never reads or writes the real ones.
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-test-"));
+  const footageDir = mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-footage-"));
+  const realFootage = path.join(CONTENT_DIR, "footage");
+  for (const name of readdirSync(realFootage)) {
+    const src = path.join(realFootage, name);
+    if (name.charAt(0) === "." || !statSync(src).isFile()) continue;
+    symlinkSync(src, path.join(footageDir, name));
+  }
+  console.log("[verify] isolated data dir " + dataDir);
+  console.log("[verify] isolated footage dir " + footageDir);
+
   const serverLog = { stdout: [], stderr: [] };
-  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port)], {
+  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
+    "--data-dir", dataDir, "--footage", footageDir], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -185,6 +205,8 @@ async function main() {
       await sleep(500);
       try { server.kill("SIGKILL"); } catch (e) { /* already gone */ }
     }
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+    try { rmSync(footageDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
   }
 
   if (hardFailure) {

@@ -10,7 +10,7 @@
  *     file through POST /api/upload and the app selects the new clip:
  *     the Source panel's "file" row shows the uploaded name, the button's
  *     own label returns to "Upload", and the file is really on disk in
- *     content/footage.
+ *     this run's isolated footage folder (never the real content/footage).
  *   - zero console errors and zero pageerror events across the run.
  *
  * Usage: node verify-upload-w2d.mjs   (run from studio/tests, or anywhere:
@@ -20,8 +20,12 @@
 import puppeteer from "puppeteer-core";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { existsSync, unlinkSync, copyFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync, unlinkSync, copyFileSync, mkdirSync,
+  mkdtempSync, readdirSync, statSync, symlinkSync, rmSync,
+} from "node:fs";
 import { findFreePort, waitForHttp200, sleep } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -71,8 +75,31 @@ async function main() {
   const baseUrl = "http://127.0.0.1:" + port;
   console.log("[verify] port " + port);
 
+  // studio/data/studio.db and content/footage are somebody's real accounts,
+  // grades and shared clip library, not test fixtures. --data-dir and
+  // --footage (server.py, also STUDIO_DATA_DIR / STUDIO_FOOTAGE) are the
+  // escape hatch server.py documents for this, the same one run.mjs uses: a
+  // fresh temp folder for the database, and a temp folder of symlinks to the
+  // real clips (never copies, so content keys still match) for the footage
+  // library. This is the fix for the exact hazard this script used to carry:
+  // uploading a clip with logins off used to land it straight in the real
+  // content/footage, which this script then deleted again, so a re-run right
+  // after a crash (or anyone reading the DB mid-run) would see a phantom
+  // project. With --footage, the upload lands in this run's own temp folder.
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-test-"));
+  const footageDir = mkdtempSync(path.join(os.tmpdir(), "fixxr-studio-footage-"));
+  const realFootage = path.join(CONTENT_DIR, "footage");
+  for (const name of readdirSync(realFootage)) {
+    const src = path.join(realFootage, name);
+    if (name.charAt(0) === "." || !statSync(src).isFile()) continue;
+    symlinkSync(src, path.join(footageDir, name));
+  }
+  console.log("[verify] isolated data dir " + dataDir);
+  console.log("[verify] isolated footage dir " + footageDir);
+
   const serverLog = { stdout: [], stderr: [] };
-  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port)], {
+  const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
+    "--data-dir", dataDir, "--footage", footageDir], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -81,7 +108,7 @@ async function main() {
 
   let browser = null;
   let hardFailure = null;
-  const footageDest = path.join(CONTENT_DIR, "footage", UPLOADED_NAME);
+  const footageDest = path.join(footageDir, UPLOADED_NAME);
 
   try {
     await waitForHttp200(baseUrl + "/api/state", 20000, 250);
@@ -167,7 +194,7 @@ async function main() {
     );
 
     record(
-      "the uploaded file actually landed on disk in content/footage",
+      "the uploaded file actually landed on disk in the isolated footage folder",
       existsSync(footageDest),
       footageDest + (existsSync(footageDest) ? " exists" : " is missing")
     );
@@ -199,6 +226,8 @@ async function main() {
     // leaving a test artefact behind in the real footage folder.
     try { if (existsSync(footageDest)) unlinkSync(footageDest); } catch (e) { /* best effort */ }
     try { if (existsSync(TEST_UPLOAD_PATH)) unlinkSync(TEST_UPLOAD_PATH); } catch (e) { /* best effort */ }
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+    try { rmSync(footageDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
   }
 
   if (hardFailure) {

@@ -649,24 +649,26 @@
      "anything else riding along with them. This is a personal grading tool " +
      "on a machine its account already has a login for, not a public " +
      "upload surface, and no scanning of any kind was built for it."],
-    ["The upload quota only ever looks at one folder.",
+    ["The upload quota only ever looks at this account's own library tree.",
      "measured, by design",
      "The default 8589934592 byte (8 GiB) per file cap and 53687091200 " +
-     "byte (50 GiB) per account total are both checked against the single " +
-     "destination folder an upload lands in (FOOTAGE with logins off, this " +
-     "account's own footage folder with them on), summing only the files " +
-     "sitting directly inside it. Nothing here looks at the rest of the " +
-     "disk, at studio/cache (which this same wave measured at over 2.6 GB " +
-     "just from the frame cache during testing), or at other accounts' " +
-     "folders, so an account can still fill the disk by staying under its " +
-     "own 50 GiB and letting the shared caches grow unbounded around it. " +
-     "The quota check itself also has a gap: two uploads to the same " +
-     "account starting at the same moment both read the folder's current " +
-     "size before either has written a byte, so both can pass a check that " +
-     "only one of them should have, and the folder ends up over the cap by " +
-     "roughly the smaller of the two uploads. Measured by reading the code " +
-     "path, not by triggering it: _dir_total_bytes() and the write that " +
-     "follows it are not under one lock."],
+     "byte (50 GiB) per account total are both checked against " +
+     "library.tree_bytes() of the account's whole library root " +
+     "(content/footage with logins off, studio/data/users/<id>/footage " +
+     "with them on), walked recursively rather than summed one level " +
+     "deep, so parking files a folder or two down does not dodge the cap. " +
+     "Nothing here looks at the rest of the disk, at studio/cache " +
+     "(measured elsewhere at over 2.6 GB just from the frame cache), or " +
+     "at other accounts' folders, so an account can still fill the disk " +
+     "by staying under its own 50 GiB and letting the shared caches grow " +
+     "unbounded around it. The quota check itself also has a gap: two " +
+     "uploads to the same account starting at the same moment both read " +
+     "the tree's current size before either has written a byte, so both " +
+     "can pass a check that only one of them should have, and the tree " +
+     "ends up over the cap by roughly the smaller of the two uploads. " +
+     "Measured by reading the code path, not by triggering it: " +
+     "library.tree_bytes() and the write that follows it are not under " +
+     "one lock."],
     ["An upload is one request with no resume.",
      "no resume, no chunking",
      "The whole file is one HTTP POST body, written to a temp file and " +
