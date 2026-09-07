@@ -305,6 +305,71 @@ def test_cmd_stats_image_text(ctx):
          expect_stdout=("luma", "sat", "rgb", "hue", "clipped", "bands"))
 
 
+def test_cmd_stats_image_still_defaults_to_display_referred(ctx):
+    """Round 2 tooling note 1: a still (`--image` on a JPEG/PNG/TIFF/WebP)
+    with no --input-space/--working-space is measured as already display
+    referred (rec709 in, rec709 working space): the identity, so its
+    numbers match the same file measured with those two flags given
+    explicitly. Stderr says the assumption was made, rather than leaving it
+    silent."""
+    png, *_ = _synthetic_png()
+    r = subprocess.run([PY, ENGINE, "stats", "--image", str(png), "--json"],
+                       capture_output=True, text=True)
+    ctx.expect_eq("stats --image (default still): exit code", r.returncode, 0)
+    ctx.note(f"stderr: {r.stderr.strip()[:200]}")
+    ctx.expect_true("stderr says it measured this as display referred",
+                    "display referred" in r.stderr, r.stderr[:300])
+    if r.returncode != 0:
+        return
+    default_out = json.loads(r.stdout)
+
+    r2 = subprocess.run(
+        [PY, ENGINE, "stats", "--image", str(png), "--input-space", "rec709",
+         "--working-space", "rec709", "--json"],
+        capture_output=True, text=True)
+    ctx.expect_eq("stats --image --input-space rec709 --working-space rec709: "
+                 "exit code", r2.returncode, 0)
+    if r2.returncode != 0:
+        return
+    explicit_out = json.loads(r2.stdout)
+    ctx.expect_true(
+        "the silent default and the same flags given explicitly measure "
+        "the same luma mean",
+        abs(default_out["stats"]["luma"]["mean"]
+            - explicit_out["stats"]["luma"]["mean"]) < 0.01,
+        f"{default_out['stats']['luma']['mean']} vs "
+        f"{explicit_out['stats']['luma']['mean']}")
+
+
+def test_cmd_stats_image_explicit_input_space_changes_the_reading(ctx):
+    """Round 2 tooling note 1: --input-space used to have no effect at all
+    on `stats --image` (the still was always a raw decode); an explicit
+    --input-space now actually runs the convert stage, so a still forced
+    through apple_log reads different numbers than the same file measured
+    as display referred, and prints no "display referred" note (the flag,
+    not the default, decided)."""
+    png, *_ = _synthetic_png()
+    r_default = subprocess.run(
+        [PY, ENGINE, "stats", "--image", str(png), "--json"],
+        capture_output=True, text=True)
+    r_log = subprocess.run(
+        [PY, ENGINE, "stats", "--image", str(png), "--input-space", "apple_log",
+         "--json"],
+        capture_output=True, text=True)
+    ctx.expect_eq("stats --image --input-space apple_log: exit code",
+                 r_log.returncode, 0)
+    if r_default.returncode != 0 or r_log.returncode != 0:
+        return
+    default_out = json.loads(r_default.stdout)
+    log_out = json.loads(r_log.stdout)
+    delta = abs(default_out["stats"]["luma"]["mean"]
+               - log_out["stats"]["luma"]["mean"])
+    ctx.expect_gt("an explicit --input-space measures different numbers "
+                 "than the display-referred default", delta, 0.01)
+    ctx.expect_true("no display-referred note once the flag decided it",
+                    "display referred" not in r_log.stderr, r_log.stderr[:200])
+
+
 def test_cmd_stats_region_matches_the_route_contract(ctx):
     """Contract E4 at the CLI: a region measures only that patch, the way
     POST /api/stats already does."""
@@ -355,6 +420,46 @@ def test_cmd_stats_times_and_image_together_is_refused(ctx):
           "measures a clip")
 
 
+def test_cmd_stats_clip_and_image_together_is_refused(ctx):
+    """Round 2 tooling note 4: a positional clip and --image both given used
+    to be silently accepted (the --image branch ran and the clip was
+    dropped on the floor); one sentence names both instead."""
+    png, *_ = _synthetic_png()
+    r = subprocess.run([PY, ENGINE, "stats", SRC, "--image", str(png)],
+                       capture_output=True, text=True)
+    ctx.expect_true("exits non zero", r.returncode != 0, f"exit {r.returncode}")
+    ctx.expect_true("stderr is not empty", bool(r.stderr.strip()), repr(r.stderr))
+    ctx.expect_true("message names both a clip and --image",
+                    "use one or the other" in r.stderr, r.stderr.strip()[:200])
+
+
+def test_cmd_stats_still_image_positional_is_refused(ctx):
+    """Round 2 tooling note 4: a still image format passed as the clip
+    positional (no --image) used to silently run through the default Apple
+    Log grading path and report wrong numbers for a plain PNG; it is
+    refused up front now, pointing at --image."""
+    png, *_ = _synthetic_png()
+    _fails(ctx, "stats with a still passed positionally",
+          ["stats", str(png)], "use --image FILE for a still")
+
+
+def test_cmd_stats_still_positional_with_times_is_not_an_empty_reason(ctx):
+    """The concrete bug this closes: `stats STILL.png --times 0,1` used to
+    fail with an EMPTY stderr tail (ffmpeg silently writes 0 bytes seeking
+    past a still's one frame, so `_grade_frame_stats`'s own error message
+    had nothing to append). The still positional is refused before any of
+    that runs now, with the same one sentence a still positional gets
+    without --times."""
+    png, *_ = _synthetic_png()
+    r = subprocess.run([PY, ENGINE, "stats", str(png), "--times", "0,1"],
+                       capture_output=True, text=True)
+    ctx.expect_true("exits non zero", r.returncode != 0, f"exit {r.returncode}")
+    ctx.expect_true("stderr is not empty", bool(r.stderr.strip()), repr(r.stderr))
+    ctx.expect_true("message says to use --image for a still",
+                    "use --image FILE for a still" in r.stderr,
+                    r.stderr.strip()[:200])
+
+
 # --------------------------------------------------------------------------
 # sweep
 # --------------------------------------------------------------------------
@@ -398,6 +503,80 @@ def test_sweep_sheet_writes_a_labelled_comparison(ctx):
     ctx.expect_gt("three panels side by side is wide", float(w), float(h))
 
 
+def test_sweep_negative_leading_value_without_quoting(ctx):
+    """Round 2 tooling note 3: `--values -0.1,0,0.1` as two shell words
+    used to be refused by argparse as an unrecognised flag; it is read as
+    the value now, the same as the already-working `--values=-0.1,0,0.1`
+    spelling."""
+    r = subprocess.run(
+        [PY, ENGINE, "sweep", SRC, "-p", "natural", "--time", str(H.TIME_A),
+         "--param", "primaries.temperature", "--values", "-0.1,0,0.1", "--json"],
+        capture_output=True, text=True)
+    ctx.expect_eq("sweep --values -0.1,0,0.1 (unquoted): exit code",
+                 r.returncode, 0)
+    if r.returncode != 0:
+        ctx.note(f"stderr: {r.stderr.strip()[:300]}")
+        return
+    out = json.loads(r.stdout)
+    ctx.expect_eq("values round trip in order, negative included",
+                  [row["value"] for row in out["results"]], [-0.1, 0, 0.1])
+
+
+def test_sweep_json_sheet_stdout_stays_pure_json(ctx):
+    """Round 2 tooling note 3: with --sheet, --json used to print a text
+    line ("sweep sheet (...) -> OUT.jpg") after the JSON block, which broke
+    a caller doing json.loads(stdout). That line now goes to stderr."""
+    out = H.WORK / "sweep_sheet_json.jpg"
+    r = subprocess.run(
+        [PY, ENGINE, "sweep", SRC, "-p", "natural", "--time", str(H.TIME_A),
+         "--param", "primaries.saturation", "--values", "0.5,1.5",
+         "--json", "--sheet", str(out)],
+        capture_output=True, text=True)
+    ctx.expect_eq("sweep --json --sheet: exit code", r.returncode, 0)
+    if r.returncode != 0:
+        return
+    parsed = None
+    try:
+        parsed = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        ctx.note(f"stdout: {r.stdout.strip()[-300:]}")
+        ctx.check(False, f"stdout is not pure JSON: {exc}")
+        return
+    ctx.expect_true("stdout parsed as JSON with the sweep results",
+                    "results" in parsed, str(set(parsed)))
+    ctx.expect_true("the sheet path note went to stderr instead",
+                    "sweep sheet" in r.stderr, r.stderr.strip()[:200])
+    ctx.expect_true("the sheet file exists", out.exists(), str(out))
+
+
+def test_sweep_measures_at_640_wide_by_default(ctx):
+    """Round 2 tooling note 3: sweep used to always measure at the source's
+    full resolution; the default is now 640 wide, the same as what POST
+    /api/stats measures a clip at."""
+    r = _cli(ctx, "sweep (default width)",
+             ["sweep", SRC, "-p", "natural", "--time", str(H.TIME_A),
+              "--param", "primaries.saturation", "--values", "1.0", "--json"])
+    if r is None:
+        return
+    out = json.loads(r.stdout)
+    w, h = out["results"][0]["size"]
+    ctx.expect_eq("measured width is 640 by default", w, 640)
+    ctx.expect_true("height came down with it, not full 4K",
+                    h < 2000, f"{w}x{h}")
+
+
+def test_sweep_width_flag_changes_the_measured_size(ctx):
+    r = _cli(ctx, "sweep --width 320",
+             ["sweep", SRC, "-p", "natural", "--time", str(H.TIME_A),
+              "--param", "primaries.saturation", "--values", "1.0",
+              "--width", "320", "--json"])
+    if r is None:
+        return
+    out = json.loads(r.stdout)
+    w, _h = out["results"][0]["size"]
+    ctx.expect_eq("--width is honoured", w, 320)
+
+
 def register(suite):
     g = "stats"
     suite.add(g, "server_imports_frame_stats_rather_than_defining_it",
@@ -437,6 +616,14 @@ def register(suite):
     suite.add(g, "cmd_stats_image_text",
               test_cmd_stats_image_text,
               doc="the default text is the studio strip, not signalstats")
+    suite.add(g, "cmd_stats_image_still_defaults_to_display_referred",
+              test_cmd_stats_image_still_defaults_to_display_referred,
+              doc="a JPEG/PNG/TIFF/WebP --image with no space flags reads "
+                  "as rec709 (identity) and says so on stderr")
+    suite.add(g, "cmd_stats_image_explicit_input_space_changes_the_reading",
+              test_cmd_stats_image_explicit_input_space_changes_the_reading,
+              doc="an explicit --input-space on --image now actually runs "
+                  "the convert stage")
     suite.add(g, "cmd_stats_region_matches_the_route_contract",
               test_cmd_stats_region_matches_the_route_contract,
               doc="contract E4 holds at the CLI too")
@@ -449,9 +636,33 @@ def register(suite):
     suite.add(g, "cmd_stats_times_and_image_together_is_refused",
               test_cmd_stats_times_and_image_together_is_refused,
               doc="--times measures a clip; --image is one still")
+    suite.add(g, "cmd_stats_clip_and_image_together_is_refused",
+              test_cmd_stats_clip_and_image_together_is_refused,
+              doc="a clip positional and --image together name both in "
+                  "one sentence, rather than silently dropping the clip")
+    suite.add(g, "cmd_stats_still_image_positional_is_refused",
+              test_cmd_stats_still_image_positional_is_refused,
+              doc="a still passed as the clip positional points at --image "
+                  "instead of quietly grading it as video")
+    suite.add(g, "cmd_stats_still_positional_with_times_is_not_an_empty_reason",
+              test_cmd_stats_still_positional_with_times_is_not_an_empty_reason,
+              doc="the concrete empty-stderr bug this closes")
     suite.add(g, "sweep_two_values_json",
               test_sweep_two_values_json,
               doc="one row per value, reporting a real engine effect")
     suite.add(g, "sweep_sheet_writes_a_labelled_comparison",
               test_sweep_sheet_writes_a_labelled_comparison,
               doc="--sheet reuses cinegrade sheet's own contact sheet code")
+    suite.add(g, "sweep_negative_leading_value_without_quoting",
+              test_sweep_negative_leading_value_without_quoting,
+              doc="--values -0.1,0,0.1 as two shell words works unquoted")
+    suite.add(g, "sweep_json_sheet_stdout_stays_pure_json",
+              test_sweep_json_sheet_stdout_stays_pure_json,
+              doc="--json --sheet: stdout is JSON only, the sheet note "
+                  "goes to stderr")
+    suite.add(g, "sweep_measures_at_640_wide_by_default",
+              test_sweep_measures_at_640_wide_by_default,
+              doc="sweep no longer measures at the source's full resolution")
+    suite.add(g, "sweep_width_flag_changes_the_measured_size",
+              test_sweep_width_flag_changes_the_measured_size,
+              doc="--width overrides the 640 default")

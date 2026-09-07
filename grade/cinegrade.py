@@ -38,6 +38,10 @@ from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# The run folder: the repo checkout itself. studio/server.py has its own
+# CONTENT constant (STUDIO.parent) for the identical directory; the two
+# never disagree because ROOT is always grade/ inside that same checkout.
+CONTENT = ROOT.parent
 LUT_TECH = ROOT / "luts" / "technical"
 LUT_LOOKS = ROOT / "luts" / "looks"
 PRESETS = ROOT / "presets"
@@ -421,6 +425,34 @@ def rotation_tag_suspect(tag, codec, coded_width, coded_height) -> bool:
     except (TypeError, ValueError):
         return False
     return deg % 360 in (90, 270) and ch > cw
+
+
+def rotation_tag_note(tag, codec, coded_width, coded_height) -> str:
+    """One plain sentence explaining a rotation_tag_suspect answer.
+
+    Round 2 tooling item 17: the boolean alone reads as a verdict ("this tag
+    is wrong"), which it is not: rotation_tag_suspect's own docstring says a
+    false positive is fine and a silent false negative is the failure it is
+    built to avoid. This exists so a caller sees why the flag fired, in
+    words, next to it. "" for the not-suspect case on purpose, not a
+    reassurance ("no issue") that would itself read as a verdict.
+
+    Delegates the yes/no to rotation_tag_suspect() so the two never
+    disagree; only decides which of that function's two tells to name in
+    the sentence, using the same cinema-codec check.
+    """
+    if not rotation_tag_suspect(tag, codec, coded_width, coded_height):
+        return ""
+    deg = int(tag or 0)
+    codec_name = str(codec or "unknown")
+    if any(name in codec_name.lower() for name in _CINEMA_CODECS):
+        return (f"the file carries a {deg} tag on a {codec_name} stream; "
+               f"the tag is often wrong on this kind of file, run orient "
+               f"and look")
+    return (f"the file carries a {deg} tag but the frame is already "
+           f"taller than wide before any rotation is applied; a phone "
+           f"would not write a quarter turn on that shape, run orient and "
+           f"look")
 
 
 # --------------------------------------------------------------------------
@@ -1407,17 +1439,37 @@ def f_mid_detail_segment(mid: float, info: dict, cur: str, segs: list[str]) -> s
 
 
 def f_look(cfg, slot="lut") -> list[str]:
-    """Build the lut3d filter for one look slot ("lut" or "lut2")."""
+    """Build the lut3d filter for one look slot ("lut" or "lut2").
+
+    Three ways `look.lut` resolves, tried in order (round 2 tooling note
+    10): an absolute path, or one relative to the CURRENT DIRECTORY, if
+    that already exists (unchanged, and how a browser-launched look never
+    behaves, since the studio server never calls this with a relative
+    value); failing that, a path relative to CONTENT (the run folder, the
+    repo checkout), so a caller does not have to cd into content/ or spell
+    an absolute path just to point at a cube that lives somewhere else in
+    the checkout; failing that, a bare name (with or without .cube) inside
+    LUT_LOOKS, the browser's own looks folder and dropdown
+    (`studio/server.py`'s `list_looks()` only ever sends bare stems from
+    there, so that lookup, and the browser, are unaffected by the new
+    CONTENT fallback above it).
+    """
     lut = cfg["look"].get(slot)
     if not lut:
         return []
     p = Path(lut)
     if not p.exists():
+        content_relative = CONTENT / lut
+        if content_relative.is_file():
+            p = content_relative
+    if not p.exists():
         p = LUT_LOOKS / (lut if lut.endswith(".cube") else f"{lut}.cube")
     if not p.exists():
         avail = sorted(x.stem for x in LUT_LOOKS.glob("*.cube"))
         raise GradeError(
-            f"look LUT not found: {lut}. available: {', '.join(avail)}")
+            f"look LUT not found: {lut!r}. Give a bare name from "
+            f"{LUT_LOOKS} ({', '.join(avail)}), or a path (absolute, or "
+            f"relative to {CONTENT})")
     return [f"lut3d=file={esc(p)}:interp=tetrahedral"]
 
 
@@ -2963,7 +3015,9 @@ def cmd_render(a):
                  "-preset", o["preset"], "-pix_fmt", "yuv420p"]
     args += ["-color_primaries", "bt709", "-color_trc", "bt709",
              "-colorspace", "bt709", a.output]
-    run(args, a.verbose)
+    start = a.start or 0.0
+    total = a.duration if a.duration else max(0.1, info["duration"] - start)
+    run_render(args, a.verbose, total=total)
     # The single most consequential decision a mixed folder render makes:
     # which input transform it resolved to. Before this line the only way
     # to see it was --verbose plus reading the cube name out of the middle
@@ -3058,30 +3112,53 @@ def cmd_scopes(a):
         subprocess.run(["open", "-a", "Preview", a.output])
 
 
-def _measure_region_size(region, info) -> tuple[int, int]:
-    """The pixel size a stats measurement at this region comes back as, with
-    no --width flag on `stats`/`sweep` to scale it: the whole frame, or
-    exactly the region's own pixels."""
+def _measure_region_size(region, info, width=None) -> tuple[int, int]:
+    """The pixel size a stats measurement at this region and width comes
+    back as: the whole frame, or exactly the region's own pixels, scaled to
+    `width` (round 2 tooling note 3: `sweep` used to always measure at full
+    resolution) by the identical arithmetic `region_tail`'s own `scale`
+    filter runs, so the buffer this decodes never mismatches what ffmpeg
+    actually wrote. `width=None` is the no-scale case, unchanged."""
     if region is None:
-        return int(info["width"]), int(info["height"])
-    reg = normalise_region(region)
-    _, _, w, h = region_pixels(reg, info)
-    return w, h
+        w, h = int(info["width"]), int(info["height"])
+    else:
+        reg = normalise_region(region)
+        _, _, w, h = region_pixels(reg, info)
+    if not width:
+        return w, h
+    if region is None:
+        tw = max(2, int(width))
+    else:
+        tw = max(2, min(int(round(width * w / float(info["width"]))), w))
+    th = max(2, int(round(h * tw / float(w) / 2)) * 2)
+    return tw, th
 
 
-def _grade_frame_stats(a, cfg, info, t: float, region=None) -> dict:
+def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
+                       width=None) -> dict:
     """One graded frame of `a.input`, measured through grade.stats.frame_stats.
 
     The same numbers `POST /api/stats` returns for the same clip, config,
     time and region: both read the array through the one function, not two
     hand written copies of it.
+
+    `path` overrides `a.input` as the file actually read: `cmd_stats`'s
+    `--image` branch measures `a.image` through this same graph builder
+    (round 2 tooling note 1, an explicit --input-space/--working-space on a
+    still) while `a.input` stays whatever the parsed command line carried,
+    which may be nothing at all on that branch.
+
+    `width` scales the measured frame down before it is read (round 2
+    tooling note 3: `sweep` used to always measure at the source's full
+    resolution); `None` measures at the source's own size, unchanged.
     """
     import numpy as np                                        # noqa: PLC0415
     from stats import frame_stats                            # noqa: PLC0415
-    w, h = _measure_region_size(region, info)
-    extra = region_tail(region, None, None, info) + ["format=rgb24"]
+    src = path if path is not None else a.input
+    w, h = _measure_region_size(region, info, width=width)
+    extra = region_tail(region, None, width, info) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
-    args = ffmpeg_inputs(a.input, cfg, info, t)
+    args = ffmpeg_inputs(src, cfg, info, t)
     args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     r = subprocess.run(args, capture_output=True, timeout=60)
@@ -3090,7 +3167,7 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None) -> dict:
         raise GradeError("cinegrade could not measure that frame:\n"
                          + r.stderr.decode("utf-8", "replace")[-1200:])
     rgb = np.frombuffer(r.stdout[:want], np.uint8).reshape(h, w, 3)
-    return {"time": t, "key": f"{Path(a.input).name}@{t:g}s",
+    return {"time": t, "key": f"{Path(src).name}@{t:g}s",
             "size": [w, h], "stats": frame_stats(rgb)}
 
 
@@ -3126,6 +3203,14 @@ def _print_stats(a, payload) -> None:
     _print_stats_block(payload["key"], payload)
 
 
+# The still image formats `stats` treats as display referred by default
+# (round 2 tooling note 1): a JPEG, PNG, TIFF or WebP is, in practice,
+# always an export or a screenshot already in display code values, never
+# a raw log dump. Anything else (a video container, or a format not on
+# this list) keeps today's behaviour: no default is guessed for it.
+STILL_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+
+
 def cmd_stats(a):
     """Numeric readback: the same numbers `POST /api/stats` returns, for a
     graded clip frame or a plain reference still, whichever the caller asked
@@ -3140,21 +3225,59 @@ def cmd_stats(a):
     `"results"` list, one `{"time", "key", "size", "stats"}` row per time,
     because there `"time"` is the whole point of asking; a single call has
     no second time to distinguish itself from, so it carries none.
+
+    `--image` on a JPEG, PNG, TIFF or WebP is measured as display referred
+    (rec709 in, rec709 working space, i.e. the raw decoded bytes, no CST)
+    unless `--input-space` or `--working-space` is given explicitly, in
+    which case that flag wins and the still is measured through the real
+    convert stage instead (round 2 tooling note 1: the flag used to have no
+    effect at all on `--image`, so a log encoded still silently measured as
+    if it were already graded). A clip positional that is itself one of
+    those still formats is refused rather than quietly run through the
+    default Apple Log path (round 2 tooling note 4): use `--image` for it.
     """
     from stats import frame_stats, decode_image              # noqa: PLC0415
 
     region = getattr(a, "region", None)
+    if a.image and a.input:
+        raise GradeError(
+            f"stats got both a clip ({a.input!r}) and --image "
+            f"({a.image!r}); use one or the other, not both")
     if a.image:
         if getattr(a, "times", None):
             raise GradeError("--times measures a clip; --image is one still")
-        rgb = decode_image(a.image, region=region)
-        _print_stats(a, {"key": Path(a.image).name,
-                         "size": [int(rgb.shape[1]), int(rgb.shape[0])],
-                         "stats": frame_stats(rgb)})
+        suffix = Path(a.image).suffix.lower()
+        explicit_space = bool(getattr(a, "input_space", None)) or \
+            bool(getattr(a, "working_space", None))
+        if explicit_space:
+            cfg = deepcopy(DEFAULTS)
+            if getattr(a, "input_space", None):
+                cfg["convert"]["input"] = a.input_space
+            if getattr(a, "working_space", None):
+                cfg["convert"]["working_space"] = a.working_space
+            info = probe(a.image, rotation="auto")
+            row = _grade_frame_stats(a, cfg, info, 0.0, region, path=a.image)
+            row.pop("time", None)
+            row["key"] = Path(a.image).name
+        else:
+            if suffix in STILL_IMAGE_EXTS:
+                print(f"stats --image: measuring {Path(a.image).name} as "
+                     f"display referred (rec709); pass --input-space/"
+                     f"--working-space if it is log encoded instead.",
+                     file=sys.stderr)
+            rgb = decode_image(a.image, region=region)
+            row = {"key": Path(a.image).name,
+                  "size": [int(rgb.shape[1]), int(rgb.shape[0])],
+                  "stats": frame_stats(rgb)}
+        _print_stats(a, row)
         return
 
     if not a.input:
         raise GradeError("stats needs either a clip, or --image FILE")
+    if Path(a.input).suffix.lower() in STILL_IMAGE_EXTS:
+        raise GradeError(
+            f"{a.input}: use --image FILE for a still, not the clip "
+            f"positional (which always goes through the video grading path)")
     cfg = apply_overrides(load_preset(a.preset), a)
     info = probe(a.input, rotation=cli_rotation(a, cfg))
     if getattr(a, "times", None):
@@ -3226,11 +3349,13 @@ def cmd_sweep(a):
     if a.sheet:
         tmp_dir = tempfile.mkdtemp(prefix="cinegrade_sweep_")
     try:
+        width = getattr(a, "width", None) or 640
         for v in values:
             cfg = _set_dotted(deepcopy(base), a.param, v)
             info = probe(a.input, rotation=cli_rotation(a, cfg))
             rows.append({"param": a.param, "value": v,
-                        **_grade_frame_stats(a, cfg, info, a.time)})
+                        **_grade_frame_stats(a, cfg, info, a.time,
+                                             width=width)})
             if a.sheet:
                 png = Path(tmp_dir) / f"sweep_{len(rows)}.png"
                 graph = graph_with_mask(cfg, info, tail_extra=["format=rgb24"],
@@ -3270,7 +3395,12 @@ def cmd_sweep(a):
             bs = row["stats"]["bands"]["saturation"]
             print(f"{row['value']!s:>12}  " + "  ".join(f"{v:.3f}" for v in bs))
     if a.sheet:
-        print(f"\nsweep sheet ({len(rows)} up) -> {a.sheet}")
+        # --json keeps stdout pure JSON (round 2 tooling note 3: this line
+        # used to print after the JSON block and broke a caller's parse),
+        # so with --json this goes to stderr instead; without it, stdout is
+        # already the plain text table above and this stays alongside it.
+        dest = sys.stderr if getattr(a, "json", False) else sys.stdout
+        print(f"\nsweep sheet ({len(rows)} up) -> {a.sheet}", file=dest)
 
 
 
@@ -3334,6 +3464,48 @@ def _orient_label_png(text: str, width: int, scale: int, out: Path,
     return height
 
 
+def _orient_write_sheet(a, raw):
+    """--sheet OUT.jpg (round 2 tooling note 8): the four fixed candidate
+    rotations (0, 90, 180, 270; not auto, the same four the --json
+    `candidates` dict already reports) as one labelled 2x2 sheet, built
+    through `build_contact_sheet`, the same PIL contact-sheet code
+    `cmd_sheet` uses, rather than the hand-drawn single-row PNG the plain
+    (non-json) run below writes to `--output`. Written from its own
+    function so it runs the same way whether or not --json is also given:
+    the --json branch in cmd_orient returns before that hand-drawn PNG is
+    ever built, so this is the only sheet a `--json --sheet` run produces.
+    The first label carries the tag and the rotation_tag_suspect flag, so
+    the file this sheet came from is identifiable without reading anything
+    else.
+    """
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise GradeError(
+            "orient --sheet needs Pillow: .venv/bin/pip install pillow") from exc
+    tmp = Path(tempfile.mkdtemp(prefix="cinegrade-orient-sheet-"))
+    try:
+        images = []
+        for mode in ("0", "90", "180", "270"):
+            info = probe(a.input, rotation=mode)
+            out = tmp / f"orient_sheet_{mode}.png"
+            args = ["ffmpeg", "-v", "error", "-y"] + rotate_args(mode)
+            args += ["-ss", str(a.time), "-i", a.input,
+                     "-vf", f"{rotate_prefix(info)}scale=-2:{a.height},format=rgb24",
+                     "-frames:v", "1", str(out)]
+            run(args, a.verbose)
+            images.append(Image.open(out).convert("RGB"))
+        suspect = rotation_tag_suspect(
+            raw["rotation"], raw["codec"], raw["width"], raw["height"])
+        tag = raw["rotation"] or "0"
+        labels = [f"0 tag={tag}{' suspect' if suspect else ''}",
+                 "90", "180", "270"]
+        sheet = build_contact_sheet(images, labels, 2, 2, height=a.height)
+        sheet.save(a.sheet)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_orient(a):
     """One contact sheet of every rotation, so a wrong tag is read off it.
 
@@ -3342,15 +3514,27 @@ def cmd_orient(a):
     picture clockwise. The panel that is upright names the --rotate value to
     pass to every other command.
 
-    --json skips the contact sheet entirely and prints the tag, the four
-    fixed candidate rotations (their post-rotation width and height, the
-    same numbers the printed panel list already gave) and
-    rotation_tag_suspect, through the identical rotation_tag_suspect()
-    function GET /api/state's clip list calls, so an agent can branch on
+    --json skips the default (--output) contact sheet entirely and prints
+    the tag, the four fixed candidate rotations (their post-rotation width
+    and height, the same numbers the printed panel list already gave),
+    rotation_tag_suspect and rotation_tag_note, through the identical
+    functions GET /api/state's clip list calls, so an agent can branch on
     the same answer the studio would show without decoding an image.
+
+    --sheet OUT.jpg writes a labelled 2x2 sheet of the four candidates,
+    independently of --json: it works whether or not --json is also given
+    (see _orient_write_sheet).
     """
-    if getattr(a, "json", False):
+    want_sheet = bool(getattr(a, "sheet", None))
+    want_json = bool(getattr(a, "json", False))
+
+    if want_sheet or want_json:
         raw = probe(a.input, rotation="0")
+
+    if want_sheet:
+        _orient_write_sheet(a, raw)
+
+    if want_json:
         candidates = {mode: {"width": probe(a.input, rotation=mode)["width"],
                              "height": probe(a.input, rotation=mode)["height"]}
                      for mode in ("0", "90", "180", "270")}
@@ -3362,17 +3546,22 @@ def cmd_orient(a):
         # the rotation tag rather than needing a second command.
         resolved, warnings = resolve_input(
             apply_input_space(deepcopy(DEFAULTS), a), raw)
-        print(json.dumps({
+        out = {
             "tag": raw["rotation"],
             "candidates": candidates,
             "rotation_tag_suspect": rotation_tag_suspect(
+                raw["rotation"], raw["codec"], raw["width"], raw["height"]),
+            "rotation_tag_note": rotation_tag_note(
                 raw["rotation"], raw["codec"], raw["width"], raw["height"]),
             "transfer": raw.get("color_transfer", ""),
             "primaries": raw.get("color_primaries", ""),
             "resolved_input": resolved,
             "source_primaries": source_primaries(raw, resolved),
             "warnings": warnings,
-        }))
+        }
+        if want_sheet:
+            out["sheet"] = a.sheet
+        print(json.dumps(out))
         return
 
     tmp = Path(tempfile.mkdtemp(prefix="cinegrade-orient-"))
@@ -3473,6 +3662,53 @@ def run(args, verbose=False, stdin_bytes=None):
     if r.returncode != 0:
         raise GradeError(f"ffmpeg failed ({r.returncode})\n{err[-4000:]}")
     return r
+
+
+def run_render(args, verbose=False, total=None):
+    """Run one ffmpeg render, streaming "render Xs of Ys" progress lines to
+    stderr as it goes (round 2 tooling note 9), so a poller watching this
+    process can tell alive-but-slow from stuck without parsing ffmpeg's own
+    -stats output. `args` is the same argument list `run()` would take
+    (ending in the real output path); this inserts `-progress pipe:1
+    -nostats` itself, ahead of the output path, the same flags
+    studio/server.py's own render job worker already puts on its ffmpeg
+    call, so the two read the identical `out_time_us=` stream.
+
+    stdout carries none of this: ffmpeg's own progress stream is read from
+    its stdout pipe and never echoed there, only summarised to stderr, so
+    the caller's own final line (cmd_render's "rendered ... -> OUT",
+    printed by the caller after this returns) stays the only thing on
+    stdout, the same as every other subcommand.
+
+    One line per integer second of rendered OUTPUT (not wall clock time:
+    out_time_us is ffmpeg's own encoded-so-far position), deduplicated so a
+    fast source does not spam a line per progress tick.
+    """
+    if verbose:
+        print(" ".join(shlex.quote(x) for x in args), file=sys.stderr)
+    progress_args = args[:-1] + ["-progress", "pipe:1", "-nostats", args[-1]]
+    proc = subprocess.Popen(progress_args, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    last_shown = None
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line.startswith("out_time_us="):
+                continue
+            try:
+                secs = int(line.split("=", 1)[1]) / 1e6
+            except ValueError:
+                continue
+            shown = int(secs)
+            if total and shown != last_shown:
+                print(f"render {secs:.1f}s of {total:.1f}s", file=sys.stderr)
+                last_shown = shown
+    finally:
+        proc.wait()
+    err = proc.stderr.read()
+    if proc.returncode != 0:
+        raise GradeError(f"ffmpeg failed ({proc.returncode})\n{err[-4000:]}")
+    return subprocess.CompletedProcess(progress_args, proc.returncode, "", err)
 
 
 # The studio server's default port. Only used to talk to an already running
@@ -4001,6 +4237,16 @@ def cmd_match(a):
     server as "use whatever this project last had saved for this
     reference", which is a browser tab's rectangle this CLI cannot see
     (contract G9 leftover 3), so this command never leaves the key out.
+
+    `--rotate` (round 2 tooling note 6) is sent as the top level `rotation`
+    field the server's `effective_rotation()` reads first, the same field
+    `grade_client.Studio.match()` sends when it was constructed with a
+    `rotation`. With no `--rotate`, this falls back to `cfg["rotation"]`
+    (a non-auto rotation saved on the --preset/config given) and then to
+    "auto", exactly the fallback order `cli_rotation` already gives every
+    other subcommand that measures a frame off local disk; match is the one
+    command that measures over HTTP instead, so it could not reuse that
+    fallback until it had a --rotate flag of its own to feed it.
     """
     base = require_server(a)
     hdr = studio_headers(a)
@@ -4012,6 +4258,7 @@ def cmd_match(a):
         "method": a.method, "strength": a.strength,
         "luma_preserve": a.luma_preserve,
         "ref_crop": ref_crop, "frame_crop": frame_crop,
+        "rotation": cli_rotation(a, cfg),
     }
     if a.name:
         payload["name"] = a.name
@@ -4157,6 +4404,20 @@ def _sheet_load(path: Path, t: float, tmp_dir: Path, verbose: bool):
     return Image.open(frame).convert("RGB")
 
 
+def _sheet_region_crop(img, region):
+    """Crop one already-loaded sheet panel to `--region` (round 2 tooling
+    note 7): four fractions of THAT PANEL'S OWN size, the same meaning
+    `still --region` gives a graded frame, applied after every panel is
+    loaded rather than before any of them are decoded. Mixed aspect inputs
+    each crop to their own frame this way, not to one shared pixel box, and
+    no --zoom is needed: a sheet panel is already scaled to the sheet's own
+    shared height by build_contact_sheet, so there is nothing a zoom would
+    do that picking the region tighter does not already do."""
+    reg = normalise_region(region)
+    x, y, w, h = region_pixels(reg, {"width": img.width, "height": img.height})
+    return img.crop((x, y, x + w, y + h))
+
+
 def _label_metrics(font):
     """One label strip height for every panel, from a reference string with
     both an ascender and a descender, so real labels never disagree with it
@@ -4257,6 +4518,8 @@ def cmd_sheet(a):
     with tempfile.TemporaryDirectory(prefix="cinegrade_sheet_") as tmp_s:
         tmp = Path(tmp_s)
         images = [_sheet_load(p, a.time, tmp, a.verbose) for p in paths]
+        if getattr(a, "region", None):
+            images = [_sheet_region_crop(im, a.region) for im in images]
         sheet = build_contact_sheet(images, labels, cols, rows,
                                     height=a.height, width=a.width)
         sheet.save(a.output)
@@ -4325,6 +4588,34 @@ def cmd_docs(a):
             end = j
             break
     print("\n".join(lines[idx:end]).rstrip())
+
+
+def _fix_negative_values_flag(argv: list[str]) -> list[str]:
+    """`sweep --values -0.1,0,0.1` (round 2 tooling note 3): argparse decides
+    whether a token is an option before `--values`'s own action ever runs,
+    and `-0.1,0,0.1` starts with a dash, so it is refused as an unrecognised
+    flag rather than read as the value. `--values=-0.1,0,0.1` (one token,
+    the `=` form) already works today; this rewrites the two token spelling
+    into that one before argparse ever sees it, so both work identically and
+    a caller never has to know the difference or quote anything.
+
+    Only `--values` is touched, and only when the very next token starts
+    with a minus followed by a digit or a decimal point: every other flag,
+    and a `--values` whose first number is not negative, passes through
+    unchanged.
+    """
+    out = []
+    i = 0
+    neg = re.compile(r"^-\.?\d")
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--values" and i + 1 < len(argv) and neg.match(argv[i + 1]):
+            out.append(f"--values={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def main():
@@ -4440,8 +4731,15 @@ def main():
     o.add_argument("--height", type=int, default=600)
     o.add_argument("--open", action="store_true")
     o.add_argument("--json", action="store_true",
-                   help="print the tag, the four candidate rotations and "
-                        "rotation_tag_suspect; no contact sheet is rendered")
+                   help="print the tag, the four candidate rotations, "
+                        "rotation_tag_suspect and rotation_tag_note; the "
+                        "default (--output) contact sheet is skipped, but "
+                        "--sheet still writes if given")
+    o.add_argument("--sheet",
+                   help="write the four candidate rotations (0, 90, 180, "
+                        "270) as one labelled 2x2 sheet to this path, "
+                        "through the same code cmd_sheet uses; works "
+                        "alongside --json")
     o.set_defaults(fn=cmd_orient)
 
     st = sub.add_parser(
@@ -4461,8 +4759,11 @@ def main():
                          "the frame, 0 0 1 1 being the whole frame. Same "
                          "meaning as still's --region")
     st.add_argument("--times", help="comma separated seconds; measures a "
-                                    "clip at each one and returns a list "
-                                    "instead of one block (not with --image)")
+                                    "clip at each one. --json prints "
+                                    "{\"results\": [...]} instead of the "
+                                    "single-frame {key, size, stats} "
+                                    "envelope, one {time, key, size, stats} "
+                                    "row per second (not with --image)")
     st.set_defaults(fn=cmd_stats)
 
     sw = sub.add_parser(
@@ -4476,12 +4777,22 @@ def main():
                          "fx.halation.strength or layers.0.correct.exposure")
     sw.add_argument("--values", required=True,
                     help="comma separated values tried at --param, e.g. "
-                         "0,0.25,0.5,0.75,1.0")
+                         "0,0.25,0.5,0.75,1.0. A leading negative works "
+                         "either spelled out (--values -0.1,0,0.1) or with "
+                         "an = (--values=-0.1,0,0.1); both reach this the "
+                         "same way")
+    sw.add_argument("--width", type=int, default=640,
+                    help="measure each value at this width, scaled down "
+                         "from the source (default 640, the same as what "
+                         "POST /api/stats measures a clip at); round 2 "
+                         "tooling note 3, this used to always measure at "
+                         "the source's full resolution")
     sw.add_argument("--json", action="store_true")
     sw.add_argument("--sheet", metavar="OUT.jpg",
                     help="also write a labelled contact sheet, one panel "
                          "per value, through the same sheet code cinegrade "
-                         "sheet uses")
+                         "sheet uses. With --json this path is printed to "
+                         "stderr, so stdout stays pure JSON")
     sw.set_defaults(fn=cmd_sweep)
 
     ss = sub.add_parser(
@@ -4604,6 +4915,15 @@ def main():
                          "call's config; left out, the server's own defaults")
     mt.add_argument("--method", choices=["reinhard", "histogram"],
                     default="reinhard")
+    mt.add_argument("--rotate", choices=list(ROTATIONS),
+                    help="auto honours the clip's own display matrix (the "
+                         "default), 0 ignores it, and 90/180/270 ignore it "
+                         "and turn the picture that many degrees clockwise "
+                         "before the fit measures it; sent as this call's "
+                         "rotation field, falling back to --preset's own "
+                         "config.rotation and then to auto, the same order "
+                         "every other subcommand's --rotate falls back "
+                         "through (see: cinegrade orient)")
     mt.add_argument("--strength", type=float, default=1.0)
     mt.add_argument("--luma-preserve", dest="luma_preserve",
                     action="store_true", default=True)
@@ -4697,6 +5017,14 @@ def main():
                          "default is each file's stem")
     sh.add_argument("--time", type=float, default=0.0,
                     help="the frame time for any video input")
+    sh.add_argument("--region", nargs=4, type=float,
+                    metavar=("X0", "Y0", "X1", "Y1"),
+                    help="crop every panel to this rectangle after loading "
+                         "it: four fractions of THAT PANEL'S OWN size, 0 0 "
+                         "1 1 being the whole panel, same meaning as "
+                         "still's --region. No --zoom is needed here: each "
+                         "panel is already scaled to the sheet's shared "
+                         "height afterwards")
     sh.add_argument("--verbose", "-v", action="store_true")
     sh.set_defaults(fn=cmd_sheet)
 
@@ -4708,7 +5036,7 @@ def main():
                     help="list every heading and exit")
     dc.set_defaults(fn=cmd_docs)
 
-    a = ap.parse_args()
+    a = ap.parse_args(_fix_negative_values_flag(sys.argv[1:]))
     # colour-science prints a notice about the missing scipy and matplotlib
     # extras the first time something imports it (grade/slice.py does, via
     # colorlib, on nearly every command). Neither extra is used here; keep

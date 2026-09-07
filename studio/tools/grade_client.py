@@ -325,16 +325,19 @@ class Studio:
         return self.request("POST", "/api/stats", body=body)
 
     def stats_at(self, clip: str, times, config: dict | None = None,
-                width: int = 640) -> list:
+                width: int = 640) -> dict:
         """POST /api/stats with a `times` list (contract G3): one call, one
-        render per time, returns the `results` list, each entry `{time,
-        key, size, stats}`. On a server that has not shipped this yet the
-        route silently answers the single time shape instead: check for a
-        `results` key before trusting the length of what comes back."""
+        render per time, returns the route's own envelope unchanged,
+        `{"results": [...]}`, each entry `{time, key, size, stats}` (round 2
+        tooling note 2: this used to unwrap the list for the caller, which
+        was the one place in this module that did not hand back exactly
+        what the route answers; `cinegrade stats --times --json` prints
+        this identical shape). On a server that has not shipped this route
+        yet, `"results"` is simply absent from what comes back: check for it
+        rather than assuming the key is always there."""
         body = self._with_rotation({"clip": clip, "times": list(times),
                                     "width": width, "config": config or {}})
-        result = self.request("POST", "/api/stats", body=body)
-        return result.get("results", [])
+        return self.request("POST", "/api/stats", body=body)
 
     def ref_stats(self, name: str, region=None) -> dict:
         """POST /api/stats with `ref` where `clip` goes (contract G3): the

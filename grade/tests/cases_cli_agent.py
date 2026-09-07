@@ -405,6 +405,57 @@ def test_agent_verbs_and_env_precedence_round_trip(ctx):
             looks_after, looks_before)
 
 
+# --------------------------------------------------------------------------
+# match --rotate (round 2 tooling note 6): the payload cinegrade.cmd_match
+# builds, checked in process by swapping out _studio_call for one that
+# records what it was handed rather than opening a socket, the same "no
+# server needed for pure logic" style the resolve_server checks above use.
+# --------------------------------------------------------------------------
+
+def _match_ns(**kw):
+    base = dict(ref="r.png", clip="c.mov", time=0.0, preset=None,
+               method="reinhard", rotate=None, strength=1.0,
+               luma_preserve=True, ref_crop=None, frame_crop=None,
+               name=None, out_dir=None, json=True,
+               port=55999, url=None, agent=None, attach=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _captured_match_payload(**ns_kw):
+    captured = {}
+    real = cg._studio_call
+    try:
+        cg._studio_call = lambda base, path, method="GET", payload=None, \
+            headers=None: (captured.__setitem__("payload", payload)
+                           or {"ok": True, "name": "x", "lut": "/tmp/x.cube",
+                              "warnings": []})
+        cg.cmd_match(_match_ns(**ns_kw))
+    finally:
+        cg._studio_call = real
+    return captured.get("payload") or {}
+
+
+def test_match_rotate_flag_is_sent_as_the_rotation_field(ctx):
+    payload = _captured_match_payload(rotate="180")
+    ctx.expect_eq("--rotate 180 is sent as the rotation field",
+                  payload.get("rotation"), "180")
+
+
+def test_match_rotation_defaults_to_auto_with_no_flag_and_no_preset(ctx):
+    payload = _captured_match_payload()
+    ctx.expect_eq("no --rotate, no preset: rotation is auto",
+                  payload.get("rotation"), "auto")
+
+
+def test_match_rotation_falls_back_to_the_configs_own_rotation(ctx):
+    preset_file = Path(tempfile.mkdtemp(prefix="cinegrade-match-rot-")) / "p.json"
+    preset_file.write_text(json.dumps({"rotation": "90"}))
+    payload = _captured_match_payload(preset=str(preset_file))
+    ctx.expect_eq("no --rotate, preset carries rotation 90: honoured",
+                  payload.get("rotation"), "90")
+
+
 def register(suite):
     g = "cli_agent"
     suite.add(g, "resolve_server_defaults_to_7431_unlabelled",
@@ -443,3 +494,13 @@ def register(suite):
               test_agent_verbs_and_env_precedence_round_trip,
               doc="match/preset/grade verbs, the real-CLI agent refusal, "
                   "and whoami's project_clip, against a real server")
+    suite.add(g, "match_rotate_flag_is_sent_as_the_rotation_field",
+              test_match_rotate_flag_is_sent_as_the_rotation_field,
+              doc="--rotate 180 lands on the payload's rotation field")
+    suite.add(g, "match_rotation_defaults_to_auto_with_no_flag_and_no_preset",
+              test_match_rotation_defaults_to_auto_with_no_flag_and_no_preset,
+              doc="no --rotate, no preset rotation: auto")
+    suite.add(g, "match_rotation_falls_back_to_the_configs_own_rotation",
+              test_match_rotation_falls_back_to_the_configs_own_rotation,
+              doc="no --rotate: the --preset config's own rotation wins "
+                  "over auto")

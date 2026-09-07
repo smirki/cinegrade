@@ -228,6 +228,11 @@ class RotationServerTest(unittest.TestCase):
         rotation_tag_suspect (advisory, never applied automatically). This
         class's own footage is real ProRes off the founder's camera, so the
         tagged clip is expected to trip the heuristic's cinema-codec tell.
+
+        Round 2 tooling item 17 adds a sibling rotation_tag_note: a plain
+        sentence explaining rotation_tag_suspect's answer, so the boolean on
+        its own never reads as a verdict. Empty exactly when the flag is
+        false, non-empty (and naming the actual tag) when it is true.
         """
         clips = json.loads(_get(self.base + "/clips")[0])["clips"]
         mine = [c for c in clips if c["name"] == self.clip][0]
@@ -242,6 +247,19 @@ class RotationServerTest(unittest.TestCase):
             self.assertTrue(mine["rotation_tag_suspect"],
                             "a quarter turn tag on a ProRes file is exactly "
                             "the C011 case the heuristic exists for")
+        self.assertIn("rotation_tag_note", mine)
+        self.assertIsInstance(mine["rotation_tag_note"], str)
+        if mine["rotation_tag_suspect"]:
+            self.assertNotEqual(mine["rotation_tag_note"], "",
+                                "a suspect tag must carry an explanation, "
+                                "not just a bare boolean")
+            self.assertIn(mine["rotation_tag"], mine["rotation_tag_note"],
+                          "the note should name the actual tag it is about")
+            self.assertIn("run orient and look", mine["rotation_tag_note"])
+        else:
+            self.assertEqual(mine["rotation_tag_note"], "",
+                             "a note on a tag that is not flagged reads as "
+                             "a reassurance, which is itself a verdict")
 
 
 PRECEDENCE_SCRIPT = r'''

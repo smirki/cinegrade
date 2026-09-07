@@ -519,6 +519,73 @@ def test_orient_json_on_a_normal_phone_tag_is_not_suspect(ctx):
                     out.get("rotation_tag_suspect") is False, out)
 
 
+def test_orient_sheet_writes_a_labelled_2x2_of_the_four_candidates(ctx):
+    """--sheet OUT.jpg (round 2 tooling note 8): the four fixed candidates
+    (0, 90, 180, 270; auto is not one of them, same as --json's own
+    `candidates` dict) as one labelled 2x2, through build_contact_sheet
+    (the same code cmd_sheet uses), usable together with --json. Also
+    covers rotation_tag_note (lane F2's addition, next to
+    rotation_tag_suspect, in --json's own dict).
+
+    build_contact_sheet is monkeypatched to a wrapper that records what it
+    was called with and then still calls the real function, so this proves
+    both things at once: the real file lands on disk through the real PIL
+    assembly, and cmd_orient handed it exactly four panels, laid out 2x2,
+    labelled 0 (carrying the tag and the suspect flag), 90, 180, 270.
+    """
+    png, sw, sh = _corner_source()
+    out = H.WORK / "orient_sheet.jpg"
+
+    captured = {}
+    real_build = cg.build_contact_sheet
+
+    def _capture(images, labels, cols, rows, height=None, width=None):
+        captured["images"] = images
+        captured["labels"] = labels
+        captured["cols"] = cols
+        captured["rows"] = rows
+        return real_build(images, labels, cols, rows, height=height, width=width)
+
+    a = _Args()
+    a.input = str(png)
+    a.time = 0.0
+    a.height = 200
+    a.verbose = False
+    a.sheet = str(out)
+    a.json = True
+
+    cg.build_contact_sheet = _capture
+    try:
+        buf = StringIO()
+        with redirect_stdout(buf):
+            cg.cmd_orient(a)
+    finally:
+        cg.build_contact_sheet = real_build
+
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    result = json.loads(lines[-1])
+
+    ctx.expect_true("orient --sheet writes the file", out.exists(), str(out))
+    ctx.expect_eq("--json reports the sheet path too",
+                  result.get("sheet"), str(out))
+    ctx.expect_true("rotation_tag_note is in the --json dict",
+                    "rotation_tag_note" in result, result)
+    ctx.expect_eq("an untagged synthetic source is not suspect, so the "
+                  "note is the empty string",
+                  result.get("rotation_tag_note"), "")
+
+    ctx.expect_eq("four candidates go into the sheet",
+                  len(captured.get("images", [])), 4)
+    ctx.expect_eq("laid out 2 columns", captured.get("cols"), 2)
+    ctx.expect_eq("laid out 2 rows", captured.get("rows"), 2)
+    labels = captured.get("labels") or []
+    ctx.note(f"labels: {labels}")
+    ctx.expect_eq("labels are 0, 90, 180, 270 in order",
+                  [lb.split()[0] for lb in labels], ["0", "90", "180", "270"])
+    ctx.expect_true("the first label also carries the tag",
+                    len(labels) > 0 and "tag=" in labels[0], labels)
+
+
 def register(suite):
     g = "rotation"
     suite.add(g, "auto_and_zero_match_the_old_boolean",
@@ -572,3 +639,7 @@ def register(suite):
     suite.add(g, "orient_json_on_a_normal_phone_tag_is_not_suspect",
               test_orient_json_on_a_normal_phone_tag_is_not_suspect,
               doc="a real phone quarter turn on its own codec is not flagged")
+    suite.add(g, "orient_sheet_writes_a_labelled_2x2_of_the_four_candidates",
+              test_orient_sheet_writes_a_labelled_2x2_of_the_four_candidates,
+              doc="orient --sheet: a real 2x2 file, four panels, and "
+                  "rotation_tag_note alongside --json")

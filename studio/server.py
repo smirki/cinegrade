@@ -4750,9 +4750,19 @@ class Handler(BaseHTTPRequestHandler):
             self._guard_read(payload.get("clip"))
             # The project's stored rectangles are a browser tab convenience,
             # not a default: an agent gets them only by sending them.
-            self._json(match_reference_job(
+            result = match_reference_job(
                 payload, self._uid(),
-                use_stored_crops=not self.caller_agent))
+                use_stored_crops=not self.caller_agent)
+            # Round 2 tooling item 5: "looks" is the whole ~60 entry look
+            # catalogue, put here so the browser tab's dropdown can refresh
+            # from this one response (see fillLooks(result.looks) in
+            # static/app.js) instead of a second GET /api/looks. An agent has
+            # no dropdown and was paying thousands of tokens for it on every
+            # match; drop it for an agent caller only, so the browser's
+            # response is unchanged byte for byte.
+            if self.caller_agent:
+                result.pop("looks", None)
+            self._json(result)
             return
 
         if route == "parity/report" and method == "POST":
@@ -4859,6 +4869,22 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._body()
             p = write_preset(payload["name"], payload.get("config"),
                              payload.get("comment", ""), self._presets_uid())
+            if self.caller_agent:
+                # Round 2 tooling item 5: "presets" below is the entire
+                # library listing, sent back on every single save. The
+                # browser tab's savePreset() reads it (fillPresets(j.presets)
+                # repaints the dropdown); an agent does not have a dropdown
+                # and was paying for the whole library on every save. An
+                # agent gets confirmation of the call it made instead: the
+                # name it saved under, the comment that ended up on disk
+                # (write_preset() can keep an existing comment when this
+                # call sent none), the path, and ok. Ask GET /api/presets
+                # for the list.
+                self._json({"name": p.stem,
+                            "comment": read_preset_comment(
+                                p.stem, self._presets_uid()),
+                            "path": str(p), "ok": True})
+                return
             self._json({"saved": p.name, "path": str(p),
                         "presets": list_presets(self._presets_uid())})
             return
@@ -5302,13 +5328,22 @@ class Handler(BaseHTTPRequestHandler):
         # Nothing here ever changes what gets rendered; "raw" (the mode "0"
         # block just above, the file's own coded width and height before any
         # tag is applied) is what the codec tell in that heuristic needs.
+        # rotation_tag_note (round 2 tooling item 17): the same tell, in one
+        # plain sentence, "" when not suspect, so the boolean alone never
+        # reads as a verdict either way. CG.rotation_tag_note() delegates
+        # its yes/no to CG.rotation_tag_suspect() itself, so the two fields
+        # cannot disagree.
         if "error" in entry:
             entry.setdefault("rotation_tag", "0")
             entry.setdefault("rotation_tag_suspect", False)
+            entry.setdefault("rotation_tag_note", "")
         else:
             entry["rotation_tag"] = str(int(entry.get("rotation") or 0))
             raw_dims = entry.get("raw") or {}
             entry["rotation_tag_suspect"] = CG.rotation_tag_suspect(
+                entry.get("rotation"), entry.get("codec"),
+                raw_dims.get("width"), raw_dims.get("height"))
+            entry["rotation_tag_note"] = CG.rotation_tag_note(
                 entry.get("rotation"), entry.get("codec"),
                 raw_dims.get("width"), raw_dims.get("height"))
         # The two dimension blocks above are the two the app has always shown

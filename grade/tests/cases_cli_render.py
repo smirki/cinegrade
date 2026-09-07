@@ -11,6 +11,7 @@ decoder killing the whole render.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 import harness as H
@@ -188,6 +189,43 @@ def test_audio_maps_first_stream_only(ctx):
                       streams[0].get("codec_name"), "aac")
 
 
+_PROGRESS_RE = re.compile(r"^render \d+\.\d+s of \d+\.\d+s$")
+
+
+def test_render_progress_lines_go_to_stderr_not_stdout(ctx):
+    """Round 2 tooling note 9: ffmpeg's own -progress output, reduced to
+    one "render Xs of Ys" line per second of rendered output, so a poller
+    can tell alive from stuck. These go to stderr; stdout keeps only the
+    single final "rendered ... -> OUT" line, unchanged, so a caller piping
+    stdout through json or anything else never sees a progress line."""
+    out = H.WORK / "render_progress.mp4"
+    r = _cli(["render", SRC, "-p", "natural", "--codec", "libx264",
+             "-t", "3", "--no-audio", "-o", str(out)])
+    ctx.note(f"exit {r.returncode}")
+    ctx.expect_eq("a 3 second bounded render exits 0", r.returncode, 0)
+
+    stdout_lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    progress_on_stdout = [ln for ln in stdout_lines if _PROGRESS_RE.match(ln)]
+    ctx.expect_eq("stdout carries no progress lines",
+                  len(progress_on_stdout), 0)
+    ctx.expect_eq("stdout keeps exactly the one final line",
+                  len(stdout_lines), 1)
+    if stdout_lines:
+        ctx.expect_true("stdout's one line is the final rendered summary",
+                        stdout_lines[0].startswith("rendered "),
+                        stdout_lines[0])
+
+    progress_lines = [ln for ln in r.stderr.splitlines()
+                      if _PROGRESS_RE.match(ln.strip())]
+    ctx.note(f"progress lines on stderr: {progress_lines}")
+    ctx.expect_true("at least one progress line appears on stderr",
+                    len(progress_lines) >= 1, r.stderr[-600:])
+    if progress_lines:
+        last = progress_lines[-1].strip()
+        ctx.expect_true("a progress line names the 3.0s total",
+                        last.endswith("of 3.0s"), last)
+
+
 def register(suite):
     g = "cli_render"
     suite.add(g, "width_scale_mutually_exclusive",
@@ -210,3 +248,6 @@ def register(suite):
     suite.add(g, "audio_maps_first_stream_only", test_audio_maps_first_stream_only,
               doc="a second, undecodable audio stream no longer kills the "
                   "render; --no-audio is optional again")
+    suite.add(g, "render_progress_lines_go_to_stderr_not_stdout",
+              test_render_progress_lines_go_to_stderr_not_stdout,
+              doc="render Xs of Ys lines on stderr, stdout keeps one final line")

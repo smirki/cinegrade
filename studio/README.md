@@ -361,12 +361,27 @@ usage in "The first party client module" below. The list below describes
 what lives inside `stats`:
 
 - luma percentiles at 5, 25, 50, 75 and 95, as 0 to 1
-- mean saturation, computed as `(max - min) / max` per pixel
+- mean saturation, computed as `(max - min) / max` per pixel. This falls
+  under ANY toe lift, `primaries.black_lift` included (measured under
+  "Which way is which" below: 0.1843 to 0.1716 to 0.1502 as `black_lift`
+  goes 0, 0.1, 0.2, with luma barely moving), because raising the floor
+  raises `min` toward `max` on every lifted pixel; a falling saturation mean
+  does not by itself mean a grade went duller, check `black_lift`/
+  `highlight_rolloff`/a curve's toe before reading it as a colour change.
+  ACES (`convert.tonemap: aces`) desaturates highlights the same way past
+  about +1 stop of `convert.exposure`: measured on real footage, saturation
+  mean fell 23 percent over the first stop pushed (0.1843 to 0.1421) and 31
+  percent over the second (to 0.0984), an accelerating fall rather than a
+  steady one.
 - percent of pixels in each hue family (warm, green, cool, magenta), counting only
   pixels above 10 percent saturation so that grey does not vote
 - percent clipped black (code 2 or under) and clipped white (code 253 or over)
 - `bands`: the same frame sliced into eight equal brightness bands (0 = pure
-  black, 1 = pure white), each one read as:
+  black, 1 = pure white). This is NOT eight per-band dicts: `bands` is one
+  dict of four parallel eight-item lists (`saturation`, `warm`, `tint`,
+  `count`, plus the nine-item `edges` the bands sit between), so band 3's
+  numbers are `saturation[3]`, `warm[3]`, `tint[3]`, `count[3]`, not a
+  fourth entry in some `bands[3]`. Read as:
   - **saturation**: how colourful that brightness range is on average (0 = no
     colour, higher = more vivid). Near zero in a shadow band or a highlight band
     is normal, not a fault: it just means little colour lives there.
@@ -508,6 +523,15 @@ apple_log,hlg,pq,rec709,slog3,logc3,vlog,clog3,dlog}` (overrides
 transforms" above; on `render`, `still`, `compare`, `scopes`, `stats`,
 `orient` and `sweep`), `--verbose/-v` (also un-silences colour-science's own
 scipy/matplotlib startup notice, silent by default on every command).
+`NAME_OR_PATH` on `--preset` checks the literal path first (`load_preset` in
+`grade/cinegrade.py`) and only falls back to `grade/presets/NAME.json` when
+that path does not exist, so a file `grade save`/`preset save` wrote, a
+`PUT /api/grade`/`POST /api/preset` body saved to disk, or any hand written
+JSON, goes straight to `--preset` with no need to copy it into
+`grade/presets/` first, including for a field with no dedicated flag (see
+the measured rows added to "Which way is which" below for a worked
+example).
+
 `--agent`/`--attach`/`--if-rev`, and `--port`/`--url` (env `STUDIO_PORT`/
 `STUDIO_URL`), are documented under "Per caller identity" in Agent API
 below, since they only apply to `session`, `whoami`, `project`, `match`,
@@ -520,19 +544,19 @@ landing on the port 7431 default, which is a human's own live studio.
 
 | Command | Flags beyond the shared set | What it does |
 | --- | --- | --- |
-| `render IN -o OUT` | `--start`, `--duration/-t` (seconds); `--no-audio`; `--codec NAME` (this render only, never the preset file; extension must agree, `prores_ks` to `.mov`, else `.mp4`, or the command refuses before ffmpeg runs); `--width N` / `--scale F` (mutually exclusive; scales the pixel denominated FX params the same way the studio preview does); audio maps only the first stream (`0:a:0?`), so a second, undecodable stream (an iPhone spatial audio `apac` track) no longer kills the render | writes a finished file to `grade/out/` (or wherever `-o` points), then prints `rendered (input INPUT, rotation ROTATION) -> PATH`, naming the resolved input transform (`Input transforms` above) and the rotation mode actually used, not only `rendered -> PATH` |
+| `render IN -o OUT` | `--start`, `--duration/-t` (seconds); `--no-audio`; `--codec NAME` (this render only, never the preset file; extension must agree, `prores_ks` to `.mov`, else `.mp4`, or the command refuses before ffmpeg runs); `--width N` / `--scale F` (mutually exclusive; scales the pixel denominated FX params the same way the studio preview does); audio maps only the first stream (`0:a:0?`), so a second, undecodable stream (an iPhone spatial audio `apac` track) no longer kills the render | writes a finished file to `grade/out/` (or wherever `-o` points), streaming `render Xs of Ys` progress to STDERR once per second of rendered output while it runs (stdout carries nothing until the end), then prints the one final `rendered (input INPUT, rotation ROTATION) -> PATH` line on stdout, naming the resolved input transform (`Input transforms` above) and the rotation mode actually used, not only `rendered -> PATH` |
 | `still IN -o OUT` | `--time` (default 0); `--width`; `--region X0 Y0 X1 Y1`, `--zoom F` (see "What the numbers mean" above) | one graded frame as a PNG |
 | `compare IN -o OUT` | `--time`; `--width` (default 560); `--region`, `--zoom`; `--looks a,b,c`; `--presets a,b,c`; `--open` (Preview.app) | a grid of the same frame under several looks or presets |
 | `scopes IN -o OUT` | `--time`; `--width` (default 700); `--open` | histogram, waveform, parade and vectorscope as one image |
-| `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect}` instead of rendering a sheet; see "Rotation" above) | a contact sheet of all four rotations, or the JSON verdict |
-| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; no grade applied, `input` becomes optional, `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows each carry a `"time"` key too, since that is the field being varied |
-| `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order); `--json`; `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
-| `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
+| `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect, rotation_tag_note, ...}` instead of rendering the default sheet; see "Rotation" above); `--sheet OUT.jpg` (a labelled 2x2 of the four fixed candidates, 0/90/180/270; independent of `--json`, both together write both and the JSON dict gains a `"sheet"` key naming the path) | the default hand drawn row sheet, a labelled 2x2, the JSON facts, or (with both flags) all of the JSON plus the 2x2; `rotation_tag_suspect` is a prompt to go look, not a verdict, and `rotation_tag_note` says why in one sentence, see "Rotation" |
+| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
+| `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order; a leading negative parses unquoted, `--values -0.1,0,0.1`, as well as with an `=`); `--width` (default 640, scaled down from the source, matching `POST /api/stats`'s own default; this used to always measure at the source's full resolution); `--json` (stdout stays pure JSON even with `--sheet`, which then prints its path to stderr instead); `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
+| `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input); `--region X0 Y0 X1 Y1` (crops each panel to fractions of ITS OWN size, after loading, before the shared height is solved; no `--zoom`, a cropped panel is already rescaled to the shared height afterwards) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
 | `docs [SECTION]` | `SECTION` (a heading's text, matched case insensitively at any level, skipping headings inside fenced code blocks; omit to list); `--list` (list every heading and exit; a `SECTION` that matches nothing also lists them, rather than failing) | prints one section of this file, or the whole table of contents |
 | `session {get,patch} [JSON]` | `JSON` for `patch` (a partial config, deep merged into the live one; `-` reads it from stdin); `--port`/`--url` (default port 7431 with neither, env `STUDIO_PORT`/`STUDIO_URL`, see "Per caller identity" below); `--replace` (overwrite instead of merging); `--by`; `--message` (for `patch`, a readable commit message); see "Per caller identity" below for `--agent`/`--attach`/`--if-rev` | reads or changes a running server's live config, see "Driving the open page from outside" below |
 | `whoami` | `--port`/`--url`; `--json` (carries `"project_clip"` next to the project key once one is open); see "Per caller identity" below for `--agent`/`--attach` | who a write from this shell counts as, and what project is open (with its clip name), see "Identity" above |
 | `project {open,show,log,checkout,fork,undo,redo,rotate,time}` | `open CLIP [--rotation auto\|0\|90\|180\|270]`; `log [--limit N] [--all]`; `checkout ID`; `fork [NAME] [--from ID]`; `rotate auto\|0\|90\|180\|270`; `time SECONDS`; every one takes `--port`/`--url`, `--by`, `--json`, and (see below) `--agent`/`--attach` | a clip's git style history, see "Projects and history" below |
-| `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
+| `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--rotate {auto,0,90,180,270}` (sent as this call's own `rotation` field; falls back to `--preset`'s own config `rotation`, then `auto`, same order every other subcommand's `--rotate` falls back through; `match` previously had no rotation handling at all); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
 | `preset {save,load} NAME` | `save NAME -p grade.json --comment TEXT`; `load NAME [--expand] [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `POST`/`GET /api/preset`: the shared, named grade store, read and written by every account and agent alike |
 | `grade {save,load} CLIP` | `save CLIP -p grade.json --message TEXT`; `load CLIP [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `PUT`/`GET /api/grade` (contract C3): one clip's own per clip grade, distinct from the shared `preset` above and from `session patch` (the live config a browser tab is watching; `grade save` never wakes it) |
 
@@ -783,20 +807,31 @@ they were given.
 `cinegrade orient IN.MOV --json` skips rendering its usual contact sheet and
 prints one JSON object instead: `{"tag": ..., "candidates": {"0": {"width":
 W, "height": H}, "90": {...}, "180": {...}, "270": {...}}, "rotation_tag_suspect":
-bool}`. `"tag"` is the file's own raw display matrix value exactly as ffprobe
-reports it (it can be negative, e.g. `-90`). `rotation_tag_suspect` is advisory
-only and NOTHING ever applies a rotation because of it: it flags a tag that
-looks like it does not belong on this file, for either of two reasons: the
-codec is a professional or cinema one (ProRes, DNxHD/HR, CineForm, R3D, BRAW,
-ARRIRAW, CinemaDNG) carrying any quarter turn tag, since those tools do not
-normally write one for a phone-style reason; or the file's own raw (pre
-rotation) coded dimensions are already landscape while the tag asks for a turn
-into portrait. False positives are expected and fine (it is advisory); false
-negatives are not meant to happen on real footage. `GET /api/state` exposes the
-same two numbers on every clip as `rotation_tag` (a string, `"0"` when the file
-carries none) and `rotation_tag_suspect` (bool), computed by the exact same
-function `orient` uses, so the CLI and the studio UI can never disagree about
-one clip.
+bool, "rotation_tag_note": "..."}`. `"tag"` is the file's own raw display matrix
+value exactly as ffprobe reports it (it can be negative, e.g. `-90`).
+`rotation_tag_suspect` is advisory only and NOTHING ever applies a rotation
+because of it: it flags a tag that looks like it does not belong on this file,
+for either of two reasons: the codec is a professional or cinema one (ProRes,
+DNxHD/HR, CineForm, R3D, BRAW, ARRIRAW, CinemaDNG) carrying any quarter turn
+tag, since those tools do not normally write one for a phone-style reason; or
+the file's own raw (pre rotation) coded dimensions are already landscape while
+the tag asks for a turn into portrait. False positives are expected and fine
+(it is advisory); false negatives are not meant to happen on real footage.
+`GET /api/state` exposes the same numbers on every clip as `rotation_tag` (a
+string, `"0"` when the file carries none), `rotation_tag_suspect` (bool) and
+`rotation_tag_note` (string), computed by the exact same functions `orient`
+uses, so the CLI and the studio UI can never disagree about one clip.
+
+`rotation_tag_note` (round 2 tooling item 17; the field name stays
+`rotation_tag_suspect`, unchanged) is one plain sentence saying WHY
+`rotation_tag_suspect` fired, naming the tell that caught it (the cinema
+codec, or the already-portrait coded frame), so the boolean alone never has
+to be read as a verdict either way. It is `""` when `rotation_tag_suspect` is
+`False`, and that empty string is NOT a reassurance that the tag is correct:
+the two tells above are deliberately generous rather than exhaustive (a false
+positive is fine, a silent false negative on a genuinely sideways file is the
+failure they exist to avoid), so an empty note only means neither tell fired
+this time, not that the tag was checked and found good.
 
 On a camera that always writes a quarter turn tag on a professional codec
 (every clip shot on the ProRes fixtures this repo ships with, for example),
@@ -805,6 +840,14 @@ only the ones that are actually sideways: each of those calls is individually
 correct given the two reasons above, but on a camera like that the flag is the
 normal answer, not an exceptional one. Read it as "run `orient` and look at
 the frame before trusting the tag", never as "something is broken here".
+
+`cinegrade orient IN.MOV --sheet OUT.jpg` writes a labelled 2x2 of the four
+fixed candidates (0, 90, 180, 270; not `auto`, the same four `--json`'s own
+`candidates` already names), through the same contact-sheet code `cinegrade
+sheet` uses, so "always look" (see the studio-grading skill) is one command
+instead of decoding `--json`'s numbers by hand or reading the default hand
+drawn row sheet. `--sheet` works independently of `--json`: with both given,
+both are written, and the JSON dict gains a `"sheet"` key naming the path.
 
 ## Per clip grades
 
@@ -1182,9 +1225,21 @@ be on, off, or both together:
   (degrees clockwise on screen), `softness` (feather width as a fraction of
   the shape's own radius), and its own `invert` (grades outside the shape
   instead of inside).
-- **Key** (`mask.key`), the HSL qualifier: `hue_center`/`hue_width`/
+- **Key** (`mask.key`), the HSL qualifier: its own `enabled` (bool, default
+  `false`: a layer with a key left off, same as one with no window, keys
+  nothing out and grades the whole frame), `hue_center`/`hue_width`/
   `hue_soft` (degrees), `sat_low`/`sat_high`/`sat_soft` and `lum_low`/
-  `lum_high`/`lum_soft` (0 to 1), and its own `invert`.
+  `lum_high`/`lum_soft` (0 to 1), and its own `invert`. The shipped default
+  (`hue_center: 30, hue_width: 40, hue_soft: 15`) keys only a band of warm
+  hues around orange: turned on with nothing else changed, a key silently
+  restricts a lum/sat only correction to that band instead of the whole
+  frame. `hue_width` is the covered arc's full width in degrees against a
+  hue distance that is capped at 180 (the far side of the wheel from
+  `hue_center`), so a lum/sat only key with NO hue restriction at all needs
+  `hue_width: 360` (`hue_soft` then stops mattering: at the arc's own edge,
+  180 degrees out, the ratio that drives the falloff is exactly 1
+  regardless of softness), not 180, which still only covers one side of the
+  wheel.
 
 `mask.invert` inverts the COMBINED matte (window times key) as a whole, after
 both halves are computed, rather than either half on its own. With neither
@@ -1339,6 +1394,16 @@ multiplier around 1.0, and no points at all is the identity. The three hue
 axes wrap, so a point near the left edge and one near the right edge are
 neighbours.
 
+Each curve's own list (`hue_hue`, `hue_sat`, `hue_lum`, `lum_sat`,
+`sat_sat`) is a plain `[x, y]` pair list, unsorted input allowed (sorted and
+de-duplicated by x on read). X is 0 to 1 for all five, but what 0 to 1 MEANS
+differs by curve, read from source (`CURVE_AXES` in `grade/slice.py`): for
+the three hue-wheel curves it is the pixel's own hue divided by 360 (0 and 1
+are both red, which is why those three wrap); for Lum vs Sat it is Rec.709
+luma; for Sat vs Sat it is the pixel's own HSV saturation, `(max - min) /
+max`. Y is turns of hue offset for Hue vs Hue, a multiplier around the 1.0
+neutral for the other four, exactly as stated above.
+
 **Color Slice** (`slice`), six hue vectors (red, yellow, green, cyan, blue,
 magenta) plus a measured skin vector, each with its own `hue` (degrees of
 rotation, -60 to 60), `sat` (multiplier, 0 to 2) and `density` (-1 to 1,
@@ -1380,6 +1445,12 @@ comparison against either was run, because neither is installed on this
 machine, and the names are borrowed only because they describe what the
 controls are for.
 
+For a pale colour such as a hazy sky, reach for a layer's `mask.key` instead
+of a slice vector: a layer's `correct` is a per channel gain, applied flat
+regardless of how saturated the pixel already is, where a slice vector's
+weight (above) is scaled by the pixel's own saturation and so barely moves a
+pale pixel at all (measured under "Which way is which" below).
+
 ## Which way is which
 
 Positive and negative are easy to get backwards from reading a formula, so
@@ -1398,12 +1469,50 @@ code and trusted:
 | `hue_curves.hue_sat` (and, by the same code declared convention, `hue_lum`/`lum_sat`/`sat_sat`: all four are multipliers around a neutral of 1.0, `CURVE_AXES` in `grade/slice.py`) | a y value above 1.0 raises saturation (or luminance); below 1.0 lowers it | one point at `y: 1.6`: mean saturation 0.1843 to 0.2949 |
 | `layers.N.correct.exposure` | brighter, the same stops unit `convert.exposure` uses | `exposure: 1.0`: mean luma 0.3780 to 0.5029 |
 | `layers.N.correct.temperature`/`tint` | the same sign as `primaries.temperature`/`tint` above | not a second render: `layer_lut`'s own R/G/B gains are `exposure + temperature`, `exposure + tint`, `exposure - temperature`, the identical formula run on the display side instead of the working space, confirmed by reading `grade/cinegrade.py`'s `layer_lut`; see "Correct" under Layers for its own range table |
+| `primaries.black_lift` | raises the shadow floor (a toe lift) and pushes saturation down as it lifts | `black_lift: 0.1`: p5 0.0978 to 0.1160, p50 0.4201 to 0.4190, p95 0.6618 to 0.6617, sat mean 0.1843 to 0.1716; `black_lift: 0.2`: p5 to 0.1580, p50 to 0.4167, p95 to 0.6613, sat mean to 0.1502 (midtones and highlights barely move; the toe is exactly what moves) |
+| `primaries.highlight_rolloff` | compresses the highlights down (a shoulder), leaves the shadow floor untouched | `highlight_rolloff: 0.15`: p5 unmoved at 0.0978, p50 0.4201 to 0.4190, p95 0.6618 to 0.6543, sat mean 0.1843 to 0.1826; `highlight_rolloff: 0.35`: p5 still 0.0978, p95 to 0.6343, sat mean to 0.1781 |
+| `curves.master` | a point ABOVE the identity diagonal raises luma at that x and lowers saturation; a point BELOW it lowers luma and raises saturation | one point at `[0.5, 0.65]` (above): p5 0.0978 to 0.1519, p50 0.4201 to 0.5711, p95 0.6618 to 0.7898, sat mean 0.1843 to 0.1549; the mirror point `[0.5, 0.35]` (below): p5 to 0.0462, p50 to 0.2789, p95 to 0.5212, sat mean to 0.2277 |
 
 `hue_curves.hue_hue` (an additive offset in turns, not a multiplier: see
 `CURVE_AXES` again) rotates hue the same direction Color Slice's own `hue`
 does, by the same code declared convention as the measured row above; it was
 not separately re-rendered, since it is the same rotation on a different
 curve editor.
+
+The three new rows above were MEASURED the same way as the rest of the
+table, on top of an otherwise default config, `black_lift` and
+`highlight_rolloff` having no dedicated CLI flag: a one line JSON file
+(e.g. `{"primaries": {"black_lift": 0.1}}`, or `{"curves": {"enabled":
+true, "master": [[0.0,0.0],[0.5,0.65],[1.0,1.0]]}}`) handed to `--preset`
+(a literal path works, see "CLI reference" below), then `cinegrade still
+content/footage/A001_09011336_C002.MOV --time 2 --width 320 --preset
+FILE.json -o OUT.png`, then `cinegrade stats --image OUT.png --input-space
+rec709 --working-space rec709 --json`. State `--input-space rec709 --working-space rec709` explicitly whenever a
+JPEG or PNG goes to `--image`: both are already display referred Rec.709
+code, so the flags change nothing here, but naming them costs nothing and
+holds regardless of what a still with no flags at all currently resolves to.
+
+### Color Slice's saturation falloff
+
+A vector's hue weight carries the pixel's own saturation (stated above), so
+the same requested rotation lands harder on a vivid pixel than a pale one.
+MEASURED: three synthetic 64x64 patches, hue 240 (Color Slice's own `blue`
+centre) and HSV value 0.75, at source saturation 0.1, 0.3 and 0.6, built
+with `ffmpeg -f lavfi -i color=c=0x...:s=64x64:d=1` encoded to a one frame
+ProRes `.mov` tagged `bt709`, run through `cinegrade still PATCH.mov
+--input-space rec709 --working-space rec709 --preset FILE.json -o OUT.png`
+(`FILE.json` setting `slice.enabled: true` and `slice.vectors.blue.hue:
+-55`), against the same patch with no slice at all, hue read off the mean
+pixel of each PNG with `colorsys.rgb_to_hsv`:
+
+| Source saturation | Delivered rotation | Fraction of the -55 requested |
+| --- | --- | --- |
+| 0.1 | -3.3 degrees | 6% |
+| 0.3 | -17.3 degrees | 31% |
+| 0.6 | -33.4 degrees | 61% |
+
+A pale sky sits at the low end of this table: a vector's -55 lands as a few
+degrees, not 55, for the same reason the falloff above exists at all.
 
 ## Grain
 
@@ -1439,6 +1548,19 @@ still routes grain to ffmpeg on purpose, which is what gives every output
 frame ffmpeg's own per-frame noise instead of one frozen plate repeated.
 
 ## Detail and denoise
+
+`detail.soften` is a raw gblur sigma IN PIXELS (`f_detail` in
+`grade/cinegrade.py` passes it straight to ffmpeg's `gblur=sigma=`, no
+frame-width scaling the way `mid_detail`'s sigma below gets), so its unit
+depends on the width of whatever is being rendered. `scale_for_preview` in
+`studio/server.py` divides a preview render's copy of it by
+`source_width / preview_width` (multiplies by the inverse, `preview_width /
+source_width`) so a small preview shows the same relative softness a full
+render would, the same treatment halation and bloom's sigmas get; at the
+640 wide default preview against 3840 wide source footage that factor is
+about 1/6, so a `soften` of 0.15 (visibly soft on the full render) becomes
+a sigma near 0.025 in the preview panel, too small to see: the same number
+reads sharp in the preview and soft in the delivered file.
 
 `detail.mid_detail` (-1 to 1) is local contrast: the same split, blur, blend
 idea as sharpen, but on a wide gaussian, sigma 2 percent of the frame width
@@ -1490,6 +1612,18 @@ alone. At `balance` 0.5 the output matches the pixel average of the two
 branches to within 0.50 of 65535, read back at 16 bit. The GPU shader port
 renders the same parallel blend: both new parity rows (`balance` 0.5,
 `balance` 1.0 with `mix2` 1.0) measure EXACT at 640 and 1280 wide.
+
+Both slots' `lut` value (round 2 tooling item 8) resolves in this order,
+stopping at the first hit: an absolute path, or one already valid relative
+to the current directory (unchanged; a browser-launched look never sends
+one of these, only a bare name); then a path relative to `content/` (the
+repo checkout), so a caller does not have to `cd` into `content/` or spell
+an absolute path to point at a cube living elsewhere in the checkout; then
+a bare name (with or without `.cube`) looked up in `grade/luts/looks/`, the
+folder the browser's own dropdown is built from. Nothing not found at any
+of those three stops is an error naming the value that failed and the
+folder and the bare names actually available there, not a generic "file not
+found."
 
 ## Apple Log 2
 
@@ -1930,6 +2064,21 @@ which rectangle it measured rather than "whatever happened to be saved."
 1.0, 1.0]` (the whole frame) whenever the caller gives neither crop, so an
 agent using the client module never depended on this fallback either way.
 
+`rotation` (one of `auto`, `0`, `90`, `180`, `270`) turns the clip before the
+fit measures it, the same field `effective_rotation()` reads on every other
+route; `cinegrade match --rotate` sends it, falling back to `--preset`'s own
+config `rotation` and then `auto` when not given, see "CLI reference" above.
+
+The full response also carries the entire looks catalogue (about 60 entries,
+the same list `GET /api/looks` returns) UNLESS the caller identified itself as
+an agent (`X-Studio-Agent`/`?agent=`, logins off): for that caller the
+`"looks"` key is dropped from this one response (round 2 tooling item 9, see
+"Per caller identity, with logins off" below for the full rule, including a
+Bearer token caller's response, which is never trimmed). A browser tab's own
+`matchReference()` repaints its LUT dropdown straight from this response, so
+that behaviour is unchanged; an agent that wants the catalogue calls
+`GET /api/looks` for it, once, rather than paying for it on every match.
+
 The response also carries `recommended` (bool) and `bands` (for the reference
 image and the source frame, before and after). `recommended` is a yes or no
 reading of whether this ONE fit actually helped: it is `false` when the fit's
@@ -2019,6 +2168,22 @@ agent's "save as" shows up in the browser tab too), refs, looks, and project
 histories. A commit an agent makes is authored `agent:NAME` regardless of what
 `by` a request sends, so a person's tab watching that project's history sees
 exactly who changed what.
+
+Being agent `NAME` (this header, or `?agent=`, or the body field, ALL logins
+off only, see "Getting a token" above for the separate logins-on path) also
+trims two response bodies, round 2 tooling item 9: `POST /api/match` drops
+the `"looks"` key (about 60 entries, the whole LUT catalogue, otherwise
+present on every response so the browser tab's dropdown can repaint without
+a second call) and `POST /api/preset` answers `{"name", "comment", "path",
+"ok"}` instead of `{"saved", "path", "presets"}`, dropping the entire preset
+library listing. Both were free to a browser tab's own dropdown repaint and
+expensive, per call, to an agent with no dropdown to repaint. An agent that
+wants either list asks for it once, `GET /api/looks` or `GET /api/presets`.
+Nothing about what gets saved or matched changes, only the response; a bare
+caller (no header at all) and a Bearer token caller (logins on, "Getting a
+token" above) both keep the untrimmed shape, byte for byte, since this is
+gated on the same `X-Studio-Agent`/`?agent=` identity as everything else in
+this section, which a Bearer token request never sets.
 
 `X-Studio-Attach: 0` (or an account name) makes an agent act on THAT
 session, workspace and match crops, while still signing every write with its
@@ -2207,7 +2372,10 @@ checking even when `ok` is true. On a good fit an agent applies it the same
 way the browser does, `POST /api/session` with
 `{"config": {"look": {"lut": result.name}}}`. Send `name`/`out_dir` so the
 fitted cube lands somewhere this agent owns rather than the shared default
-name (see Match Reference above).
+name (see Match Reference above). The shape above (with `"looks"`, the whole
+catalogue) is what the Bearer token caller shown below gets; a logins-off
+`X-Studio-Agent`/`?agent=` caller gets the same dict with `"looks"` dropped
+("Per caller identity, with logins off" above).
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -2228,9 +2396,13 @@ CONFIG, "by": NAME, "message": TEXT}` and returns `{"key", "updated_at",
 "head"}` (`head` is the commit this save just made, contract C1), read back
 with `GET /api/grade?clip=NAME` (`{"exists", "key", "config", "updated_at",
 "head", "branch"}`). `POST /api/preset` takes `{"name": NAME, "config":
-CONFIG, "comment": TEXT}` and returns `{"saved", "path", "presets"}`, read
-back with `GET /api/preset?name=NAME`. An agent talking to an older build
-that has not shipped `PUT /api/grade` yet should fall back to a preset save;
+CONFIG, "comment": TEXT}` and returns `{"saved", "path", "presets"}` (the
+whole preset library) to a Bearer token caller or a bare one; a logins-off
+`X-Studio-Agent`/`?agent=` caller instead gets `{"name", "comment", "path",
+"ok"}`, no library ("Per caller identity, with logins off" above). Either
+shape is read back with `GET /api/preset?name=NAME`. An agent talking to an
+older build that has not shipped `PUT /api/grade` yet should fall back to a
+preset save;
 either way, follow the write with the matching plain `GET` so the agent is
 not just trusting its own POST or PUT, it is confirming the save actually
 landed. Remember this route does not wake a watching tab ("The `by` field,
@@ -2301,6 +2473,12 @@ return the project dict at the top level with the clip under `"name"`, the
 same shape `GET`/`POST /api/project*` return on the wire ("The routes an
 agent actually needs" above): this module is the one place that shape is
 already unwrapped correctly, so an agent importing it never has to guess.
+`stats_at`, by contrast, hands back `POST /api/stats`'s own `{"results":
+[...]}` envelope unchanged (round 2 tooling item 2: it used to unwrap that
+list for the caller, the one place in this module that did not hand back
+exactly what the route answers); check for the `"results"` key rather than
+assuming it, since an older server without the `times` route simply omits
+it.
 Module level functions, usable without a server at all: `brief(stats)` (one
 readable line), `bands(stats)`, `diff(a, b)` (signed, b minus a; drops
 `definitions` and `bands.edges` from the result, since both are measurement

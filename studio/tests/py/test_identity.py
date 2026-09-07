@@ -409,11 +409,17 @@ class Identity(unittest.TestCase):
 
     def test_15_a_preset_an_agent_saves_is_everybody_s(self):
         name = "l2-identity-probe"
+        # An agent caller gets the trimmed save shape (round 2 tooling item
+        # 5): "name" (no .json suffix, unlike the bare caller's "saved"),
+        # "comment", "path", "ok", no library listing. See test_16 for the
+        # two shapes checked directly against each other.
         saved = call("/api/preset",
                      {"name": name, "config": {"convert": {"exposure": 0.25}},
                       "comment": "saved by an agent"},
                      headers=agent("sonnet"))
-        self.assertEqual(saved["saved"], f"{name}.json")
+        self.assertEqual(saved["name"], name)
+        self.assertEqual(saved["comment"], "saved by an agent")
+        self.assertTrue(saved["ok"])
         # users/0/presets, whoever saved it, so the browser tab sees it.
         self.assertEqual(Path(saved["path"]).parent,
                          Path(STATE["tmp"]).resolve() / "users" / "0"
@@ -425,7 +431,41 @@ class Identity(unittest.TestCase):
         back = call(f"/api/preset?name={urllib.parse.quote(name)}")
         self.assertAlmostEqual(back["config"]["convert"]["exposure"], 0.25)
 
-    def test_16_footage_is_one_shared_root_for_every_caller(self):
+    def test_16_preset_save_shape_differs_by_caller(self):
+        # Round 2 tooling item 5: a bare (browser-shaped) caller keeps the
+        # response savePreset() and fillPresets() in static/app.js actually
+        # read, byte for byte; an agent caller gets confirmation of its own
+        # call instead of the whole preset library re-sent on every save.
+        name = "l2-preset-shape-probe"
+        bare = call("/api/preset",
+                    {"name": name, "config": {"convert": {"exposure": 0.1}},
+                     "comment": "from the browser"})
+        self.assertEqual(bare["saved"], f"{name}.json")
+        self.assertIn("path", bare)
+        self.assertIn("presets", bare)
+        self.assertIn(name, [p["name"] for p in bare["presets"]])
+        for missing in ("name", "comment", "ok"):
+            self.assertNotIn(missing, bare,
+                             f"the browser shape grew a {missing!r} key")
+
+        # A second save, as an agent, with no comment: write_preset() keeps
+        # the existing comment on disk rather than blanking it, and the
+        # agent shape's own "comment" must read back what is actually
+        # there, not just echo the (empty) one this call sent.
+        trimmed = call("/api/preset",
+                       {"name": name, "config": {"convert": {"exposure": 0.2}}},
+                       headers=agent("presetshape"))
+        self.assertEqual(trimmed["name"], name)
+        self.assertEqual(trimmed["comment"], "from the browser",
+                         "the agent shape must report the comment the file "
+                         "actually carries, not the blank one this call sent")
+        self.assertIn("path", trimmed)
+        self.assertTrue(trimmed["ok"])
+        for missing in ("saved", "presets"):
+            self.assertNotIn(missing, trimmed,
+                             f"an agent's response still carries {missing!r}")
+
+    def test_17_footage_is_one_shared_root_for_every_caller(self):
         # Logins are off, so an agent reads the same footage folder user 0
         # does: the library read guards treat it exactly like user 0.
         for headers in (None, agent("sonnet"), agent("opus")):
@@ -436,7 +476,7 @@ class Identity(unittest.TestCase):
                 self.assertIn(clip, names,
                               "an agent could not see the shared footage")
 
-    def test_17_a_commit_by_an_agent_is_signed_by_the_agent(self):
+    def test_18_a_commit_by_an_agent_is_signed_by_the_agent(self):
         clip = STATE["clips"][0]
         session_post({"clip": clip,
                       "config": {"convert": {"exposure": 0.61}},
@@ -448,7 +488,7 @@ class Identity(unittest.TestCase):
 
     # --- the log ----------------------------------------------------------
 
-    def test_18_every_request_is_logged_with_its_caller(self):
+    def test_19_every_request_is_logged_with_its_caller(self):
         call("/api/whoami", headers=agent("logprobe"))
         call("/api/whoami", headers={"X-Studio-Agent": "logprobe",
                                      "X-Studio-Attach": "0"})
@@ -464,7 +504,7 @@ class Identity(unittest.TestCase):
                          r"^\d\d:\d\d:\d\d agent:logprobe GET /api/whoami "
                          r"\d{3} \d+ms$")
 
-    def test_19_the_log_names_the_clip_when_there_is_one(self):
+    def test_20_the_log_names_the_clip_when_there_is_one(self):
         clip = STATE["clips"][0]
         session_post({"clip": clip, "time": 4.0}, agent("clipprobe"))
         lines = [ln for ln in log_text().splitlines()
@@ -474,7 +514,7 @@ class Identity(unittest.TestCase):
 
     # --- the browser is unaffected ---------------------------------------
 
-    def test_20_state_still_has_everything_the_page_reads(self):
+    def test_21_state_still_has_everything_the_page_reads(self):
         out = call("/api/state")
         for key in ("defaults", "clips", "presets", "looks", "refs",
                     "renders", "paths", "stat_definitions", "scope_aspect",

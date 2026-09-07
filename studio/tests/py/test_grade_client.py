@@ -677,8 +677,13 @@ class ContractRoutesLanded(_ServerCase):
         self.assertIn("luma", result["stats"])
 
     def test_stats_at_measures_several_times_in_one_call(self):
-        results = self.studio().stats_at(self.clip, [0.2, 0.8], config={},
-                                         width=200)
+        out = self.studio().stats_at(self.clip, [0.2, 0.8], config={},
+                                     width=200)
+        # stats_at returns the route's own envelope unchanged (round 2
+        # tooling note 2), not the bare "results" list: a caller that reads
+        # out["results"] is reading exactly what POST /api/stats answered.
+        self.assertEqual(set(out), {"results"})
+        results = out["results"]
         self.assertEqual(len(results), 2)
         self.assertIn("time", results[0])
         self.assertIn("stats", results[0])

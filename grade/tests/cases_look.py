@@ -12,6 +12,9 @@ both ends are exact operations and any drift is a real change.
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 import numpy as np
 
 import harness as H
@@ -61,6 +64,62 @@ def _render16(clip, t, cfg):
              "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
     raw = H._run_bytes(args)
     return np.frombuffer(raw, dtype="<u2").reshape(h, w, 3).astype(np.float64)
+
+
+def test_look_lut_accepts_a_run_folder_relative_path(ctx):
+    """Round 2 tooling note 10: look.lut also resolves against CONTENT (the
+    run folder, the repo checkout), not only an absolute path or one
+    relative to the CURRENT DIRECTORY (all `Path(lut).exists()` alone ever
+    covered). Copies a real look cube somewhere else in the checkout
+    (grade/tests/_work, never grade/luts/looks itself, so this never reads
+    as a LUT_LOOKS-by-name hit) and points look.lut at it by a path
+    relative to CONTENT, run with the CURRENT DIRECTORY changed to
+    somewhere outside CONTENT entirely, so the existing CWD-relative check
+    cannot be the one that finds it: only the new CONTENT fallback can."""
+    src = H.CONTENT / "grade" / "luts" / "looks" / f"{LOOK}.cube"
+    if not src.exists():
+        ctx.skip(f"{src} is not present on this machine")
+        return
+    H.WORK.mkdir(parents=True, exist_ok=True)
+    dest = H.WORK / "content_relative_look.cube"
+    dest.write_bytes(src.read_bytes())
+    rel = str(dest.relative_to(H.CONTENT))
+    ctx.note(f"look.lut = {rel!r} (CONTENT-relative, not a LUT_LOOKS name)")
+
+    cfg = H.patch(H.defaults(), {"look": {"lut": rel}})
+    elsewhere = tempfile.mkdtemp(prefix="cinegrade-look-elsewhere-")
+    old_cwd = os.getcwd()
+    os.chdir(elsewhere)
+    try:
+        filt = cg.f_look(cfg)
+    finally:
+        os.chdir(old_cwd)
+    ctx.expect_eq("exactly one lut3d filter is built", len(filt), 1)
+    if filt:
+        ctx.expect_true("the filter points at the CONTENT-relative file, "
+                        "not a LUT_LOOKS lookup",
+                        cg.esc(dest) in filt[0], filt[0])
+
+
+def test_look_lut_missing_names_both_the_looks_folder_and_the_path_option(ctx):
+    """The error for a look.lut that is neither a real path nor a LUT_LOOKS
+    stem names both places a caller could have meant: the looks folder
+    (with what IS actually there, so a typo is obvious) and that a path
+    (absolute or CONTENT-relative) is also accepted, not only a bare
+    name."""
+    cfg = H.patch(H.defaults(), {"look": {"lut": "not-a-real-look-xyz"}})
+    try:
+        cg.f_look(cfg)
+        ctx.expect_true("a bogus look.lut raises", False, "no exception")
+        return
+    except cg.GradeError as exc:
+        msg = str(exc)
+    ctx.note(msg)
+    ctx.expect_true("names the looks folder", str(cg.LUT_LOOKS) in msg, msg)
+    ctx.expect_true("mentions a path is also accepted",
+                    "path" in msg.lower(), msg)
+    ctx.expect_true("names the bad value itself",
+                    "not-a-real-look-xyz" in msg, msg)
 
 
 def test_lut2_null_is_byte_identical_to_today(ctx):
@@ -198,6 +257,14 @@ def test_mix_is_monotone(ctx):
 
 def register(suite):
     g = "look"
+    suite.add(g, "look_lut_accepts_a_run_folder_relative_path",
+              test_look_lut_accepts_a_run_folder_relative_path,
+              doc="look.lut also resolves a path relative to CONTENT, the "
+                  "run folder")
+    suite.add(g, "look_lut_missing_names_both_the_looks_folder_and_the_path_option",
+              test_look_lut_missing_names_both_the_looks_folder_and_the_path_option,
+              doc="the not-found error names LUT_LOOKS and that a path is "
+                  "also accepted")
     suite.add(g, "mix_zero_is_no_look", test_mix_zero_is_no_look,
               doc="mix=0.0 must be pixel-identical to no look at all")
     suite.add(g, "mix_one_is_full_look", test_mix_one_is_the_full_look,

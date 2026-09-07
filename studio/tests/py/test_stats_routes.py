@@ -224,12 +224,14 @@ class StatsRoutesTest(unittest.TestCase):
             return r.read(), dict(r.headers)
 
     def _match(self, **extra):
+        headers = extra.pop("headers", None) or {}
         body = {"clip": self.clip, "ref": REF_GOOD, "time": 2.0, "config": {},
                "method": "reinhard", "strength": 0.6, "luma_preserve": True}
         body.update(extra)
         req = urllib.request.Request(
             self.base + "/match", data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers={"Content-Type": "application/json", **headers},
+            method="POST")
         with urllib.request.urlopen(req, timeout=180) as r:
             return json.loads(r.read())
 
@@ -375,6 +377,32 @@ class StatsRoutesTest(unittest.TestCase):
                                  "and this now improves, pick a new fixture "
                                  "rather than loosening this assertion")
         self.assertFalse(result["recommended"])
+
+    # -- match: agent versus bare caller shape (round 2 tooling item 5) -----
+
+    def test_match_drops_looks_for_an_agent_only(self):
+        # Round 2 tooling item 5: the looks catalogue is about 60 entries,
+        # sent on every call. The browser tab's dropdown reads it
+        # (fillLooks(result.looks) in static/app.js); an agent caller has no
+        # dropdown, so the server omits the field for one only.
+        with tempfile.TemporaryDirectory(prefix="studio-stats-match-shape-") \
+                as tmp:
+            out_dir = str(Path(tmp) / "out")
+            bare = self._match(name="match-shape-bare", out_dir=out_dir)
+            agent = self._match(name="match-shape-agent", out_dir=out_dir,
+                                headers={"X-Studio-Agent": "shapecheck"})
+        self.assertIn("looks", bare)
+        self.assertGreater(len(bare["looks"]), 0,
+                           "a bare caller's response must keep the catalogue")
+        self.assertNotIn("looks", agent,
+                         "an agent caller must not pay for the catalogue")
+        # Everything about the call itself is unchanged either way.
+        for field in ("ok", "name", "lut", "crops", "distance", "lut_health",
+                     "recommended", "bands", "hue_divergence"):
+            self.assertIn(field, bare, f"{field} missing from the bare shape")
+            self.assertIn(field, agent, f"{field} missing from the agent shape")
+        self.assertEqual(bare["name"], "match-shape-bare")
+        self.assertEqual(agent["name"], "match-shape-agent")
 
 
 # --------------------------------------------------------------------------

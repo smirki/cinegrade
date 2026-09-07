@@ -120,6 +120,36 @@ def test_height_width_mutually_exclusive(ctx):
                     r.returncode != 0, f"exit {r.returncode}")
 
 
+def test_region_crops_each_panel_to_its_own_fractions(ctx):
+    """Round 2 tooling note 7: --region X0 Y0 X1 Y1 crops every panel to
+    fractions of THAT PANEL'S OWN size, applied after loading, before the
+    shared height is solved. An asymmetric crop (middle half horizontally,
+    full height) narrows every panel's own width at a fixed shared output
+    height, so a cropped sheet is reliably narrower than an uncropped
+    control sheet built from the same three mixed-aspect stills."""
+    wide, tall, huge = _mixed_aspect_inputs(ctx)
+    full = H.WORK / "sheet_region_full.jpg"
+    cropped = H.WORK / "sheet_region_cropped.jpg"
+    r_full = _cli(["sheet", str(wide), str(tall), str(huge),
+                   "-o", str(full), "--height", "300"])
+    r_cropped = _cli(["sheet", str(wide), str(tall), str(huge),
+                      "-o", str(cropped), "--height", "300",
+                      "--region", "0.25", "0.0", "0.75", "1.0"])
+    ctx.note(f"full exit {r_full.returncode}, cropped exit {r_cropped.returncode}")
+    ctx.expect_eq("uncropped sheet exits 0", r_full.returncode, 0)
+    ctx.expect_eq("cropped sheet exits 0", r_cropped.returncode, 0)
+    if r_full.returncode == 0 and r_cropped.returncode == 0 and \
+            full.exists() and cropped.exists():
+        w_full, h_full = _dims(full)
+        w_cropped, h_cropped = _dims(cropped)
+        ctx.expect_eq("both sheets share the requested panel height",
+                      h_full, h_cropped)
+        ctx.expect_true(
+            "cropping the middle half of every panel narrows the sheet",
+            w_cropped < w_full,
+            f"full width {w_full}, cropped width {w_cropped}")
+
+
 def test_docs_known_heading(ctx):
     r = _cli(["docs", "layers"])
     ctx.expect_eq("docs layers: exit code", r.returncode, 0)
@@ -175,6 +205,10 @@ def register(suite):
     suite.add(g, "height_width_mutually_exclusive",
               test_height_width_mutually_exclusive,
               doc="--height and --width together is a usage error")
+    suite.add(g, "region_crops_each_panel_to_its_own_fractions",
+              test_region_crops_each_panel_to_its_own_fractions,
+              doc="--region crops every panel to fractions of its own size, "
+                  "on mixed aspect inputs")
     suite.add(g, "docs_known_heading", test_docs_known_heading,
               doc="docs prints one section by heading name")
     suite.add(g, "docs_case_insensitive_multi_word",
