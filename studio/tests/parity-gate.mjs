@@ -16,7 +16,14 @@ for (const name of fs.readdirSync(`${CONTENT}/footage`)) {
   if (name.charAt(0) === "." || !fs.statSync(src).isFile()) continue;
   fs.symlinkSync(src, path.join(footageDir, name));
 }
-const srv = spawn(`${CONTENT}/.venv/bin/python`, ["studio/server.py", "--port", String(port), "--footage", footageDir], { cwd: CONTENT, stdio: "ignore" });
+// The cache is deliberately NOT temporary. With STUDIO_DATA_DIR pointed at a
+// fresh temp folder (which is how this gate is always invoked) the server's
+// default cache is <data dir>/cache, so every run re-decodes frames it
+// already measured. This is the harness's own stable cache folder, shared
+// with run.mjs, gitignored, and never the founder's studio/cache.
+const cacheDir = path.join(CONTENT, "studio", "tests", ".cache");
+fs.mkdirSync(cacheDir, { recursive: true });
+const srv = spawn(`${CONTENT}/.venv/bin/python`, ["studio/server.py", "--port", String(port), "--footage", footageDir, "--cache-dir", cacheDir], { cwd: CONTENT, stdio: "ignore" });
 const base = `http://127.0.0.1:${port}`;
 for (let i = 0; i < 60; i++) { try { const r = await fetch(base + "/api/state"); if (r.ok) break; } catch {} await new Promise(r => setTimeout(r, 500)); }
 const browser = await puppeteer.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true, args: ["--use-angle=metal", "--ignore-gpu-blocklist"] });

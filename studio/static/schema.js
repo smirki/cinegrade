@@ -68,6 +68,30 @@
           + "working space to rec709 for footage that is already display "
           + "referred, such as an mp4 or a Rec.709 export coming back for FX.",
       controls: [
+        SEL(["convert", "input"], "input", [
+          { value: "auto", label: "auto (read the file's tags)" },
+          { value: "apple_log", label: "apple_log" },
+          { value: "hlg", label: "hlg (BT.2100)" },
+          { value: "pq", label: "pq (BT.2100 / ST 2084)" },
+          { value: "rec709", label: "rec709 (BT.1886)" },
+          { value: "slog3", label: "slog3 (Sony, S-Gamut3.Cine)" },
+          { value: "logc3", label: "logc3 (ARRI EI 800, Wide Gamut 3)" },
+          { value: "vlog", label: "vlog (Panasonic, V-Gamut)" },
+          { value: "clog3", label: "clog3 (Canon Log 3, Cinema Gamut)" },
+          { value: "dlog", label: "dlog (DJI, D-Gamut)" }
+        ], { title: "What the SOURCE is, not a choice about the grade. auto "
+                  + "reads the file's own transfer and primaries tags: "
+                  + "arib-std-b67 is hlg, smpte2084 is pq, a bt709 transfer "
+                  + "on bt709 primaries is rec709, and a BT.2020 file with no "
+                  + "transfer tag is apple_log, which is every clip this tool "
+                  + "was built for. Set it by hand only when a file's tags are "
+                  + "missing or wrong. Every value lands on the same scene "
+                  + "linear point, so the three controls below mean exactly "
+                  + "what they always did. The clip list shows what auto "
+                  + "resolved to for the open clip. The last five are camera "
+                  + "logs and auto never picks one of them: no container tag "
+                  + "tells S-Log3 from LogC3 from V-Log, so pick the one the "
+                  + "camera shot. Each brings its own gamut with it." }),
         SEL(["convert", "working_space"], "working space", [
           { value: "dwg", label: "dwg (CST in, grade, CST out)" },
           { value: "direct", label: "direct (one LUT to 709)" },

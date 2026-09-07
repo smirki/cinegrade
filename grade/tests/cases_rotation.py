@@ -24,6 +24,10 @@ Now there are five values: auto, 0, 90, 180 and 270. What this file pins:
 
 from __future__ import annotations
 
+import json
+from contextlib import redirect_stdout
+from io import StringIO
+
 import numpy as np
 
 import harness as H
@@ -351,6 +355,170 @@ def test_the_real_clip_renders_at_the_rotated_shape(ctx):
                     f"0 -> {shapes['0']} wide, 90 -> {shapes['90']} wide")
 
 
+# --------------------------------------------------------------------------
+# contract G4: rotation lives in the config, not only on the command line
+# --------------------------------------------------------------------------
+#
+# render, still, stats, scopes and compare all resolve their rotation through
+# cli_rotation(a, cfg): --rotate wins, --no-autorotate (the alias of
+# --rotate 0) wins next, and only then does a non-auto cfg["rotation"] (the
+# preset or grade the command is already loading) get a say. These tests call
+# cli_rotation() the exact way each of those commands calls it, and then feed
+# its answer through probe() the same way each of them does, rather than
+# reimplementing the precedence rules a second time.
+
+class _Args:
+    """A stand in for argparse's Namespace with just the attributes
+    cli_rotation() and cmd_still()/cmd_render() read, so these tests do not
+    have to build a full parsed command line for two or three fields."""
+
+
+def test_cli_rotation_falls_back_to_the_configs_rotation(ctx):
+    a = _Args()
+    a.rotate = None
+    a.no_autorotate = False
+    for value in ("0", "90", "180", "270"):
+        cfg = H.patch(H.defaults(), {"rotation": value})
+        ctx.expect_eq(f"no flag, cfg rotation {value!r}",
+                      cg.cli_rotation(a, cfg), value)
+    ctx.expect_eq("no flag, cfg rotation auto",
+                  cg.cli_rotation(a, H.defaults()), "auto")
+    ctx.expect_eq("no flag, no cfg at all (an old caller) is still auto",
+                  cg.cli_rotation(a), "auto")
+
+
+def test_cli_rotate_flag_beats_the_configs_rotation(ctx):
+    a = _Args()
+    a.rotate = "270"
+    a.no_autorotate = False
+    cfg = H.patch(H.defaults(), {"rotation": "90"})
+    ctx.expect_eq("--rotate 270 over a config asking for 90",
+                  cg.cli_rotation(a, cfg), "270")
+
+
+def test_no_autorotate_still_beats_a_configs_rotation(ctx):
+    """--no-autorotate is --rotate 0 by another name (see the alias test
+    above); a preset's own rotation must lose to it exactly like --rotate
+    does, or the flag would quietly mean two different things depending on
+    which preset happened to be loaded alongside it."""
+    a = _Args()
+    a.rotate = None
+    a.no_autorotate = True
+    cfg = H.patch(H.defaults(), {"rotation": "90"})
+    ctx.expect_eq("--no-autorotate over a config asking for 90",
+                  cg.cli_rotation(a, cfg), "0")
+
+
+def test_still_and_render_honour_the_configs_rotation_with_no_flag(ctx):
+    """cmd_still and cmd_render both build their info dict as
+    `probe(a.input, rotation=cli_rotation(a, cfg))`; this calls that same
+    pair the same way, on the founder's own tagged clip, and checks the
+    config's rotation actually changed what probe reports, not merely that
+    a string passed through unchanged."""
+    a = _Args()
+    a.rotate = None
+    a.no_autorotate = False
+
+    cfg_180 = H.patch(H.defaults(), {"rotation": "180"})
+    cfg_90 = H.patch(H.defaults(), {"rotation": "90"})
+    mode_180 = cg.cli_rotation(a, cfg_180)
+    mode_90 = cg.cli_rotation(a, cfg_90)
+    ctx.expect_eq("cli_rotation reads the 180 config", mode_180, "180")
+    ctx.expect_eq("cli_rotation reads the 90 config", mode_90, "90")
+
+    info_180 = cg.probe(str(TAGGED), rotation=mode_180)
+    info_90 = cg.probe(str(TAGGED), rotation=mode_90)
+    # 180 never swaps width and height; 90 always does (contract C2's own
+    # geometry rule, pinned again above), so two different config values
+    # landing on two different shapes is the proof this is not a no-op.
+    ctx.expect_true(
+        "a config asking for 180 and one asking for 90 do not render at "
+        "the same shape",
+        (info_180["width"], info_180["height"]) != (info_90["width"], info_90["height"]),
+        f"180: {info_180['width']}x{info_180['height']}, "
+        f"90: {info_90['width']}x{info_90['height']}")
+
+
+# --------------------------------------------------------------------------
+# contract G4: orient --json and the suspect heuristic
+# --------------------------------------------------------------------------
+
+def _run_orient_json(path) -> dict:
+    a = _Args()
+    a.input = str(path)
+    a.json = True
+    buf = StringIO()
+    with redirect_stdout(buf):
+        cg.cmd_orient(a)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    return json.loads(lines[-1])
+
+
+def test_rotation_tag_suspect_pure_function(ctx):
+    """The heuristic itself, with no ffmpeg involved: a nonzero tag on a
+    cinema codec is suspect regardless of shape; a phone's own quarter turn
+    on its own landscape-coded sensor frame is not; nothing but a nonzero
+    quarter or half turn is ever considered at all."""
+    ctx.expect_true("a -90 tag on ProRes, landscape coded: suspect (C011)",
+                    cg.rotation_tag_suspect(-90, "prores", 3840, 2160), "")
+    ctx.expect_true("a 90 tag on hevc, landscape coded: not suspect (a phone)",
+                    not cg.rotation_tag_suspect(90, "hevc", 1920, 1080), "")
+    ctx.expect_true("a 90 tag on hevc, but portrait coded: suspect (no phone "
+                    "does this)", cg.rotation_tag_suspect(90, "hevc", 1080, 1920), "")
+    ctx.expect_true("no tag at all: never suspect",
+                    not cg.rotation_tag_suspect(0, "prores", 3840, 2160), "")
+    ctx.expect_true("a 180 tag on ProRes: never suspect (a half turn is not "
+                    "a phone-vs-not question)",
+                    not cg.rotation_tag_suspect(180, "prores", 3840, 2160), "")
+    ctx.expect_true("an unreadable tag refuses quietly rather than raising",
+                    cg.rotation_tag_suspect("not-a-number", "prores", 10, 10) is False, "")
+
+
+def test_orient_json_reports_tag_candidates_and_the_suspect_flag(ctx):
+    """`cinegrade orient IN --json` on C011 (see the module docstring for
+    where this file's own -90-on-a-landscape-ProRes tag came from): the tag,
+    all four fixed candidates and rotation_tag_suspect true, through the
+    identical rotation_tag_suspect() GET /api/state's clip list calls."""
+    c011 = H.CONTENT / "bakeoff" / "sources" / "A001_09061637_C011.mov"
+    if not c011.exists():
+        ctx.skip(f"{c011} is not present on this machine")
+        return
+    out = _run_orient_json(c011)
+    ctx.expect_eq("tag", out.get("tag"), -90)
+    ctx.expect_eq("four fixed candidates, auto excluded",
+                  sorted(out.get("candidates", {})), ["0", "180", "270", "90"])
+    c0 = out["candidates"]["0"]
+    c90 = out["candidates"]["90"]
+    ctx.expect_eq("candidate 0 keeps the coded width", c0["width"], 3840)
+    ctx.expect_eq("candidate 0 keeps the coded height", c0["height"], 2160)
+    ctx.expect_eq("candidate 90 swaps to the coded height as its width",
+                  c90["width"], 2160)
+    ctx.expect_eq("candidate 90 swaps to the coded width as its height",
+                  c90["height"], 3840)
+    ctx.expect_true("C011 (ProRes, a nonzero tag) is flagged suspect",
+                    out.get("rotation_tag_suspect") is True, out)
+
+
+def test_orient_json_on_a_normal_phone_tag_is_not_suspect(ctx):
+    """The contrast case the module docstring promises: a real quarter turn
+    tag that IS what it looks like (an ordinary phone shot, held upright,
+    encoded hevc on its own landscape sensor frame) is not flagged, so the
+    flag is a tell about C011-shaped files and not a blanket "any tag"
+    alarm. IMG_2591 is not on the ProRes side of the bakeoff/sources split;
+    if a clean untagged clip lands in this repo later, add it here rather
+    than replacing this one, since a tagged-but-normal file and a truly
+    untagged file are two different claims."""
+    normal = H.CONTENT / "bakeoff" / "sources" / "IMG_2591.MOV"
+    if not normal.exists():
+        ctx.skip(f"{normal} is not present on this machine")
+        return
+    out = _run_orient_json(normal)
+    ctx.note(f"IMG_2591 tag {out.get('tag')}")
+    ctx.expect_true("a phone's own quarter turn on its own codec is not "
+                    "flagged suspect",
+                    out.get("rotation_tag_suspect") is False, out)
+
+
 def register(suite):
     g = "rotation"
     suite.add(g, "auto_and_zero_match_the_old_boolean",
@@ -383,3 +551,24 @@ def register(suite):
     suite.add(g, "the_real_clip_renders_at_the_rotated_shape",
               test_the_real_clip_renders_at_the_rotated_shape,
               doc="the founder's own footage decodes and turns to the shape probe promised")
+    suite.add(g, "cli_rotation_falls_back_to_the_configs_rotation",
+              test_cli_rotation_falls_back_to_the_configs_rotation,
+              doc="with no flag, cli_rotation reads a non-auto config value")
+    suite.add(g, "cli_rotate_flag_beats_the_configs_rotation",
+              test_cli_rotate_flag_beats_the_configs_rotation,
+              doc="--rotate always wins over whatever the config says")
+    suite.add(g, "no_autorotate_still_beats_a_configs_rotation",
+              test_no_autorotate_still_beats_a_configs_rotation,
+              doc="--no-autorotate (rotate 0) also wins over the config")
+    suite.add(g, "still_and_render_honour_the_configs_rotation_with_no_flag",
+              test_still_and_render_honour_the_configs_rotation_with_no_flag,
+              doc="probe(rotation=cli_rotation(a, cfg)) actually changes shape")
+    suite.add(g, "rotation_tag_suspect_pure_function",
+              test_rotation_tag_suspect_pure_function,
+              doc="the heuristic's two tells, and its refusal to raise on nonsense")
+    suite.add(g, "orient_json_reports_tag_candidates_and_the_suspect_flag",
+              test_orient_json_reports_tag_candidates_and_the_suspect_flag,
+              doc="cinegrade orient C011 --json: tag, four candidates, suspect true")
+    suite.add(g, "orient_json_on_a_normal_phone_tag_is_not_suspect",
+              test_orient_json_on_a_normal_phone_tag_is_not_suspect,
+              doc="a real phone quarter turn on its own codec is not flagged")

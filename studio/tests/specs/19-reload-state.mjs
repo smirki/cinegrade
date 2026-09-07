@@ -183,15 +183,32 @@ export default async function run(ctx) {
     // exactly where they drift, so this checks the header caught up rather
     // than trusting that it did.
     await page.click('.paramtab[data-paramtab="history"]');
+    /* The ceiling is wall clock, and generous, because what is being waited on
+       is a whole History refresh: GET /api/project, then GET
+       /api/project/log?limit=2000, then the graph relayout, and by this point
+       in a full run that log carries every commit the specs before this one
+       made. On a cold frame cache (which is what every --data-dir run has
+       since studio/server.py's _default_cache_dir gave each one its own cache
+       folder) those two requests queue behind about a second of scope and
+       stats rendering at Chrome's six-connections-per-host limit, so a refresh
+       cycle can take seconds rather than the fraction of one the old fixed
+       count of 60 sleeps assumed. On failure it also reports what the server
+       itself said at that moment, so "the panel is stale" and "the project
+       really lost its rotation" are told apart in the evidence line rather
+       than by re-running. */
     let histRot = "";
-    for (let i = 0; i < 60; i++) {
+    const headerDeadline = Date.now() + 20000;
+    for (;;) {
       histRot = await page.evaluate(() =>
         (document.getElementById("histRotation") || {}).textContent || "");
-      if (/90/.test(histRot)) break;
+      if (/90/.test(histRot) || Date.now() >= headerDeadline) break;
       await sleep(100);
     }
     if (!/90/.test(histRot)) {
-      return fail("the History header reads " + JSON.stringify(histRot) + " after the rotation went to 90");
+      const serverSays = await getProject().catch((e) => ({ rotation: "unreadable: " + e }));
+      return fail("the History header reads " + JSON.stringify(histRot)
+        + " after the rotation went to 90 (GET /api/project says rotation "
+        + JSON.stringify(serverSays && serverSays.rotation) + " at that moment)");
     }
     await page.click('.paramtab[data-paramtab="grade"]');
     notes.push("the History header followed the rotation control: " + JSON.stringify(histRot));

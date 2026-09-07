@@ -104,7 +104,8 @@
   // truth: setDefaults() lets a caller hand over the copy the server sent so
   // an engine change cannot silently leave this file behind.
   var DEFAULTS = {
-    convert: { tonemap: "aces", exposure: 0.0, working_space: "dwg", encode: "rec709a" },
+    convert: { tonemap: "aces", exposure: 0.0, input: "auto",
+               working_space: "dwg", encode: "rec709a" },
     primaries: {
       contrast: 1.0, pivot: null, saturation: 1.0, vibrance: 0.0,
       temperature: 0.0, tint: 0.0, brightness: 0.0,
@@ -812,7 +813,10 @@
                 + "silent GPU preview that ignored it would be worse than no "
                 + "preview at all.",
     log: "Exposure and white balance as a log domain offset, one clamped add "
-       + "per channel. Pure arithmetic, no resampling, no quantisation.",
+       + "per channel. Pure arithmetic, no resampling, no quantisation. That "
+       + "offset is Apple Log's stop, so an explicit convert.input of hlg, pq "
+       + "or rec709 falls back to the ffmpeg still instead: those inputs spend "
+       + "a stop through their own transfer, which this shader does not carry.",
     cst_in: "3D LUT, real tetrahedral interpolation on texelFetch of the eight "
           + "surrounding grid points. Hardware trilinear filtering is NOT used: "
           + "it gives a different answer on a 65 cube.",
@@ -918,8 +922,22 @@
     var offR = fmt(+cv.exposure + +p.temperature, 12);
     var offG = fmt(+cv.exposure + +p.tint, 12);
     var offB = fmt(+cv.exposure - +p.temperature, 12);
+    // The shader spends a stop as the Apple Log code offset, which is the
+    // right arithmetic for Apple Log only. On every other input the engine
+    // writes that input's own formula instead, so the same stop would be a
+    // different amount of light here. Reported unsupported rather than
+    // approximated: the caller falls back to the ffmpeg still, the same way
+    // an enabled denoise does.
+    //
+    // "auto" counts as supported because the only clip it can still mean by
+    // the time this runs is an Apple Log one: live.js substitutes the clip's
+    // resolved_input for auto before calling in (see INPUT_CUBE_PREFIX), so
+    // an HLG or camera log clip arrives here named, and lands on the
+    // unsupported side exactly as an explicitly set one does.
+    var logSupported = !cv.input || cv.input === "auto" || cv.input === "apple_log";
     add("log", "Log (exposure, white balance)",
-        Math.abs(offR) > 1e-6 || Math.abs(offG) > 1e-6 || Math.abs(offB) > 1e-6, "exact");
+        Math.abs(offR) > 1e-6 || Math.abs(offG) > 1e-6 || Math.abs(offB) > 1e-6,
+        logSupported ? "exact" : "unsupported");
 
     add("cst_in", "CST in", cv.working_space === "dwg", "exact");
 
@@ -2203,18 +2221,45 @@
 
   // --- LUTs ---------------------------------------------------------
 
+  /* The cube prefix cinegrade.technical_lut_name builds, for every input the
+   * engine can name.
+   *
+   * "auto" used to be the one answer this file could not give: resolving it
+   * needs the FILE's transfer and primaries tags, which never reach the
+   * browser's render loop, so auto asked for the Apple Log cubes and an HLG
+   * clip left on auto previewed a stop or two off the server's render. That
+   * gap is closed from the OTHER side now: live.js takes the clip's own
+   * resolved_input (the answer the server already computed and published in
+   * GET /api/state) and substitutes it for "auto" before this file ever sees
+   * the config, so by the time lutRequests runs the input is concrete. The
+   * auto entry below stays as the fallback for a caller that has no state to
+   * read from, and it keeps its old answer, which is right for every Apple
+   * Log clip.
+   *
+   * The primaries assumed are each input's native ones. For the five camera
+   * logs that is not an assumption at all: their gamut comes with their
+   * curve, since no container tag can name S-Gamut3.Cine or ARRI Wide Gamut 3
+   * (see cinegrade.source_primaries). */
+  var INPUT_CUBE_PREFIX = {
+    auto: "AppleLog", apple_log: "AppleLog", hlg: "HLG", pq: "PQ",
+    rec709: "Rec709", slog3: "SLog3", logc3: "LogC3", vlog: "VLog",
+    clog3: "CLog3", dlog: "DLog"
+  };
+
   function lutRequests(cfg) {
     var reqs = [];
     var cv = cfg.convert;
+    var pre = INPUT_CUBE_PREFIX[cv.input] || "AppleLog";
     if (cv.working_space === "dwg") {
-      reqs.push({ slot: "cstIn", key: "tech:AppleLog_to_DWG.cube",
-                  body: { kind: "technical", name: "AppleLog_to_DWG.cube" } });
+      var i = pre + "_to_DWG.cube";
+      reqs.push({ slot: "cstIn", key: "tech:" + i,
+                  body: { kind: "technical", name: i } });
       var n = "DWG_to_Rec709_" + cv.tonemap + "_" + cv.encode + ".cube";
       reqs.push({ slot: "cstOut", key: "tech:" + n, body: { kind: "technical", name: n } });
     } else {
       // f_convert_out prefers the per encode file and only falls back to the
       // unsuffixed one on an old tree, so ask for the same one it would pick.
-      var d = "AppleLog_to_Rec709_" + cv.tonemap + "_" + cv.encode + ".cube";
+      var d = pre + "_to_Rec709_" + cv.tonemap + "_" + cv.encode + ".cube";
       reqs.push({ slot: "cstOut", key: "tech:" + d, body: { kind: "technical", name: d } });
     }
     /* One cube per layer, or two for the one case that needs two branches.

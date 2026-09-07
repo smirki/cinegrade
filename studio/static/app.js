@@ -163,6 +163,21 @@
     return (dims && dims.width) || S.width;
   }
 
+  /* What the open clip's file actually IS, as the server resolved it.
+   *
+   * The GPU preview cannot work this out for itself: convert.input "auto"
+   * is answered from the file's transfer and primaries tags, which live in
+   * the probe. The server already publishes its answer per clip in
+   * /api/state, so this hands it to StudioLive.renderStill and the GPU asks
+   * for the same technical cube the render would (see live.js
+   * withResolvedInput). Empty when there is no state yet, which leaves the
+   * old behaviour: "auto" means the Apple Log cubes.
+   */
+  function clipResolvedInput() {
+    var entry = S.state && S.state.clips.filter(function (c) { return c.name === S.clip; })[0];
+    return (entry && entry.source && entry.source.resolved_input) || "";
+  }
+
   /* The frame size the graph actually sees at the project's rotation.
    *
    * The same rule the server uses (server.py _rotation_dims): `auto` is the
@@ -310,6 +325,11 @@
    * is already the server's HEAD. */
   function applyServerConfig(config) {
     S.slots[S.active] = clone(config);
+    // Contract G4: this config's own rotation (a checkout, an undo, a redo,
+    // a copied grade) is what the control has to show now, not whatever it
+    // showed a moment ago; see maybeAdoptConfigRotation's own comment for
+    // when it does and does not move the control.
+    maybeAdoptConfigRotation(config);
     lastCommitted = snapshot();
     syncSlotButtons();
     Panels.refresh(cfg(), S.defaults);
@@ -503,7 +523,8 @@
       }).then(function () {
         return StudioLive.renderStill({
           clip: S.clip, time: S.time, width: S.width, rotation: S.rotation,
-          config: cfg(), sourceWidth: clipSourceWidth()
+          config: cfg(), sourceWidth: clipSourceWidth(),
+          resolvedInput: clipResolvedInput()
         });
       }).then(function (r) {
         setStageLayer("gpu");
@@ -598,8 +619,13 @@
     var live = cfg();
     if (!S.defaults || !S.defaults.convert || !live) return null;
     var flat = clone(S.defaults);
-    ["tonemap", "working_space", "encode"].forEach(function (k) {
-      flat.convert[k] = clone(live.convert[k]);
+    // input is copied with the other three because it says what the source
+    // IS, so a bypass that decoded it differently from the graded frame would
+    // be two different pictures rather than a grade against its start. Guarded
+    // with a fallback because a config saved before inputs existed has no
+    // convert.input at all.
+    ["tonemap", "working_space", "encode", "input"].forEach(function (k) {
+      if (live.convert[k] !== undefined) flat.convert[k] = clone(live.convert[k]);
     });
     if ($("beforeExposure").checked) flat.convert.exposure = live.convert.exposure;
     return flat;
@@ -638,7 +664,8 @@
   function renderGpuBypass(bcfg) {
     return StudioLive.renderStill({
       clip: S.clip, time: S.time, width: S.width, rotation: S.rotation,
-      config: bcfg, sourceWidth: clipSourceWidth()
+      config: bcfg, sourceWidth: clipSourceWidth(),
+      resolvedInput: clipResolvedInput()
     }).then(function (r) {
       var src = $("gpuCanvas"), dst = $("bypassCanvas");
       if (dst.width !== src.width || dst.height !== src.height) {
@@ -1280,6 +1307,10 @@
       S.slots[S.active] = j.config;
       S.presetName = name;
       S.presetCfg = clone(j.config);
+      // Contract G4: a preset with a real rotation moves the control to it;
+      // one saved before rotation existed, or saved with auto, leaves the
+      // control on whatever the project or the file tag already had it on.
+      maybeAdoptConfigRotation(j.config);
       lastCommitted = snapshot();
       S.history.length = 0; S.future.length = 0;
       updateUndoButtons();
@@ -2174,6 +2205,22 @@
     scheduleRender(0);
   }
 
+  // Contract G4: a loaded preset or grade that carries a real rotation
+  // moves the control to it, because the config just replaced whatever was
+  // on screen and the control has to describe what is actually about to
+  // render. "auto" (a preset that never set one, or an old preset with no
+  // rotation key at all, filled in by the server's own defaults merge)
+  // leaves the control alone: the project's own rotation, or the file's
+  // tag, keeps deciding, exactly as it did before this config carried an
+  // opinion of its own.
+  function maybeAdoptConfigRotation(config) {
+    var r = config && config.rotation;
+    if (!r) return;
+    r = String(r);
+    if (r === "auto" || ROTATIONS.indexOf(r) < 0) return;
+    if (r !== S.rotation) applyRotation(r);
+  }
+
   function syncRotationButtons() {
     var host = $("rotSeg");
     if (!host) return;
@@ -2188,14 +2235,29 @@
   // The only writer of the project's rotation. The server answers with the
   // whole project record, so the picture, the dimensions readout and the
   // History panel all move off one response.
+  //
+  // Contract G4: rotation is part of a saved grade now, not just the
+  // project's own separate field, so this also stamps config.rotation on
+  // the live config and commits it exactly like a slider release or a
+  // checkbox would (pushHistory, the same function every other control in
+  // this file calls). setRotation is the only caller of pushHistory that
+  // is not reachable from applyProject's own remote-sync path (a long poll
+  // picking up somebody else's change never calls setRotation, only
+  // applyRotation directly), so this cannot echo somebody else's rotation
+  // back at them as a commit of our own.
   function setRotation(value) {
-    if (!S.project || !S.project.open) { applyRotation(value); return Promise.resolve(); }
+    if (!S.project || !S.project.open) {
+      applyRotation(value);
+      if (cfg()) { cfg().rotation = String(value); updateModified(); pushHistory(); }
+      return Promise.resolve();
+    }
     if (value === S.rotation) return Promise.resolve();
     return api("/api/project/rotation", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rotation: String(value), by: "studio" })
     }).then(function (proj) {
       applyProject(proj, {});
+      if (cfg()) { cfg().rotation = String(value); updateModified(); pushHistory(); }
     }).catch(function (e) {
       toast(e.message || String(e), true);
       syncRotationButtons();
@@ -3613,7 +3675,8 @@
     if (S.mask || S.sheet || effectiveMode() !== MODE_AFTER) return;
     var token = ++proxyToken;
     proxySeekPromise = StudioLive.seekProxy(t, cfg, {
-      sourceWidth: clipSourceWidth()
+      sourceWidth: clipSourceWidth(),
+      resolvedInput: clipResolvedInput()
     }).then(function (r) {
       if (token !== proxyToken || !r) return;
       setStageLayer("gpu");
@@ -3664,6 +3727,7 @@
           if (token !== proxyToken || !S.gpuPlaying) return;
           StudioLive.playProxy(cfg, {
             sourceWidth: clipSourceWidth(),
+            resolvedInput: clipResolvedInput(),
             loop: true, loopStart: range.loopStart, loopEnd: range.loopEnd,
             onFrame: function (f) {
               if (token !== proxyToken) return;
@@ -3819,6 +3883,7 @@
       var lastFps = 0;
       StudioLive.startLoop(cfg, {
         sourceWidth: sourceWidth,
+        resolvedInput: clipResolvedInput(),
         onFrame: function (f) {
           S.time = f.time;
           $("timeLabel").textContent = f.time.toFixed(2) + "s";
@@ -4720,7 +4785,8 @@
           renderStill: function (t) {
             return StudioLive.renderStill({
               clip: S.clip, time: t, width: S.width, rotation: S.rotation,
-              config: cfg(), sourceWidth: clipSourceWidth()
+              config: cfg(), sourceWidth: clipSourceWidth(),
+              resolvedInput: clipResolvedInput()
             });
           },
           gpuCanvas: function () { return $("gpuCanvas"); },

@@ -211,9 +211,21 @@ async function main() {
   console.log("[run] isolated footage dir " + footageDir
     + " (" + fs.readdirSync(footageDir).length + " links to real clips)");
 
+  // The cache is the one thing that must NOT be fresh per run. --data-dir
+  // makes the server's default cache <data-dir>/cache, so a temp data dir
+  // means a cold frame, proxy and segment cache and every spec pays a real
+  // ffmpeg decode for frames it measured a minute ago; measured server side,
+  // 800 to 1700 ms cold against 1 to 2 ms warm, which is what made three
+  // specs read their answer before it arrived. This is a stable folder that
+  // belongs to the harness alone (gitignored), so repeat runs are warm again
+  // and the founder's studio/cache is still never touched.
+  const cacheDir = path.join(HERE, ".cache");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  console.log("[run] harness cache dir " + cacheDir + " (kept between runs on purpose)");
+
   const serverLog = { stdout: [], stderr: [] };
   const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
-    "--data-dir", dataDir, "--footage", footageDir], {
+    "--data-dir", dataDir, "--footage", footageDir, "--cache-dir", cacheDir], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });

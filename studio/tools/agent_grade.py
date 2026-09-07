@@ -7,6 +7,12 @@ requirement, not a new dependency) to steer a real grade. It talks to a
 running `studio/server.py` over HTTP exactly the way a browser tab does,
 using the same routes documented in studio/README.md under "Agent API".
 
+The HTTP call (`request`), the reference image decode (`decode`) and the
+measurement function it is decoded for (`measure`, which is `frame_stats`
+imported, not reimplemented) all come from `grade_client`, the first party
+client module beside this file: this script used to carry its own copies of
+all three, and now imports them so there is exactly one of each in the repo.
+
 What it does, in order:
 
 1. GET /api/state for the clip list, the ref list, the parameter defaults
@@ -51,140 +57,33 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
 import sys
-import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
-# --------------------------------------------------------------------------
-# HTTP, stdlib only
-# --------------------------------------------------------------------------
-
-
-class AgentError(Exception):
-    """Something the operator can fix: a bad flag, a 4xx from the server."""
-
-
-def _url(base: str, path: str, params: dict | None = None) -> str:
-    url = base.rstrip("/") + path
-    if params:
-        clean = {k: v for k, v in params.items() if v is not None}
-        if clean:
-            url += "?" + urllib.parse.urlencode(clean)
-    return url
-
-
-def request(method: str, base: str, path: str, token: str | None = None,
-           params: dict | None = None, body: dict | None = None,
-           want_json: bool = True, timeout: float = 60.0):
-    """One HTTP call. Raises AgentError with the server's own message on a
-    4xx/5xx, because "the server said X" is the whole point of a tool whose
-    job is to show every step honestly, including the failing ones.
-    """
-    url = _url(base, path, params)
-    data = None
-    headers = {}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        msg = raw.decode("utf-8", "replace")
-        try:
-            msg = json.loads(msg).get("error", msg)
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        raise AgentError(f"{method} {path} -> HTTP {exc.code}: {msg}") from None
-    except urllib.error.URLError as exc:
-        raise AgentError(f"{method} {path} -> could not reach {base}: "
-                         f"{exc.reason}") from None
-    if not want_json:
-        return raw
-    if not raw:
-        return {}
-    return json.loads(raw)
-
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from grade_client import StudioError as AgentError  # noqa: E402
+from grade_client import decode as _decode           # noqa: E402
+from grade_client import measure as _measure         # noqa: E402
+from grade_client import request                     # noqa: E402
 
 # --------------------------------------------------------------------------
 # reading a reference image the way an agent has to: over the network, not
-# off local disk. GET /api/ref returns a JPEG; ffmpeg (already a studio
-# requirement, invoked the same way server.py invokes it) turns that into
-# raw pixels, and the small stats function below is a pure Python
-# reimplementation of the same handful of numbers server.py's frame_stats()
-# computes with numpy, so a reference image and a rendered clip frame are
-# measured on the same definitions and can be compared directly.
+# off local disk. GET /api/ref returns a JPEG; grade_client.decode (ffmpeg
+# under the hood, already a studio requirement) turns that into raw pixels,
+# and grade_client.measure is frame_stats() itself, the same function
+# server.py measures a rendered clip frame with, so a reference image and a
+# clip are measured on the same definitions and can be compared directly.
 # --------------------------------------------------------------------------
-
-def measure_rgb24(data: bytes, width: int, height: int) -> dict:
-    n = width * height
-    if n <= 0 or len(data) < n * 3:
-        raise AgentError("decoded reference image is smaller than its own "
-                         "reported dimensions")
-    sum_r = sum_g = sum_b = 0.0
-    sum_sat = 0.0
-    luma = [0.0] * n
-    for i in range(n):
-        o = i * 3
-        r, g, b = data[o], data[o + 1], data[o + 2]
-        rf, gf, bf = r / 255.0, g / 255.0, b / 255.0
-        sum_r += rf
-        sum_g += gf
-        sum_b += bf
-        mx = max(rf, gf, bf)
-        mn = min(rf, gf, bf)
-        sum_sat += 0.0 if mx <= 1e-6 else (mx - mn) / mx
-        luma[i] = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf
-    luma.sort()
-
-    def pct(p: float) -> float:
-        idx = p / 100.0 * (n - 1)
-        lo = int(idx)
-        hi = min(lo + 1, n - 1)
-        frac = idx - lo
-        return luma[lo] + (luma[hi] - luma[lo]) * frac
-
-    return {
-        "luma": {"p5": pct(5), "p25": pct(25), "p50": pct(50), "p75": pct(75),
-                 "p95": pct(95), "mean": sum(luma) / n},
-        "saturation": {"mean": sum_sat / n},
-        "channels": {"r": sum_r / n, "g": sum_g / n, "b": sum_b / n},
-    }
-
 
 def measure_reference_image(base: str, token: str | None, name: str,
                             width: int) -> dict:
+    # decode() and measure() already raise AgentError (grade_client's own
+    # StudioError, imported under this file's name for it) with a clear
+    # message on a bad fetch or a bad decode, so there is nothing to add
+    # here by wrapping it a second time.
     jpeg = request("GET", base, "/api/ref", token=token,
                    params={"name": name, "w": width}, want_json=False)
-    with tempfile.TemporaryDirectory(prefix="agent_grade_ref_") as tmp:
-        jpg_path = Path(tmp) / "ref.jpg"
-        jpg_path.write_bytes(jpeg)
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "json",
-             str(jpg_path)],
-            capture_output=True, text=True)
-        if probe.returncode != 0:
-            raise AgentError(f"ffprobe could not read the fetched reference "
-                             f"image: {probe.stderr.strip()}")
-        dims = json.loads(probe.stdout)["streams"][0]
-        w, h = int(dims["width"]), int(dims["height"])
-        raw = subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", str(jpg_path),
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-frames:v", "1", "-"],
-            capture_output=True)
-        if raw.returncode != 0 or len(raw.stdout) < w * h * 3:
-            raise AgentError("ffmpeg could not decode the fetched reference "
-                             f"image: {raw.stderr.decode('utf-8', 'replace')}")
-    return measure_rgb24(raw.stdout, w, h)
+    return _measure(_decode(jpeg, width=width))
 
 
 # --------------------------------------------------------------------------

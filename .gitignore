@@ -6,6 +6,7 @@ grade/luts/
 grade/tests/_work/
 studio/cache/
 studio/data/
+studio/tests/.cache/
 .venv/
 node_modules/
 __pycache__/
@@ -13,3 +14,14 @@ __pycache__/
 .DS_Store
 studio/shots/
 grade/stills/
+
+# captions: keep the reference stills (the bare "refs/" rule above would eat
+# them), drop the cached stages and the rendered video
+!captions/refs/
+captions/work/
+captions/out/
+captions/omni-test/*.mp4
+
+# grading bakeoff: sources, reference stills, agent runs and the throwaway server data
+bakeoff/*
+!bakeoff/*.md

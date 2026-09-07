@@ -109,6 +109,40 @@ export default async function run(ctx) {
     return state;
   }
 
+  /* Is #undoBtn STILL disabled after giving the commit time to come back?
+     Since contract C4 the button's enabled state is computed from the project
+     response (updateUndoButtons reads head_commit.parent), so a click plus a
+     fixed sleep is not a wait for it: spec 09 says the same thing in its own
+     header and polls. Returns true only when the ceiling ran out with the
+     button still disabled, so every assertion built on it is unchanged. */
+  async function undoStillDisabled(ceilingMs) {
+    const deadline = Date.now() + (ceilingMs || 20000);
+    for (;;) {
+      if (!(await page.$eval("#undoBtn", (el) => el.disabled))) return false;
+      if (Date.now() >= deadline) return true;
+      await sleep(100);
+    }
+  }
+
+  /* Wait until the SERVER's copy of this clip's config satisfies pred, i.e.
+     until the commit a click just fired has actually landed. This is what has
+     to be true before ANY Undo: #undoBtn is enabled by every earlier commit
+     too, so "enabled" never proved that the newest edit was on the server,
+     and clicking Undo while that edit is still in flight pops the PREVIOUS
+     commit and lets the in-flight one land on top of the undone head, which
+     reads exactly like "undo did nothing". Returns the config that satisfied
+     pred, or null when the ceiling ran out. */
+  async function waitForServerConfig(pred, ceilingMs) {
+    const deadline = Date.now() + (ceilingMs || 20000);
+    const ok = (g) => !!(g && g.exists && g.config && pred(g.config));
+    let g = await getGrade(clipName);
+    while (!ok(g) && Date.now() < deadline) {
+      await sleep(120);
+      g = await getGrade(clipName);
+    }
+    return ok(g) ? g.config : null;
+  }
+
   function layerAt(cfg, idx) {
     return (cfg && Array.isArray(cfg.layers) && cfg.layers[idx]) || null;
   }
@@ -239,7 +273,7 @@ export default async function run(ctx) {
     if ((layerAt(cfg, 0) || {}).name !== "Layer 1") {
       return fail('the first added layer is named "' + (layerAt(cfg, 0) || {}).name + '", expected "Layer 1"');
     }
-    let undoDisabled = await page.$eval("#undoBtn", (el) => el.disabled);
+    let undoDisabled = await undoStillDisabled();
     if (undoDisabled) return fail("adding a layer left #undoBtn disabled, so it committed no history step");
 
     await addBtn.click();
@@ -381,11 +415,42 @@ export default async function run(ctx) {
     }
     notes.push("Move up swapped the two layers and the .selected marker followed Sky Fix to index 0");
 
-    undoDisabled = await page.$eval("#undoBtn", (el) => el.disabled);
+    /* The move's own commit has to be ON THE SERVER before Undo is pressed,
+       or Undo pops whatever was committed before it (the window drag in step
+       4) and the move's in-flight commit then lands on top of that undone
+       head, leaving the moved order on screen for good. That is not a slow
+       server, it is the wrong commit being undone, and no amount of waiting
+       afterwards recovers it. */
+    const movedOnServer = await waitForServerConfig((c) =>
+      Array.isArray(c.layers) && c.layers.length === 2
+      && (c.layers[0] || {}).name === "Sky Fix");
+    if (!movedOnServer) {
+      const g = await getGrade(clipName);
+      return fail("Move up never reached the server: GET /api/grade still holds "
+        + JSON.stringify(g && g.config && g.config.layers && g.config.layers.map((l) => l.name)));
+    }
+
+    undoDisabled = await undoStillDisabled();
     if (undoDisabled) return fail("the move left #undoBtn disabled, so it committed no history step");
     await page.click("#undoBtn");
-    await sleep(200);
+    /* Undo is a server round trip since contract C4 (#undoBtn posts to
+       /api/project/undo and the answer is what lands on screen), so this waits
+       for that answer rather than guessing a sleep, the same way spec 09 does
+       and for the reason spec 09 states: "It can no longer sleep a fixed 150 ms
+       and read: every step is a round trip." Measured on a cold frame cache
+       (which is what a fresh --data-dir run has since studio/server.py's
+       _default_cache_dir gave every --data-dir server its own cache folder):
+       the scope and stats renders that follow the move's own commit take about
+       a second each, Chrome queues this undo behind them at its six connection
+       per host limit, and the answer can arrive after 400 ms. The assertion
+       below is unchanged: an undo that never lands, or lands on the wrong
+       commit, runs this loop out and reports the same failure. */
+    const undoDeadline = Date.now() + 20000;
     cfg = await readConfig();
+    while ((layerAt(cfg, 0) || {}).placement !== "after_look" && Date.now() < undoDeadline) {
+      await sleep(100);
+      cfg = await readConfig();
+    }
     if ((layerAt(cfg, 0) || {}).placement !== "after_look" || (layerAt(cfg, 1) || {}).name !== "Sky Fix") {
       return fail("one undo after Move up left the order at " + JSON.stringify(cfg.layers.map((l) => l.name)) + ", expected the original order restored");
     }
@@ -434,7 +499,26 @@ export default async function run(ctx) {
 
     // --- 7. reload proves the round trip through the real server -----------
     await waitForGradeSettled(SETTLE_MS);
-    const onServer = await getGrade(clipName);
+    /* waitForGradeSettled above is not enough on its own any more: since
+       contract C4 the commit IS the save, grades.js no longer runs a debounced
+       PUT, and #gradeSaveState now reads "committed <short id>" rather than
+       cycling through saving/saved, so that helper returns the moment it is
+       asked. The remove's own commit is still a POST /api/session in flight,
+       and on a cold frame cache (every --data-dir run has one since
+       studio/server.py's _default_cache_dir gave each its own cache folder) it
+       queues behind about a second of scope and stats rendering at Chrome's
+       six-connections-per-host limit. So poll the server for the answer, with
+       a ceiling, instead of reading once and hoping. The assertion underneath
+       is unchanged: a remove that never reaches the server runs the loop out
+       and reports exactly the same failure. */
+    const serverDeadline = Date.now() + 20000;
+    let onServer = await getGrade(clipName);
+    while (Date.now() < serverDeadline
+           && !(onServer.exists && Array.isArray(onServer.config.layers)
+                && onServer.config.layers.length === 1)) {
+      await sleep(150);
+      onServer = await getGrade(clipName);
+    }
     if (!onServer.exists || !Array.isArray(onServer.config.layers) || onServer.config.layers.length !== 1) {
       return fail("GET /api/grade for " + clipName + " does not hold the one-layer config the UI just showed: " + JSON.stringify(onServer.config && onServer.config.layers));
     }
@@ -442,7 +526,18 @@ export default async function run(ctx) {
     await page.goto(base + "/", { waitUntil: "domcontentloaded", timeout: 30000 });
     await ctx.waitForBootComplete(20000);
     await waitForGradeSettled(SETTLE_MS);
-    const afterReload = await readConfig();
+    // Same reason as the poll above: waitForBootComplete only proves the panels
+    // rendered, and the clip's own config arrives later, on the answer to
+    // selectClip's POST /api/project/open. The line the server holds was
+    // already checked above, so this waits for the page to catch up with it
+    // rather than reading while the boot fetch is still in the air.
+    const reloadDeadline = Date.now() + 20000;
+    let afterReload = await readConfig();
+    while (Date.now() < reloadDeadline
+           && !(Array.isArray(afterReload.layers) && afterReload.layers.length === 1)) {
+      await sleep(150);
+      afterReload = await readConfig();
+    }
     if (!Array.isArray(afterReload.layers) || afterReload.layers.length !== 1) {
       return fail("after a reload config.layers is " + JSON.stringify(afterReload.layers) + ", expected the one saved layer");
     }

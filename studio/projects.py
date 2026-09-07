@@ -288,6 +288,7 @@ _LABELS = {
     "prep.denoise.enabled": "denoise",
     "prep.denoise.spatial": "denoise spatial",
     "prep.denoise.temporal": "denoise temporal",
+    "convert.input": "input",
     "convert.working_space": "working space",
     "convert.tonemap": "tone map",
     "convert.encode": "output gamma",

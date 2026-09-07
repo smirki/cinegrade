@@ -503,6 +503,14 @@ COVERED_ELSEWHERE = {
     "slice.tetra.c": "slice.tetra_pins_black_and_white",
     "slice.tetra.m": "slice.tetra_pins_black_and_white",
     "slice.tetra.y": "slice.tetra_pins_black_and_white",
+    # convert.input is what the SOURCE is, not a dial on the grade, so a lo/hi
+    # sweep on one Apple Log test frame cannot show it: forcing "hlg" on an
+    # Apple Log clip does move pixels, but only by decoding it with the wrong
+    # curve, which is the failure the parameter exists to prevent rather than
+    # the behaviour it promises. The input group instead feeds each input its
+    # own 18 percent grey code and asserts all four land on the same output.
+    "convert.input": "input.eighteen_percent_grey_lands_in_the_same_place_"
+                     "for_every_input",
     "output.codec": "output.codec_and_profile",
     "output.profile": "output.codec_and_profile",
     "output.crf": "output.crf_and_preset",
@@ -541,6 +549,14 @@ COVERED_ELSEWHERE = {
     "look.lut2": "look.balance_one_is_lut2_alone",
     "look.mix2": "look.balance_one_is_lut2_alone",
     "look.balance": "look.balance_half_is_the_average",
+    # rotation (contract G4). A five-value choice (auto, 0, 90, 180, 270),
+    # not a scalar with a lo/hi direction a render-and-compare sweep could
+    # assert a "rises with" or "falls with" claim about, so it is exercised
+    # by the whole rotation group instead: cases_rotation.py's own compat,
+    # geometry, direction and config-precedence tests, plus
+    # studio/tests/py/test_rotation.py for the server's request/config/
+    # project/tag resolution order.
+    "rotation": "rotation.cli_rotation_falls_back_to_the_configs_rotation",
 }
 
 

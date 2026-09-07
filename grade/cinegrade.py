@@ -26,12 +26,14 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from copy import deepcopy
 from pathlib import Path
 
@@ -61,6 +63,15 @@ class GradeError(Exception):
 DEFAULTS = {
     "convert": {
         "tonemap": "aces", "exposure": 0.0,
+        # What the SOURCE is, which is a fact about the file rather than a
+        # choice about the grade. "auto" reads it off the file's own transfer
+        # and primaries tags (see resolve_input); the explicit values are
+        # there for a file whose tags are missing or lying, and for the five
+        # camera logs, which no container tag can describe and which auto
+        # therefore never picks. Every one of them decodes to the same scene
+        # linear BT.2020 point, so working_space, tonemap and encode below
+        # mean exactly what they always meant.
+        "input": "auto",
         # dwg    = CST in to DaVinci Wide Gamut, grade there, CST out (default)
         # direct = one LUT straight to Rec.709
         # rec709 = the source is ALREADY display referred Rec.709, so there is
@@ -171,6 +182,18 @@ DEFAULTS = {
     # the shape of one layer and the merge base every layer is filled in from.
     "layers": [],
     "output": {"codec": "prores_ks", "profile": 3, "crf": 16, "preset": "slow"},
+    # "auto" (today's behaviour, honour the file's display matrix), or "0",
+    # "90", "180", "270" to ignore the tag and turn the picture that many
+    # degrees clockwise regardless of what it carries. This is a config key,
+    # not a request-only field, on purpose (contract G4): rotation is part of
+    # a saved grade, so a preset or a grade written with a non-auto value
+    # keeps it, and loading that preset or grade back onto its own clip
+    # renders it the way its author saw it rather than falling back to
+    # whatever the project or the file tag says. config_diff (studio/server.py)
+    # compares every key against DEFAULTS, so this one is no exception: "auto"
+    # here is stripped from a saved preset or grade exactly like every other
+    # untouched default, and a real value survives the round trip for free.
+    "rotation": "auto",
 }
 
 
@@ -330,9 +353,74 @@ def probe(path: str, autorotate: bool = True, rotation=None) -> dict:
         "autorotate": mode == "auto",
         "pix_fmt": st.get("pix_fmt"), "color_range": st.get("color_range", "tv"),
         "color_space": st.get("color_space", "bt2020nc"),
+        # The transfer and the primaries, separately, because they answer two
+        # different questions and a file can get one right and the other wrong.
+        # color_space above is the YUV MATRIX, which is a third thing again and
+        # is all this engine used to have. Absent rather than defaulted: an
+        # untagged file has to stay distinguishable from a tagged one, since
+        # "no transfer tag on a BT.2020 file" is exactly what an Apple Log
+        # clip looks like (see resolve_input).
+        "color_transfer": st.get("color_transfer", ""),
+        "color_primaries": st.get("color_primaries", ""),
         "nb_frames": st.get("nb_frames"), "duration": st.get("duration"),
         "codec": st.get("codec_name"), "profile": st.get("profile"),
     }
+
+
+# A nonzero display matrix tag on one of these codecs is worth a second look
+# (see rotation_tag_suspect below): none of them are what a phone writes.
+# ProRes, DNxHD/HR and CineForm are edit-friendly mezzanine codecs a camera
+# on a rig or gimbal writes; the raw formats are sensor dumps straight off a
+# cinema camera body. A phone shooting native video writes h264 or hevc.
+_CINEMA_CODECS = ("prores", "dnxhd", "dnxhr", "cineform", "r3d", "braw",
+                  "arriraw", "cinemadng")
+
+
+def rotation_tag_suspect(tag, codec, coded_width, coded_height) -> bool:
+    """Advisory only: does this clip's display-matrix rotation look wrong.
+
+    Nothing reads this to change what gets rendered; it only exists so an
+    agent (or `cinegrade orient IN --json`, or the studio's clip list) can
+    flag a file worth a human look instead of trusting every tag blindly.
+    False positives are fine here (a shrug that says "maybe check this
+    one"); a silent false negative on a file that really is sideways is the
+    failure this exists to avoid, so the two tells below are deliberately
+    generous rather than narrow.
+
+    A tag of 0 or 180 is never suspect: it does not change which side is up
+    versus down, only up versus... still up, so there is nothing here for a
+    quarter-turn tell to catch. Given a nonzero quarter turn, either tell
+    below is enough on its own to flag it:
+
+    1. The file is one of _CINEMA_CODECS. Phones write a rotation tag
+       because they physically rotate in the hand; a camera that masters to
+       one of these codecs ships flat and gets corrected in an edit, not by
+       a display-matrix atom, so a tag here is very often stale or
+       hand-entered metadata rather than the picture's own orientation.
+       This is exactly A001_09061637_C011.mov: a ProRes file with a -90 tag
+       on a shot that is already landscape.
+    2. The tag is a quarter turn (90 or 270, either sign) and the CODED
+       frame (`coded_width`/`coded_height`: the decoder's own width and
+       height, from probing at rotation="0", before any tag is applied) is
+       already taller than it is wide. A phone's sensor is fixed landscape,
+       so a phone only ever writes a quarter-turn tag on a landscape-coded
+       frame; a quarter turn on a frame that is already portrait-coded is
+       not a shape a phone produces, so it reads as a copied-over or
+       hand-set tag instead.
+    """
+    try:
+        deg = int(tag or 0)
+    except (TypeError, ValueError):
+        return False
+    if deg % 180 == 0:
+        return False
+    if any(name in str(codec or "").lower() for name in _CINEMA_CODECS):
+        return True
+    try:
+        cw, ch = int(coded_width), int(coded_height)
+    except (TypeError, ValueError):
+        return False
+    return deg % 360 in (90, 270) and ch > cw
 
 
 # --------------------------------------------------------------------------
@@ -350,6 +438,341 @@ def source_matrix(info) -> str:
     matrix keeps the old bt2020 answer, so no camera clip changes.
     """
     return "bt709" if (info or {}).get("color_space") in DISPLAY_MATRICES else "bt2020"
+
+
+# --------------------------------------------------------------------------
+# convert.input: what the source actually is
+# --------------------------------------------------------------------------
+#
+# This engine decoded every source as Apple Log, because that is what it was
+# built for. An HLG phone clip pushed down that path lands about three stops
+# dark with crushed blacks, and nothing says so. The input stage exists to make
+# the decode a fact read off the file instead of an assumption.
+#
+# The rule is one line long: the transfer tag picks the curve, the primaries
+# tag picks the matrix, and they are answered separately because a file can
+# carry BT.2020 primaries with a Rec.709 transfer or the other way round. The
+# YUV matrix (color_space, used by source_matrix above) is a third tag again
+# and is not part of this decision.
+
+# The five camera logs, kept as their own tuple because several rules below
+# are about "is this a manufacturer's log curve" and not about one name.
+#
+# None of them is ever the answer to "auto". A container has no tag that tells
+# S-Log3 from LogC3 from V-Log: all five come off the camera labelled BT.2020
+# primaries with either no transfer tag or a bt2020 one, which is the same
+# thing an Apple Log file looks like. Guessing between them would be guessing
+# between five different pictures, so they are explicit values only and auto
+# keeps answering apple_log for an untagged BT.2020 file exactly as it did.
+CAMERA_LOG_INPUTS = ("slog3", "logc3", "vlog", "clog3", "dlog")
+
+INPUTS = ("auto", "apple_log", "hlg", "pq", "rec709") + CAMERA_LOG_INPUTS
+
+# ffprobe's spelling of each transfer characteristic, and the input it means.
+# Both HLG spellings appear in the wild: ffprobe prints "arib-std-b67", and
+# some tools write "arib_std_b67".
+TRANSFER_INPUTS = {
+    "arib-std-b67": "hlg",
+    "arib_std_b67": "hlg",
+    "smpte2084": "pq",
+    "bt709": "rec709",
+    "bt2020-10": "rec709",   # the BT.2020 OETF is the BT.709 curve at 10 bit
+    "bt2020-12": "rec709",
+    "bt2020_10bit": "rec709",
+    "bt2020_12bit": "rec709",
+}
+
+# A transfer tag that says nothing. An Apple Log file carries none of these
+# tags at all, which is why an untagged BT.2020 file resolves to apple_log.
+UNKNOWN_TRANSFERS = {"", "unknown", "unspecified", "reserved", "n/a"}
+
+# The two primaries sets this engine can build a cube for.
+PRIMARIES_TAGS = {
+    "bt709": "bt709", "bt470bg": "bt709", "smpte170m": "bt709",
+    "smpte240m": "bt709", "unknown": "", "unspecified": "", "reserved": "",
+    "bt2020": "bt2020",
+}
+
+# Where each input's own standard puts its primaries, used when the file does
+# not say. Mirrors colorlib.INPUT_NATIVE_PRIMARIES; stated again here so the
+# CLI does not have to import numpy and colour-science to answer it.
+NATIVE_PRIMARIES = {"apple_log": "bt2020", "hlg": "bt2020", "pq": "bt2020",
+                    "rec709": "bt709", "slog3": "sgamut3cine",
+                    "logc3": "awg3", "vlog": "vgamut",
+                    "clog3": "cinemagamut", "dlog": "dgamut"}
+
+
+def source_primaries(info, resolved: str = "apple_log") -> str:
+    """The primaries this source is on.
+
+    "bt709" or "bt2020" for the four inputs a container can describe, and the
+    camera's own gamut for the five it cannot.
+
+    An untagged or unrecognised file falls back to the resolved input's own
+    native primaries, which for apple_log is bt2020, exactly what this engine
+    has always assumed.
+
+    A camera log's gamut is NOT read off the file, and that is on purpose.
+    There is no code point in any container for S-Gamut3.Cine, ARRI Wide Gamut
+    3, V-Gamut, Cinema Gamut or D-Gamut, so those files carry "bt2020" (the
+    nearest available label) or nothing at all. Reading that tag would matrix
+    a V-Log file as though it were BT.2020 and quietly desaturate it. The
+    curve and its gamut are one decision the camera made together, so naming
+    the curve names the gamut.
+    """
+    native = NATIVE_PRIMARIES.get(resolved, "bt2020")
+    if native not in ("bt709", "bt2020"):
+        return native
+    tag = str((info or {}).get("color_primaries") or "").strip().lower()
+    return PRIMARIES_TAGS.get(tag, "") or native
+
+
+def resolve_input(cfg, info=None) -> tuple[str, list[str]]:
+    """(input name, warnings) for this config and this file.
+
+    An explicit convert.input wins and is never second-guessed: the caller can
+    see the picture and the metadata cannot. "auto" reads the file:
+
+      transfer arib-std-b67                     -> hlg
+      transfer smpte2084                        -> pq
+      transfer bt709 with bt709 primaries       -> rec709
+      no usable transfer tag                    -> apple_log
+      anything else                             -> apple_log, with a warning
+
+    "auto" never answers with a camera log. S-Log3, LogC3, V-Log, Canon Log 3
+    and D-Log all arrive tagged the same way an Apple Log file is (BT.2020
+    primaries, no transfer tag the standards define), so the container cannot
+    tell them apart and a guess would be a guess between five different
+    pictures. Those five are set by hand or not at all.
+
+    The fourth line is what keeps every existing grade byte identical: an
+    Apple Log clip carries BT.2020 primaries and no transfer tag at all, so
+    "auto" gives it exactly the decode it has always had, and so does any
+    hand-built info dict that has no tags in it either.
+
+    The last line is deliberately a warning and not a refusal. A file with an
+    unexpected pair of tags still renders the way it always did, and the
+    warning names the tag so the user can set convert.input themselves.
+    """
+    cfg = cfg or {}
+    chosen = str((cfg.get("convert") or {}).get("input") or "auto").lower()
+    if chosen not in INPUTS:
+        raise GradeError(f"convert.input must be one of {', '.join(INPUTS)}, "
+                         f"got {chosen!r}")
+    if chosen != "auto":
+        return chosen, []
+
+    info = info or {}
+    transfer = str(info.get("color_transfer") or "").strip().lower()
+    primaries = str(info.get("color_primaries") or "").strip().lower()
+    if transfer in UNKNOWN_TRANSFERS:
+        return "apple_log", []
+    guess = TRANSFER_INPUTS.get(transfer)
+    if guess in ("hlg", "pq"):
+        return guess, []
+    if guess == "rec709" and PRIMARIES_TAGS.get(primaries) == "bt709":
+        return "rec709", []
+    return "apple_log", [
+        f"transfer tag {transfer!r} with primaries {primaries or 'unset'!r} is "
+        f"not one this engine recognises on its own, so the source is being "
+        f"decoded as Apple Log (what it has always done). Set convert.input to "
+        f"one of {', '.join(INPUTS[1:])} if that is wrong."]
+
+
+def input_of(cfg, info=None) -> str:
+    """resolve_input's answer without the warnings, for the graph builders."""
+    return resolve_input(cfg, info)[0]
+
+
+def technical_lut_name(source: str, primaries: str, stage: str,
+                       tonemap: str = "aces", encode: str = "") -> str:
+    """The file name of one technical cube.
+
+    One function so the generator (grade/tools/make_cst.py) writes the exact
+    name the engine later looks for. The Apple Log names are the ones this
+    repository already ships and must not move:
+
+        AppleLog_to_DWG.cube
+        AppleLog_to_Rec709_aces_rec709a.cube
+
+    A source that is not on its input's native primaries gets an infix naming
+    the primaries it really is on, so Rec.709 on BT.2020 primaries is
+    Rec709_2020_to_DWG.cube and there is no way to load the wrong matrix.
+
+    A camera log never takes that infix: its gamut comes with its curve (see
+    source_primaries), so there is one cube set per camera log and it is named
+    SLog3_to_DWG.cube, LogC3_to_DWG.cube and so on.
+    """
+    label = {"apple_log": "AppleLog", "hlg": "HLG", "pq": "PQ",
+             "rec709": "Rec709", "slog3": "SLog3", "logc3": "LogC3",
+             "vlog": "VLog", "clog3": "CLog3", "dlog": "DLog"}[source]
+    if primaries and primaries != NATIVE_PRIMARIES[source]:
+        label += {"bt709": "_709", "bt2020": "_2020"}[primaries]
+    if stage == "dwg":
+        return f"{label}_to_DWG.cube"
+    tail = f"_{encode}" if encode else ""
+    return f"{label}_to_Rec709_{tonemap}{tail}.cube"
+
+
+# --------------------------------------------------------------------------
+# exposure, per input
+# --------------------------------------------------------------------------
+#
+# A stop has to be a doubling of scene light whatever the source is, and the
+# only place this graph can spend one is in the source's own encoded domain,
+# before the CST cube. So each input gets the expression that IS a doubling
+# for its own curve, rather than one constant borrowed from another curve.
+#
+# APPLE_LOG_STOP is right for Apple Log alone. Using it on an HLG or PQ file
+# would still brighten the picture, which is exactly why it would go unnoticed:
+# the number of stops printed on the control would simply not be the number of
+# stops applied.
+#
+# The constants below repeat colorlib's, on purpose. colorlib imports numpy and
+# colour-science, which this file must not: the CLI has to start instantly and
+# the studio server builds graph text on request. The suite asserts the two
+# copies agree (cases_input.constants_match_colorlib).
+
+# ITU-R BT.2100 Table 5, HLG.
+HLG_A = 0.17883277
+HLG_B = 0.28466892
+HLG_C = 0.55991073
+HLG_SYSTEM_GAMMA = 1.2
+
+# SMPTE ST 2084 / BT.2100 Table 4, PQ.
+PQ_M1 = 0.1593017578125
+PQ_M2 = 78.84375
+PQ_C1 = 0.8359375
+PQ_C2 = 18.8515625
+PQ_C3 = 18.6875
+
+# The five camera logs, as the six constants and two cuts of the one shape all
+# five share (colorlib.CameraLog says the same thing in full, with each
+# document quoted next to its numbers):
+#
+#     y = C * log10(A * x + B) + D      for x >= cut_x
+#     y = E * x + F                     for x <  cut_x
+#
+# x is scene linear reflectance, y is that curve's own code value. Repeated
+# here for the same reason the HLG and PQ constants above are: this file must
+# not import numpy or colour-science. The suite asserts the two copies agree
+# (cases_input.the_engine_and_colorlib_agree_on_every_constant).
+CAMERA_LOG_CONSTANTS = {
+    # Sony S-Log3 technical summary. 18% grey is 10 bit code 420 (0.410557).
+    "slog3": {"A": 1.0 / 0.19, "B": 0.01 / 0.19, "C": 261.5 / 1023.0,
+              "D": 420.0 / 1023.0,
+              "E": (171.2102946929 - 95.0) / 0.01125 / 1023.0,
+              "F": 95.0 / 1023.0, "cut_x": 0.01125,
+              "cut_y": 171.2102946929 / 1023.0},
+    # ARRI Log C curve usage document, EI 800. 18% grey is code 400 (0.391007).
+    "logc3": {"A": 5.555556, "B": 0.052272, "C": 0.247190, "D": 0.385537,
+              "E": 5.367655, "F": 0.092809, "cut_x": 0.010591,
+              "cut_y": 5.367655 * 0.010591 + 0.092809},
+    # Panasonic V-Log/V-Gamut reference manual. 18% grey is 42.3 IRE.
+    "vlog": {"A": 1.0, "B": 0.00873, "C": 0.241514, "D": 0.598206,
+             "E": 5.6, "F": 0.125, "cut_x": 0.01, "cut_y": 0.181},
+    # Canon Log gamma curves white paper, Canon Log 3. 18% grey is 32.8 IRE.
+    # The document's 14.98325 and 2.3069815 are stated against reflectance
+    # divided by 0.9, so both are divided by 0.9 here and the cut multiplied
+    # by it, which is the same curve written against reflectance directly.
+    "clog3": {"A": 14.98325 / 0.9, "B": 1.0, "C": 0.42889912,
+              "D": 0.069886632, "E": 2.3069815 / 0.9, "F": 0.073059361,
+              "cut_x": 0.014 * 0.9, "cut_y": 0.105357102},
+    # DJI D-Log white paper. 18% grey is 0.398765.
+    "dlog": {"A": 0.9892, "B": 0.0108, "C": 0.256663, "D": 0.584555,
+             "E": 6.025, "F": 0.0929, "cut_x": 0.0078, "cut_y": 0.14},
+}
+
+# ffmpeg's expression language has log() (natural) and exp() but no log10 and
+# no base-10 power, so the two conversions are written once here rather than
+# spelled out five times in the string below.
+LN10 = 2.302585092994046
+LOG10E = 0.4342944819032518
+
+
+def _camera_log_exposure_expr(source: str, stops: float) -> str:
+    """One lut expression that moves a camera log by `stops` stops of light.
+
+    Decode the code value to scene linear with the vendor's own inverse curve,
+    multiply the light by 2 ** stops, encode it again with the vendor's own
+    forward curve. There is no shortcut for these five the way a constant
+    offset is one for Apple Log: every one of them has a linear toe and an
+    offset inside the logarithm, so a code space offset would be a different
+    number of stops at every code, biggest exactly where the shadows are.
+
+    ld(0) is the incoming signal, ld(2) the scaled scene light. Both halves
+    are the published curve, in the shape CAMERA_LOG_CONSTANTS documents.
+    """
+    k = CAMERA_LOG_CONSTANTS[source]
+    a, b, c, d = k["A"], k["B"], k["C"], k["D"]
+    e, f = k["E"], k["F"]
+    gain = 2.0 ** stops
+    # 10 ** z is exp(z * ln 10); the max() floors the log's argument for the
+    # same reason the HLG expression above floors its own.
+    scene = (f"if(lt(st(0,val/maxval),{k['cut_y']!r}),"
+             f"(ld(0)-{f!r})/{e!r},"
+             f"(exp(((ld(0)-{d!r})/{c!r})*{LN10})-{b!r})/{a!r})")
+    return (f"clip(if(lt(st(2,max({gain:.9f}*{scene},0)),{k['cut_x']!r}),"
+            f"{e!r}*ld(2)+{f!r},"
+            f"{c!r}*log(max({a!r}*ld(2)+{b!r},1e-9))*{LOG10E}+{d!r})*maxval,"
+            f"0,maxval)")
+
+
+def exposure_expr(source: str, stops: float) -> str:
+    """One lut expression that moves `source` by `stops` stops of scene light.
+
+    Apple Log's is a constant code offset, because an offset on a log curve is
+    a linear gain and that is the string this engine has always emitted.
+
+    HLG scales the pre-OOTF scene light by 2 ** (stops / 1.2) rather than by
+    2 ** stops. That is not a fudge: the BT.2100 OOTF multiplies each channel
+    by its own luminance to the power (gamma - 1), so scaling all three scene
+    channels by k scales the OOTF's output by exactly k ** gamma, for every
+    colour and not just for neutrals. Taking the 1.2th root first is what makes
+    the display light, and therefore the scene linear the cube produces, come
+    out doubled per stop.
+
+    PQ is absolute, so a stop is a plain doubling of cd/m2 there.
+
+    Rec.709 is a display code, so a stop is the code multiply 2 ** (stops /
+    2.4): the same expression the working_space "rec709" branch below writes,
+    written once here and used by both.
+
+    The five camera logs decode, scale the light and re-encode with their own
+    published curve, which _camera_log_exposure_expr writes from one shape and
+    one table of constants.
+
+    st()/ld() are ffmpeg's own expression registers. They are used rather than
+    inlining each sub-expression four times because `lut` evaluates this once
+    per code value per plane (65536 * 3 on this 16 bit buffer), and because a
+    formula written once is a formula that can be checked against the standard
+    it cites.
+    """
+    if source in CAMERA_LOG_CONSTANTS:
+        return _camera_log_exposure_expr(source, stops)
+    if source == "apple_log":
+        return f"clip(val+{stops * APPLE_LOG_STOP:.6f}*maxval,0,maxval)"
+    if source == "rec709":
+        return f"clip(val*{2.0 ** (stops / DISPLAY_GAMMA):.6f},0,maxval)"
+    if source == "hlg":
+        k = 2.0 ** (stops / HLG_SYSTEM_GAMMA)
+        # ld(0) is the signal, ld(2) the scaled scene light. The two branches
+        # are BT.2100's own piecewise OETF and its inverse.
+        scene = (f"if(lte(st(0,val/maxval),0.5),ld(0)*ld(0)/3,"
+                 f"(exp((ld(0)-{HLG_C})/{HLG_A})+{HLG_B})/12)")
+        return (f"clip(if(lte(st(2,{k:.9f}*{scene}),0.083333333),"
+                f"sqrt(3*ld(2)),"
+                f"{HLG_A}*log(max(12*ld(2)-{HLG_B},1e-9))+{HLG_C})*maxval,"
+                f"0,maxval)")
+    if source == "pq":
+        k = 2.0 ** stops
+        # ld(0) is the signal to the power 1/m2, ld(3) the re-encoded scaled
+        # luminance to the power m1. Both halves are ST 2084 verbatim.
+        nits = (f"pow(max(st(0,pow(val/maxval,{1.0 / PQ_M2!r}))-{PQ_C1},0)"
+                f"/({PQ_C2}-{PQ_C3}*ld(0)),{1.0 / PQ_M1!r})")
+        return (f"clip(pow(({PQ_C1}+{PQ_C2}*st(3,pow(st(2,min({k:.9f}*{nits},1))"
+                f",{PQ_M1})))/(1+{PQ_C3}*ld(3)),{PQ_M2})*maxval,0,maxval)")
+    raise GradeError(f"no exposure formula for input {source!r}")
 
 
 def f_log_stage(cfg, info, normalised=False) -> list[str]:
@@ -435,11 +858,21 @@ def f_log_stage(cfg, info, normalised=False) -> list[str]:
             # stops means exposure, temperature and tint mean the same thing to
             # the user on both kinds of source, rather than one set of numbers
             # doing something different depending on what was loaded.
-            def ex(stops):
-                return f"clip(val*{2.0 ** (stops / DISPLAY_GAMMA):.6f},0,maxval)"
+            #
+            # Decided by the WORKING SPACE and not by convert.input, because
+            # this branch is about there being no CST at either end: whatever
+            # the file is, nothing undoes its curve, so the code the graph
+            # holds is a delivery code and a stop is a code multiply.
+            src = "rec709"
         else:
-            def ex(stops):
-                return f"clip(val+{stops * APPLE_LOG_STOP:.6f}*maxval,0,maxval)"
+            # Anywhere else a CST does run, so the stop is spent in the
+            # source's own encoded domain and has to be that curve's stop.
+            # apple_log writes the exact string it always wrote, which is what
+            # keeps every existing render byte identical.
+            src = input_of(cfg, info)
+
+        def ex(stops):
+            return exposure_expr(src, stops)
         chain.append(f"lut=r='{ex(off_r)}':g='{ex(off_g)}':b='{ex(off_b)}'")
     return chain
 
@@ -516,6 +949,36 @@ def f_denoise(cfg) -> list[str]:
 # what primaries sees is simply the delivery code.
 MID_GREY_CODE = {"dwg": 0.3360, "direct": 0.4883, "rec709": 0.4587}
 
+# On the `direct` path there is no CST IN, so primaries operate on the SOURCE's
+# own code values and the pivot has to be that source's own 18% grey. The Apple
+# Log entry is MID_GREY_CODE["direct"] above, unchanged. The others are the
+# same 0.18 scene linear pushed back through each input's own encode:
+#   hlg     BT.2100 OETF of the scene light that the OOTF puts at 26 cd/m2
+#   pq      ST 2084 inverse EOTF of 26 cd/m2 (BT.2408 Reference Level)
+#   rec709  the BT.709 OETF of 0.18
+# Every one is derived, printed by grade/tools/make_cst.py --anchors, and
+# asserted against colorlib in cases_input.
+#   camera logs  each vendor's own forward curve at 0.18, which is the number
+#                its documentation quotes: S-Log3 code 420 of 1023, LogC3 code
+#                400 of 1023, V-Log 42.3 IRE, Canon Log 3 32.8 IRE.
+MID_GREY_CODE_INPUT = {"apple_log": 0.4883, "hlg": 0.3786, "pq": 0.3800,
+                       "rec709": 0.4090, "slog3": 0.4106, "logc3": 0.3910,
+                       "vlog": 0.4233, "clog3": 0.3280, "dlog": 0.3988}
+
+
+def mid_grey_code(cfg, info=None) -> float:
+    """The code PRIMARIES sees for an 18% grey card, in this configuration.
+
+    Only the `direct` working space depends on the input: `dwg` has already
+    converted every source into DaVinci Wide Gamut by this point, so its grey
+    is one number for all of them, and `rec709` never converts anything.
+    """
+    ws = cfg["convert"]["working_space"]
+    if ws != "direct":
+        return MID_GREY_CODE[ws]
+    return MID_GREY_CODE_INPUT[input_of(cfg, info)]
+
+
 # The transfer a display referred source is assumed to carry. Only used to turn
 # a stop into a code multiply on the rec709 path; the grade itself never
 # linearises, so an exact match to the file's real transfer is not required.
@@ -557,53 +1020,102 @@ def _triplet(value, default):
     return [float(value)] * 3
 
 
-def f_convert_in(cfg) -> list[str]:
-    if cfg["convert"]["working_space"] == "dwg":
-        return [_tech_lut("AppleLog_to_DWG.cube")]
-    return []
+def f_convert_in(cfg, info=None) -> list[str]:
+    """CST IN: the source's own curve into the DWG working space.
+
+    info is optional so a caller that has no probe (bake_lut, a hand-built
+    config) keeps the Apple Log answer it has always had.
+    """
+    if cfg["convert"]["working_space"] != "dwg":
+        return []
+    src = input_of(cfg, info)
+    return [_tech_lut(technical_lut_name(src, source_primaries(info, src), "dwg"))]
 
 
 # Apple Log clips come off the camera tagged bt2020nc; an ordinary delivery file
-# is tagged bt709. That one field is enough to tell the two apart, and it is the
-# only thing standing between a user and a silently ruined picture.
+# is tagged bt709. That one field is the YUV matrix, which is a different tag
+# from the transfer and the primaries resolve_input reads.
 LOG_MATRICES = {"bt2020nc", "bt2020c", "bt2020_ncl", "bt2020_cl"}
 DISPLAY_MATRICES = {"bt709", "smpte170m", "bt470bg", "smpte240m", "fcc"}
 
 
-def check_source_space(cfg, info) -> None:
-    """Refuse a source and working space that cannot go together.
+def check_source_space(cfg, info) -> tuple[str, list[str]]:
+    """Resolve the input, and refuse only what genuinely cannot be rendered.
 
-    Grading a normal Rec.709 video down the Apple Log path does not error, it
-    just quietly produces garbage: the CST out applies a log to display
-    transform to a picture that never had a log curve, so the tone map runs
-    twice. Measured on a real delivery file, median luma fell from 0.332 to
-    0.238 and mean saturation went from 0.33 to 0.59, giving neon greens and
-    blown skin. A wrong picture that renders successfully is worse than a
-    refusal, because nothing tells the user to look for a cause.
+    Returns (resolved input, warnings) so a caller that wants to show the user
+    what happened can, and so the studio server has one place to ask.
 
-    Only clearly tagged mismatches are refused. An untagged file is left alone
-    rather than guessed at, since the caller may well know better than the
-    metadata does.
+    Both refusals it used to make were decided by the YUV MATRIX tag alone,
+    which is the wrong question asked of the wrong field: the matrix says
+    nothing about the transfer, and "bt2020" covers Apple Log, HLG and PQ,
+    which need three different decodes. Each refusal now also asks what the
+    source RESOLVED to, so:
+
+    1. working_space "rec709" on a bt2020 file is refused only when the file
+       really does resolve to camera log. An HLG or PQ delivery file is
+       BT.2020 and is not camera log, so it is allowed with a warning, which
+       is the case that used to be refused for no good reason.
+    2. A bt709 tagged file on a log working space is refused only when it
+       still resolves to "apple_log", which now means its transfer tag was
+       missing or unrecognised. A file that carries a real bt709 transfer
+       resolves to input "rec709", gets decoded correctly, and needs no
+       refusal at all. The danger the old rule protected against is real and
+       measured (median luma 0.332 to 0.238, saturation 0.33 to 0.59); what
+       changed is that there is now a right answer to offer instead.
+
+    3. A camera log (slog3, logc3, vlog, clog3, dlog) on working_space
+       "rec709" is refused for exactly the same reason apple_log is: the
+       caller has said in so many words that the source IS a manufacturer's
+       log curve, and "rec709" is the one working space that undoes no curve
+       at all, so the picture would come out flat and grey with nothing on
+       screen to explain it. This refusal cannot change any existing grade:
+       none of those five inputs existed before.
+
+    Everything else is a warning. A warning describes a picture that will
+    render; a refusal is for a picture that would be wrong with nothing on
+    screen to say so.
     """
     ws = cfg["convert"]["working_space"]
+    src, warnings = resolve_input(cfg, info)
     matrix = (info or {}).get("color_space") or ""
-    if ws == "rec709" and matrix in LOG_MATRICES:
+    if ws == "rec709" and src in CAMERA_LOG_INPUTS:
         raise GradeError(
-            f"source is tagged {matrix}, which is camera log, but working_space "
-            f"is 'rec709' (for footage that is already display referred). "
-            f"The log curve would never be undone and the picture would stay "
-            f"flat and desaturated. Use working_space 'dwg' or 'direct'.")
-    if ws != "rec709" and matrix in DISPLAY_MATRICES:
+            f"convert.input is '{src}', which is a camera log curve, but "
+            f"working_space is 'rec709' (for footage that is already display "
+            f"referred). Nothing on that path undoes a log curve, so the "
+            f"picture would stay flat and desaturated with nothing on screen "
+            f"to say why. Use working_space 'dwg' or 'direct'.")
+    if ws == "rec709" and src == "apple_log" and matrix in LOG_MATRICES:
+        raise GradeError(
+            f"source is tagged {matrix} with no transfer this engine knows, so "
+            f"it resolves to camera log, but working_space is 'rec709' (for "
+            f"footage that is already display referred). The log curve would "
+            f"never be undone and the picture would stay flat and desaturated. "
+            f"Use working_space 'dwg' or 'direct'.")
+    if ws != "rec709" and src == "apple_log" and matrix in DISPLAY_MATRICES:
         raise GradeError(
             f"source is tagged {matrix}, which is already display referred "
-            f"Rec.709, but working_space is '{ws}', which expects Apple Log. "
-            f"That applies a log to display transform to a picture that never "
-            f"had a log curve and silently wrecks it (measured: median luma "
-            f"0.332 to 0.238, saturation 0.33 to 0.59). "
-            f"Use working_space 'rec709' for this clip.")
+            f"Rec.709, but it resolves to input 'apple_log' and working_space "
+            f"is '{ws}'. That applies a log to display transform to a picture "
+            f"that never had a log curve and silently wrecks it (measured: "
+            f"median luma 0.332 to 0.238, saturation 0.33 to 0.59). Set "
+            f"convert.input to 'rec709', or working_space to 'rec709' to grade "
+            f"it in place.")
+    if ws == "rec709" and src in ("hlg", "pq"):
+        # Not fatal, and no longer a refusal: an HLG or PQ file is BT.2020 but
+        # it is NOT camera log, and grading it in place is a legitimate ask (it
+        # is how an FX only round trip works). Worth saying out loud that the
+        # curve is not being undone, which is all this warning does.
+        warnings.append(
+            f"working_space is 'rec709' (no conversion at either end) but the "
+            f"source resolves to '{src}', whose transfer this grade will not "
+            f"undo. Use working_space 'dwg' or 'direct' to convert it.")
+    return src, warnings
 
 
-def f_convert_out(cfg) -> list[str]:
+def f_convert_out(cfg, info=None) -> list[str]:
+    """CST OUT. info is optional for the same reason f_convert_in's is: only
+    the `direct` path reads it, and only to pick which input's cube to load."""
     c = cfg["convert"]
     if c["working_space"] == "rec709":
         # Already in the delivery space. Applying a technical LUT here would be
@@ -620,10 +1132,13 @@ def f_convert_out(cfg) -> list[str]:
     # tree whose technical LUTs predate this still renders, and the newly
     # generated _gamma24 cubes are byte identical to the old unsuffixed ones,
     # so nothing that was already correct moves.
-    per_encode = LUT_TECH / f"AppleLog_to_Rec709_{c['tonemap']}_{c['encode']}.cube"
+    src = input_of(cfg, info)
+    prim = source_primaries(info, src)
+    per_encode = LUT_TECH / technical_lut_name(src, prim, "direct",
+                                               c["tonemap"], c["encode"])
     if per_encode.exists():
         return [_tech_lut(per_encode.name)]
-    return [_tech_lut(f"AppleLog_to_Rec709_{c['tonemap']}.cube")]
+    return [_tech_lut(technical_lut_name(src, prim, "direct", c["tonemap"]))]
 
 
 def _saturation_matrix(sat: float) -> str:
@@ -734,15 +1249,18 @@ def _tone_ends_points(bl: float, hr: float, pivot: float, n: int = 6) -> str:
     return " ".join(out)
 
 
-def f_primaries(cfg) -> list[str]:
+def f_primaries(cfg, info=None) -> list[str]:
     """Runs inside the working space, before the output transform.
 
     Temperature and tint are deliberately absent: they are handled in the log
     stage, where an offset is exactly a linear gain.
+
+    info is optional and is only read for the default pivot on the `direct`
+    working space, where what primaries sees is the source's own code values
+    and mid grey therefore depends on which input the source is.
     """
     p = cfg["primaries"]
-    ws = cfg["convert"]["working_space"]
-    pivot = p["pivot"] if p.get("pivot") is not None else MID_GREY_CODE[ws]
+    pivot = p["pivot"] if p.get("pivot") is not None else mid_grey_code(cfg, info)
     chain = []
 
     # Lift and gain are one linear remap: black lands on `lift`, white on
@@ -1962,8 +2480,8 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     # every render, still, preview and scope goes through.
     check_source_space(cfg, info)
     head = (f_log_stage(cfg, info, normalised=src_normalised) + f_denoise(cfg)
-            + f_convert_in(cfg)
-            + f_primaries(cfg) + f_convert_out(cfg)
+            + f_convert_in(cfg, info)
+            + f_primaries(cfg, info) + f_convert_out(cfg, info)
             + f_curves(cfg) + f_slice(cfg))
     # The before_look layers. With no layers this is the one head chain the
     # engine has always emitted, ending on [cst], so nothing already graded
@@ -2263,17 +2781,30 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
 # commands
 # --------------------------------------------------------------------------
 
-def cli_rotation(a) -> str:
-    """The rotation one parsed command line asks for.
+def cli_rotation(a, cfg: dict | None = None) -> str:
+    """The rotation one parsed command line, and optionally its config, asks for.
 
     --rotate wins when it is given. --no-autorotate stays as the alias of
     --rotate 0 it always was, so every script and every note written before
-    this flag existed keeps working unchanged.
+    this flag existed keeps working unchanged. With neither flag present, a
+    non-auto `cfg["rotation"]` (contract G4: rotation lives in the config, the
+    same preset or grade the rest of the render reads) is next, so a preset
+    saved with a real rotation renders correctly with no flag at all. `cfg`
+    is optional and defaults to None so every existing caller (and every
+    existing test) that passes one argument is unaffected.
     """
     chosen = getattr(a, "rotate", None)
     if chosen:
         return normalise_rotation(chosen)
-    return "0" if getattr(a, "no_autorotate", False) else "auto"
+    if getattr(a, "no_autorotate", False):
+        return "0"
+    if cfg is not None:
+        from_cfg = cfg.get("rotation")
+        if from_cfg not in (None, ""):
+            mode = normalise_rotation(from_cfg)
+            if mode != "auto":
+                return mode
+    return "auto"
 
 
 # --------------------------------------------------------------------------
@@ -2386,30 +2917,65 @@ def region_tail(region, zoom, width, info):
 
 def cmd_render(a):
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, rotation=cli_rotation(a))
-    graph = graph_with_mask(cfg, info)
-    o = cfg["output"]
-    args = ffmpeg_inputs(a.input, cfg, info, a.start, a.duration)
+    rotation_mode = cli_rotation(a, cfg)
+    info = probe(a.input, rotation=rotation_mode)
+    # --codec only swaps the encoder for this invocation; the preset dict
+    # (and file, if any) is never written back to.
+    codec = a.codec or cfg["output"]["codec"]
+    expect_ext = ".mov" if codec == "prores_ks" else ".mp4"
+    out_ext = Path(a.output).suffix.lower()
+    if out_ext != expect_ext:
+        raise GradeError(
+            f"-o {a.output} needs a {expect_ext} extension for --codec "
+            f"{codec}, not {out_ext or 'no extension'}")
+    rcfg, rinfo, head, src = cfg, info, None, "0:v"
+    if a.width is not None or a.scale is not None:
+        # Reuse the preview path's own scaler (studio/server.py) rather than
+        # a second one, so a scaled render is the same picture the studio
+        # would show at that size: same fraction off halation/bloom sigma,
+        # radial blur, RGB split, soften and grain size.
+        sys.path.insert(0, str(ROOT.parent / "studio"))
+        import server as studio_server
+        raw_width = a.width if a.width is not None else info["width"] * a.scale
+        width = max(2, int(raw_width) // 2 * 2)
+        factor = width / float(info["width"])
+        height = max(2, int(round(info["height"] * factor / 2)) * 2)
+        rinfo = dict(info, width=width, height=height)
+        rcfg = studio_server.scale_for_preview(cfg, factor)
+        head = (f"[0:v]{rotate_prefix(rinfo)}"
+               f"scale={width}:{height}:flags=bicubic,setsar=1[studiosrc]")
+        src = "studiosrc"
+    graph = graph_with_mask(rcfg, rinfo, src_label=src, head_extra=head)
+    o = dict(cfg["output"], codec=codec)
+    args = ffmpeg_inputs(a.input, rcfg, rinfo, a.start, a.duration)
     if a.duration:
         args += ["-t", str(a.duration)]
     args += ["-filter_complex", graph, "-map", "[vout]"]
     if not a.no_audio:
-        args += ["-map", "0:a?", "-c:a", "aac", "-b:a", "256k"]
-    if o["codec"] == "prores_ks":
+        # First audio stream only: a phone clip whose second stream has no
+        # decoder used to kill the whole render.
+        args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "256k"]
+    if codec == "prores_ks":
         args += ["-c:v", "prores_ks", "-profile:v", str(o["profile"]),
                  "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
     else:
-        args += ["-c:v", o["codec"], "-crf", str(o["crf"]),
+        args += ["-c:v", codec, "-crf", str(o["crf"]),
                  "-preset", o["preset"], "-pix_fmt", "yuv420p"]
     args += ["-color_primaries", "bt709", "-color_trc", "bt709",
              "-colorspace", "bt709", a.output]
     run(args, a.verbose)
-    print(f"rendered -> {a.output}")
+    # The single most consequential decision a mixed folder render makes:
+    # which input transform it resolved to. Before this line the only way
+    # to see it was --verbose plus reading the cube name out of the middle
+    # of the printed ffmpeg command (contract G9 friction 7).
+    resolved_input = resolve_input(cfg, info)[0]
+    print(f"rendered (input {resolved_input}, rotation {rotation_mode}) "
+         f"-> {a.output}")
 
 
 def cmd_still(a):
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, rotation=cli_rotation(a))
+    info = probe(a.input, rotation=cli_rotation(a, cfg))
     extra = region_tail(getattr(a, "region", None), getattr(a, "zoom", None),
                         a.width, info) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
@@ -2425,7 +2991,8 @@ def cmd_compare(a):
     This is the agent feedback loop: one image showing every candidate, so a
     grading decision is a single look instead of N separate renders.
     """
-    info = probe(a.input, rotation=cli_rotation(a))
+    info = probe(a.input, rotation=cli_rotation(
+        a, apply_input_space(load_preset(a.preset), a)))
     if a.presets:
         variants = [(v, {"preset": v}) for v in a.presets.split(",")]
     elif a.looks:
@@ -2441,7 +3008,7 @@ def cmd_compare(a):
                        a.width, info) + ["format=rgb24"]
     paths = []
     for name, spec in variants:
-        cfg = load_preset(spec.get("preset") or a.preset)
+        cfg = apply_input_space(load_preset(spec.get("preset") or a.preset), a)
         if "look" in spec:
             cfg["look"]["lut"] = spec["look"]
         graph = graph_with_mask(cfg, info, encode_out=False, tail_extra=tail)
@@ -2468,7 +3035,7 @@ def cmd_compare(a):
 def cmd_scopes(a):
     """Waveform + vectorscope + the frame, so a grade can be read numerically."""
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, rotation=cli_rotation(a))
+    info = probe(a.input, rotation=cli_rotation(a, cfg))
     graph = graph_with_mask(cfg, info, encode_out=False)
     W = a.width
     graph += (
@@ -2491,32 +3058,219 @@ def cmd_scopes(a):
         subprocess.run(["open", "-a", "Preview", a.output])
 
 
+def _measure_region_size(region, info) -> tuple[int, int]:
+    """The pixel size a stats measurement at this region comes back as, with
+    no --width flag on `stats`/`sweep` to scale it: the whole frame, or
+    exactly the region's own pixels."""
+    if region is None:
+        return int(info["width"]), int(info["height"])
+    reg = normalise_region(region)
+    _, _, w, h = region_pixels(reg, info)
+    return w, h
+
+
+def _grade_frame_stats(a, cfg, info, t: float, region=None) -> dict:
+    """One graded frame of `a.input`, measured through grade.stats.frame_stats.
+
+    The same numbers `POST /api/stats` returns for the same clip, config,
+    time and region: both read the array through the one function, not two
+    hand written copies of it.
+    """
+    import numpy as np                                        # noqa: PLC0415
+    from stats import frame_stats                            # noqa: PLC0415
+    w, h = _measure_region_size(region, info)
+    extra = region_tail(region, None, None, info) + ["format=rgb24"]
+    graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
+    args = ffmpeg_inputs(a.input, cfg, info, t)
+    args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    r = subprocess.run(args, capture_output=True, timeout=60)
+    want = w * h * 3
+    if r.returncode != 0 or len(r.stdout) < want:
+        raise GradeError("cinegrade could not measure that frame:\n"
+                         + r.stderr.decode("utf-8", "replace")[-1200:])
+    rgb = np.frombuffer(r.stdout[:want], np.uint8).reshape(h, w, 3)
+    return {"time": t, "key": f"{Path(a.input).name}@{t:g}s",
+            "size": [w, h], "stats": frame_stats(rgb)}
+
+
+def _print_stats_block(label: str, row: dict) -> None:
+    s = row["stats"]
+    w, h = row["size"]
+    lu, sa, ch, fam = s["luma"], s["saturation"], s["channels"], s["families"]
+    cl, bd = s["clipped"], s["bands"]
+    print(f"{label}  {w}x{h}")
+    print(f"  luma     p5 {lu['p5']:.4f}  p25 {lu['p25']:.4f}  p50 {lu['p50']:.4f}  "
+          f"p75 {lu['p75']:.4f}  p95 {lu['p95']:.4f}  mean {lu['mean']:.4f} "
+          f"({lu['mean8']:.1f}/255)")
+    print(f"  sat      mean {sa['mean']:.4f}  mean(coloured) {sa['mean_coloured']:.4f}  "
+          f"p95 {sa['p95']:.4f}")
+    print(f"  rgb      r {ch['r']:.4f}  g {ch['g']:.4f}  b {ch['b']:.4f}")
+    print("  hue      " + "  ".join(f"{k} {v:.1f}%" for k, v in fam.items()))
+    print(f"  clipped  black {cl['black']:.2f}%  white {cl['white']:.2f}%")
+    print("  bands    luma edges " + " ".join(f"{e:.3f}" for e in bd["edges"]))
+    print("    sat    " + "  ".join(f"{v:.3f}" for v in bd["saturation"]))
+    print("    warm   " + "  ".join(f"{v:+.3f}" for v in bd["warm"]))
+    print("    tint   " + "  ".join(f"{v:+.3f}" for v in bd["tint"]))
+
+
+def _print_stats(a, payload) -> None:
+    if getattr(a, "json", False):
+        print(json.dumps(payload, indent=2))
+        return
+    if "results" in payload:
+        for row in payload["results"]:
+            _print_stats_block(f"t={row['time']:g}s  {row['key']}", row)
+            print()
+        return
+    _print_stats_block(payload["key"], payload)
+
+
 def cmd_stats(a):
-    """Numeric readback: an agent can verify a grade without looking at it."""
+    """Numeric readback: the same numbers `POST /api/stats` returns, for a
+    graded clip frame or a plain reference still, whichever the caller asked
+    for. Both go through grade.stats.frame_stats, not two implementations of
+    the same handful of numbers: seven of ten bakeoff agents hand wrote this
+    formula once each before this command measured anything itself.
+
+    `--json` on a single clip frame or a single `--image` both come back as
+    exactly the route's own envelope, `{"key", "size", "stats"}`: every
+    number lives one level deeper, under `"stats"`, whichever input this
+    command measured (contract G9 friction 3 and 6). `--times` still adds a
+    `"results"` list, one `{"time", "key", "size", "stats"}` row per time,
+    because there `"time"` is the whole point of asking; a single call has
+    no second time to distinguish itself from, so it carries none.
+    """
+    from stats import frame_stats, decode_image              # noqa: PLC0415
+
+    region = getattr(a, "region", None)
+    if a.image:
+        if getattr(a, "times", None):
+            raise GradeError("--times measures a clip; --image is one still")
+        rgb = decode_image(a.image, region=region)
+        _print_stats(a, {"key": Path(a.image).name,
+                         "size": [int(rgb.shape[1]), int(rgb.shape[0])],
+                         "stats": frame_stats(rgb)})
+        return
+
+    if not a.input:
+        raise GradeError("stats needs either a clip, or --image FILE")
     cfg = apply_overrides(load_preset(a.preset), a)
-    info = probe(a.input, rotation=cli_rotation(a))
-    graph = graph_with_mask(cfg, info, encode_out=False, tail_extra=[
-        "format=yuv420p", "signalstats", "metadata=mode=print:file=-"])
-    args = ffmpeg_inputs(a.input, cfg, info, a.time)
-    args += ["-filter_complex", graph, "-map", "[vout]",
-             "-frames:v", "1", "-f", "null", "-"]
-    r = subprocess.run(args, capture_output=True, text=True)
-    wanted = ("YMIN", "YLOW", "YAVG", "YHIGH", "YMAX", "UAVG", "VAVG", "SATAVG", "SATMAX")
-    vals = {}
-    for line in r.stdout.splitlines():
-        if "lavfi.signalstats." in line:
-            k, _, v = line.partition("=")
-            vals[k.strip().split(".")[-1]] = v.strip()
-    print(f"preset={a.preset or 'defaults'} look={cfg['look']['lut']} t={a.time}s")
-    print("  8-bit code values (0-255):")
-    for k in wanted:
-        if k in vals:
-            print(f"    {k:8} {vals[k]}")
-    if "YAVG" in vals:
-        y = float(vals["YAVG"])
-        note = ("under" if y < 90 else "over" if y > 150 else "in range")
-        print(f"  mid-tone check: YAVG {y:.1f} is {note} "
-              f"(a normal Rec.709 frame averages roughly 95-140)")
+    info = probe(a.input, rotation=cli_rotation(a, cfg))
+    if getattr(a, "times", None):
+        times = [float(t) for t in a.times.split(",")]
+        results = [_grade_frame_stats(a, cfg, info, t, region) for t in times]
+        _print_stats(a, {"results": results})
+        return
+    row = _grade_frame_stats(a, cfg, info, a.time, region)
+    # _grade_frame_stats always stamps "time" on, because the --times list
+    # above needs it on every row; a single frame has no second row to tell
+    # itself apart from, so it is dropped here to match --image's envelope
+    # exactly rather than carrying a field the route itself never returns.
+    row.pop("time", None)
+    _print_stats(a, row)
+
+
+# --------------------------------------------------------------------------
+# sweep: one parameter, many values, one table. Reports, never chooses.
+# --------------------------------------------------------------------------
+
+def _set_dotted(cfg: dict, dotted: str, value):
+    """Set 'fx.halation.strength' style paths in a config, in place.
+
+    An all-digits path component indexes a list, so 'layers.0.correct.exposure'
+    reaches into the layer stack; every other component is a dict key. The
+    same convention the test suite's own sweep helper uses, kept as a small
+    independent copy here because cinegrade.py does not import grade/tests/.
+    """
+    node = cfg
+    keys = dotted.split(".")
+    for k in keys[:-1]:
+        node = node[int(k)] if k.isdigit() and isinstance(node, list) else node[k]
+    last = keys[-1]
+    if last.isdigit() and isinstance(node, list):
+        node[int(last)] = value
+    else:
+        node[last] = value
+    return cfg
+
+
+def _parse_sweep_value(text: str):
+    """A sweep value from the command line: a bool, a number, or a string,
+    in that order, so `--values true,false`, `--values 0.5,1.0` and
+    `--values aces,filmic,none` all do what they look like they do."""
+    text = text.strip()
+    low = text.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        f = float(text)
+        return int(f) if f.is_integer() and "." not in text and "e" not in low else f
+    except ValueError:
+        return text
+
+
+def cmd_sweep(a):
+    """One parameter, many values, one stats table. Never chooses: this
+    prints what each value measures and leaves the read to whoever asked."""
+    from stats import frame_stats                            # noqa: PLC0415
+
+    base = apply_input_space(
+        load_preset(a.preset) if a.preset else deepcopy(DEFAULTS), a)
+    values = [_parse_sweep_value(v) for v in a.values.split(",") if v.strip() != ""]
+    if not values:
+        raise GradeError("sweep needs at least one value in --values")
+
+    rows = []
+    sheet_paths, sheet_labels, tmp_dir = [], [], None
+    if a.sheet:
+        tmp_dir = tempfile.mkdtemp(prefix="cinegrade_sweep_")
+    try:
+        for v in values:
+            cfg = _set_dotted(deepcopy(base), a.param, v)
+            info = probe(a.input, rotation=cli_rotation(a, cfg))
+            rows.append({"param": a.param, "value": v,
+                        **_grade_frame_stats(a, cfg, info, a.time)})
+            if a.sheet:
+                png = Path(tmp_dir) / f"sweep_{len(rows)}.png"
+                graph = graph_with_mask(cfg, info, tail_extra=["format=rgb24"],
+                                        encode_out=False)
+                args = ffmpeg_inputs(a.input, cfg, info, a.time)
+                args += ["-filter_complex", graph, "-map", "[vout]",
+                         "-frames:v", "1", str(png)]
+                run(args, a.verbose)
+                sheet_paths.append(png)
+                sheet_labels.append(f"{a.param}={v}")
+        if a.sheet:
+            from PIL import Image
+            images = [Image.open(p).convert("RGB") for p in sheet_paths]
+            sheet = build_contact_sheet(images, sheet_labels, len(images), 1)
+            sheet.save(a.sheet)
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if getattr(a, "json", False):
+        print(json.dumps({"param": a.param, "results": rows}, indent=2))
+    else:
+        print(f"sweep {a.param} on {Path(a.input).name} @ {a.time:g}s")
+        print(f"{'value':>12}  {'p5':>6} {'p25':>6} {'p50':>6} {'p75':>6} "
+              f"{'p95':>6}  {'sat':>6}  {'r':>6} {'g':>6} {'b':>6}  "
+              f"{'clip%':>7}")
+        for row in rows:
+            s = row["stats"]
+            lu, sa, ch, cl = s["luma"], s["saturation"], s["channels"], s["clipped"]
+            print(f"{row['value']!s:>12}  {lu['p5']:6.3f} {lu['p25']:6.3f} "
+                  f"{lu['p50']:6.3f} {lu['p75']:6.3f} {lu['p95']:6.3f}  "
+                  f"{sa['mean']:6.3f}  {ch['r']:6.3f} {ch['g']:6.3f} "
+                  f"{ch['b']:6.3f}  {cl['black'] + cl['white']:7.2f}")
+        edges = rows[0]["stats"]["bands"]["edges"]
+        print("\nbands saturation, luma edges " + " ".join(f"{e:.2f}" for e in edges))
+        for row in rows:
+            bs = row["stats"]["bands"]["saturation"]
+            print(f"{row['value']!s:>12}  " + "  ".join(f"{v:.3f}" for v in bs))
+    if a.sheet:
+        print(f"\nsweep sheet ({len(rows)} up) -> {a.sheet}")
 
 
 
@@ -2587,7 +3341,40 @@ def cmd_orient(a):
     matrix); 0 ignores that tag; 90, 180 and 270 ignore it and then turn the
     picture clockwise. The panel that is upright names the --rotate value to
     pass to every other command.
+
+    --json skips the contact sheet entirely and prints the tag, the four
+    fixed candidate rotations (their post-rotation width and height, the
+    same numbers the printed panel list already gave) and
+    rotation_tag_suspect, through the identical rotation_tag_suspect()
+    function GET /api/state's clip list calls, so an agent can branch on
+    the same answer the studio would show without decoding an image.
     """
+    if getattr(a, "json", False):
+        raw = probe(a.input, rotation="0")
+        candidates = {mode: {"width": probe(a.input, rotation=mode)["width"],
+                             "height": probe(a.input, rotation=mode)["height"]}
+                     for mode in ("0", "90", "180", "270")}
+        # orient renders no grade, so there is nothing here for the rest of
+        # the shared flags to change. --input-space is the exception: this is
+        # the one command an agent runs BEFORE it knows what the file is, and
+        # what a file resolves to is exactly the kind of fact it comes here
+        # for, so the resolution is reported (with the flag honoured) next to
+        # the rotation tag rather than needing a second command.
+        resolved, warnings = resolve_input(
+            apply_input_space(deepcopy(DEFAULTS), a), raw)
+        print(json.dumps({
+            "tag": raw["rotation"],
+            "candidates": candidates,
+            "rotation_tag_suspect": rotation_tag_suspect(
+                raw["rotation"], raw["codec"], raw["width"], raw["height"]),
+            "transfer": raw.get("color_transfer", ""),
+            "primaries": raw.get("color_primaries", ""),
+            "resolved_input": resolved,
+            "source_primaries": source_primaries(raw, resolved),
+            "warnings": warnings,
+        }))
+        return
+
     tmp = Path(tempfile.mkdtemp(prefix="cinegrade-orient-"))
     try:
         panels = []
@@ -2636,6 +3423,21 @@ def cmd_orient(a):
         subprocess.run(["open", "-a", "Preview", a.output])
 
 
+def apply_input_space(cfg, a):
+    """--input-space, on its own, because two commands need only this one.
+
+    `compare` builds a fresh config per panel and `sweep` builds one per swept
+    value, and neither runs the rest of apply_overrides today. Widening what
+    those two honour would change what they already render, so they call this
+    instead: the input transform is a statement about the FILE, and a file
+    does not become a different file from one panel to the next.
+    """
+    value = getattr(a, "input_space", None)
+    if value:
+        cfg["convert"]["input"] = value
+    return cfg
+
+
 def apply_overrides(cfg, a):
     if getattr(a, "look", None):
         cfg["look"]["lut"] = a.look
@@ -2643,6 +3445,7 @@ def apply_overrides(cfg, a):
         cfg["convert"]["exposure"] = a.exposure
     if getattr(a, "tonemap", None):
         cfg["convert"]["tonemap"] = a.tonemap
+    apply_input_space(cfg, a)
     if getattr(a, "working_space", None):
         cfg["convert"]["working_space"] = a.working_space
     for k in ("contrast", "saturation", "temperature", "tint"):
@@ -2690,29 +3493,143 @@ def resolve_by(a) -> str:
     by = getattr(a, "by", None)
     if by:
         return str(by)
+    agent = resolve_agent(a)
+    if agent:
+        # A named caller signs as itself. The server decides the author for
+        # real (it writes agent:NAME whatever the body says), so this only
+        # makes the label the tab echoes on match what the history will say.
+        return f"agent:{agent}"
     env = os.environ.get("CINEGRADE_AGENT")
     if env:
         return env
     return "cli"
 
 
-def _studio_call(port: int, path: str, method: str = "GET",
-                 payload: dict | None = None) -> dict:
-    """One HTTP round trip to a running studio server.
+def resolve_agent(a) -> str:
+    """The agent name this shell calls as, or "" for the plain local caller.
 
-    Same reasoning as cmd_session below: plain HTTP to 127.0.0.1 and nothing
-    else, against a server that is already running and already bound to the
-    loopback interface, so this adds no listener, no port and no remote
-    surface of its own. A 4xx from the server (a bad clip name, no project
-    open, an unknown commit id) comes back as a message, not a traceback.
+    `--agent` wins, then the STUDIO_AGENT environment variable, so a lane can
+    export its name once and never type it again. Nothing is invented: with
+    neither set the caller is user 0, exactly as it was before contract G2.
+    """
+    name = getattr(a, "agent", None)
+    if name:
+        return str(name).strip()
+    return os.environ.get("STUDIO_AGENT", "").strip()
+
+
+def studio_headers(a) -> dict:
+    """The identity headers every studio call from this CLI carries."""
+    headers = {}
+    agent = resolve_agent(a)
+    if agent:
+        headers["X-Studio-Agent"] = agent
+    attach = getattr(a, "attach", None)
+    if attach is not None and str(attach).strip() != "":
+        headers["X-Studio-Attach"] = str(attach).strip()
+    return headers
+
+
+def add_server_flags(p) -> None:
+    """--port, --url, --agent and --attach: the four flags shared by every
+    subcommand that talks to a running studio server (contract G2).
+
+    No subcommand hardcodes 7431 as an argparse default any more: `--port`
+    defaults to None here, so "nothing was said on this call" is a value
+    `resolve_server` below can see, which is what lets `require_server` tell
+    an agent's own choice of server apart from silently inheriting the
+    human's (contract G9 friction 8: session/whoami/project used to default
+    onto the founder's live studio with no way to redirect them).
+    """
+    p.add_argument("--port", type=int, default=None,
+                   help="talk to the studio server on 127.0.0.1 at this "
+                        "port. Also settable as STUDIO_PORT (--port wins "
+                        "when both are given). A human gets the 7431 "
+                        "default with neither; an agent (--agent or "
+                        "STUDIO_AGENT) must set one of --port, --url, "
+                        "STUDIO_PORT or STUDIO_URL")
+    p.add_argument("--url",
+                   help="talk to the studio server at this base URL "
+                        "instead of building one from --port. Also "
+                        "settable as STUDIO_URL; a URL always wins over a "
+                        "port, from either source")
+    p.add_argument("--agent", metavar="NAME",
+                   help="call as agent NAME, so this shell gets its own "
+                        "live session and open project instead of sharing "
+                        "the browser tab's. Also settable as STUDIO_AGENT")
+    p.add_argument("--attach", metavar="USER",
+                   help="act on USER's session/project instead of your "
+                        "own: 0 for the local browser tab, or an account "
+                        "name. Needs a server with logins off")
+
+
+def resolve_server(a) -> tuple[str, bool]:
+    """The base URL this CLI call talks to, and whether the caller named it.
+
+    A URL beats a port, and either beats the hardcoded 7431 default: `--url`
+    or `STUDIO_URL` wins outright (the flag first); failing that, `--port`
+    or `STUDIO_PORT` (again the flag first); failing that, port 7431, the
+    founder's own live studio (this CLI never binds anything of its own, it
+    only ever talks to a server that is already running).
+
+    `given` is False only in that last, nothing-was-said case. That is what
+    lets `require_server` below tell a human's silent default apart from an
+    agent that forgot to name its server.
+    """
+    url = (getattr(a, "url", None) or os.environ.get("STUDIO_URL") or "").strip()
+    if url:
+        return url.rstrip("/"), True
+    port = getattr(a, "port", None)
+    if port is not None:
+        return f"http://127.0.0.1:{port}", True
+    env_port = os.environ.get("STUDIO_PORT", "").strip()
+    if env_port:
+        return f"http://127.0.0.1:{env_port}", True
+    return f"http://127.0.0.1:{STUDIO_PORT}", False
+
+
+def require_server(a) -> str:
+    """resolve_server(a), refused before any request goes out when an agent
+    named itself but never named a server.
+
+    A human calling with no --agent and no STUDIO_AGENT still gets today's
+    silent 7431 default, unchanged: nothing about a person's own use of this
+    CLI is any different. An agent (--agent given, or STUDIO_AGENT set) gets
+    that same silent default ONLY when it also named a server itself; the
+    whole point of this check is that guessing 7431 for an unnamed agent
+    means guessing the founder's live studio, which is exactly the trap
+    contract G2's own integration review found and asked to close.
+    """
+    base, given = resolve_server(a)
+    if resolve_agent(a) and not given:
+        raise GradeError(
+            "an agent must name its server: pass --port or --url, or set "
+            "STUDIO_PORT or STUDIO_URL; the 7431 default is a human's live "
+            "studio, not a guess for an agent to inherit")
+    return base
+
+
+def _studio_call(base: str, path: str, method: str = "GET",
+                 payload: dict | None = None,
+                 headers: dict | None = None) -> dict:
+    """One HTTP round trip to a running studio server at `base` (a full
+    "http://host:port", from resolve_server/require_server above).
+
+    Same reasoning as cmd_session below: plain HTTP and nothing else,
+    against a server that is already running, so this adds no listener, no
+    port and no remote surface of its own. A 4xx from the server (a bad
+    clip name, no project open, an unknown commit id) comes back as a
+    message, not a traceback.
     """
     import urllib.error                                     # noqa: PLC0415
     import urllib.request                                   # noqa: PLC0415
 
-    url = f"http://127.0.0.1:{port}/api/{path}"
+    url = f"{base}/api/{path}"
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if data is not None else {}
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    sent = dict(headers or {})
+    if data is not None:
+        sent["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=sent, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())
@@ -2721,8 +3638,8 @@ def _studio_call(port: int, path: str, method: str = "GET",
         raise GradeError(f"studio refused it: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GradeError(
-            f"no studio server answering on 127.0.0.1:{port} ({exc.reason}). "
-            f"Start one with ./studio.sh, or pass --port.") from exc
+            f"no studio server answering at {base} ({exc.reason}). "
+            f"Start one with ./studio.sh, or pass --port/--url.") from exc
 
 
 def cmd_session(a):
@@ -2739,7 +3656,8 @@ def cmd_session(a):
     import urllib.error                                     # noqa: PLC0415
     import urllib.request                                   # noqa: PLC0415
 
-    url = f"http://127.0.0.1:{a.port}/api/session"
+    base = require_server(a)
+    url = f"{base}/api/session"
     body = None
     if a.action == "patch":
         raw = a.json
@@ -2761,11 +3679,14 @@ def cmd_session(a):
         patch.setdefault("by", resolve_by(a))
         if getattr(a, "message", None):
             patch.setdefault("message", a.message)
+        if getattr(a, "if_rev", None) is not None:
+            patch.setdefault("if_rev", int(a.if_rev))
         patch["replace"] = bool(a.replace)
         body = json.dumps(patch).encode()
 
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"},
+    headers = studio_headers(a)
+    headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers,
                                  method="POST" if body else "GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -2775,8 +3696,8 @@ def cmd_session(a):
         raise GradeError(f"studio refused it: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GradeError(
-            f"no studio server answering on 127.0.0.1:{a.port} ({exc.reason}). "
-            f"Start one with ./studio.sh, or pass --port.") from exc
+            f"no studio server answering at {base} ({exc.reason}). "
+            f"Start one with ./studio.sh, or pass --port/--url.") from exc
 
     if out.get("config") is None:
         print("the studio is running but no browser has published a config yet; "
@@ -2797,19 +3718,47 @@ def cmd_whoami(a):
     command, so that is what is shown here: the account name when logins are
     on (nothing overrides that, ever), otherwise --by, else CINEGRADE_AGENT,
     else cli.
+
+    A project key alone is an unreadable hash, so when one is open this
+    makes one more call, to GET /api/project, and shows the clip name next
+    to it (contract G9 friction 6: proving "these two agents have different
+    clips open" used to need a second call from the agent itself; the
+    second call still happens, it now happens in here so the agent's own
+    turn is one command).
     """
-    out = _studio_call(a.port, "whoami")
+    base = require_server(a)
+    out = _studio_call(base, "whoami", headers=studio_headers(a))
+    project_clip = None
+    if out.get("project"):
+        try:
+            proj = _studio_call(base, "project", headers=studio_headers(a))
+            project_clip = proj.get("name")
+        except GradeError:
+            project_clip = None
     effective_by = out.get("user") if (out.get("auth") and out.get("user")) \
         else resolve_by(a)
     if a.json:
         shown = dict(out)
         shown["by"] = effective_by
+        shown["project_clip"] = project_clip
         print(json.dumps(shown, indent=2))
         return
+    caller = out.get("caller") or {}
     print(f"user     {out.get('user') or '(no account, logins are off)'}")
     print(f"by       {effective_by}")
     print(f"logins   {'on' if out.get('auth') else 'off'}")
-    print(f"project  {out.get('project') or '(none open)'}")
+    # Contract G2: who the server thinks is calling, which is not the same
+    # question as who signs a write. `caller` is the row this shell's session
+    # and open project belong to; `attached` says it is acting as somebody
+    # else while still signing as itself.
+    print(f"caller   {caller.get('name') or 'local'} "
+          f"(id {caller.get('id', 0)})")
+    if caller.get("attached_to") is not None:
+        print(f"attached {caller['attached_to']}")
+    project_line = out.get("project") or "(none open)"
+    if project_clip:
+        project_line += f"  ({project_clip})"
+    print(f"project  {project_line}")
 
 
 def _relative_time(ts: float) -> str:
@@ -2957,26 +3906,32 @@ def cmd_project(a):
     project command is exactly as safe to run alongside a browser tab open on
     the same clip: it is the same server, the same routes, the same commits.
     """
+    base = require_server(a)
     by = resolve_by(a)
     cmd = a.project_cmd
+    # Contract G2: --agent and --attach ride on every call in this group, so
+    # an agent's open project is its own and `--attach 0` works the whole way
+    # through rather than on the first call only.
+    hdr = studio_headers(a)
 
     if cmd == "open":
-        out = _studio_call(a.port, "project/open", "POST",
-                           {"clip": a.clip, "by": by})
+        out = _studio_call(base, "project/open", "POST",
+                           {"clip": a.clip, "by": by}, headers=hdr)
         if a.rotation:
-            out = _studio_call(a.port, "project/rotation", "POST",
-                               {"rotation": a.rotation, "by": by})
+            out = _studio_call(base, "project/rotation", "POST",
+                               {"rotation": a.rotation, "by": by}, headers=hdr)
         _project_output(a, out, f"opened {a.clip}")
         return
 
     if cmd == "show":
-        out = _studio_call(a.port, "project", "GET")
+        out = _studio_call(base, "project", "GET", headers=hdr)
         _project_output(a, out, None)
         return
 
     if cmd == "log":
         limit = 2000 if a.all else max(1, int(a.limit))
-        out = _studio_call(a.port, f"project/log?limit={limit}", "GET")
+        out = _studio_call(base, f"project/log?limit={limit}", "GET",
+                           headers=hdr)
         if a.json:
             print(json.dumps(out, indent=2))
         else:
@@ -2984,8 +3939,8 @@ def cmd_project(a):
         return
 
     if cmd == "checkout":
-        out = _studio_call(a.port, "project/checkout", "POST",
-                           {"commit": a.commit, "by": by})
+        out = _studio_call(base, "project/checkout", "POST",
+                           {"commit": a.commit, "by": by}, headers=hdr)
         _project_output(a, out, f"checked out {a.commit}")
         return
 
@@ -2995,33 +3950,381 @@ def cmd_project(a):
             payload["name"] = a.name
         if a.from_commit:
             payload["commit"] = a.from_commit
-        out = _studio_call(a.port, "project/fork", "POST", payload)
+        out = _studio_call(base, "project/fork", "POST", payload, headers=hdr)
         _project_output(a, out, f"forked {out.get('branch', '')}".rstrip())
         return
 
     if cmd == "undo":
-        out = _studio_call(a.port, "project/undo", "POST", {"by": by})
+        out = _studio_call(base, "project/undo", "POST", {"by": by},
+                           headers=hdr)
         _project_output(a, out, "undo")
         return
 
     if cmd == "redo":
-        out = _studio_call(a.port, "project/redo", "POST", {"by": by})
+        out = _studio_call(base, "project/redo", "POST", {"by": by},
+                           headers=hdr)
         _project_output(a, out, "redo")
         return
 
     if cmd == "rotate":
-        out = _studio_call(a.port, "project/rotation", "POST",
-                           {"rotation": a.rotation, "by": by})
+        out = _studio_call(base, "project/rotation", "POST",
+                           {"rotation": a.rotation, "by": by}, headers=hdr)
         _project_output(a, out, f"rotation set to {a.rotation}")
         return
 
     if cmd == "time":
-        out = _studio_call(a.port, "project/time", "POST",
-                           {"time": a.seconds, "by": by})
+        out = _studio_call(base, "project/time", "POST",
+                           {"time": a.seconds, "by": by}, headers=hdr)
         _project_output(a, out, f"time set to {a.seconds:g}s")
         return
 
     raise GradeError(f"unknown project command {cmd!r}")
+
+
+# --------------------------------------------------------------------------
+# match, preset and grade: thin wrappers over the server's own routes
+#
+# No local equivalent exists for any of these (the fit in match, the shared
+# preset store, and the per clip saved grade all live on the server), so
+# founder decision 4 ("the CLI is the primary agent surface, the server
+# mirrors it") runs the other way here on purpose: these three commands
+# exist so an agent never has to fall back to curl the way one bakeoff
+# lane did (contract G9 friction 5).
+# --------------------------------------------------------------------------
+
+def cmd_match(a):
+    """POST /api/match: fit a look cube from a reference image toward a clip
+    frame, the same call studio/tools/grade_client.py's Studio.match() makes.
+
+    Crops are always sent explicitly, the whole frame when neither
+    --ref-crop nor --frame-crop is given: an absent crop key reads to the
+    server as "use whatever this project last had saved for this
+    reference", which is a browser tab's rectangle this CLI cannot see
+    (contract G9 leftover 3), so this command never leaves the key out.
+    """
+    base = require_server(a)
+    hdr = studio_headers(a)
+    cfg = load_preset(a.preset) if a.preset else {}
+    ref_crop = list(a.ref_crop) if a.ref_crop else [0.0, 0.0, 1.0, 1.0]
+    frame_crop = list(a.frame_crop) if a.frame_crop else [0.0, 0.0, 1.0, 1.0]
+    payload = {
+        "ref": a.ref, "clip": a.clip, "time": a.time, "config": cfg,
+        "method": a.method, "strength": a.strength,
+        "luma_preserve": a.luma_preserve,
+        "ref_crop": ref_crop, "frame_crop": frame_crop,
+    }
+    if a.name:
+        payload["name"] = a.name
+    if a.out_dir:
+        payload["out_dir"] = a.out_dir
+    out = _studio_call(base, "match", "POST", payload, headers=hdr)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    gain = (out.get("distance") or {}).get("gain_colour_pct")
+    line = (f"match {out.get('name')} -> {out.get('lut')}  "
+           f"ok={out.get('ok')} recommended={out.get('recommended')}")
+    if gain is not None:
+        line += f" gain_colour_pct={gain}"
+    print(line)
+    for w in out.get("warnings") or []:
+        print(f"  ! {w}")
+
+
+def cmd_preset(a):
+    """`preset save` (POST /api/preset) and `preset load` (GET /api/preset):
+    the shared, named grade store every account and agent reads and writes
+    (contract G2: always users/0/presets with logins off, so an agent's
+    save shows up for the person at the keyboard and the other way round).
+    """
+    import urllib.parse                                       # noqa: PLC0415
+
+    base = require_server(a)
+    hdr = studio_headers(a)
+    if a.preset_cmd == "save":
+        cfg = load_preset(a.preset)
+        out = _studio_call(base, "preset", "POST",
+                           {"name": a.name, "config": cfg,
+                            "comment": a.comment or ""}, headers=hdr)
+        if a.json:
+            print(json.dumps(out, indent=2))
+        else:
+            print(f"saved preset {out.get('saved')} -> {out.get('path')}")
+        return
+    if a.preset_cmd == "load":
+        q = f"name={urllib.parse.quote(a.name)}"
+        if a.expand:
+            q += "&expand=true"
+        out = _studio_call(base, f"preset?{q}", headers=hdr)
+        if a.output:
+            Path(a.output).write_text(json.dumps(out.get("config"), indent=2))
+        if a.json:
+            print(json.dumps(out, indent=2))
+            return
+        print(f"preset   {out.get('name')}")
+        print(f"comment  {out.get('comment') or '(none)'}")
+        print(f"expanded {bool(out.get('expanded'))}")
+        if a.output:
+            print(f"config   -> {a.output}")
+        else:
+            print(json.dumps(out.get("config"), indent=2))
+        return
+    raise GradeError(f"unknown preset command {a.preset_cmd!r}")
+
+
+def cmd_grade(a):
+    """`grade save` (PUT /api/grade) and `grade load` (GET /api/grade): the
+    per clip saved grade, contract C3, distinct from `preset` above (a
+    shared, named config) and from `session patch` (the LIVE config a
+    browser tab is watching). This route does not wake a watching tab; use
+    `session patch` for a change meant to be seen live.
+    """
+    import urllib.parse                                       # noqa: PLC0415
+
+    base = require_server(a)
+    hdr = studio_headers(a)
+    if a.grade_cmd == "save":
+        cfg = load_preset(a.preset)
+        payload = {"clip": a.clip, "config": cfg}
+        if a.message:
+            payload["message"] = a.message
+        out = _studio_call(base, "grade", "PUT", payload, headers=hdr)
+        if a.json:
+            print(json.dumps(out, indent=2))
+        else:
+            print(f"saved grade for {a.clip}: key {out.get('key')}, "
+                 f"head {out.get('head')}")
+        return
+    if a.grade_cmd == "load":
+        out = _studio_call(base, f"grade?clip={urllib.parse.quote(a.clip)}",
+                           headers=hdr)
+        if a.output and out.get("config") is not None:
+            Path(a.output).write_text(json.dumps(out["config"], indent=2))
+        if a.json:
+            print(json.dumps(out, indent=2))
+            return
+        if not out.get("exists"):
+            print(f"no saved grade for {a.clip}")
+            return
+        print(f"grade    {a.clip}")
+        print(f"key      {out.get('key')}")
+        if out.get("head"):
+            print(f"head     {out['head']}")
+        if a.output:
+            print(f"config   -> {a.output}")
+        else:
+            print(json.dumps(out.get("config"), indent=2))
+        return
+    raise GradeError(f"unknown grade command {a.grade_cmd!r}")
+
+
+# --------------------------------------------------------------------------
+# sheet: a labelled comparison image out of stills, frames or both
+# --------------------------------------------------------------------------
+
+_SHEET_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+_SHEET_GAP = 10
+_SHEET_BG = (18, 18, 18)
+_SHEET_FG = (230, 230, 230)
+_SHEET_LABEL_PAD = 6
+_SHEET_DEFAULT_HEIGHT = 480
+
+
+def _parse_grid(spec: str, n: int):
+    """'COLSxROWS' -> (cols, rows), the same order ImageMagick's -tile uses."""
+    try:
+        cols_s, rows_s = spec.lower().split("x")
+        cols, rows = int(cols_s), int(rows_s)
+    except ValueError:
+        raise GradeError(f"--grid wants COLSxROWS, e.g. 2x3, got {spec!r}") from None
+    if cols < 1 or rows < 1:
+        raise GradeError(f"--grid needs at least one column and one row, "
+                         f"got {spec!r}")
+    if n > cols * rows:
+        raise GradeError(f"--grid {spec} has {cols * rows} slots for {n} inputs")
+    return cols, rows
+
+
+def _sheet_load(path: Path, t: float, tmp_dir: Path, verbose: bool):
+    """One PIL image for a sheet panel: opened directly, or decoded from a
+    video through one bounded ffmpeg call at time `t`."""
+    from PIL import Image
+    if path.suffix.lower() in _SHEET_IMAGE_EXTS:
+        return Image.open(path).convert("RGB")
+    frame = tmp_dir / f"{path.stem}.png"
+    run(["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-i", str(path),
+        "-t", "1", "-frames:v", "1", str(frame)], verbose)
+    return Image.open(frame).convert("RGB")
+
+
+def _label_metrics(font):
+    """One label strip height for every panel, from a reference string with
+    both an ascender and a descender, so real labels never disagree with it
+    and every panel ends up the exact same total height."""
+    from PIL import Image, ImageDraw
+    d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox = d.textbbox((0, 0), "Ag", font=font)
+    return (bbox[3] - bbox[1]) + 2 * _SHEET_LABEL_PAD, bbox[1]
+
+
+def _sheet_panel(img, label, height, font, label_h, top_offset):
+    from PIL import Image, ImageDraw
+    w = max(1, round(img.width * height / img.height))
+    img = img.resize((w, height), Image.LANCZOS)
+    panel = Image.new("RGB", (w, label_h + height), _SHEET_BG)
+    d = ImageDraw.Draw(panel)
+    d.text((_SHEET_LABEL_PAD, _SHEET_LABEL_PAD - top_offset), label,
+           fill=_SHEET_FG, font=font)
+    panel.paste(img, (0, label_h))
+    return panel
+
+
+def build_contact_sheet(images, labels, cols, rows, height=None, width=None):
+    """Scale every input to one common height (never a common width), pad
+    to the tallest row and widest row, mixed aspect inputs never fail.
+
+    `height` fixes the shared panel height directly. `width` instead fixes
+    the whole sheet's width: the shared height is solved from whichever row
+    of scaled panels would add up to the widest total, so nothing overflows.
+    With neither, panels default to _SHEET_DEFAULT_HEIGHT.
+    """
+    from PIL import Image, ImageFont
+
+    rows_of = [list(zip(images[r * cols:(r + 1) * cols],
+                        labels[r * cols:(r + 1) * cols]))
+              for r in range(rows)]
+    rows_of = [row for row in rows_of if row]
+
+    if height:
+        target_h = int(height)
+    elif width:
+        best = 0.0
+        for row in rows_of:
+            aspect_sum = sum(im.width / im.height for im, _ in row)
+            gaps = _SHEET_GAP * max(0, len(row) - 1)
+            if aspect_sum:
+                best = max(best, (width - gaps) / aspect_sum)
+        target_h = max(2, int(round(best))) if best > 0 else _SHEET_DEFAULT_HEIGHT
+    else:
+        target_h = _SHEET_DEFAULT_HEIGHT
+
+    font = ImageFont.load_default()
+    label_h, top_offset = _label_metrics(font)
+
+    panel_rows = [[_sheet_panel(im, lb, target_h, font, label_h, top_offset)
+                  for im, lb in row] for row in rows_of]
+
+    row_heights = [max((p.height for p in row), default=0) for row in panel_rows]
+    row_widths = [sum(p.width for p in row) + _SHEET_GAP * max(0, len(row) - 1)
+                 for row in panel_rows]
+    canvas_w = max(row_widths, default=0)
+    if width and width > canvas_w:
+        canvas_w = int(width)
+    canvas_h = sum(row_heights) + _SHEET_GAP * max(0, len(row_heights) - 1)
+
+    sheet = Image.new("RGB", (max(1, canvas_w), max(1, canvas_h)), _SHEET_BG)
+    y = 0
+    for row, rh in zip(panel_rows, row_heights):
+        x = 0
+        for p in row:
+            sheet.paste(p, (x, y))
+            x += p.width + _SHEET_GAP
+        y += rh + _SHEET_GAP
+    return sheet
+
+
+def cmd_sheet(a):
+    try:
+        import PIL  # noqa: F401
+    except ImportError as exc:
+        raise GradeError("sheet needs Pillow: .venv/bin/pip install pillow") from exc
+
+    paths = [Path(p) for p in a.inputs]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise GradeError(f"sheet input not found: {', '.join(missing)}")
+
+    cols, rows = (len(paths), 1) if not a.grid else _parse_grid(a.grid, len(paths))
+
+    if a.labels:
+        labels = [s.strip() for s in a.labels.split(",")]
+        if len(labels) != len(paths):
+            raise GradeError(
+                f"--labels has {len(labels)} names for {len(paths)} inputs")
+    else:
+        labels = [p.stem for p in paths]
+
+    with tempfile.TemporaryDirectory(prefix="cinegrade_sheet_") as tmp_s:
+        tmp = Path(tmp_s)
+        images = [_sheet_load(p, a.time, tmp, a.verbose) for p in paths]
+        sheet = build_contact_sheet(images, labels, cols, rows,
+                                    height=a.height, width=a.width)
+        sheet.save(a.output)
+    print(f"sheet ({len(paths)} up, {cols}x{rows}) -> {a.output}")
+
+
+# --------------------------------------------------------------------------
+# docs: print one section of studio/README.md by heading name
+# --------------------------------------------------------------------------
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+
+
+def _readme_headings(text: str):
+    """[(line_index, level, title), ...] for every ATX heading, skipping
+    anything inside a fenced code block (a shell comment starting with
+    `#` inside a ```bash fence is not a heading)."""
+    headings = []
+    in_fence = False
+    fence = None
+    for i, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, marker
+            elif marker == fence:
+                in_fence, fence = False, None
+            continue
+        if in_fence:
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            headings.append((i, len(m.group(1)), m.group(2).strip()))
+    return headings
+
+
+def cmd_docs(a):
+    readme = ROOT.parent / "studio" / "README.md"
+    if not readme.exists():
+        raise GradeError(f"missing {readme}")
+    lines = readme.read_text().splitlines()
+    headings = _readme_headings("\n".join(lines))
+    if not headings:
+        raise GradeError(f"no headings found in {readme}")
+
+    def list_headings():
+        for _, level, title in headings:
+            print(f"{'  ' * (level - 1)}{title}")
+
+    if a.list or not a.section:
+        list_headings()
+        return
+
+    target = a.section.strip().lower()
+    match = next((h for h in headings if h[2].lower() == target), None)
+    if match is None:
+        print(f"no section named {a.section!r} in {readme}; sections:")
+        list_headings()
+        return
+
+    idx, level, _title = match
+    end = len(lines)
+    for j, lvl, _ in headings:
+        if j > idx and lvl <= level:
+            end = j
+            break
+    print("\n".join(lines[idx:end]).rstrip())
 
 
 def main():
@@ -3029,12 +4332,24 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def common(p):
-        p.add_argument("input")
+    def common(p, required_input=True):
+        p.add_argument("input", nargs=None if required_input else "?",
+                       help=None if required_input else
+                       "omit with --image, which measures a still instead "
+                       "of a clip")
         p.add_argument("--preset", "-p")
         p.add_argument("--look", "-l")
         p.add_argument("--exposure", "-e", type=float)
         p.add_argument("--tonemap", choices=["aces", "filmic", "none"])
+        # Not --input: every subcommand already has an `input` positional for
+        # the clip, and argparse would make one shadow the other.
+        p.add_argument("--input-space", choices=list(INPUTS),
+                       help="what the SOURCE is (convert.input): auto reads "
+                            "the file's own transfer and primaries tags, and "
+                            "the rest override that. auto never picks one of "
+                            "the five camera logs (slog3, logc3, vlog, clog3, "
+                            "dlog) because no container tag tells them apart, "
+                            "so those are named here or not used")
         p.add_argument("--working-space", choices=["dwg", "direct", "rec709"],
                        help="rec709 for footage that is already display "
                             "referred (an mp4, a Rec.709 export coming back "
@@ -3057,6 +4372,22 @@ def main():
     r.add_argument("--start", type=float)
     r.add_argument("--duration", "-t", type=float)
     r.add_argument("--no-audio", action="store_true")
+    r.add_argument("--codec",
+                   help="override output.codec for this render only, never "
+                        "the preset file; picks the output extension the "
+                        "same way the studio server does (prores_ks -> "
+                        ".mov, anything else -> .mp4)")
+    r_scale = r.add_mutually_exclusive_group()
+    r_scale.add_argument("--width", type=int,
+                         help="render at this width instead of the source's, "
+                              "scaling the pixel-denominated FX params "
+                              "(halation/bloom sigma, radial blur, RGB "
+                              "split, soften, grain size) the same way the "
+                              "studio's preview does")
+    r_scale.add_argument("--scale", type=float,
+                         help="render at this fraction of the source width "
+                              "(0.5 = half size), scaling the same "
+                              "pixel-denominated FX params as --width")
     r.set_defaults(fn=cmd_render)
 
     def region_flags(p):
@@ -3108,11 +4439,50 @@ def main():
     o.add_argument("--time", type=float, default=0.0)
     o.add_argument("--height", type=int, default=600)
     o.add_argument("--open", action="store_true")
+    o.add_argument("--json", action="store_true",
+                   help="print the tag, the four candidate rotations and "
+                        "rotation_tag_suspect; no contact sheet is rendered")
     o.set_defaults(fn=cmd_orient)
 
-    st = sub.add_parser("stats"); common(st)
+    st = sub.add_parser(
+        "stats",
+        help="the studio strip for a clip frame or a still: luma, "
+             "saturation, hue families, clipping and per-band colour, as "
+             "numbers. The same measurement POST /api/stats returns")
+    common(st, required_input=False)
     st.add_argument("--time", type=float, default=0.0)
+    st.add_argument("--image", help="measure this still instead of INPUT; "
+                                    "no grade is applied, --preset and the "
+                                    "look/primaries flags are ignored")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--region", nargs=4, type=float,
+                    metavar=("X0", "Y0", "X1", "Y1"),
+                    help="measure only this rectangle: four fractions of "
+                         "the frame, 0 0 1 1 being the whole frame. Same "
+                         "meaning as still's --region")
+    st.add_argument("--times", help="comma separated seconds; measures a "
+                                    "clip at each one and returns a list "
+                                    "instead of one block (not with --image)")
     st.set_defaults(fn=cmd_stats)
+
+    sw = sub.add_parser(
+        "sweep",
+        help="one config parameter, many values, one stats table per "
+             "value: reports what each value measures, never which to pick")
+    common(sw)
+    sw.add_argument("--time", type=float, default=0.0)
+    sw.add_argument("--param", required=True,
+                    help="dotted path into the config, e.g. "
+                         "fx.halation.strength or layers.0.correct.exposure")
+    sw.add_argument("--values", required=True,
+                    help="comma separated values tried at --param, e.g. "
+                         "0,0.25,0.5,0.75,1.0")
+    sw.add_argument("--json", action="store_true")
+    sw.add_argument("--sheet", metavar="OUT.jpg",
+                    help="also write a labelled contact sheet, one panel "
+                         "per value, through the same sheet code cinegrade "
+                         "sheet uses")
+    sw.set_defaults(fn=cmd_sweep)
 
     ss = sub.add_parser(
         "session",
@@ -3122,11 +4492,14 @@ def main():
     ss.add_argument("json", nargs="?",
                     help="for patch: a partial config object, deep merged into "
                          "the live one. '-' reads it from stdin.")
-    ss.add_argument("--port", type=int, default=STUDIO_PORT)
+    add_server_flags(ss)
     ss.add_argument("--replace", action="store_true",
                     help="overwrite the live config instead of merging into it")
     ss.add_argument("--by",
                     help="who this write is from (else CINEGRADE_AGENT, else cli)")
+    ss.add_argument("--if-rev", type=int, metavar="N", dest="if_rev",
+                    help="for patch: refuse the write, unchanged, unless the "
+                         "session is still at revision N (409 otherwise)")
     ss.add_argument("--message",
                     help="for patch: a readable message for the commit this "
                          "write records, sent as message; without it the "
@@ -3134,9 +4507,10 @@ def main():
     ss.set_defaults(fn=cmd_session)
 
     def common_project(p):
-        """--port, --by and --json, identical on every project command and
-        on whoami, so an agent's own wrapper script has one shape to build."""
-        p.add_argument("--port", type=int, default=STUDIO_PORT)
+        """--port, --url, --by, --agent, --attach and --json, identical on
+        every project command and on whoami, so an agent's own wrapper
+        script has one shape to build."""
+        add_server_flags(p)
         p.add_argument("--by",
                        help="who this write is from (else CINEGRADE_AGENT, "
                             "else cli); an agent should send agent:NAME")
@@ -3215,7 +4589,135 @@ def main():
     common_project(pt)
     pt.set_defaults(fn=cmd_project)
 
+    mt = sub.add_parser(
+        "match",
+        help="fit a look cube from a reference image onto a clip frame, "
+             "through the studio server's POST /api/match: no local "
+             "equivalent exists, so this is a thin wrapper (see "
+             "grade_client.Studio.match for the client module's own copy)")
+    mt.add_argument("ref", help="a reference image name under content/refs, "
+                                "or an absolute path")
+    mt.add_argument("clip", help="a clip name from GET /api/state")
+    mt.add_argument("--time", type=float, default=0.0)
+    mt.add_argument("--preset", "-p",
+                    help="a preset name or a JSON config file, sent as this "
+                         "call's config; left out, the server's own defaults")
+    mt.add_argument("--method", choices=["reinhard", "histogram"],
+                    default="reinhard")
+    mt.add_argument("--strength", type=float, default=1.0)
+    mt.add_argument("--luma-preserve", dest="luma_preserve",
+                    action="store_true", default=True)
+    mt.add_argument("--no-luma-preserve", dest="luma_preserve",
+                    action="store_false")
+    mt.add_argument("--ref-crop", nargs=4, type=float,
+                    metavar=("X0", "Y0", "X1", "Y1"))
+    mt.add_argument("--frame-crop", nargs=4, type=float,
+                    metavar=("X0", "Y0", "X1", "Y1"))
+    mt.add_argument("--name", help="the cube's own name; the server's "
+                                   "default carries this caller's id, the "
+                                   "reference, the clip and the method")
+    mt.add_argument("--out-dir", dest="out_dir",
+                    help="where the fitted cube lands; the server's "
+                         "default is the shared grade/luts/looks")
+    mt.add_argument("--json", action="store_true")
+    add_server_flags(mt)
+    mt.set_defaults(fn=cmd_match)
+
+    pset = sub.add_parser(
+        "preset",
+        help="save or load a shared, named grade (POST/GET /api/preset), "
+             "read and written by every account and agent alike")
+    preset_sub = pset.add_subparsers(dest="preset_cmd", required=True)
+
+    psv = preset_sub.add_parser("save", help="POST /api/preset")
+    psv.add_argument("name")
+    psv.add_argument("--preset", "-p", required=True,
+                     help="a preset name or a JSON config file: what gets "
+                          "saved under NAME")
+    psv.add_argument("--comment", default="")
+    psv.add_argument("--json", action="store_true")
+    add_server_flags(psv)
+    psv.set_defaults(fn=cmd_preset)
+
+    psl = preset_sub.add_parser("load", help="GET /api/preset")
+    psl.add_argument("name")
+    psl.add_argument("--expand", action="store_true",
+                     help="ask the server to mark the response expanded "
+                          "(the config itself is always fully expanded)")
+    psl.add_argument("--output", "-o",
+                     help="write the config to this file instead of "
+                          "printing it")
+    psl.add_argument("--json", action="store_true")
+    add_server_flags(psl)
+    psl.set_defaults(fn=cmd_preset)
+
+    grd = sub.add_parser(
+        "grade",
+        help="save or load one clip's own per clip grade (PUT/GET "
+             "/api/grade, contract C3); distinct from `preset` above")
+    grade_sub = grd.add_subparsers(dest="grade_cmd", required=True)
+
+    grs = grade_sub.add_parser("save", help="PUT /api/grade")
+    grs.add_argument("clip")
+    grs.add_argument("--preset", "-p", required=True,
+                     help="a preset name or a JSON config file: what gets "
+                          "saved for CLIP")
+    grs.add_argument("--message")
+    grs.add_argument("--json", action="store_true")
+    add_server_flags(grs)
+    grs.set_defaults(fn=cmd_grade)
+
+    grl = grade_sub.add_parser("load", help="GET /api/grade")
+    grl.add_argument("clip")
+    grl.add_argument("--output", "-o",
+                     help="write the config to this file instead of "
+                          "printing it")
+    grl.add_argument("--json", action="store_true")
+    add_server_flags(grl)
+    grl.set_defaults(fn=cmd_grade)
+
+    sh = sub.add_parser(
+        "sheet",
+        help="a labelled comparison image: several stills or clip frames "
+             "side by side, scaled to a common height so mixed aspect "
+             "inputs never fail")
+    sh.add_argument("inputs", nargs="+",
+                    help="PNG, JPG or any ffmpeg-readable video (one frame "
+                         "at --time)")
+    sh.add_argument("--output", "-o", required=True)
+    sh_size = sh.add_mutually_exclusive_group()
+    sh_size.add_argument("--height", type=int,
+                         help="every panel's height in pixels")
+    sh_size.add_argument("--width", type=int,
+                         help="the whole sheet's width in pixels; the "
+                              "shared panel height is solved from it")
+    sh.add_argument("--grid", help="COLSxROWS, e.g. 2x3; default is one row")
+    sh.add_argument("--labels",
+                    help="comma separated labels, one per input, in order; "
+                         "default is each file's stem")
+    sh.add_argument("--time", type=float, default=0.0,
+                    help="the frame time for any video input")
+    sh.add_argument("--verbose", "-v", action="store_true")
+    sh.set_defaults(fn=cmd_sheet)
+
+    dc = sub.add_parser(
+        "docs", help="print one section of studio/README.md by name")
+    dc.add_argument("section", nargs="?",
+                    help="a heading's text, case insensitive; omit to list")
+    dc.add_argument("--list", action="store_true",
+                    help="list every heading and exit")
+    dc.set_defaults(fn=cmd_docs)
+
     a = ap.parse_args()
+    # colour-science prints a notice about the missing scipy and matplotlib
+    # extras the first time something imports it (grade/slice.py does, via
+    # colorlib, on nearly every command). Neither extra is used here; keep
+    # the notice silent unless the command asked for --verbose (see how
+    # grade/tests/run_tests.py filters the same warning for the suite).
+    if getattr(a, "verbose", False):
+        warnings.filterwarnings("always", module="colour")
+    else:
+        warnings.filterwarnings("ignore", module="colour")
     try:
         a.fn(a)
     except GradeError as exc:

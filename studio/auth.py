@@ -244,6 +244,126 @@ def create_user(name: str, password: str, role: str = "user",
     return {"id": uid, "name": name, "role": role, "org_id": int(org_id or 1)}
 
 
+# --------------------------------------------------------------------------
+# agents (contract G2)
+#
+# An agent is not an account. It is a row in the same table so that everything
+# already keyed by a user id (the live session, the open project, the stored
+# match crops, the rotation fallback) is per agent for free, with no second
+# store and no "is this an agent" branch inside any of them. What makes it not
+# an account is the two things below: `kind` is `agent`, and the password
+# column holds an empty string, which verify_password() can never match
+# because it is not even shaped like a scrypt record. check_login() refuses
+# the row outright as well, so there are two independent reasons a sign in as
+# an agent fails and neither of them depends on the other.
+# --------------------------------------------------------------------------
+
+AGENT_PREFIX = "agent:"
+AGENT_KIND = "agent"
+
+
+def agent_row_name(name: str) -> str:
+    """The users.name an agent called NAME occupies."""
+    return AGENT_PREFIX + (name or "").strip()
+
+
+# Resolved agent rows, by (database file, row name). This is answered on
+# EVERY request from a named caller, including the frame requests a scrub
+# fires several times a second, so the second call onwards must not pay for a
+# schema check and two queries. Keyed by the database path as well as the
+# name so pointing the server at another data folder cannot serve an id from
+# the old one. Stale only if a row is deleted underneath a running server,
+# which is a --delete-user on a live process; a restart clears it.
+_agent_cache: dict[tuple, dict] = {}
+_agent_lock = threading.Lock()
+
+
+def ensure_agent(name: str) -> dict:
+    """The row for agent NAME, created on first sight. Never has a password.
+
+    Idempotent and safe to call on every request: the common path is a dict
+    lookup, and the first call is one SELECT. The INSERT is tried once and a
+    race with another thread inserting the same name comes back as an
+    IntegrityError, which is re-read rather than raised, because two requests
+    from the same agent arriving together is normal, not an error.
+    """
+    row_name = agent_row_name(name)
+    if not (name or "").strip():
+        raise AuthError(400, "an agent needs a name")
+    if len(row_name) > 64 + len(AGENT_PREFIX) or "/" in name or "\\" in name:
+        raise AuthError(400, "agent names are up to 64 characters and cannot "
+                             "contain a slash")
+    ck = (str(db.DB_PATH), row_name)
+    with _agent_lock:
+        hit = _agent_cache.get(ck)
+    if hit is not None:
+        return dict(hit)
+    db.init_schema()
+    con = db.connect()
+    try:
+        row = con.execute("SELECT id, name, role, kind FROM users "
+                          "WHERE name = ?", (row_name,)).fetchone()
+        if row is None:
+            try:
+                cur = con.execute(
+                    "INSERT INTO users (name, role, password, created_at, "
+                    "org_id, kind) VALUES (?, ?, ?, ?, ?, ?)",
+                    (row_name, "user", "", time.time(), 1, AGENT_KIND))
+                con.commit()
+                uid = int(cur.lastrowid)
+            except sqlite3.IntegrityError:
+                row = con.execute("SELECT id, name, role, kind FROM users "
+                                  "WHERE name = ?", (row_name,)).fetchone()
+                if row is None:
+                    raise
+                uid = int(row["id"])
+        else:
+            uid = int(row["id"])
+            if row["kind"] != AGENT_KIND:
+                # A human account already holds that name. Refusing is the
+                # only safe answer: quietly acting as them would hand an
+                # agent somebody's session and their open project.
+                raise AuthError(409, f"{row_name} is already an account, so "
+                                     f"it cannot also be an agent")
+    finally:
+        con.close()
+    # Same as an account: the folder exists from the moment the row does, so
+    # a path confinement check has a real directory to compare against.
+    (USERS_DIR / str(uid) / "footage").mkdir(parents=True, exist_ok=True)
+    out = {"id": uid, "name": row_name, "role": "user", "kind": AGENT_KIND}
+    with _agent_lock:
+        _agent_cache[ck] = dict(out)
+    return out
+
+
+def user_id_by_name(name: str) -> int | None:
+    """The id of an account or agent by exact name, or None."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    con = db.connect()
+    try:
+        row = con.execute("SELECT id FROM users WHERE name = ?",
+                          (name,)).fetchone()
+    finally:
+        con.close()
+    return int(row["id"]) if row else None
+
+
+def user_kind(user_id: int) -> str:
+    """`agent`, `person`, or `person` for user 0 and anything unknown."""
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return "person"
+    con = db.connect()
+    try:
+        row = con.execute("SELECT kind FROM users WHERE id = ?",
+                          (uid,)).fetchone()
+    finally:
+        con.close()
+    return str(row["kind"]) if row and row["kind"] else "person"
+
+
 def list_users() -> list[dict]:
     db.init_schema()
     con = db.connect()
@@ -267,9 +387,16 @@ def delete_user(name: str) -> bool:
     try:
         cur = con.execute("DELETE FROM users WHERE name = ?", ((name or "").strip(),))
         con.commit()
-        return cur.rowcount > 0
+        gone = cur.rowcount > 0
     finally:
         con.close()
+    if gone:
+        # An agent row can be deleted like any other. Drop it from the id
+        # cache so a server that is still running does not keep handing out
+        # the id of a row that is no longer there.
+        with _agent_lock:
+            _agent_cache.pop((str(db.DB_PATH), (name or "").strip()), None)
+    return gone
 
 
 def user_count() -> int:
@@ -304,11 +431,19 @@ def check_login(name: str, password: str) -> dict | None:
     """
     con = db.connect()
     try:
-        row = con.execute("SELECT id, name, role, password FROM users "
+        row = con.execute("SELECT id, name, role, password, kind FROM users "
                           "WHERE name = ?", ((name or "").strip(),)).fetchone()
     finally:
         con.close()
     if row is None:
+        hash_password(password or "no such user")
+        return None
+    if row["kind"] == AGENT_KIND:
+        # An agent row is not a login account (contract G2). Its password
+        # column is empty, so verify_password below would refuse it anyway;
+        # this is the explicit second lock, and it pays for the same scrypt
+        # hash first so an agent name cannot be told from an unknown one by
+        # how fast the answer comes back.
         hash_password(password or "no such user")
         return None
     if not verify_password(password or "", row["password"]):

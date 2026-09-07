@@ -26,10 +26,24 @@ on the network" below before binding it anywhere but 127.0.0.1. There is no buil
 step, no npm, no CDN: the page is hand written files served off disk and it works
 with the network cable out.
 
+The first calls worth making against a running server, before anything that reads
+a clip: `GET /api/health` (cheap, no ffprobe, just "is it up, which build, where is
+its cache and data") and then `GET /api/state` (the full picture: defaults, the
+clip list, presets, looks, refs, and, per contract G2, who the server thinks this
+caller is). Neither is a guess: `/api/footage` and `/api/clips` alone are not the
+first call anything should make. See "API" below for both shapes, and "Agent API"
+for the caller identity block `GET /api/state` carries.
+
 Requirements are the ones the engine already has: the repo venv at
 `content/.venv`, plus `ffmpeg` and `ffprobe` on PATH. Clips are read from
 `content/footage/`, reference images from `content/refs/`, and renders are written to
-`grade/out/`.
+`grade/out/`. Pillow is the one optional extra: only `cinegrade sheet` and the
+frame labels the client module's `contact_sheet()` draws need it, and the venv is
+uv made, so it installs the same way every other dependency did:
+
+```bash
+uv pip install --python .venv/bin/python numpy colour-science pillow
+```
 
 Two flags move the two folders that hold real work, and both exist for the same
 reason: a test run must not write into it.
@@ -48,6 +62,12 @@ reason: a test run must not write into it.
   have to lead to the very same files or every saved grade and every project in
   the specs would belong to a different clip. Deleting the temp folder afterwards
   removes the links and never the clips.
+- The browser harness itself (`studio/tests/run.mjs` and
+  `studio/tests/parity-gate.mjs`) points its own `--cache-dir` at
+  `studio/tests/.cache` rather than at a fresh temp folder, so repeat runs
+  stay warm instead of re-rendering from cold every time; it is gitignored,
+  and the founder's own `studio/cache` is never touched by a test run either
+  way. Delete `studio/tests/.cache` to force the next harness run cold.
 
 ## Logins and accounts
 
@@ -231,6 +251,14 @@ back `403 Forbidden` with `--behind-https-proxy` added and nothing else changed.
 
 ## Where things are
 
+Where the code itself lives, in one line before the tree: the engine core (the
+whole grading pipeline, the CLI, presets, DEFAULTS) is `grade/cinegrade.py`; the
+server and the API glue around it is `studio/*.py`; the frame measurement both of
+them share is `grade/stats.py`; the first party client for driving the server from
+outside is `studio/tools/grade_client.py`. `studio/cinegrade.py` does not exist:
+the server imports the engine from `grade/` (see "How a preview frame is made"
+below for the exact import), it does not carry its own copy.
+
 ```
 content/
   studio.sh                 launcher, execs the venv python
@@ -261,14 +289,24 @@ content/
       window-editor.js      the selected layer's window, drawn and dragged on the picture
       live.js               GPU still preview, the live loop, proxy playback
     tools/
-      agent_grade.py         the Agent API proof: measure, patch, save, on a loop
+      grade_client.py        first party client: Studio class, brief/bands/diff,
+                             decode/measure, contact_sheet. See "Agent API" below
+      agent_grade.py         the Agent API proof: measure, patch, save, on a loop,
+                             now built on grade_client.py instead of its own copies
     tests/                  puppeteer-core UI harness against real Chrome, npm test
-    cache/                  derived frames and JPEGs, safe to delete (gitignored)
+    cache/                  derived frames and JPEGs, safe to delete (gitignored,
+                             keyed off --data-dir/--cache-dir, see "Run it" above)
   grade/
+    cinegrade.py             the engine: pipeline, CLI, DEFAULTS, presets
+    stats.py                 frame_stats, bands, decode_image: the one shared
+                             measurement, imported by the server, the CLI and
+                             grade_client.py alike
     presets/*.json          shared with the CLI, this is where Save writes
     luts/looks/*.cube       the look list, this is where Import writes
     luts/layers/            layer correction cubes, one 33 point cube per layer (gitignored)
     luts/slice/             Color Slice / Tetra cubes, 33 point (gitignored)
+    luts/technical/         input transform cubes (HLG, PQ, Rec.709), from
+                             grade/tools/make_cst.py, see "Input transforms" below
     out/                    finished renders
 ```
 
@@ -310,18 +348,65 @@ place, not moved.
 ## What the numbers mean
 
 The stats strip under the viewer is the same measurement the grading notes were
-written against:
+written against, and it is the exact dict `POST /api/stats`, `cinegrade stats` and
+`studio/tools/grade_client.py`'s `stats()`/`brief()` all return (`grade/stats.py`
+owns it once, nobody re-derives it). On the wire (`POST /api/stats`, and
+`cinegrade stats --json` on a clip or on `--image`) this dict is one level
+down, wrapped as `{"key", "size", "stats"}` (plus `region`/`region_pixels`
+when a `region` was given): read `luma` off `response["stats"]`, not off the
+top level, or the first field access is a `KeyError`. `grade_client.py`'s
+`Studio.stats()` returns that same wrapped shape (`.stats(...)["stats"]`);
+its `brief()` and `diff()` expect the unwrapped inner dict, matching the
+usage in "The first party client module" below. The list below describes
+what lives inside `stats`:
 
 - luma percentiles at 5, 25, 50, 75 and 95, as 0 to 1
 - mean saturation, computed as `(max - min) / max` per pixel
 - percent of pixels in each hue family (warm, green, cool, magenta), counting only
   pixels above 10 percent saturation so that grey does not vote
 - percent clipped black (code 2 or under) and clipped white (code 253 or over)
+- `bands`: the same frame sliced into eight equal brightness bands (0 = pure
+  black, 1 = pure white), each one read as:
+  - **saturation**: how colourful that brightness range is on average (0 = no
+    colour, higher = more vivid). Near zero in a shadow band or a highlight band
+    is normal, not a fault: it just means little colour lives there.
+  - **warm**: mean red minus mean blue in that band. Positive is warmer, negative
+    is cooler, zero is neither.
+  - **tint**: mean green minus the average of red and blue in that band. Positive
+    leans green, negative leans magenta, zero is neutral.
+  - **count**: how many of the frame's pixels actually fall in that band. A band
+    with very few or zero pixels is a genuinely dark or bright frame with little
+    content there; its saturation/warm/tint read as flat zero rather than a
+    number computed from almost no pixels.
 
-Those are measured on the preview frame, at 640 wide and 8-bit, from the same decoded
-array the picture and the scopes come from. Picture and numbers therefore cannot
-disagree with each other, but they can both differ slightly from the full resolution
-10-bit render. The Limits panel in the app spells out where.
+  None of the four is ever compared against another band's, or used to call one
+  band "wrong": a band is a readout, the same way the luma percentiles and hue
+  family percentages above it already are. A whole frame number, banded or not,
+  also moves with framing: a hue family percentage tracks how much sky or skin is
+  in shot as much as it tracks the grade, so a wide shot and a close-up of the
+  same grade will not read the same. See "Match Reference" below for
+  `hue_divergence`, the check for a metric that improved only because a fit's
+  target content does not match the shot's.
+
+Those are measured on the preview frame, at 640 wide and 8-bit by default (`stats`
+on the CLI measures the source's own resolution instead, since there is no preview
+render to piggyback on) from the same decoded array the picture and the scopes come
+from. Picture and numbers therefore cannot disagree with each other, but they can
+both differ slightly from the full resolution 10-bit render. The Limits panel in
+the app spells out where.
+
+`region` (four fractions of the frame, `X0 Y0 X1 Y1`, after rotation, 0 0 1 1 being
+the whole frame) narrows every one of these numbers to one rectangle: on
+`POST /api/frame` and `POST /api/stats` it is the `region` field, honoured whether
+the request is measuring a clip, a `ref`, or an outside `path`; on the CLI it is
+`--region X0 Y0 X1 Y1` on `still`, `compare` and `stats`. The crop runs AFTER the
+whole grade and before any output scale, so the patch is exactly the pixels the
+full render puts there: windows, vignette and grain sit where the full frame would
+show them, not where they would sit in an isolated crop. `zoom` (a request field on
+`POST /api/frame`/`POST /api/stats`, or `--zoom` alongside `--region` on `still`
+and `compare`) renders the region at that many times the size it would have inside
+a plain render at the requested width, default 1, capped by how many real source
+pixels the region actually has.
 
 ## API
 
@@ -330,10 +415,11 @@ defaults, so a partial config is legal everywhere.
 
 | Route | Method | What it does |
 | --- | --- | --- |
-| `state` | GET | defaults, clips, presets, looks, refs, renders, stat definitions |
+| `health` | GET | `{ok, version, clips, uptime_s, ffmpeg_slots_free, cache_dir, data_dir, logins}`; the cheapest possible "is it up" call, no ffprobe. See "Run it" above and "Per caller identity" below |
+| `state` | GET | defaults, clips (each with a `source` block and rotation tags, see "Input transforms" and "Rotation" below), presets, looks, refs, renders, stat definitions, and this caller's own identity under `caller` |
 | `clips` | GET | probe info for everything in `footage/` |
-| `frame` | POST | render one preview frame, returns JPEG |
-| `stats` | POST | the numbers above for one frame |
+| `frame` | POST | render one preview frame, returns JPEG. Takes `region`/`zoom` (see "What the numbers mean" above), `mask_layer` when `mode` is `"mask"` (which layer's matte to show; absent is the first enabled one), and a read only `path` (an absolute file outside the footage root, logins off only, see "Reading a file directly" below) |
+| `stats` | POST | the numbers above for one frame. Takes `ref` (a name under `content/refs`, measured instead of a clip), `times` (a list of seconds, answers `{"results": [...]}` instead of one block), `region`, and the same read only `path` |
 | `scope` | POST | histogram, waveform, parade or vectorscope as a JPEG |
 | `thumb` | GET | timeline thumbnail, ungraded |
 | `ref` | GET | a reference image from `content/refs/` |
@@ -361,17 +447,94 @@ defaults, so a partial config is legal everywhere.
 | `grade/copy` | POST | copy one clip's saved grade onto another |
 | `auth/login`, `auth/logout`, `auth/me`, `auth/token`, `auth/tokens` | see below | see Logins and accounts below |
 | `reveal` | POST | open a Finder window on the machine running the server; answers only that same machine, see Running it on the network below |
-| `match` | POST | fit a look cube toward a reference image, see Match Reference below |
+| `match` | POST | fit a look cube toward a reference image, see Match Reference below. Takes `name`/`out_dir` (where the fitted cube lands) and answers with `recommended` (bool) and `bands` for the reference and the source frame |
 | `source` | POST | the decoded, downscaled source frame as raw rgb48le |
 | `lut` | POST | a technical, look, layer or slice (Color Slice / Tetra) cube as float32, for the GPU preview |
 | `grain/plate` | GET | a raw rgb48le grain plate for one stock/size/strength/seed/softness/color, for the GPU preview |
-| `session` | GET / POST | read or change the live config of the open page |
+| `session` | GET / POST | read or change the live config of the open page. `POST` takes an optional `if_rev`: a write that would land on a revision other than the one given is refused 409 with the current `rev` and the current session, instead of silently overwriting it |
 | `session/wait` | GET | long poll, returns as soon as the live config moves |
 | `parity/report` | GET / POST | the GPU versus ffmpeg parity numbers |
 
 Preview requests carry `X-Studio-Client` and `X-Studio-Gen` headers. The server drops
 a request whose generation is already stale, so dragging a slider does not queue up a
 line of doomed ffmpeg runs behind the one you actually want.
+
+### `mask_layer`, and reading a file directly
+
+`POST /api/frame` with `"mode": "mask"` shows a layer's matte instead of the graded
+picture (the picture is `"graded"`, the default; the ungraded source is `"flat"`).
+`"mask_layer"` picks WHICH layer's matte to show, by its index in `layers`; leave it
+out and the first enabled layer's matte is what comes back. Without it, checking a
+second layer's mask meant disabling every other layer and rendering twice.
+
+`"path"` on `POST /api/frame` and `POST /api/stats` is a different thing from
+`clip` or `ref`: an absolute file the server was never told about (a render mid
+copy, a frame from outside `content/footage/` entirely). It is decoded and
+measured or served exactly as it sits on disk, no grading `config` applied, no
+project opened, no session touched, nothing registered anywhere, and it is
+refused 403 the moment logins are on (naming itself, not the ordinary 401 every
+other route gives with no session): with an account system there is no login to
+check the file against, so honouring an arbitrary path would be a way past every
+other route's read guard. This is the server side of the one decode function
+`grade/stats.py`'s `decode_image()` gives the CLI's `stats --image` and the client
+module's `decode()` too, so a file measured through any of the three is the same
+bytes and the same numbers.
+
+Measuring a `path` raw, ignoring whatever `config` is sent, is by design and
+stays that way: threading a config through a `path` read would mean grading an
+arbitrary file with the server's own defaults (an aces tonemap and an Apple
+Log CST land on a plain PNG the moment `config` is `{}`, which every existing
+caller already sends), it would give `path` an escape hatch around the same
+read guard that refuses it 403 with logins on, and the render cache has no
+file mtime in its key, so a second call after the file changed on disk would
+serve the first call's pixels. To measure a graded intermediate: render it
+first with the CLI (`cinegrade still FILE -o out.png --preset ...`, which
+takes any path, not only a registered clip), then measure `out.png`, either
+`POST /api/stats {"path": "/abs/out.png"}` or `cinegrade stats --image
+out.png`. Render, then measure; a raw `path` read never grades.
+
+## CLI reference
+
+`grade/cinegrade.py` is the primary agent surface; the server mirrors it, not
+the other way round. Every subcommand below takes `input` (the clip or still
+to grade, positional) plus a shared set of grading flags unless noted:
+`--preset/-p NAME_OR_PATH`, `--look/-l NAME`, `--exposure/-e STOPS`,
+`--tonemap {aces,filmic,none}`, `--working-space {dwg,direct,rec709}`,
+`--contrast`, `--saturation`, `--temperature`, `--tint`, `--rotate
+{auto,0,90,180,270}` (beats the config's own `rotation`, see "Rotation"
+above), `--no-autorotate` (alias for `--rotate 0`), `--input-space {auto,
+apple_log,hlg,pq,rec709,slog3,logc3,vlog,clog3,dlog}` (overrides
+`convert.input`, including whatever `--preset` carries; see "Input
+transforms" above; on `render`, `still`, `compare`, `scopes`, `stats`,
+`orient` and `sweep`), `--verbose/-v` (also un-silences colour-science's own
+scipy/matplotlib startup notice, silent by default on every command).
+`--agent`/`--attach`/`--if-rev`, and `--port`/`--url` (env `STUDIO_PORT`/
+`STUDIO_URL`), are documented under "Per caller identity" in Agent API
+below, since they only apply to `session`, `whoami`, `project`, `match`,
+`preset` and `grade`, the six commands that talk to a running server rather
+than grading a file directly. One rule worth repeating here since it is easy
+to trip on a mixed command line: naming `--agent`/`STUDIO_AGENT` on any of
+those six without also naming a server (`--port`, `--url`, `STUDIO_PORT` or
+`STUDIO_URL`) is refused before any request goes out, rather than silently
+landing on the port 7431 default, which is a human's own live studio.
+
+| Command | Flags beyond the shared set | What it does |
+| --- | --- | --- |
+| `render IN -o OUT` | `--start`, `--duration/-t` (seconds); `--no-audio`; `--codec NAME` (this render only, never the preset file; extension must agree, `prores_ks` to `.mov`, else `.mp4`, or the command refuses before ffmpeg runs); `--width N` / `--scale F` (mutually exclusive; scales the pixel denominated FX params the same way the studio preview does); audio maps only the first stream (`0:a:0?`), so a second, undecodable stream (an iPhone spatial audio `apac` track) no longer kills the render | writes a finished file to `grade/out/` (or wherever `-o` points), then prints `rendered (input INPUT, rotation ROTATION) -> PATH`, naming the resolved input transform (`Input transforms` above) and the rotation mode actually used, not only `rendered -> PATH` |
+| `still IN -o OUT` | `--time` (default 0); `--width`; `--region X0 Y0 X1 Y1`, `--zoom F` (see "What the numbers mean" above) | one graded frame as a PNG |
+| `compare IN -o OUT` | `--time`; `--width` (default 560); `--region`, `--zoom`; `--looks a,b,c`; `--presets a,b,c`; `--open` (Preview.app) | a grid of the same frame under several looks or presets |
+| `scopes IN -o OUT` | `--time`; `--width` (default 700); `--open` | histogram, waveform, parade and vectorscope as one image |
+| `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect}` instead of rendering a sheet; see "Rotation" above) | a contact sheet of all four rotations, or the JSON verdict |
+| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; no grade applied, `input` becomes optional, `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows each carry a `"time"` key too, since that is the field being varied |
+| `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order); `--json`; `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
+| `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
+| `docs [SECTION]` | `SECTION` (a heading's text, matched case insensitively at any level, skipping headings inside fenced code blocks; omit to list); `--list` (list every heading and exit; a `SECTION` that matches nothing also lists them, rather than failing) | prints one section of this file, or the whole table of contents |
+| `session {get,patch} [JSON]` | `JSON` for `patch` (a partial config, deep merged into the live one; `-` reads it from stdin); `--port`/`--url` (default port 7431 with neither, env `STUDIO_PORT`/`STUDIO_URL`, see "Per caller identity" below); `--replace` (overwrite instead of merging); `--by`; `--message` (for `patch`, a readable commit message); see "Per caller identity" below for `--agent`/`--attach`/`--if-rev` | reads or changes a running server's live config, see "Driving the open page from outside" below |
+| `whoami` | `--port`/`--url`; `--json` (carries `"project_clip"` next to the project key once one is open); see "Per caller identity" below for `--agent`/`--attach` | who a write from this shell counts as, and what project is open (with its clip name), see "Identity" above |
+| `project {open,show,log,checkout,fork,undo,redo,rotate,time}` | `open CLIP [--rotation auto\|0\|90\|180\|270]`; `log [--limit N] [--all]`; `checkout ID`; `fork [NAME] [--from ID]`; `rotate auto\|0\|90\|180\|270`; `time SECONDS`; every one takes `--port`/`--url`, `--by`, `--json`, and (see below) `--agent`/`--attach` | a clip's git style history, see "Projects and history" below |
+| `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
+| `preset {save,load} NAME` | `save NAME -p grade.json --comment TEXT`; `load NAME [--expand] [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `POST`/`GET /api/preset`: the shared, named grade store, read and written by every account and agent alike |
+| `grade {save,load} CLIP` | `save CLIP -p grade.json --message TEXT`; `load CLIP [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `PUT`/`GET /api/grade` (contract C3): one clip's own per clip grade, distinct from the shared `preset` above and from `session patch` (the live config a browser tab is watching; `grade save` never wakes it) |
 
 ## How a preview frame is made
 
@@ -407,29 +570,241 @@ They are now `lut` expressions doing the same arithmetic without the cap, and th
 take a scalar or a per channel triple. No shipped preset set either value, and all
 nine baseline stills stayed byte identical across the change.
 
-## Grading footage that is not Apple Log
+## Input transforms
 
-The engine was built for Apple Log and used to assume it silently. Loading an
-ordinary Rec.709 mp4 did not error, it applied a log to display conversion to a
-picture that never had a log curve: measured on a real delivery file, median luma
-fell from 0.332 to 0.238 and mean saturation rose from 0.33 to 0.59, giving neon
-colour and blown skin.
+The engine was built for Apple Log, and for a while it assumed that silently. The
+grade now starts by deciding what the source actually IS: that decision is
+`convert.input`, a top level config key, one of `"auto"` (the default),
+`"apple_log"`, `"hlg"`, `"pq"`, `"rec709"`, or one of five manufacturer camera
+logs, `"slog3"`, `"logc3"`, `"vlog"`, `"clog3"`, `"dlog"` (see "Camera logs"
+below). `GET /api/state`'s `convert_definitions.input` carries this exact list
+under `values`, the five camera logs again under their own `camera_logs`, and a
+`note` field stating the same auto rule in one paragraph, so an agent can read
+what the field accepts instead of guessing or reading the source. `"auto"`
+reads the file's own tags and never resolves to a camera log:
 
-Set `convert.working_space` to `rec709` for that footage. It skips the log stage,
-CST IN and CST OUT and grades in place, while primaries, curves, hue curves,
-Color Slice, layers, the look LUT, FX, grain, detail and letterbox all still run.
+| what ffprobe says | `resolved_input` |
+| --- | --- |
+| transfer `arib-std-b67` | `hlg` |
+| transfer `smpte2084` | `pq` |
+| transfer `bt709` with `bt709` primaries | `rec709` |
+| no usable transfer tag (what an Apple Log or camera log file carries) | `apple_log` |
+| anything else | `apple_log`, plus a warning naming the tag |
+
+The last line is what keeps every existing grade byte identical: an Apple Log
+clip has always had bt2020 primaries and no transfer tag, so `auto` decodes it
+exactly as it always has, and an unrecognised pair of tags still renders the way
+it always did rather than refusing, with the warning telling you what to set
+`convert.input` to if that guess is wrong. A camera log file carries the exact
+same tags (bt2020 primaries, no transfer tag), so `auto` decodes it as
+`apple_log` too, wrongly: name the camera log by hand (in the Input select, in
+`convert.input`, or with `--input-space` on the CLI, see "Choosing the input
+from the CLI" below) whenever the source is not really Apple Log. An explicit
+value is never second guessed. Every clip in `GET /api/state` (and the app's
+clip list) shows its own `source` block: the three raw tags (`transfer`,
+`primaries`, `matrix`), `resolved_input`, and any `warnings`, so you can see the
+decode before rendering anything.
+
+Every input decodes to the same scene linear point on BT.2020 primaries that
+the Apple Log path has always reached, so `working_space`, `tonemap`, `encode`
+and every creative control below mean exactly what they always meant: an 18
+percent grey card renders the same whether the source was shot Apple Log, HLG,
+PQ, delivered as Rec.709, or shot on one of the five camera logs. The standards
+behind each decode, so this is checkable rather than asserted:
+
+- **HLG**: ITU-R BT.2100's inverse OETF, then the BT.2100 OOTF at system gamma
+  1.2 on a nominal 1000 cd/m2 display.
+- **PQ**: SMPTE ST 2084's EOTF to absolute cd/m2.
+- **Rec.709**: ITU-R BT.1886 (a pure 2.4 gamma) to display linear, then one
+  documented scale so a BT.709 encoded 18 percent grey card lands on 0.18 scene
+  linear instead of the 0.62 stops dark it would otherwise land at.
+- The shared anchor across all of them is ITU-R BT.2408: 26 cd/m2 (its Reference
+  Level) is 0.18 scene linear, which puts 203 cd/m2 (its Reference White) at
+  1.405. Run `.venv/bin/python grade/tools/make_cst.py --anchors` on a live
+  checkout to print 18 percent grey in each input's own code values (apple_log
+  0.4883, hlg 0.3786, pq 0.3800, rec709 0.4090, slog3 0.4106, logc3 0.3910,
+  vlog 0.4233, clog3 0.3280, dlog 0.3988) as a standing cross check that these
+  constants are anchored on the standard or the vendor's own document, not
+  fitted to a picture. Each camera log number is cross checked a second way:
+  against colour-science 0.4.7's own independent implementation of the same
+  curve and gamut, agreeing to 1e-8 or better, and that cross check runs on
+  every test suite run so a future edit to a constant has to survive it.
+
+Primaries are a separate question from the transfer curve, handled separately: a
+file whose primaries are `bt709` is matrixed into BT.2020 before anything else
+runs; a file already on `bt2020` primaries passes through unchanged. A file that
+carries one input's curve on another's primaries (an HLG file tagged with bt709
+primaries, say) loads its own cube for that exact combination, so there is no way
+to apply the wrong matrix by accident.
+
+Exposure is a true doubling of scene light per stop for every input, not the
+Apple Log constant borrowed for everything else: measured through a real ffmpeg
+render, one stop comes out between 1.991 and 2.000 on HLG, PQ and Rec.709 alike
+(the residual is the LUT's own 16-bit rounding). None of the five camera logs
+can spend a stop as a simple code offset the way Apple Log does (each has a
+linear toe and an offset inside its own logarithm, so an offset would be a
+different number of stops at every code, worst exactly where the shadows are),
+so their exposure runs the vendor's own inverse curve, a multiply by
+`2 ** stops`, and the vendor's own forward curve, as one expression: measured on
+seven patches from three stops under mid grey to three over, one stop comes out
+1.9946 to 1.9999, one stop down 0.4967 to 0.5013.
+
+`convert.working_space: "rec709"` is the other half of this and still means what
+it always meant: the source is ALREADY display referred, so skip the log stage,
+CST IN and CST OUT and grade in place, while primaries, curves, hue curves, Color
+Slice, layers, the look LUT, FX, grain, detail and letterbox all still run.
 Exposure, temperature and tint keep working and keep meaning stops; on this path
-a stop is a code multiply rather than a log offset, because there is no log
-curve to offset.
+a stop is a code multiply rather than a log offset, because there is no log curve
+to offset. What changed is which files this is allowed on: asking for `rec709`
+working space on an HLG or PQ file (both BT.2020) used to be refused outright and
+now is allowed, with a warning, because neither one is camera log; asking for it
+on a file that resolves to `apple_log` because its transfer tag is missing or
+unrecognised is still refused, naming the right mode, because that file really is
+camera log and the log curve would never be undone (measured on a real delivery
+file wrongly graded this way: median luma fell from 0.332 to 0.238 and mean
+saturation rose from 0.33 to 0.59, giving neon colour and blown skin). An
+explicit camera log value gets the exact same refusal as `apple_log`, for the
+exact same reason: that path undoes no curve at all, so a log source would
+render flat and grey with nothing on screen to say why, and naming a camera log
+already says in so many words that the source has one. Use `dwg` or `direct`
+instead. An untagged file is never guessed at either way.
 
-The two are not interchangeable and picking the wrong one is now refused with a
-message naming the right mode, rather than rendered wrong. The test is the clip's
-own matrix tag: `bt2020nc` is camera log, `bt709` is already display referred.
-An untagged file is left alone rather than guessed at.
+### Camera logs
+
+Five manufacturer log curves are `convert.input` values alongside `apple_log`,
+`hlg`, `pq` and `rec709`, and they decode to the same scene linear point every
+other input reaches, so everything downstream means what it always meant:
+
+| value | what it is | the document it comes from | 18% grey code | gamut |
+| --- | --- | --- | --- | --- |
+| `slog3` | Sony S-Log3 | Sony's S-Log3 technical summary | 0.4106 (10 bit code 420) | S-Gamut3.Cine |
+| `logc3` | ARRI LogC3 at EI 800 | ARRI's Log C curve usage document | 0.3910 (10 bit code 400) | ARRI Wide Gamut 3 |
+| `vlog` | Panasonic V-Log | the V-Log/V-Gamut reference manual | 0.4233 (42.3 IRE) | V-Gamut |
+| `clog3` | Canon Log 3 | Canon's Canon Log gamma curves white paper | 0.3280 (32.8 IRE) | Cinema Gamut |
+| `dlog` | DJI D-Log | DJI's D-Log white paper | 0.3988 | D-Gamut |
+
+Two things to know about them.
+
+**`auto` never picks one.** No container tag can tell S-Log3 from LogC3 from
+V-Log: all five come off the camera looking exactly like an Apple Log file
+(BT.2020 primaries, no transfer tag), so guessing would be guessing between
+five different pictures. Name the one the camera actually shot, in the Input
+select, in `convert.input`, or with `--input-space` on the CLI (below).
+
+**The gamut comes with the curve.** There is no code point in any container for
+S-Gamut3.Cine or ARRI Wide Gamut 3 or the other three, so those files are
+tagged `bt2020` because that is the nearest label available, not because it is
+true. The engine does not read that tag for these five: naming the curve names
+the gamut, and there is exactly one technical cube set per camera log
+(`SLog3_to_DWG.cube` and so on, with no primaries infix, since reading the tag
+would matrix the file as though it were plain BT.2020 and quietly desaturate
+it).
+
+One caveat that is about the file rather than the curve: the engine normalises
+a source to full scale using the file's own `color_range` tag before any curve
+runs, exactly like HLG, PQ and Rec.709 already do. A camera log file that is
+tagged legal range while actually carrying data levels (several camera formats
+do) decodes a fraction of a stop off. Fix the tag on the file; the curve is not
+the thing to adjust.
+
+### Choosing the input from the CLI
+
+    cinegrade still IN.MOV -o out.png --input-space vlog
+
+`--input-space`, not `--input`: every subcommand already has an `input`
+positional for the clip itself. It is on `render`, `still`, `compare`,
+`scopes`, `stats`, `orient` and `sweep`, takes any `convert.input` value
+(`auto`, `apple_log`, `hlg`, `pq`, `rec709`, `slog3`, `logc3`, `vlog`, `clog3`,
+`dlog`), and overrides whatever a `--preset` carries.
+
+`cinegrade orient IN --json` also prints what the file resolves to (`transfer`,
+`primaries`, `resolved_input`, `source_primaries`, `warnings`) next to the
+rotation tag, honouring `--input-space`, so the one command an agent runs
+before it knows anything about a file answers both questions at once (see
+"Rotation" below for the rest of that command's output).
+
+### Generating the technical cubes
+
+    .venv/bin/python grade/tools/make_cst.py --batch --size 65 \
+        --out-dir grade/luts/technical
+    .venv/bin/python grade/tools/make_cst.py --anchors
+
+The first writes every non Apple Log cube, 90 files (HLG, PQ and Rec.709 on
+both gamuts, plus the five camera logs, times the tonemap and encode
+combinations each needs). Apple Log's own cubes are not touched and stay byte
+identical. The second prints 18 percent grey in each input's own code values,
+including the five camera logs with the document each number came from, listed
+above under "The standards behind each decode" and "Camera logs".
 
 This is also the FX only round trip described in `grade/FREE-RESOLVE.md`: grade
 somewhere else, export Rec.709, bring it back here for halation, bloom, grain and
 a vignette without touching the colour.
+
+### The GPU live preview and the file's tags
+
+Fixed everywhere: the clip's resolved input (`clips[].source.resolved_input`,
+the same answer the render uses) is handed to every GPU path, still, loop and
+proxy playback alike, so a preview asks for the cube the server would,
+including on `auto` for HLG, PQ, or a named camera log. Nothing changes for an
+Apple Log clip. Server renders, CLI renders and stills were always correct
+regardless; the live GPU preview now agrees with them in every mode, not only
+the still one.
+
+## Rotation
+
+`"rotation"` is a top level config key, alongside `convert` and `primaries`, not
+only a request field: one of `"auto"` (default, honour the file's own display
+matrix tag, today's behaviour), `"0"`, `"90"`, `"180"`, `"270"` (ignore the tag
+and turn the picture that many degrees clockwise regardless of what it says).
+Because it lives in the config, it is part of a saved grade or preset: `PUT
+/api/grade` and `POST /api/preset` persist it, and loading either back applies
+it, the same way loading a preset replaces the rest of the config ("Presets: the
+comment rule and the Load rule" below). Loading a preset or grade that carries a
+real value moves the rotation control to match it; one that carries `"auto"` (or
+predates this feature, filled in as `"auto"` by the defaults merge) leaves the
+control exactly where it was, since `"auto"` means "let the project or the
+file's tag keep deciding", not "force zero". It is also stripped from a saved
+preset exactly like every other untouched default (presets are diffs against
+the engine's defaults), so a preset nobody ever set a real rotation on stays
+silent about it, and a preset that did carry a real one survives the round trip.
+
+Resolution order, most specific wins: an explicit `rotation` field on the
+request itself, then a non-auto `rotation` sitting inside the request's own
+`config`, then the open project's stored rotation, then the file's own display
+matrix tag. This is one level deeper than "Playback" above describes for the
+proxy and scrub routes (request field, then legacy `autorotate` boolean, then
+the project): the config-level value now sits between the request field and the
+project, everywhere a route accepts a `config`. On the CLI, `--rotate` beats
+everything including the config; `--no-autorotate` forces `"0"` and also beats
+the config; with neither flag, `render`, `still`, `stats`, `scopes`, `compare`
+and `orient` all honour a non-auto `rotation` sitting in the preset or config
+they were given.
+
+`cinegrade orient IN.MOV --json` skips rendering its usual contact sheet and
+prints one JSON object instead: `{"tag": ..., "candidates": {"0": {"width":
+W, "height": H}, "90": {...}, "180": {...}, "270": {...}}, "rotation_tag_suspect":
+bool}`. `"tag"` is the file's own raw display matrix value exactly as ffprobe
+reports it (it can be negative, e.g. `-90`). `rotation_tag_suspect` is advisory
+only and NOTHING ever applies a rotation because of it: it flags a tag that
+looks like it does not belong on this file, for either of two reasons: the
+codec is a professional or cinema one (ProRes, DNxHD/HR, CineForm, R3D, BRAW,
+ARRIRAW, CinemaDNG) carrying any quarter turn tag, since those tools do not
+normally write one for a phone-style reason; or the file's own raw (pre
+rotation) coded dimensions are already landscape while the tag asks for a turn
+into portrait. False positives are expected and fine (it is advisory); false
+negatives are not meant to happen on real footage. `GET /api/state` exposes the
+same two numbers on every clip as `rotation_tag` (a string, `"0"` when the file
+carries none) and `rotation_tag_suspect` (bool), computed by the exact same
+function `orient` uses, so the CLI and the studio UI can never disagree about
+one clip.
+
+On a camera that always writes a quarter turn tag on a professional codec
+(every clip shot on the ProRes fixtures this repo ships with, for example),
+`rotation_tag_suspect` is `true` for every single clip from that camera, not
+only the ones that are actually sideways: each of those calls is individually
+correct given the two reasons above, but on a camera like that the flag is the
+normal answer, not an exceptional one. Read it as "run `orient` and look at
+the frame before trusting the tag", never as "something is broken here".
 
 ## Per clip grades
 
@@ -469,11 +844,32 @@ have a saved grade for.
 Presets are two separate places on purpose. `grade/presets/*.json` is the shipped
 library, checked into the repository and shared by every account: it is where
 `cinegrade.py`'s own CLI presets live, and a save there would be a shared edit to
-a tracked file. Your own saved presets go to `studio/data/users/<id>/presets/`
-instead (id `0` when logins are off), gitignored the same way the accounts
-database is. Overwriting a library preset writes a user copy that shadows it
-rather than editing the shared file, which is the only sane meaning of
-Overwrite on a file every other account is also reading.
+a tracked file. Your own saved presets go to `<data-dir>/users/<id>/presets/`
+instead (`studio/data/users/0/presets/` with no `--data-dir` and logins off,
+which is the ordinary local case: id `0` is shared by the browser tab and every
+agent alike, contract G2, so an agent's "save as" shows up where the person at
+the keyboard will see it and the other way round), gitignored the same way the
+accounts database is. Overwriting a library preset writes a user copy that
+shadows it rather than editing the shared file, which is the only sane meaning
+of Overwrite on a file every other account is also reading.
+
+A preset file on disk is not a full config: it stores only the branches that
+differ from the engine's own defaults (`DEFAULTS` in `grade/cinegrade.py`), the
+same diff `config_diff` computes everywhere else. A preset that only touches
+`primaries.saturation` is a one-line JSON file, not a dump of every parameter
+the engine has; reading the file back and expecting the whole config to be
+sitting there is a naive equality check that fails for a reason that has
+nothing to do with the save being broken. `GET /api/preset?name=NAME` always
+answers with the FULLY EXPANDED config regardless (`full_config()` runs on
+every read, so a preset saved before a field existed is migrated the same way
+a live config is), never the bare diff on disk; add `?expand=true` and the
+response also carries `"expanded": true`, a flag, not a second copy of the
+config under a different key. The response is `{"name", "comment", "config",
+"expanded"}`; `"comment"` is always present now, which is a different thing
+from the `_comment`-stripped-on-Load rule below: that rule is about what rides
+into the editor's live config; this is the route itself, which used to write
+`_comment` on save and silently drop it on read, so a caller confirming its own
+save had to read the file on disk instead of trusting the API.
 
 ### Presets: the comment rule and the Load rule
 
@@ -623,10 +1019,24 @@ way). Nothing on the server adds an `agent:` prefix for you: an agent that
 wants to read as one spells it out itself, `--by agent:colorbot-3` or
 `CINEGRADE_AGENT=agent:colorbot-3`, the same convention "The `by` field" below
 already uses for `POST /api/session`. `GET /api/whoami` (`{"user", "by",
-"auth", "project"}`) answers what account is signed in, whether logins are on
-at all, and which project this account currently has open; with logins on the
-account name always wins regardless of what a caller sends, since a signed in
-browser cannot sign somebody else's name to a commit by editing a JSON body.
+"auth", "project", "caller"}`) answers what account is signed in, whether
+logins are on at all, and which project this account currently has open; with
+logins on the account name always wins regardless of what a caller sends,
+since a signed in browser cannot sign somebody else's name to a commit by
+editing a JSON body. `project` on the route is only the project's own content
+key, an unreadable hash on its own; `cinegrade whoami --json` makes one more
+call, `GET /api/project`, and adds `"project_clip"` next to it (and a
+parenthetical on the plain text `project` line), so seeing which clip a
+project key means, or that two agents have different clips open, needs no
+second command from the caller's own side.
+
+`by` here is a free text label on ONE commit; it is not the same thing as the
+`caller` block next to it, which is the server's own per caller identity with
+logins off (contract G2, `X-Studio-Agent`/`X-Studio-Attach`: see "Per caller
+identity" under Agent API below). The two compose: setting `--agent NAME` on
+the CLI (or the `STUDIO_AGENT` environment variable) also becomes the default
+for `--by` when `--by` is not given, so the label a commit carries matches the
+identity that made the write without having to say both.
 
 One rule matters more than the others: **the edit path is `POST
 /api/session`, never `PUT /api/grade`.** `PUT /api/grade` still works and
@@ -684,9 +1094,18 @@ project` and reports `moved: false`.
 ### The CLI
 
 `grade/cinegrade.py` has the same routes as commands, so a shell script needs
-no HTTP client. Every one of them takes `--port` (default 7431), `--by`, and
-`--json` (the server's raw JSON instead of a table); `session patch` also
-takes `--by` and `--message`, sent as `by` and `message` on the wire.
+no HTTP client. Every one of them takes `--port`/`--url` (env `STUDIO_PORT`/
+`STUDIO_URL`; port 7431 with none of the four), `--by`, and `--json` (the
+server's raw JSON instead of a table); `session patch` also takes `--by`,
+`--message` and `--if-rev N` (the optimistic revision check, see "`session`"
+in the API table above), sent as `by`, `message` and `if_rev` on the wire.
+`session`, `whoami`, every `project` subcommand, and `match`/`preset`/`grade`
+also take `--agent NAME` (env `STUDIO_AGENT`) and `--attach USER`, so this
+shell gets its own live session, project and saved crops instead of sharing
+the browser tab's; naming an agent without naming a server (`--port`,
+`--url`, or either environment variable) is refused rather than silently
+defaulting to 7431. See "Per caller identity" under Agent API below for the
+full shape of that.
 
 ```
 cinegrade.py whoami
@@ -777,7 +1196,10 @@ with no special case in the preview scaler.
 `mask.show` stores "show this layer's matte" in the preset; for a quick look
 without touching the config, use the Matte button (`#maskBtn`) over the
 viewer instead, which shows the SELECTED layer's mask, not merely the first
-enabled one.
+enabled one. An outside caller with no "selected layer" to speak of asks
+`POST /api/frame` for `"mode": "mask"` and names the layer with `"mask_layer"`
+(its index in `layers`; absent is the first enabled one), see "mask_layer,
+and reading a file directly" above.
 
 ### Correct
 
@@ -958,6 +1380,31 @@ comparison against either was run, because neither is installed on this
 machine, and the names are borrowed only because they describe what the
 controls are for.
 
+## Which way is which
+
+Positive and negative are easy to get backwards from reading a formula, so
+every row below was set on one control at a time, on top of an otherwise
+default config, and MEASURED through a real render
+(`cinegrade still content/footage/A001_09011336_C002.MOV --time 2 --width 320
+-o OUT.png`, then `cinegrade stats --image OUT.png --json`), not read off the
+code and trusted:
+
+| Control | Positive means | Measured |
+| --- | --- | --- |
+| `primaries.temperature` | warmer: more red, less blue | `--temperature 0.3`: mean R 0.393 to 0.472, mean B 0.356 to 0.303 |
+| `primaries.tint` | greener: more green relative to red and blue | `--tint 0.3`: mean G 0.376 to 0.430, R and B nearly unmoved |
+| `slice.vectors.<name>.hue` | rotates that hue family up the wheel, toward the next hue (red toward yellow/green) | red vector `hue: 15`: mean G 0.3757 to 0.3773, luma and saturation unchanged (a pure hue move, no brightness or vividness change) |
+| `slice.vectors.<name>.density`, and the global `slice.density` | darkens that hue family (or the whole frame, for the global control); negative brightens, already stated above in "Hue curves, Color Slice and Tetra" | red vector `density: 0.5`: mean luma 0.3780 to 0.3752, every channel down |
+| `hue_curves.hue_sat` (and, by the same code declared convention, `hue_lum`/`lum_sat`/`sat_sat`: all four are multipliers around a neutral of 1.0, `CURVE_AXES` in `grade/slice.py`) | a y value above 1.0 raises saturation (or luminance); below 1.0 lowers it | one point at `y: 1.6`: mean saturation 0.1843 to 0.2949 |
+| `layers.N.correct.exposure` | brighter, the same stops unit `convert.exposure` uses | `exposure: 1.0`: mean luma 0.3780 to 0.5029 |
+| `layers.N.correct.temperature`/`tint` | the same sign as `primaries.temperature`/`tint` above | not a second render: `layer_lut`'s own R/G/B gains are `exposure + temperature`, `exposure + tint`, `exposure - temperature`, the identical formula run on the display side instead of the working space, confirmed by reading `grade/cinegrade.py`'s `layer_lut`; see "Correct" under Layers for its own range table |
+
+`hue_curves.hue_hue` (an additive offset in turns, not a multiplier: see
+`CURVE_AXES` again) rotates hue the same direction Color Slice's own `hue`
+does, by the same code declared convention as the measured row above; it was
+not separately re-rendered, since it is the same rotation on a different
+curve editor.
+
 ## Grain
 
 New fields on `grain`: `stock` (`custom`, `16mm`, `35mm`, `65mm`),
@@ -1097,13 +1544,15 @@ This and every other route in this section (`play/prepare`, `thumb`, the
 `range`/`limit` scrub reads) read rotation the same way `frame` and every
 render path do (contract C2, see "Render engines" and `grade/README.md`
 `--rotate`): a request may send `"rotation": "auto"|"0"|"90"|"180"|"270"` (or
-`?rotation=` on a GET); when that is absent the legacy `"autorotate":
-true|false` is still honoured (`true` means `auto`, `false` means `0`); only
-when NEITHER is sent does the server fall back to the open project's own
-rotation. A caller that keeps sending `autorotate` therefore pins itself to
-`auto` or `0` forever, because a boolean cannot say `90`, `180` or `270`: it
-will never see the project's rotation take effect. `studio/static/live.js`
-and the CLI's `project rotate` both send `rotation` and never `autorotate`.
+`?rotation=` on a GET); when that is absent a non-auto `rotation` inside the
+request's own `config` wins next (contract G4, see "Rotation" above); when
+that is also absent the legacy `"autorotate": true|false` is still honoured
+(`true` means `auto`, `false` means `0`); only when none of those three are
+sent does the server fall back to the open project's own rotation. A caller
+that keeps sending `autorotate` therefore pins itself to `auto` or `0`
+forever, because a boolean cannot say `90`, `180` or `270`: it will never see
+the project's rotation take effect. `studio/static/live.js` and the CLI's
+`project rotate` both send `rotation` and never `autorotate`.
 
 ## Upload
 
@@ -1454,6 +1903,46 @@ two colour distributions and reports how far it got. A real call moved a frame
 useful part and are shown verbatim; `ok: false` means do not apply the result.
 The full contract is in `grade/tools/MATCH-REF-INTEGRATION.md`.
 
+`name` and `out_dir` are forwarded straight to `match_reference()`, which
+already accepted both: send them to say where the fitted cube lands instead
+of trusting the shared filename `match_reference()` would otherwise pick
+(`match_u<uid>_<ref>_<clip>_<method>`, which already carries the caller's own
+id, contract G2, so two agents matching at once do not collide even with no
+name given). A relative `out_dir` lands inside `content/`; an absolute one is
+trusted as the caller's own folder; either way it is created if missing.
+
+`ref_crop` and `frame_crop` (contract C7, four fractions each, `[X0, Y0, X1,
+Y1]`) are the rectangles a person draws by hand on the reference and the
+frame in the studio UI, saved on the open project. They are a browser tab
+convenience, not something a match call inherits by default the moment a
+`ref` and a `clip` are named: a caller sending `X-Studio-Agent` gets the
+whole image compared unless it sends `ref_crop`/`frame_crop` itself, even
+when the project already has rectangles saved. A bare browser style caller
+still falls back to whatever is saved, exactly as before, since the
+rectangle it would inherit is one it (or the person at that tab) drew
+itself. Attaching to another user's session (`--attach`) does not change
+this: an attached agent is still an agent, and still gets the whole frame
+unless it sends the rectangles explicitly. An agent that wants the person's
+own rectangle reads it first, from `GET /api/project` (`extras.match_crops`),
+and sends it back on the match call, which also means its own notes can say
+which rectangle it measured rather than "whatever happened to be saved."
+`studio/tools/grade_client.py`'s `Studio.match()` already sends `[0.0, 0.0,
+1.0, 1.0]` (the whole frame) whenever the caller gives neither crop, so an
+agent using the client module never depended on this fallback either way.
+
+The response also carries `recommended` (bool) and `bands` (for the reference
+image and the source frame, before and after). `recommended` is a yes or no
+reading of whether this ONE fit actually helped: it is `false` when the fit's
+own `gain_colour_pct` came back negative (the shot moved further from the
+reference, not closer) or when `lut_health.probes_ok` is false (a technically
+broken LUT, a probe pinned to hard black or white). It is a measurement, not a
+score: it is never a comparison against a different reference, method or
+strength, and it is not `ok`'s replacement, it is one more reading alongside
+it, from numbers `match_reference()` already computes. `bands` is the same
+per-band block "What the numbers mean" above describes, so a caller can see
+whether the fit's colour move landed evenly across the tonal range or only in
+one part of it, without a second decode.
+
 ## Agent API
 
 The studio exists so an AI agent can grade footage through it, not only a person
@@ -1495,6 +1984,117 @@ cookie authenticated write has to pass, because that check exists to stop a
 browser from being tricked into a request it did not mean to send, and a
 script sending its own Authorization header was never at risk of that.
 
+### Per caller identity, with logins off
+
+Logins off has always meant every caller is user id 0: one shared live
+session, one shared open project per clip, one shared bag of match crops.
+That was fine for one person, and wrong the moment a second agent (or a
+person and an agent) touched the same server: one editing the session the
+other had open, or a match landing on whichever project happened to be open
+rather than the caller's own. Contract G2 fixes this without turning logins
+on.
+
+Send `X-Studio-Agent: NAME` on any request and the server treats you as agent
+`NAME`: your own live session, your own open project (branch, playhead), your
+own saved match crops, your own rotation fallback. Also accepted as
+`?agent=NAME` on a GET and as a body field `"agent"` on a POST or PUT. The
+name goes through the same check every other name in this file does (no
+slashes, no leading dot, up to 64 characters); a bad one is refused 400. Send
+nothing and you are user 0, exactly as before, which is what the browser tab
+does, so the tab is unaffected by any of this.
+
+```bash
+curl -s -H "X-Studio-Agent: colorbot-3" http://127.0.0.1:7431/api/state \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["caller"])'
+# -> {"id": 1, "name": "agent:colorbot-3", "attached_to": null}
+```
+
+An agent is a row in the accounts table named `agent:NAME`, with no password
+and a `kind` of `agent`. It is created the first time that name calls, and it
+can never sign in, even after logins are turned on later: `kind` is checked
+before any password is, so there are two independent locks. Shared between
+every caller with logins off, on purpose (contract G2's own list): the
+footage folder, presets (always `users/0/presets`, read and write, so an
+agent's "save as" shows up in the browser tab too), refs, looks, and project
+histories. A commit an agent makes is authored `agent:NAME` regardless of what
+`by` a request sends, so a person's tab watching that project's history sees
+exactly who changed what.
+
+`X-Studio-Attach: 0` (or an account name) makes an agent act on THAT
+session, workspace and match crops, while still signing every write with its
+own name: this is how an agent drives what a specific human already has open,
+rather than always working in its own private sandbox. Logins off only: with
+logins on the header is refused 403, because a signed in caller's token or
+cookie already IS the attachment, and honouring a second header on top of it
+would be a way to act as somebody else without ever signing in as them.
+
+`POST /api/session` also accepts `if_rev`: send back the revision you last
+read, and a write that would land on top of a change you never saw is refused
+409, with the current `rev` and the current session in the body, rather than
+silently overwriting it. This is the fix for the exact failure mode a shared
+session invites: two callers patching from the same stale read.
+
+`GET /api/health` is the cheap first call (see "Run it" above):
+`{ok, version, clips, uptime_s, ffmpeg_slots_free, cache_dir, data_dir,
+logins}`, no ffprobe, just "is it up, which build, where did its cache and
+data go". `GET /api/state` and `GET /api/whoami` both carry the same `caller:
+{id, name, attached_to}` block. The server also isolates its own frame cache
+per data dir (`--cache-dir DIR`, env `STUDIO_CACHE_DIR`; with `--data-dir` and
+no explicit `--cache-dir` the cache becomes `<data-dir>/cache`; with neither
+it stays `studio/cache`, unaffected), which is what stops a throwaway test
+server from evicting a real one's cached frames just by running alongside it.
+
+The request log is one line per request on stderr by default:
+`HH:MM:SS caller METHOD /route clip=NAME status Nms`, with `>N` appended after
+the caller's name while attached to user `N`. `--quiet` turns it off, except
+an attached request, which is always logged regardless, since "who did that
+to somebody else's session" is exactly the question this log exists to
+answer.
+
+On the CLI: `--agent NAME` (env `STUDIO_AGENT`) and `--attach USER` on
+`session`, `whoami`, every `project` subcommand, and `match`, `preset
+save`/`load`, `grade save`/`load` (below); `session patch` also takes
+`--if-rev N`. `cinegrade whoami` prints a `caller` line and, while attached,
+an `attached` line.
+
+```bash
+STUDIO_AGENT=colorbot-3 cinegrade.py whoami
+# caller   agent:colorbot-3 (id 1)
+
+cinegrade.py session patch '{"primaries": {"contrast": 1.1}}' \
+  --agent colorbot-3 --attach 0
+# writes into user 0's live session (what the browser tab shows),
+# still signed agent:colorbot-3
+```
+
+Every one of those subcommands also takes `--port`, and now `--url` (env
+`STUDIO_URL`) alongside the older `--port`'s own env, `STUDIO_PORT`: a URL
+wins outright over a port, from either source, and within either tier a
+flag wins over its matching environment variable; with none of the four the
+default is port 7431, a human's own live studio. That silent default is
+where the port trap lived: a plain `session patch` with no `--port` used to
+land on the founder's own live server with no way to tell it apart from a
+throwaway one. It is now refused instead, but ONLY for a call that also
+named an agent: passing `--agent` or setting `STUDIO_AGENT` with no
+`--port`, `--url`, `STUDIO_PORT` or `STUDIO_URL` at all raises before any
+request goes out, with a message saying an agent must name its server. A
+human calling with no agent identity keeps the old silent 7431 default,
+completely unaffected. Set `STUDIO_URL` (or `STUDIO_PORT`) once per shell
+alongside `STUDIO_AGENT`, rather than repeating `--port`/`--url` on every
+call, and this refusal never fires by accident.
+`studio/tools/grade_client.py`'s `Studio` class reads `STUDIO_URL` the same
+way it already reads `STUDIO_AGENT`: a constructor argument wins, else the
+environment variable, else the 7431 default; it has no equivalent refusal,
+since a caller building a `Studio` object has already had to name a `base`
+or accept that default on purpose.
+
+One cosmetic gap, left as is on purpose: a plain `GET /api/whoami` with no
+`X-Studio-Agent` header and no session cookie reports `"by": "cli"` even
+when the caller is an ordinary browser style request, because a GET has no
+body to read a real `by` off of. Harmless: nothing that actually signs a
+write reads this field, every real write goes through `session`, `project`
+or `grade save`, each of which sends its own `by`.
+
 ### The `by` field, and the project it now writes to
 
 `POST /api/session` and the config it returns carry a `by` field: a short,
@@ -1524,9 +2124,15 @@ CLI's `project` commands are documented in full there.
 
 ### The routes an agent actually needs
 
-**`GET /api/state`**: defaults, the clip list, the ref list, the preset list,
-and (with an account) that the token is even valid, since a bad token 401s
-here before anything else does.
+**`GET /api/health`** first, if there is any doubt the server is even up: no
+ffprobe, just `{ok, version, clips, uptime_s, ffmpeg_slots_free, cache_dir,
+data_dir, logins}` (see "Per caller identity" above). Then:
+
+**`GET /api/state`**: defaults, the clip list (each with a `source` block and
+rotation tags, "Input transforms" and "Rotation" above), the ref list, the
+preset list, this caller's own identity under `caller`, and (with an account)
+that the token is even valid, since a bad token 401s here before anything
+else does.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7431/api/state
@@ -1563,7 +2169,11 @@ it in Python or JS, and send the whole array back.
 `{"key", "stats", "size"}`. This is how an agent measures whether a patch
 helped: see "What the numbers mean" above for what each field in `stats`
 actually is, it is the identical measurement whether a person or a script
-asked for it.
+asked for it. `clip` can be swapped for `ref` (a name under `content/refs`,
+so the reference itself is measured the same way) or `path` (an absolute
+file outside the footage root, logins off only); `times` (a list of seconds)
+answers `{"results": [...]}` instead of one block; `region` narrows any of
+the three to one rectangle.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -1572,9 +2182,13 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ```
 
 **`POST /api/frame`**: the same request shape as `stats`, plus optional
-`"mode"` (`graded`, `flat` or `mask`) and `"format": "raw"` to skip JPEG
-encoding, returns the rendered picture instead of numbers. An agent that
-wants to look at the frame rather than only measure it uses this.
+`"mode"` (`graded`, `flat` or `mask`, with `"mask_layer"` picking which
+layer's matte to show), `"region"`/`"zoom"` for a close up patch, `"path"`
+for the same read only outside file `stats` takes, and `"format": "raw"` to
+skip JPEG encoding. Returns the rendered picture instead of numbers. An agent
+that wants to look at the frame rather than only measure it uses this, and
+should: "How a preview frame is made" above and the standing warning in "What
+the numbers mean" both say the numbers alone can mislead, on purpose.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -1583,18 +2197,30 @@ curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 ```
 
 **`POST /api/match`**: `{"ref": NAME, "clip": NAME, "time": SECONDS,
-"config": CONFIG}` fits a look cube toward a reference image (see
-Match Reference above) and returns `{"ok", "name", "lut", "warnings",
-"stats", "distance", ...}`. `ok: false` means the fit failed its own health
-check and should not be applied; on `ok: true` an agent applies it the same
+"config": CONFIG, "name": NAME, "out_dir": DIR}` fits a look cube toward a
+reference image (see Match Reference above) and returns `{"ok", "name",
+"lut", "warnings", "stats", "distance", "recommended", "bands", ...}`. `ok:
+false` means the fit failed its own health check and should not be applied;
+`recommended: false` is a second, narrower reading (the fit measurably moved
+the shot further from the reference, or the LUT itself is unsound) worth
+checking even when `ok` is true. On a good fit an agent applies it the same
 way the browser does, `POST /api/session` with
-`{"config": {"look": {"lut": result.name}}}`.
+`{"config": {"look": {"lut": result.name}}}`. Send `name`/`out_dir` so the
+fitted cube lands somewhere this agent owns rather than the shared default
+name (see Match Reference above).
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"ref": "IMG_2570.PNG", "clip": "A001.MOV", "time": 3.0}' \
   http://127.0.0.1:7431/api/match
 ```
+
+This route sends the whole frame unless the caller sends `ref_crop`/
+`frame_crop` itself; it never inherits a rectangle a person drew in a
+browser tab (see "Match Reference" above). `cinegrade match` is the CLI
+equivalent, and `Studio.match()` the client one (below); this is the one
+place the server is the primary surface and the CLI mirrors it, not the
+other way round, since the fit itself only exists here.
 
 **`PUT /api/grade`** (contract C3, per clip saves) or **`POST /api/preset`**
 (a shared, named grade): `PUT /api/grade` takes `{"clip": NAME, "config":
@@ -1609,7 +2235,9 @@ either way, follow the write with the matching plain `GET` so the agent is
 not just trusting its own POST or PUT, it is confirming the save actually
 landed. Remember this route does not wake a watching tab ("The `by` field,
 and the project it now writes to" above): for a change meant to be seen live,
-`POST /api/session` is the one to use.
+`POST /api/session` is the one to use. `cinegrade grade save`/`load` and
+`cinegrade preset save`/`load` are the CLI equivalents, see "CLI reference"
+above for their flags.
 
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -1620,10 +2248,70 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/j
 **Projects and history** ("Projects and history" above has the full route
 table and a real transcript): `POST /api/project/open {"clip": NAME}` opens
 or creates the project and is the read an agent should do first, instead of
-guessing what config is live; `GET /api/project/log` is the whole commit
-tree; `POST /api/project/checkout|fork|undo|redo` move or branch HEAD;
-`GET /api/whoami` answers who a write from this agent currently counts as.
-All of them take the same `by` this section already describes.
+guessing what config is live; `GET /api/project` reads the same caller's open
+project back without opening or creating anything. Both return the project
+dict at the TOP level, with the clip under `"name"` (`{"open": true, "key",
+"name", "branch", "head", ...}`), not nested under a `"project"` key: an
+earlier agent guessed the nested shape by hand and hit a `KeyError`. `GET
+/api/project/log` is the whole commit tree; `POST
+/api/project/checkout|fork|undo|redo` move or branch HEAD; `GET /api/whoami`
+answers who a write from this agent currently counts as, and, once a project
+is open, carries `"project_clip"` next to the project's own key (a hash on
+its own is not readable) so proving two agents have different clips open
+needs no second call. All of them take the same `by` this section already
+describes.
+
+### The first party client module
+
+`studio/tools/grade_client.py` (stdlib plus numpy; Pillow optional, only for
+`contact_sheet`'s text labels, see "Run it" above) wraps every route above so
+an agent talks to the server in a few lines instead of hand rolling `curl` or
+`urllib`. It sends `agent`/`attach`/`rotation` on every call once set on the
+`Studio` object, so a rotation is never silently inherited from whatever the
+shared session last had, and it decodes an `HTTPError` body and raises the
+server's own message rather than a truncated traceback.
+
+```python
+import sys
+sys.path.insert(0, "studio/tools")
+from grade_client import Studio, brief, diff
+
+studio = Studio(base="http://127.0.0.1:7431", agent="colorbot-3")
+state = studio.state()
+clip = state["clips"][0]["name"]
+
+before = studio.stats(clip=clip, time=1.0, config={})["stats"]
+print(brief(before, clip=clip))
+
+studio.session_patch({"primaries": {"saturation": 1.1}}, clip=clip, time=1.0,
+                     by="agent:colorbot-3")
+after = studio.stats(clip=clip, time=1.0,
+                     config={"primaries": {"saturation": 1.1}})["stats"]
+print(diff(before, after))          # signed deltas, after minus before
+
+studio.grade_save(clip, {"primaries": {"saturation": 1.1}}, message="warmer")
+```
+
+Methods: `state`, `health`, `whoami`, `project_open(clip, rotation=None,
+by=None)`, `project`, `frame`, `stats`, `stats_at(clip, times, ...)`,
+`ref_stats`, `match`, `preset_save`/`preset_load`, `grade_save`/`grade_load`,
+`session_get`/`session_patch`, `sweep`, and the escape hatch `request(method,
+path, ...)` for anything not wrapped yet. `project_open` and `project` both
+return the project dict at the top level with the clip under `"name"`, the
+same shape `GET`/`POST /api/project*` return on the wire ("The routes an
+agent actually needs" above): this module is the one place that shape is
+already unwrapped correctly, so an agent importing it never has to guess.
+Module level functions, usable without a server at all: `brief(stats)` (one
+readable line), `bands(stats)`, `diff(a, b)` (signed, b minus a; drops
+`definitions` and `bands.edges` from the result, since both are measurement
+constants that never differ between two frames from the same server and
+would otherwise print as a wall of zeros burying the real deltas),
+`decode(path, width=None)` and `measure(array)` (the exact `grade/stats.py`
+functions, imported once, never a second copy), and `contact_sheet(paths,
+out, labels=None, height=480, grid=None)` (the same common-height,
+mixed-aspect labelled sheet `cinegrade sheet` builds).
+`studio/tools/agent_grade.py` is built on this module instead of carrying
+its own copies of the same three things.
 
 ### The proof
 

@@ -155,22 +155,64 @@
     });
   }
 
+  /* convert.input "auto" resolved to what the SERVER says this clip is.
+   *
+   * gpu.js cannot resolve "auto" on its own: that needs the file's transfer
+   * and primaries tags, which live in the probe and never reach the render
+   * loop. So the answer is carried in instead. GET /api/state already
+   * publishes it per clip as clips[].source.resolved_input, computed by the
+   * same cinegrade.resolve_input the render uses, so this is not a second
+   * opinion about the file, it is the same one.
+   *
+   * Without this an HLG or PQ clip left on "auto" previewed through the Apple
+   * Log cube while the server rendered it through the right one, which is the
+   * gap contract G1 left open. With it the GPU asks for the cube the server
+   * would, and a camera log clip (which can only ever be set by hand) behaves
+   * the same way an explicitly set one does.
+   *
+   * Nothing changes for an Apple Log clip: its resolved_input IS "apple_log",
+   * which names the same cubes "auto" already named and leaves the log stage
+   * reported exact, so the human's GPU preview is the picture it was.
+   *
+   * The config is copied rather than edited: it belongs to the caller, who is
+   * usually holding the live UI state object.
+   */
+  function withResolvedInput(config, resolved) {
+    if (!resolved || !config || !config.convert) return config;
+    if (config.convert.input && config.convert.input !== "auto") return config;
+    var out = {}, k;
+    for (k in config) {
+      if (Object.prototype.hasOwnProperty.call(config, k)) out[k] = config[k];
+    }
+    out.convert = {};
+    for (k in config.convert) {
+      if (Object.prototype.hasOwnProperty.call(config.convert, k)) {
+        out.convert[k] = config.convert[k];
+      }
+    }
+    out.convert.input = resolved;
+    return out;
+  }
+
   /* Grade one still frame on the GPU and present it to the canvas passed to
    * init(). Rejects (never throws synchronously) when the GPU cannot be
    * trusted for this config, so a caller can always `.catch` into the
    * server path without a try/catch of its own.
    *
-   * p: { clip, time, width, rotation, config, sourceWidth, apiBase }
+   * p: { clip, time, width, rotation, config, sourceWidth, apiBase,
+   *      resolvedInput }
    * sourceWidth is the clip's own upright width (pre-downscale), needed to
    * compute the same pixelScale the server's scale_for_preview would use;
    * without it a reduced-size preview overstates every pixel-denominated FX.
+   * resolvedInput is clips[].source.resolved_input for this clip; leaving it
+   * out keeps the old behaviour, where "auto" means the Apple Log cubes.
    */
   function renderStill(p) {
     if (!inst) {
       return Promise.reject(new Error(
         "no GPU renderer available (" + (initReason || "not initialised") + ")"));
     }
-    var cfg = p.config;
+    var cfg = withResolvedInput(p.config, p.resolvedInput);
     var check = checkStages(cfg);
     if (check.blocking.length) {
       var e = new Error("GPU preview cannot render this config: " + check.report.summary);
@@ -288,18 +330,24 @@
    * is no separate "apply" step to wire up, the loop is always grading
    * whatever getCfg() returns right now.
    *
-   * opts: { sourceWidth, onFrame(info), onError(err) }
+   * opts: { sourceWidth, resolvedInput, onFrame(info), onError(err) }
    * Renders every animation frame the display asks for, not only when the
    * clip's own frame index advances, so a knob dragged between two source
    * frames still updates at display rate instead of waiting on the next
    * one; the source texture itself is only re-uploaded when the index
    * actually changes, which is the one part of this that is not free.
+   *
+   * resolvedInput is clips[].source.resolved_input for the clip in the
+   * buffer, the same field renderStill takes: without it a clip left on
+   * "auto" would loop through the Apple Log cubes while the server renders
+   * it as whatever its tags say. Leaving it out keeps the old behaviour.
    */
   function startLoop(getCfg, opts) {
     if (!loopBuf) throw new Error("no loop range prepared");
     if (!inst) throw new Error("no GPU renderer available");
     opts = opts || {};
     var sourceWidth = opts.sourceWidth || loopBuf.w;
+    var resolvedInput = opts.resolvedInput;
     var factor = loopBuf.w / sourceWidth;
     var gen = loopGen;
     running = true; busy = false; lastIdx = -1; fpsWindow.length = 0;
@@ -324,7 +372,7 @@
         uploadedTag = tag;
         lastIdx = idx;
       }
-      var cfg = getCfg();
+      var cfg = withResolvedInput(getCfg(), resolvedInput);
       busy = true;
       inst.ready(cfg, { pixelScale: factor }).then(function () {
         if (!running || gen !== loopGen) { busy = false; return; }
@@ -619,10 +667,17 @@
   /* One graded frame from whatever the video is showing. Used by the play
    * loop, by seeking while paused and by frame stepping, so all three land
    * on identical pixels for the same time and config.
+   *
+   * opts.resolvedInput is the clip's clips[].source.resolved_input, exactly
+   * as renderStill takes it: it is applied here rather than at the three
+   * call sites so playProxy, seekProxy and stepProxy cannot drift apart on
+   * which cube "auto" means. Leaving it out keeps the old behaviour, where
+   * "auto" is the Apple Log cubes.
    */
   function renderProxyFrame(cfg, opts) {
     if (!inst) return Promise.reject(new Error("no GPU renderer available"));
     if (!proxyVideo) return Promise.reject(new Error("no proxy attached"));
+    cfg = withResolvedInput(cfg, opts && opts.resolvedInput);
     var check = checkStages(cfg);
     if (check.blocking.length) {
       var e = new Error("GPU playback cannot render this config: " + check.report.summary);
@@ -677,6 +732,10 @@
    * getCfg is called fresh per frame for the same reason startLoop does it:
    * that, and nothing else, is what makes a knob change show up on the next
    * frame instead of needing playback restarted.
+   *
+   * opts.resolvedInput (clips[].source.resolved_input) rides through to
+   * renderProxyFrame, which is where "auto" becomes a real input for every
+   * proxy path at once; seekProxy and stepProxy take the same key.
    *
    * requestVideoFrameCallback is the right clock here because it fires once
    * per frame the compositor actually presents, so this renders exactly the
@@ -944,6 +1003,7 @@
     reason: reason,
     setDefaults: setDefaults,
     checkStages: checkStages,
+    withResolvedInput: withResolvedInput,
     renderStill: renderStill,
     budget: budget,
     prepareLoop: prepareLoop,

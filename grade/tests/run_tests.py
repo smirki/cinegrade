@@ -46,12 +46,18 @@ import cases_rotation         # noqa: E402
 import cases_match_crop       # noqa: E402
 import cases_region           # noqa: E402
 import cases_cli_project      # noqa: E402
+import cases_cli_render       # noqa: E402
+import cases_cli_agent        # noqa: E402
+import cases_sheet            # noqa: E402
+import cases_input            # noqa: E402
+import cases_stats            # noqa: E402
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,
            cases_slice, cases_grain, cases_layers, cases_detail,
            cases_rotation, cases_match_crop, cases_region, cases_cli,
-           cases_cli_project]
+           cases_cli_project, cases_cli_render, cases_cli_agent,
+           cases_sheet, cases_input, cases_stats]
 
 
 def main():

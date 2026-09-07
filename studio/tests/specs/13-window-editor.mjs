@@ -253,11 +253,78 @@ export default async function run(ctx) {
   notes.push("layers[0].mask.window.enabled auto-enabled false -> true");
 
   // --- 3. one drag is one undo step ----------------------------------------
-  const undoDisabled = await page.$eval("#undoBtn", (el) => el.disabled);
+  /* The drag's OWN commit has to be on the server before Undo is pressed.
+     #undoBtn is already enabled here by the commits earlier in this spec (the
+     preset load, the window button), so its enabled state never proved that
+     the drag landed, and an Undo pressed while the drag is still in flight
+     pops the PREVIOUS commit and lets the drag's commit land on top of that
+     undone head: the wrong commit is undone, cx stays where the drag put it,
+     and no amount of waiting afterwards recovers it. Read the server from the
+     node side so this poll does not queue behind the page's own six
+     connections. */
+  let clipForGrade = "";
+  try {
+    const cl = await fetch(ctx.baseUrl + "/api/clips").then((r) => r.json());
+    clipForGrade = (((cl && cl.clips) || [])[0] || {}).name || "";
+  } catch (e) {
+    clipForGrade = "";
+  }
+  if (clipForGrade) {
+    const gradeUrl = ctx.baseUrl + "/api/grade?clip=" + encodeURIComponent(clipForGrade);
+    const landed = () =>
+      fetch(gradeUrl)
+        .then((r) => r.json())
+        .then((g) => {
+          const w = g && g.exists ? windowOf(g.config) : {};
+          return w.enabled === true && Math.abs(Number(w.cx) - cx1) <= 1e-9;
+        })
+        .catch(() => false);
+    const landDeadline = Date.now() + 20000;
+    let onServer = await landed();
+    while (!onServer && Date.now() < landDeadline) {
+      await new Promise((r) => setTimeout(r, 120));
+      onServer = await landed();
+    }
+    if (!onServer) {
+      const g = await fetch(gradeUrl).then((r) => r.json()).catch(() => ({}));
+      return fail("the drag's commit never reached the server: GET /api/grade holds "
+        + JSON.stringify(g && g.exists ? windowOf(g.config) : null) + ", expected cx " + cx1);
+    }
+  }
+  /* #undoBtn's enabled state is computed from the project response since
+     contract C4 (updateUndoButtons reads head_commit.parent), so the drag's
+     commit has to come back before the button can turn on: a fixed sleep is
+     not a wait for that, which is the same point spec 09 makes in its own
+     header. Poll, then assert exactly what this always asserted. */
+  let undoDisabled = true;
+  const enableDeadline = Date.now() + 20000;
+  for (;;) {
+    undoDisabled = await page.$eval("#undoBtn", (el) => el.disabled);
+    if (!undoDisabled || Date.now() >= enableDeadline) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
   if (undoDisabled) return fail("cx changed but #undoBtn is disabled, so the drag committed no history step");
   await page.click("#undoBtn");
-  await new Promise((r) => setTimeout(r, 200));
-  const afterUndo = await readConfig();
+  /* Undo is a server round trip since contract C4 (#undoBtn posts to
+     /api/project/undo and the answer is what lands on screen), so this waits
+     for that answer instead of guessing at a sleep, exactly as spec 09 does
+     and for the reason spec 09 gives: "It can no longer sleep a fixed 150 ms
+     and read: every step is a round trip."
+     Measured, on a server started with a fresh --data-dir and therefore a COLD
+     frame cache (which is what the harness does since studio/server.py's
+     _default_cache_dir put every --data-dir run's cache inside its own data
+     folder): the four scope/stats renders that follow the drag's own commit
+     take about a second each, Chrome's six-connections-per-host limit queues
+     this undo behind them, and the answer arrives between 190 ms and 420 ms.
+     Against a warm cache it arrives inside 190 ms. Either way the assertion
+     below is unchanged: if the undo never lands, or lands on the wrong commit,
+     this loop runs out and the same failure is reported. */
+  const undoDeadline = Date.now() + 20000;
+  let afterUndo = await readConfig();
+  while (Math.abs(Number(windowOf(afterUndo).cx) - cx0) > 1e-9 && Date.now() < undoDeadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    afterUndo = await readConfig();
+  }
   const win2 = windowOf(afterUndo);
   if (Math.abs(Number(win2.cx) - cx0) > 1e-9) {
     return fail("one #undoBtn press left cx at " + win2.cx + ", expected it back at " + cx0 + " (the drag is meant to be one step, not many)");

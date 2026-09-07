@@ -56,11 +56,48 @@ OUT = GRADE / "out"
 TOOLS = GRADE / "tools"
 STUDIO_TOOLS = STUDIO / "tools"
 PARITY_REPORT = STUDIO_TOOLS / "parity-results.json"
-CACHE = STUDIO / "cache"
+
+
+def _default_cache_dir() -> Path:
+    """Where decoded frames, proxies and play segments are cached.
+
+    studio/cache unless somebody says otherwise, which is what the founder's
+    long running server uses and what it keeps using. Two overrides, in this
+    order:
+
+    1. STUDIO_CACHE_DIR (or --cache-dir, which sets it in main()).
+    2. STUDIO_DATA_DIR (or --data-dir): a run that was given its own data
+       folder is a test or a throwaway server, and it gets its own cache
+       under that folder too. Without this rule every temp server in a build
+       shares one 600 file cache with the real one and evicts the frames the
+       person at the keyboard is scrubbing through.
+
+    Read at import so the module level SEGMENTS and PROXY paths below are
+    already right; main() calls set_cache_dir() again for the flags, which
+    rebinds all three.
+    """
+    explicit = os.environ.get("STUDIO_CACHE_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    data = os.environ.get("STUDIO_DATA_DIR", "").strip()
+    if data:
+        return Path(data).expanduser().resolve() / "cache"
+    return STUDIO / "cache"
+
+
+CACHE = _default_cache_dir()
 STATIC = STUDIO / "static"
 
 sys.path.insert(0, str(GRADE))
 import cinegrade as CG  # noqa: E402  (path has to be set first)
+# frame_stats moved to grade/stats.py so the CLI (`cinegrade stats`,
+# `cinegrade sweep`) and studio/tools/grade_client.py read a frame through
+# the same numbers this server does, instead of each carrying its own copy.
+# Unchanged in what it returns; only where it lives moved.
+from stats import (  # noqa: E402  (same reason)
+    frame_stats, bands as stats_bands, decode_image as stats_decode_image,
+    StatsError, HUE_FAMILIES, SAT_FLOOR, CLIP_BLACK, CLIP_WHITE,
+)
 
 # studio/ itself, so `import auth` and `import db` resolve no matter how this
 # file was invoked. Running it as a script already puts its own folder on
@@ -414,6 +451,27 @@ def browse_dir(raw: str | None, user: dict | None = None) -> dict:
             "error": error}
 
 
+def set_cache_dir(path) -> Path:
+    """Point the frame cache somewhere other than studio/cache.
+
+    Three module globals name a piece of that folder (CACHE itself, SEGMENTS
+    for play segments, PROXY for proxy encodes) and the last two are computed
+    from CACHE at import, so all three are rebound here. Everything else
+    reads CACHE at call time, which is why one assignment is enough for the
+    rest of the file.
+
+    STUDIO_CACHE_DIR is set as well so a child process (the GPU render's
+    browser worker, a tool imported from this module) lands in the same
+    place rather than quietly falling back to studio/cache.
+    """
+    global CACHE, SEGMENTS, PROXY
+    CACHE = Path(path).expanduser().resolve()
+    SEGMENTS = CACHE / "segments"
+    PROXY = CACHE / "proxy"
+    os.environ["STUDIO_CACHE_DIR"] = str(CACHE)
+    return CACHE
+
+
 def set_footage(path) -> None:
     """Point the shared footage folder somewhere other than content/footage.
 
@@ -432,6 +490,64 @@ def set_footage(path) -> None:
     FOOTAGE.mkdir(parents=True, exist_ok=True)
     LIB.FOOTAGE = FOOTAGE
     PROJECTS.FOOTAGE = FOOTAGE
+
+
+def git_version() -> str:
+    """The short commit this tree is on, or "unknown".
+
+    Read out of the .git folder rather than by running git: this is answered
+    inside a request, and starting a subprocess per health check would make
+    the cheapest route the most expensive one. Three files, in the order git
+    itself would look: HEAD (a ref or a detached sha), the loose ref file,
+    then packed-refs for a ref that has been packed away.
+
+    Never raises. A tarball with no .git, a worktree, a half written HEAD
+    during a rebase: all of them are "unknown", which is the honest answer.
+    """
+    try:
+        git = CONTENT / ".git"
+        if git.is_file():
+            # A worktree or a submodule: .git is a file saying gitdir: PATH.
+            line = git.read_text(errors="replace").strip()
+            if line.startswith("gitdir:"):
+                git = Path(line.split(":", 1)[1].strip())
+                if not git.is_absolute():
+                    git = (CONTENT / git).resolve()
+        head = (git / "HEAD").read_text(errors="replace").strip()
+        if not head.startswith("ref:"):
+            return head[:7] if head else "unknown"
+        ref = head.split(":", 1)[1].strip()
+        loose = git / ref
+        if loose.is_file():
+            return loose.read_text(errors="replace").strip()[:7] or "unknown"
+        packed = git / "packed-refs"
+        if packed.is_file():
+            for row in packed.read_text(errors="replace").splitlines():
+                if row.startswith("#") or " " not in row:
+                    continue
+                sha, name = row.split(" ", 1)
+                if name.strip() == ref:
+                    return sha.strip()[:7] or "unknown"
+    except Exception:                                         # noqa: BLE001
+        pass
+    return "unknown"
+
+
+def clip_count() -> int:
+    """How many clips GET /api/state would list, without probing any of them.
+
+    A directory listing and a dict length, so GET /api/health stays the cheap
+    call it is meant to be: _clips() runs ffprobe twice per file.
+    """
+    n = 0
+    try:
+        if FOOTAGE.exists():
+            for p in FOOTAGE.iterdir():
+                if p.suffix.lower() in VIDEO_EXT and p.is_file():
+                    n += 1
+    except OSError:
+        pass
+    return n + sum(1 for p in EXTERNAL_CLIPS.values() if p.exists())
 
 
 def ensure_dirs() -> None:
@@ -509,12 +625,18 @@ def _project_rotation(user_id) -> str | None:
 
 
 def effective_rotation(payload_or_query, user_id=None) -> str:
-    """The rotation one request means, from the four places it can come from.
+    """The rotation one request means, from the five places it can come from.
 
     In order: an explicit "rotation" field, then the legacy autorotate flag
     (the POST body's "autorotate" and the query string's "rot", where true or
-    1 means "auto" and false or 0 means "0"), then the rotation stored on the
-    project this account has open, then "auto".
+    1 means "auto" and false or 0 means "0"), then a non-auto "rotation" on
+    the request's own "config" (contract G4: rotation is part of a saved
+    grade, so a caller that hands this request a grade or a preset whole,
+    with no top level rotation field of its own, still gets that grade's own
+    rotation rather than falling through to whatever this account's open
+    project or the file's own tag says), then the rotation stored on the
+    project this account has open, then "auto" (which is what leaves the
+    file's own display matrix tag in charge, unchanged).
 
     The legacy flag is not deprecated-and-ignored: the browser still sends it
     on every request, and a CLI script written before rotation existed still
@@ -524,6 +646,11 @@ def effective_rotation(payload_or_query, user_id=None) -> str:
     for key in ("rotation", "rot", "autorotate"):
         if src.get(key) not in (None, ""):
             return CG.normalise_rotation(src[key])
+    config = src.get("config")
+    if isinstance(config, dict) and config.get("rotation") not in (None, ""):
+        mode = CG.normalise_rotation(config["rotation"])
+        if mode != "auto":
+            return mode
     return CG.normalise_rotation(_project_rotation(user_id))
 
 
@@ -656,8 +783,13 @@ def flat_config(cfg: dict, keep_exposure: bool) -> dict:
     "ungraded" even means, so the comparison would be dishonest otherwise.
     """
     flat = deepcopy(CG.DEFAULTS)
-    for key in ("tonemap", "working_space", "encode"):
-        flat["convert"][key] = cfg["convert"][key]
+    # `input` is copied for the same reason: it says what the source IS, so a
+    # bypass frame that decoded it differently from the graded frame would be
+    # comparing two different pictures rather than a grade against its start.
+    # It is read with a default so a config saved before inputs existed, which
+    # carries no convert.input at all, still lands on "auto".
+    for key in ("tonemap", "working_space", "encode", "input"):
+        flat["convert"][key] = cfg["convert"].get(key, flat["convert"][key])
     if keep_exposure:
         flat["convert"]["exposure"] = cfg["convert"]["exposure"]
     return flat
@@ -868,6 +1000,62 @@ def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
     return args
 
 
+# --------------------------------------------------------------------------
+# single flight: one render per cache key, however many callers asked at once
+#
+# Every commit the page makes fires one POST /api/stats and three or four
+# POST /api/scope with the SAME clip, time, width and config, so they land on
+# one render_raw cache key exactly. On a warm cache that is four cheap reads.
+# On a cold one it was four full ffmpeg renders of the identical frame, in
+# parallel, competing for the same cores (measured 800 to 1700 ms each
+# against 1 to 2 ms warm). This makes the first caller render and the rest
+# wait for it and then read what it just wrote.
+#
+# Lock order is always this lock and then FFMPEG_SLOTS, never the other way
+# round, so the pair cannot deadlock. Entries are reference counted and
+# dropped once the last waiter leaves, so the map cannot grow across a long
+# session.
+
+_flight_guard = threading.Lock()
+_flight: dict[str, list] = {}
+
+
+class _SingleFlight:
+    """`with _SingleFlight(key):` holds the one lock for that key.
+
+    Not a plain dict of locks: an entry has to be removed when nobody is
+    using it or a long session accumulates one lock per frame ever rendered,
+    and removing it while somebody is still queued behind it would let two
+    threads render the same frame anyway. The count is what makes the removal
+    safe, and it is only ever touched under `_flight_guard`.
+    """
+
+    __slots__ = ("key", "entry")
+
+    def __init__(self, key: str):
+        self.key = key
+        self.entry = None
+
+    def __enter__(self):
+        with _flight_guard:
+            entry = _flight.get(self.key)
+            if entry is None:
+                entry = [threading.Lock(), 0]
+                _flight[self.key] = entry
+            entry[1] += 1
+        self.entry = entry
+        entry[0].acquire()
+        return self
+
+    def __exit__(self, *_exc):
+        self.entry[0].release()
+        with _flight_guard:
+            self.entry[1] -= 1
+            if self.entry[1] <= 0:
+                _flight.pop(self.key, None)
+        return False
+
+
 def render_raw(clip: str, time_s: float, width: int, cfg: dict,
                rotation) -> tuple[np.ndarray, dict]:
     """One graded frame as an RGB array, cached on disk.
@@ -899,36 +1087,55 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
     raw_path = _cache_path("frames", key, "rgb")
     meta = {"key": key, "width": width, "height": height,
             "source_width": info["width"], "source_height": info["height"]}
-    if raw_path.exists():
+
+    def cached():
+        """The finished frame off disk, or None if it is not there.
+
+        Read twice: once before queueing behind any other caller wanting this
+        exact frame, and once after, because the caller ahead has by then
+        written it.
+        """
+        if not raw_path.exists():
+            return None
         try:
             os.utime(raw_path, None)
             return np.frombuffer(raw_path.read_bytes(), np.uint8).reshape(
-                height, width, 3), meta
+                height, width, 3)
         except FileNotFoundError:
-            pass  # pruned between exists() and read; fall through and re-render
+            # pruned between exists() and read; treat it as a miss
+            return None
 
-    # source_frame has already turned the picture, so the grade graph must
-    # not turn it again: src_normalised says exactly that.
-    src, _smeta = source_frame(clip, time_s, width, rotation)
+    hit = cached()
+    if hit is not None:
+        return hit, meta
 
-    graph = CG.graph_with_mask(pcfg, pinfo, encode_out=False,
-                               tail_extra=["format=rgb24"],
-                               src_label="0:v", src_normalised=True)
-    args = ["ffmpeg", "-v", "error", "-y"]
-    args += _grade_inputs(width, height, pcfg, pinfo)
-    args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
-             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    with _SingleFlight("frame:" + key):
+        hit = cached()
+        if hit is not None:
+            return hit, meta
 
-    with FFMPEG_SLOTS:
-        proc = subprocess.run(args, input=src.tobytes(), capture_output=True)
-    if proc.returncode != 0 or len(proc.stdout) < width * height * 3:
-        raise StudioError("ffmpeg could not render that frame:\n"
-                          + proc.stderr.decode("utf-8", "replace")[-1200:])
+        # source_frame has already turned the picture, so the grade graph must
+        # not turn it again: src_normalised says exactly that.
+        src, _smeta = source_frame(clip, time_s, width, rotation)
 
-    data = proc.stdout[:width * height * 3]
-    raw_path.write_bytes(data)
-    _prune_cache("frames")
-    return np.frombuffer(data, np.uint8).reshape(height, width, 3), meta
+        graph = CG.graph_with_mask(pcfg, pinfo, encode_out=False,
+                                   tail_extra=["format=rgb24"],
+                                   src_label="0:v", src_normalised=True)
+        args = ["ffmpeg", "-v", "error", "-y"]
+        args += _grade_inputs(width, height, pcfg, pinfo)
+        args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+
+        with FFMPEG_SLOTS:
+            proc = subprocess.run(args, input=src.tobytes(), capture_output=True)
+        if proc.returncode != 0 or len(proc.stdout) < width * height * 3:
+            raise StudioError("ffmpeg could not render that frame:\n"
+                              + proc.stderr.decode("utf-8", "replace")[-1200:])
+
+        data = proc.stdout[:width * height * 3]
+        raw_path.write_bytes(data)
+        _prune_cache("frames")
+        return np.frombuffer(data, np.uint8).reshape(height, width, 3), meta
 
 
 # --------------------------------------------------------------------------
@@ -1600,86 +1807,57 @@ def render_scope(rgb: np.ndarray, key: str, kind: str, size: int) -> bytes:
     return proc.stdout
 
 
-# Hue families, in degrees. The boundaries are stated here and shown in the UI
-# so the warm/cool/green split is a definition the user can check, not a number
-# that appeared from somewhere.
-HUE_FAMILIES = [
-    ("warm", 345.0, 75.0),
-    ("green", 75.0, 165.0),
-    ("cool", 165.0, 285.0),
-    ("magenta", 285.0, 345.0),
-]
-SAT_FLOOR = 0.10          # below this a pixel counts as neutral, not coloured
-CLIP_BLACK = 2            # 8-bit code at or under which a pixel reads as crushed
-CLIP_WHITE = 253
+# frame_stats(), HUE_FAMILIES, SAT_FLOOR, CLIP_BLACK and CLIP_WHITE moved to
+# grade/stats.py (imported above), unchanged in what they return: nothing
+# else in this repo referenced them by this module's name.
 
 
-def frame_stats(rgb: np.ndarray) -> dict:
-    a = rgb.astype(np.float32) / 255.0
-    r, g, b = a[..., 0], a[..., 1], a[..., 2]
-    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+# --------------------------------------------------------------------------
+# path source: a read only frame or stats measurement of a file this server
+# never registers anywhere, for /api/frame and /api/stats' `path` field
+# --------------------------------------------------------------------------
 
-    mx = a.max(-1)
-    mn = a.min(-1)
-    delta = mx - mn
-    sat = np.where(mx > 1e-6, delta / np.maximum(mx, 1e-6), 0.0)
+def path_source_frame(payload: dict, user_id) -> np.ndarray:
+    """The decoded frame for a request's read-only `path` field.
 
-    hue = np.zeros_like(mx)
-    nz = delta > 1e-9
-    i = nz & (mx == r)
-    hue[i] = ((g - b)[i] / delta[i]) % 6.0
-    i = nz & (mx == g) & (mx != r)
-    hue[i] = ((b - r)[i] / delta[i]) + 2.0
-    i = nz & (mx == b) & (mx != r) & (mx != g)
-    hue[i] = ((r - g)[i] / delta[i]) + 4.0
-    hue = (hue * 60.0) % 360.0
+    `path` names an absolute file outside anything this server tracks: no
+    footage root, no EXTERNAL_CLIPS entry, no project opened, no session
+    write. It exists for measuring or previewing a file this server was
+    never told about (an intermediate render, a clip mid-copy), which is
+    exactly why it is refused the moment logins are on: there is no account
+    to check the file against, so honouring it would be a way past every
+    other route's read guard. Rotation follows the same rule a clip does
+    (effective_rotation), since nothing about that resolution depends on the
+    source being a registered clip. The grading `config` a clip request can
+    carry is not applied here: this is a raw decode of the file as it is on
+    disk, the same guarantee `decode_image` gives the CLI and the client
+    module, so a caller reads the same bytes no matter which of the three
+    asked for them.
+    """
+    if AUTH.enabled():
+        raise AUTH.AuthError(403, "the path field only works with logins off")
+    raw = str(payload.get("path") or "")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        raise StudioError(f"path must be absolute, got: {raw!r}")
+    if not p.is_file():
+        raise StudioError(f"file not found: {p}")
+    return stats_decode_image(
+        str(p), width=int(payload.get("width", 960)),
+        region=payload.get("region"), time=float(payload.get("time", 0)),
+        rotation=effective_rotation(payload, user_id))
 
-    total = float(y.size)
-    coloured = sat >= SAT_FLOOR
-    families = {}
-    for name, lo, hi in HUE_FAMILIES:
-        if lo < hi:
-            sel = (hue >= lo) & (hue < hi)
-        else:                                   # the warm family wraps past 360
-            sel = (hue >= lo) | (hue < hi)
-        families[name] = round(float((sel & coloured).sum()) / total * 100.0, 2)
-    families["neutral"] = round(float((~coloured).sum()) / total * 100.0, 2)
 
-    p5, p25, p50, p75, p95 = (float(v) for v in np.percentile(y, [5, 25, 50, 75, 95]))
-    raw = rgb
-    clipped_black = float((raw.max(-1) <= CLIP_BLACK).sum()) / total * 100.0
-    clipped_white = float((raw.min(-1) >= CLIP_WHITE).sum()) / total * 100.0
-
-    return {
-        "luma": {
-            "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),
-            "p75": round(p75, 4), "p95": round(p95, 4),
-            "mean": round(float(y.mean()), 4),
-            "mean8": round(float(y.mean()) * 255.0, 1),
-            "min": round(float(y.min()), 4), "max": round(float(y.max()), 4),
-        },
-        "saturation": {
-            "mean": round(float(sat.mean()), 4),
-            "mean_coloured": round(float(sat[coloured].mean()) if coloured.any() else 0.0, 4),
-            "p95": round(float(np.percentile(sat, 95)), 4),
-        },
-        "channels": {
-            "r": round(float(r.mean()), 4),
-            "g": round(float(g.mean()), 4),
-            "b": round(float(b.mean()), 4),
-        },
-        "families": families,
-        "clipped": {
-            "black": round(clipped_black, 3),
-            "white": round(clipped_white, 3),
-        },
-        "definitions": {
-            "sat_floor": SAT_FLOOR,
-            "clip_black_code": CLIP_BLACK,
-            "clip_white_code": CLIP_WHITE,
-            "families": {n: [lo, hi] for n, lo, hi in HUE_FAMILIES},
-        },
-    }
+def path_source_key(payload: dict) -> str:
+    """A stable identity key for a `path` sourced frame or stats call, for
+    the same X-Frame-Key / cache-key role `render_raw`'s key plays for a clip.
+    Not written into any cache on disk (this route caches nothing), only
+    used to give the client something stable to compare across two calls.
+    """
+    raw = str(payload.get("path") or "")
+    bits = "|".join(str(payload.get(k)) for k in
+                    ("time", "width", "region", "rotation"))
+    return "path:" + hashlib.sha1(f"{raw}|{bits}".encode()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------
@@ -1743,6 +1921,26 @@ def read_preset(name: str, user_id: int = 0) -> dict:
     # different preset) with the text of whatever was loaded most recently.
     cfg.pop("_comment", None)
     return cfg
+
+
+def read_preset_comment(name: str, user_id: int = 0) -> str:
+    """The `_comment` a preset file carries, "" when it has none.
+
+    Split from read_preset() because read_preset() strips _comment on
+    purpose (its own docstring: the comment describes the FILE, not a config
+    about to become someone's live grade). GET /api/preset wants both at
+    once (contract G4: the documented read back could not confirm the thing
+    POST just wrote, since GET silently dropped it), so it reads the file a
+    second time here rather than changing what read_preset() hands the
+    editor.
+    """
+    p, _library = preset_path(name, user_id)
+    if not p.exists():
+        raise StudioError(f"preset not found: {name}")
+    try:
+        return json.loads(p.read_text()).get("_comment", "") or ""
+    except json.JSONDecodeError:
+        return ""
 
 
 def write_preset(name: str, cfg: dict, comment: str = "",
@@ -2338,12 +2536,32 @@ def proxy_state(params: dict) -> dict:
 # --------------------------------------------------------------------------
 
 # One live session PER USER, keyed by user id, each with exactly the shape the
-# single global LIVE dict used to have. With logins off every request resolves
-# to user 0, so there is one entry and the behaviour is what it always was.
+# single global LIVE dict used to have. With logins off a plain request still
+# resolves to user 0, so the browser tab's entry is the one it always was;
+# a caller that named itself with X-Studio-Agent gets its own (contract G2).
 # With logins on, two people grading at once would otherwise share one mirror:
 # one browser's publish would land in the other's long poll and overwrite the
 # picture they were working on.
 LIVE: dict[int, dict] = {}
+
+
+class LiveRevMismatch(Exception):
+    """A session write arrived with an if_rev that is no longer current.
+
+    Carries the state the caller should have been looking at, so the route
+    can answer 409 with the current revision in one round trip rather than
+    making the caller ask again to find out what it missed.
+    """
+
+    def __init__(self, rev: int, state: dict):
+        self.rev = int(rev)
+        self.state = state
+        super().__init__(
+            f"the session has moved on: you sent if_rev but the current "
+            f"revision is {self.rev}. Read the session again and re-send. "
+            f"Nothing was changed")
+
+
 _live_lock = threading.Lock()
 # Woken on every change so a waiting long poll returns immediately instead of
 # the browser having to poll on a timer and lag behind by up to that interval.
@@ -2462,9 +2680,21 @@ def live_set(payload: dict, user_id: int = 0, author: str | None = None) -> dict
     `author` is who the server decided the caller is (the account name with
     logins on). `by` stays exactly what the caller sent, because session.js
     filters its own echo on it and changing it would make the tab fight itself.
+
+    `if_rev` is optional and is the whole of the concurrency story (contract
+    G2): send the revision you last read and the write is refused, untouched,
+    if anything landed in between. Checked under the same lock the write
+    takes, so there is no window between the check and the change.
     """
     with _live_lock:
         state = _live_state(user_id)
+        if payload.get("if_rev") is not None:
+            try:
+                want = int(payload["if_rev"])
+            except (TypeError, ValueError):
+                raise StudioError("if_rev is a revision number") from None
+            if want != int(state["rev"]):
+                raise LiveRevMismatch(int(state["rev"]), deepcopy(state))
         patch = payload.get("config")
         if patch is not None:
             if payload.get("replace") or state["config"] is None:
@@ -2578,10 +2808,14 @@ def _crop_from(payload: dict, field: str, stored):
     """One rectangle and where it came from.
 
     Three cases, and the difference between the last two matters: a field the
-    caller did not send falls back to what the project saved (that is how an
-    agent or the CLI picks up the rectangle the person drew), while a field
-    sent as null is the caller saying "this one, whole image", which must not
-    be quietly overridden by a saved rectangle they cannot see.
+    caller did not send falls back to what the project saved (that is how the
+    browser tab keeps measuring the rectangle the person drew, on the call the
+    page makes without repeating it), while a field sent as null is the caller
+    saying "this one, whole image", which must not be quietly overridden by a
+    saved rectangle they cannot see.
+
+    `stored` arrives as None for an agent caller, so that fallback never fires
+    for one: see `match_reference_job`'s `use_stored_crops`.
     """
     if field in payload:
         value = payload.get(field)
@@ -2589,7 +2823,8 @@ def _crop_from(payload: dict, field: str, stored):
     return (stored, "project") if stored else (None, "none")
 
 
-def match_reference_job(payload: dict, user_id=None) -> dict:
+def match_reference_job(payload: dict, user_id=None,
+                        use_stored_crops: bool = True) -> dict:
     """Fit a look cube that moves the current frame toward a reference image.
 
     Synchronous rather than a background Job because the tool costs 1.4 to 3.0
@@ -2636,7 +2871,18 @@ def match_reference_job(payload: dict, user_id=None) -> dict:
     # means "use whatever this project saved for this reference"; explicitly
     # null means "whole image". With neither, this call is byte for byte the
     # call it was before the rectangles existed.
-    saved = stored_match_crops(payload, user_id)
+    #
+    # use_stored_crops is False for an agent caller (the route passes
+    # `not caller_agent`). The stored rectangles live on the PROJECT, which is
+    # shared by every caller with logins off, so an agent that never drew a box
+    # was silently measuring a rectangle a person drew in a browser tab it
+    # cannot see, and two agents on the same clip inherited each other's. The
+    # browser tab keeps the fallback because the rectangle it would inherit is
+    # the one it drew itself, one call earlier, on the pane in front of it. An
+    # agent that does want the person's rectangle reads it from
+    # GET /api/project (extras.match_crops) and sends it explicitly, which is
+    # also what makes its own notes say which rectangle it measured.
+    saved = stored_match_crops(payload, user_id) if use_stored_crops else {}
     for_ref = saved.get(str(ref)) or saved.get(ref_path.name) or {}
     if not isinstance(for_ref, dict):
         for_ref = {}
@@ -2658,6 +2904,26 @@ def match_reference_job(payload: dict, user_id=None) -> dict:
             f"strength must be a number, got {payload.get('strength')!r}")
     strength = max(0.0, min(1.0, strength))
     luma_preserve = bool(payload.get("luma_preserve", True))
+    # A default name that carries the caller's own identity, not just ref,
+    # clip and method: those three alone are exactly what let thirteen
+    # concurrent bakeoff agents overwrite each other's cube under the same
+    # name in the shared looks folder. With logins off every caller (browser
+    # tab or agent) still has a distinct user id (contract G2), so this is
+    # collision free the moment two callers are actually two identities.
+    uid = 0 if user_id is None else int(user_id)
+    name = payload.get("name") or (
+        f"match_u{uid}_{_match_name_part(ref_path.stem)}_"
+        f"{_match_name_part(Path(payload['clip']).stem)}_{method}")
+    # out_dir: a relative path lands inside the repo (content/), an absolute
+    # path is trusted as the caller's own folder. Either way it is created
+    # if missing, so a caller does not have to mkdir before it can match.
+    out_dir = payload.get("out_dir")
+    if out_dir:
+        dest_dir = Path(out_dir)
+        if not dest_dir.is_absolute():
+            dest_dir = CONTENT / dest_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = str(dest_dir)
     try:
         result = match_reference(
             ref=str(ref_path),
@@ -2681,6 +2947,8 @@ def match_reference_job(payload: dict, user_id=None) -> dict:
             auto_crop=crop_frac is None,
             ref_crop=ref_crop,
             frame_crop=frame_crop,
+            name=name,
+            out_dir=out_dir,
         )
     except MatchError as exc:
         raise StudioError(str(exc)) from exc
@@ -2693,7 +2961,20 @@ def match_reference_job(payload: dict, user_id=None) -> dict:
     crops["ref_source"] = ref_from if crops.get("ref") else "none"
     crops["frame_source"] = frame_from if crops.get("frame") else "none"
     result["looks"] = list_looks()
+    # A measurement, not a ranking: this is a single boolean gate on the one
+    # fit that was just run, from numbers match_reference already computed
+    # (gain_colour_pct, lut_health.probes_ok), never a score and never a
+    # comparison against any other candidate.
+    gain = (result.get("distance") or {}).get("gain_colour_pct")
+    probes_ok = ((result.get("lut_health") or {}).get("probes_ok", True))
+    result["recommended"] = bool(probes_ok and not (gain is not None and gain < 0))
     return result
+
+
+def _match_name_part(stem: str) -> str:
+    """The same sanitiser match_ref.py's own default name uses, so a name
+    this route builds and a name match_ref.py would have built look alike."""
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem).lower()
 
 
 REBUILD_STEPS = [
@@ -2724,6 +3005,13 @@ for _tm in ("aces", "filmic", "none"):
             ["--stage", "out", "--tonemap", _tm, "--encode", _enc, "--size", "65",
              "--out", str(TECHNICAL / f"DWG_to_Rec709_{_tm}_{_enc}.cube")],
             "make_cst.py"))
+# The non Apple Log inputs (convert.input): HLG, PQ and Rec.709, each with the
+# same product of tone map and encode as above. One step rather than forty
+# because make_cst.py's batch mode writes them all from a single process, which
+# costs one numpy and colour-science import instead of forty. The Apple Log
+# cubes are NOT in this batch: they are the sixteen steps above, unchanged.
+REBUILD_STEPS.append((["--batch", "--size", "65",
+                       "--out-dir", str(TECHNICAL)], "make_cst.py"))
 REBUILD_STEPS.append(([], "make_looks.py"))
 
 
@@ -2855,6 +3143,51 @@ def ref_image(name: str, width: int) -> bytes:
     return proc.stdout
 
 
+def ref_source_frame(payload: dict) -> tuple[np.ndarray, dict]:
+    """The decoded reference still for `POST /api/stats`' `ref` field.
+
+    `ref` is a name resolved through the exact rules `list_refs` and
+    `safe_name` already use, so a caller cannot ask for anything outside
+    content/refs and cannot ask for anything list_refs would not show. Images
+    only: a reference is a still by definition. Measured through
+    stats_decode_image, the same one decode function `path` and the CLI use,
+    so a reference measured through the studio and the same reference
+    measured through `cinegrade stats --image` are the same numbers.
+    """
+    name = safe_name(payload["ref"])
+    known = {r["name"] for r in list_refs()}
+    if name not in known:
+        raise StudioError(f"reference not found: {name}")
+    rgb = stats_decode_image(str(REFS / name), width=payload.get("width"),
+                             region=payload.get("region"))
+    return rgb, {"key": f"ref:{name}"}
+
+
+def resolve_stats_frame(payload: dict, uid: int, time_s: float) -> tuple[np.ndarray, dict]:
+    """One measured frame for `POST /api/stats`, from whichever source field
+    the request used: `path` (read only, logins off only, registers
+    nothing), `ref` (a still under content/refs) or `clip` (a footage clip,
+    graded through the live config exactly as the frame route grades it).
+    `time_s` is read by the clip and path forms; a ref is always the same
+    still no matter what time was sent.
+    """
+    if payload.get("path") is not None:
+        at_time = dict(payload, time=time_s)
+        rgb = path_source_frame(at_time, uid)
+        return rgb, {"key": path_source_key(at_time)}
+    if payload.get("ref") is not None:
+        return ref_source_frame(payload)
+    if "clip" not in payload:
+        raise StudioError("stats needs one of: clip, ref, path")
+    cfg = full_config(payload.get("config"))
+    if payload.get("mode") == "flat":
+        cfg = flat_config(cfg, bool(payload.get("keep_exposure")))
+    return render_region(payload["clip"], time_s,
+                         int(payload.get("width", 640)), cfg,
+                         effective_rotation(payload, uid),
+                         payload.get("region"), payload.get("zoom"))
+
+
 def list_renders() -> list[dict]:
     items = []
     if OUT.exists():
@@ -2906,9 +3239,33 @@ class Handler(BaseHTTPRequestHandler):
     user = None
     auth_method = ""            # "cookie", "bearer" or ""
 
+    # Caller identity, contract G2. Set fresh on every request by
+    # _resolve_caller(), class level defaults for the same reason as above.
+    # caller_id is WHO IS CALLING; _uid() below is WHOSE STATE this request
+    # acts on, and the two differ only while attached.
+    caller_id = 0
+    caller_name = "local"
+    caller_agent = ""           # the bare NAME from X-Studio-Agent, or ""
+    attached_to = None          # a user id while X-Studio-Attach is in play
+    _body_cache = None          # the parsed JSON body, read at most once
+    _body_read = False          # ... and whether that read has happened
+    _caller_used = False        # _uid() has been answered, so it cannot move
+    _status = 0                 # last status sent, for the request log
+
     def log_message(self, fmt, *args):                        # noqa: A003
         if VERBOSE:
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def send_response(self, code, message=None):              # noqa: A003
+        """Remember the status so the request log can report it.
+
+        Overridden rather than recorded in _send() because a response can
+        leave by four other doors: the 304 in the static handler, the chunked
+        stream starter, the range responses, and BaseHTTPRequestHandler's own
+        error path. All five call this.
+        """
+        self._status = int(code)
+        super().send_response(code, message)
 
     # --- plumbing ---------------------------------------------------------
 
@@ -2952,9 +3309,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, body.encode(), "application/json")
 
     def _body(self) -> dict:
+        # Cached: the body is one read off a socket, so a route that asks for
+        # it twice used to get {} the second time. It is also where a caller
+        # is allowed to name itself (contract G2: body field "agent"), and
+        # that has to be applied exactly once.
+        if self._body_read:
+            return self._body_cache
+        self._body_read = True
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
-            return {}
+            self._body_cache = {}
+            return self._body_cache
         # Checked against the declared length before a single byte is read,
         # so an oversized JSON body is refused instead of the server sitting
         # there waiting for bytes that may never come. The one route that
@@ -2965,9 +3330,13 @@ class Handler(BaseHTTPRequestHandler):
                                  f"{BODY_MAX_BYTES} byte cap for this endpoint")
         raw = self.rfile.read(n)
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise StudioError(f"bad JSON body: {exc}")
+        self._body_cache = parsed
+        if isinstance(parsed, dict) and parsed.get("agent"):
+            self._agent_from_body(str(parsed["agent"]))
+        return parsed
 
     def _raw_body(self, max_bytes: int | None = None) -> bytes:
         n = int(self.headers.get("Content-Length") or 0)
@@ -3349,11 +3718,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         self.user = None
         self.auth_method = ""
+        self._status = 0
+        started = time.time()
         try:
             if AUTH.enabled():
                 self.user, self.auth_method = AUTH.user_from_request(
                     self.headers.get("Cookie", ""),
                     self.headers.get("Authorization", ""))
+            # Contract G2, and before any route runs: with logins off a
+            # caller that named itself is its own user from here on, so the
+            # live session, the workspace and the stored crops it touches are
+            # its own and not the browser tab's.
+            self._resolve_caller()
             if path.startswith("/api/"):
                 self._api(method, path)
             else:
@@ -3387,6 +3763,43 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:                              # noqa: BLE001
             traceback.print_exc()
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+        finally:
+            self._log_request(method, path, started)
+
+    def _log_request(self, method: str, path: str, started: float) -> None:
+        """One line per request on stderr, contract G2.
+
+        On by default: several agents and a person now share one server, and
+        a silent server makes "who moved my picture" unanswerable. --quiet
+        turns it off, EXCEPT for an attached request, which is always logged
+        because acting as somebody else is the one thing that should never be
+        invisible.
+
+        Never raises: a logging bug must not turn a served request into a
+        500 after the response has already gone out.
+        """
+        attached = self.attached_to is not None
+        if QUIET and not attached:
+            return
+        try:
+            ms = (time.time() - started) * 1000.0
+            who = self.caller_name or "local"
+            if attached:
+                who = f"{who}>{self.attached_to}"
+            clip = ""
+            src = self._body_cache if isinstance(self._body_cache, dict) else {}
+            name = src.get("clip") or src.get("ref") or ""
+            if not name:
+                q = self._query()
+                name = q.get("clip") or q.get("ref") or ""
+            if name:
+                clip = f" clip={name}"
+            sys.stderr.write("%s %s %s %s%s %d %.0fms\n" % (
+                time.strftime("%H:%M:%S"), who, method, path, clip,
+                self._status or 0, ms))
+            sys.stderr.flush()
+        except Exception:                                     # noqa: BLE001
+            pass
 
     # --- static -----------------------------------------------------------
 
@@ -3442,14 +3855,124 @@ class Handler(BaseHTTPRequestHandler):
                 == "https")
 
     def _uid(self) -> int:
-        """The account this request belongs to.
+        """WHOSE state this request acts on.
 
-        With logins off _dispatch leaves self.user as None and everything is
-        the local user, id 0. Every per user store (grades, presets, the live
-        session) keys off this one number, so "auth off changes nothing" holds
-        without a single "is auth on" branch inside those stores.
+        With logins on that is the signed in account, exactly as before. With
+        logins off it is user 0 for a plain caller (so the browser tab is
+        untouched), the agent's own row for a caller that sent
+        X-Studio-Agent, and the attached user's row while X-Studio-Attach is
+        in play. Every per caller store (the live session, the workspace, the
+        stored match crops, the rotation fallback) keys off this one number,
+        so none of them needs an "is this an agent" branch.
+
+        Who is CALLING is caller_id and caller_name, and that is what signs a
+        commit. The two differ only while attached, which is the whole point
+        of attaching: act as them, sign as yourself.
         """
-        return int(self.user["id"]) if self.user else 0
+        self._caller_used = True
+        if self.attached_to is not None:
+            return int(self.attached_to)
+        return int(self.caller_id)
+
+    def _presets_uid(self) -> int:
+        """Whose preset folder to read and write (contract G2).
+
+        Presets are SHARED with logins off: agents save into users/0/presets
+        so the person at the browser tab sees what an agent saved, and an
+        agent sees what the person saved. With logins on nothing changes:
+        each account keeps its own folder.
+        """
+        return self._uid() if AUTH.enabled() else 0
+
+    def _caller_block(self) -> dict:
+        """The `caller` block GET /api/state and GET /api/whoami answer with."""
+        return {"id": int(self.caller_id),
+                "name": str(self.caller_name),
+                "attached_to": (int(self.attached_to)
+                                if self.attached_to is not None else None)}
+
+    def _agent_from_body(self, raw: str) -> None:
+        """Apply a body field "agent" as the caller, if it is still allowed.
+
+        The header is the normal way in; the body field exists so a caller
+        that cannot set headers still has one. It arrives late, because the
+        body is only read once a route asks for it, so it is refused rather
+        than half applied if this request has already acted as somebody.
+        """
+        if AUTH.enabled() or self.caller_agent or not raw.strip():
+            return
+        if self._caller_used:
+            raise StudioError(
+                "this route resolved the caller before it read the body, so "
+                "the body field \"agent\" came too late. Send the name as the "
+                "X-Studio-Agent header instead")
+        self._set_agent(raw)
+
+    def _set_agent(self, raw: str) -> None:
+        """Become agent NAME: find or create its row, keep its name."""
+        name = safe_name(raw)
+        if len(name) > 64:
+            raise StudioError("an agent name is up to 64 characters")
+        row = AUTH.ensure_agent(name)
+        self.caller_id = int(row["id"])
+        self.caller_name = str(row["name"])
+        self.caller_agent = name
+
+    def _resolve_caller(self) -> None:
+        """Decide who this request is, before any route runs (contract G2).
+
+        Header first, then ?agent=NAME on the query string; the body field is
+        applied later by _body() because the body has not been read yet here.
+        Nothing in this method touches the socket, so it cannot interfere
+        with a route that reads the body itself.
+        """
+        self.caller_id = int(self.user["id"]) if self.user else 0
+        self.caller_name = (str(self.user["name"]) if self.user
+                            else ("anonymous" if AUTH.enabled() else "local"))
+        self.caller_agent = ""
+        self.attached_to = None
+        self._body_cache = None
+        self._body_read = False
+        self._caller_used = False
+
+        attach = (self.headers.get("X-Studio-Attach") or "").strip()
+        if AUTH.enabled():
+            # With logins on a token or a cookie IS the identity, so there is
+            # nothing for these two headers to add and one of them would be a
+            # way around the login: refuse the attach outright and ignore the
+            # agent name.
+            if attach:
+                raise AUTH.AuthError(
+                    403, "X-Studio-Attach is only for a server running "
+                         "without logins. With logins on, sign in as that "
+                         "account or use its agent token instead")
+            return
+
+        raw = (self.headers.get("X-Studio-Agent") or "").strip()
+        if not raw:
+            raw = (self._query().get("agent") or "").strip()
+        if raw:
+            self._set_agent(raw)
+
+        if attach:
+            self.attached_to = self._resolve_attach(attach)
+
+    def _resolve_attach(self, raw: str) -> int:
+        """The user id behind X-Studio-Attach, or a refusal.
+
+        `0` is the local no-login user, which is the founder's own browser
+        tab, and is the case this header mostly exists for: "look at what I
+        am looking at". Any other value is an exact account or agent name.
+        """
+        raw = raw.strip()
+        if raw == "0" or raw.lower() == "local":
+            return 0
+        uid = AUTH.user_id_by_name(raw)
+        if uid is None:
+            raise StudioError(
+                f"cannot attach to {raw!r}: there is no account or agent of "
+                f"that name. Attach to 0 for the local user")
+        return int(uid)
 
     def _require_admin(self) -> None:
         if not AUTH.enabled():
@@ -3585,14 +4108,42 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("render/gpu/") and RG.handle(self, method, route, q):
             return
 
+        # The cheap first call (contract G2). GET /api/state probes every clip
+        # with ffprobe; this one touches nothing but a directory listing, so
+        # it is what a client should use to find out whether the server is up,
+        # which build it is running and where its cache and data went.
+        if route == "health" and method == "GET":
+            self._json({
+                "ok": True,
+                "version": git_version(),
+                "clips": clip_count(),
+                "uptime_s": round(time.time() - START_TIME, 1),
+                # The semaphore's own counter, which is how many ffmpeg runs
+                # could start right now without waiting. Reading the private
+                # attribute is deliberate: threading.Semaphore has no public
+                # way to ask, and being wrong about it costs a log line, not
+                # a render.
+                "ffmpeg_slots_free": int(getattr(FFMPEG_SLOTS, "_value", 0)),
+                "cache_dir": str(CACHE),
+                "data_dir": str(DB.DATA),
+                "logins": AUTH.enabled(),
+            })
+            return
+
         if route == "state" and method == "GET":
             self._json({
                 "defaults": CG.DEFAULTS,
                 "clips": self._clips(),
-                "presets": list_presets(self._uid()),
+                "presets": list_presets(self._presets_uid()),
                 "looks": list_looks(),
                 "refs": list_refs(),
                 "renders": list_renders(),
+                # Who the server decided this caller is (contract G2). `id` is
+                # the caller's own row, `attached_to` is whose state it is
+                # acting on while X-Studio-Attach is set and null otherwise.
+                # A plain browser tab with logins off sees {0, "local", null},
+                # which is what it always effectively was.
+                "caller": self._caller_block(),
                 "paths": {
                     "content": str(CONTENT), "presets": str(PRESETS),
                     "looks": str(LOOKS), "out": str(OUT), "refs": str(REFS),
@@ -3610,6 +4161,41 @@ class Handler(BaseHTTPRequestHandler):
                     "clip_black_code": CLIP_BLACK,
                     "clip_white_code": CLIP_WHITE,
                     "families": {n: [lo, hi] for n, lo, hi in HUE_FAMILIES},
+                },
+                # The convert stage's list-valued fields, so a caller can see
+                # what a field ACCEPTS and not only what it currently is.
+                # `defaults` above answers the second question already; this
+                # answers the first, which an agent otherwise has to guess at
+                # or read out of the source.
+                "convert_definitions": {
+                    "input": {
+                        "values": list(CG.INPUTS),
+                        "default": CG.DEFAULTS["convert"]["input"],
+                        "note": "what the SOURCE is. 'auto' reads the file's "
+                                "own transfer and primaries tags; the rest "
+                                "override that. Every value decodes to the "
+                                "same scene linear point, so working_space, "
+                                "tonemap and encode are unaffected. Each "
+                                "clip's own answer is clips[].source. 'auto' "
+                                "never picks one of the five camera logs "
+                                "(slog3, logc3, vlog, clog3, dlog): no "
+                                "container tag tells them apart, so they are "
+                                "named here or not used, and each one brings "
+                                "its own camera gamut with it.",
+                        "camera_logs": list(CG.CAMERA_LOG_INPUTS),
+                    },
+                    "working_space": {
+                        "values": ["dwg", "direct", "rec709"],
+                        "default": CG.DEFAULTS["convert"]["working_space"],
+                    },
+                    "tonemap": {
+                        "values": ["aces", "filmic", "none"],
+                        "default": CG.DEFAULTS["convert"]["tonemap"],
+                    },
+                    "encode": {
+                        "values": ["rec709a", "gamma24"],
+                        "default": CG.DEFAULTS["convert"]["encode"],
+                    },
                 },
                 "scope_aspect": SCOPE_ASPECT,
             })
@@ -3714,6 +4300,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"stale": True}, 409)
                 return
             payload = self._body()
+            if payload.get("path") is not None:
+                # Read only: an absolute file outside the footage root,
+                # decoded and served without opening a project, registering
+                # an EXTERNAL_CLIPS entry or touching this account's session.
+                # Logins off only (see path_source_frame's own docstring).
+                rgb = path_source_frame(payload, self._uid())
+                key = path_source_key(payload)
+                headers = {"X-Frame-Key": key,
+                          "X-Frame-Size": f"{rgb.shape[1]}x{rgb.shape[0]}"}
+                if payload.get("format") == "raw":
+                    self._send(200, rgb.tobytes(), "application/octet-stream", headers)
+                    return
+                body = encode_jpeg(rgb, key, int(payload.get("quality", 2)))
+                self._send(200, body, "image/jpeg", headers)
+                return
             self._guard_read(payload.get("clip"))
             cfg = full_config(payload.get("config"))
             mode = payload.get("mode", "graded")
@@ -3866,8 +4467,22 @@ class Handler(BaseHTTPRequestHandler):
             # this clip as a viewer is refused here rather than discovering it
             # after the fact when their edit is not in the history.
             self._guard_edit(clip=payload.get("clip"))
-            self._json(live_set(payload, self._uid(),
-                                author=self._author(payload.get("by"))))
+            # An agent that sent no `by` is labelled with its own name rather
+            # than the generic `cli` (contract G2, the default `by`). The tab
+            # filters its own echo on this field, so a caller that DID send
+            # one keeps it exactly.
+            if self.caller_agent and not str(payload.get("by") or "").strip():
+                payload = dict(payload)
+                payload["by"] = self.caller_name
+            try:
+                self._json(live_set(payload, self._uid(),
+                                    author=self._author(payload.get("by"))))
+            except LiveRevMismatch as exc:
+                # 409, and the config is untouched: the caller read revision
+                # N, somebody else has since written N+1, and merging blind
+                # would silently throw their edit away.
+                self._json({"error": str(exc), "rev": exc.rev,
+                            "session": exc.state}, 409)
             return
 
         if route == "session/wait" and method == "GET":
@@ -3890,6 +4505,9 @@ class Handler(BaseHTTPRequestHandler):
                 "by": self._author(None),
                 "auth": AUTH.enabled(),
                 "project": PROJECTS.workspace_key(self._uid()),
+                # Same block as GET /api/state, so one call answers "who does
+                # this server think I am" whichever of the two you reach for.
+                "caller": self._caller_block(),
             })
             return
 
@@ -4130,7 +4748,11 @@ class Handler(BaseHTTPRequestHandler):
         if route == "match" and method == "POST":
             payload = self._body()
             self._guard_read(payload.get("clip"))
-            self._json(match_reference_job(payload, self._uid()))
+            # The project's stored rectangles are a browser tab convenience,
+            # not a default: an agent gets them only by sending them.
+            self._json(match_reference_job(
+                payload, self._uid(),
+                use_stored_crops=not self.caller_agent))
             return
 
         if route == "parity/report" and method == "POST":
@@ -4149,19 +4771,30 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "stats" and method == "POST":
             payload = self._body()
-            self._guard_read(payload.get("clip"))
-            cfg = full_config(payload.get("config"))
-            if payload.get("mode") == "flat":
-                cfg = flat_config(cfg, bool(payload.get("keep_exposure")))
-            # region (contract E4): measure a patch instead of the whole
-            # frame, so "what is the skin doing" is a number and not a guess
-            # from a scope of everything.
-            rgb, meta = render_region(payload["clip"], float(payload.get("time", 0)),
-                                      int(payload.get("width", 640)), cfg,
-                                      effective_rotation(payload, self._uid()),
-                                      payload.get("region"), payload.get("zoom"))
+            # path and ref are both read only and register nothing; only the
+            # clip form touches this account's read guard.
+            if payload.get("path") is None and payload.get("ref") is None:
+                self._guard_read(payload.get("clip"))
+            times = payload.get("times")
+            if times:
+                results = []
+                for t in times:
+                    rgb, meta = resolve_stats_frame(payload, self._uid(), float(t))
+                    row = {"time": float(t), "key": meta["key"],
+                          "stats": frame_stats(rgb),
+                          "size": [meta.get("width", rgb.shape[1]),
+                                   meta.get("height", rgb.shape[0])]}
+                    if "region" in meta:
+                        row["region"] = meta["region"]
+                        row["region_pixels"] = meta["region_pixels"]
+                    results.append(row)
+                self._json({"results": results})
+                return
+            rgb, meta = resolve_stats_frame(payload, self._uid(),
+                                            float(payload.get("time", 0)))
             out = {"key": meta["key"], "stats": frame_stats(rgb),
-                   "size": [meta["width"], meta["height"]]}
+                   "size": [meta.get("width", rgb.shape[1]),
+                            meta.get("height", rgb.shape[0])]}
             if "region" in meta:
                 out["region"] = meta["region"]
                 out["region_pixels"] = meta["region_pixels"]
@@ -4202,25 +4835,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, ref_image(q["name"], int(q.get("w", 900))), "image/jpeg")
             return
 
+        # Presets are the one per user store that is SHARED between callers
+        # when logins are off (contract G2): _presets_uid() is 0 for the
+        # browser tab and for every agent alike, so an agent's "save as" lands
+        # where the person at the keyboard will see it, and the other way
+        # round. With logins on it is the account, unchanged.
         if route == "presets" and method == "GET":
-            self._json({"presets": list_presets(self._uid())})
+            self._json({"presets": list_presets(self._presets_uid())})
             return
 
         if route == "preset" and method == "GET":
-            self._json({"name": q["name"],
-                        "config": read_preset(q["name"], self._uid())})
+            name = q["name"]
+            uid = self._presets_uid()
+            body = {"name": name,
+                    "comment": read_preset_comment(name, uid),
+                    "config": read_preset(name, uid)}
+            if str(q.get("expand", "")).strip().lower() in ("1", "true", "yes"):
+                body["expanded"] = True
+            self._json(body)
             return
 
         if route == "preset" and method == "POST":
             payload = self._body()
             p = write_preset(payload["name"], payload.get("config"),
-                             payload.get("comment", ""), self._uid())
+                             payload.get("comment", ""), self._presets_uid())
             self._json({"saved": p.name, "path": str(p),
-                        "presets": list_presets(self._uid())})
+                        "presets": list_presets(self._presets_uid())})
             return
 
         if route == "preset" and method == "DELETE":
-            p, library = preset_path(q["name"], self._uid())
+            p, library = preset_path(q["name"], self._presets_uid())
             if not p.exists():
                 raise StudioError(f"preset not found: {q['name']}")
             if library:
@@ -4235,7 +4879,7 @@ class Handler(BaseHTTPRequestHandler):
                          "shadow it, and delete that instead")
             p.unlink()
             self._json({"deleted": q["name"],
-                        "presets": list_presets(self._uid())})
+                        "presets": list_presets(self._presets_uid())})
             return
 
         if route == "looks" and method == "GET":
@@ -4342,7 +4986,7 @@ class Handler(BaseHTTPRequestHandler):
                        # since wave 2 lands there rather than in the shipped
                        # library, so without this entry "reveal" on a preset
                        # the user just saved would refuse to show it.
-                       GRADES.user_presets_dir(self._uid()).resolve()]
+                       GRADES.user_presets_dir(self._presets_uid()).resolve()]
             if not any(str(target.resolve()).startswith(str(a)) for a in allowed):
                 raise StudioError("that path is outside the studio folders")
             subprocess.Popen(["open", "-R", str(target)])
@@ -4427,13 +5071,18 @@ class Handler(BaseHTTPRequestHandler):
 
         With logins on the account name wins: a signed in browser cannot sign
         somebody else's name to a commit by editing a JSON body. With logins
-        off there is no account to name, so the caller's own label is used,
-        which is `studio` from the tab and `--by`, CINEGRADE_AGENT or `cli`
-        from the command line. That is the whole identity model, and it is
-        deliberately small: this is a local colour tool, not a bank.
+        off, a caller that named itself with X-Studio-Agent signs `agent:NAME`
+        and cannot sign anything else, INCLUDING while attached to somebody
+        else's session: acting as them does not mean writing history in their
+        name. Only an unnamed local caller falls back to its own label, which
+        is `studio` from the tab and `--by`, CINEGRADE_AGENT or `cli` from the
+        command line. That is the whole identity model, and it is deliberately
+        small: this is a local colour tool, not a bank.
         """
         if AUTH.enabled() and self.user:
             return str(self.user["name"])
+        if self.caller_agent:
+            return str(self.caller_name)
         label = str(by or "").strip()
         return label or "cli"
 
@@ -4618,6 +5267,50 @@ class Handler(BaseHTTPRequestHandler):
             entry.setdefault("pix_fmt", info["pix_fmt"])
             entry.setdefault("color_range", info["color_range"])
             entry.setdefault("color_space", info["color_space"])
+            entry.setdefault("color_transfer", info.get("color_transfer", ""))
+            entry.setdefault("color_primaries", info.get("color_primaries", ""))
+        # source (contract G1): what this file IS, as three separate tags plus
+        # the answer the engine reads out of them. Separate because they are
+        # separate: color_space is the YUV matrix, color_transfer is the curve
+        # and color_primaries is the gamut, and a file can get any one of them
+        # right while the others are missing or wrong. resolved_input is what
+        # convert.input "auto" lands on for this file, so the UI and an agent
+        # can see the decode BEFORE rendering anything, and `warnings` carries
+        # the sentence the engine would print about an unrecognised tag.
+        if "error" not in entry:
+            src, warns = CG.resolve_input(CG.DEFAULTS, info)
+            try:
+                # The same door every render goes through, asked with the
+                # default working space, so a clip that would be refused says
+                # so in the listing instead of only when someone renders it.
+                _src, warns = CG.check_source_space(CG.DEFAULTS, info)
+            except CG.GradeError as exc:
+                warns = warns + [str(exc)]
+            entry["source"] = {
+                "transfer": entry.get("color_transfer", ""),
+                "primaries": entry.get("color_primaries", ""),
+                "matrix": entry.get("color_space", ""),
+                "range": entry.get("color_range", ""),
+                "resolved_input": src,
+                "warnings": warns,
+            }
+        # rotation_tag (contract G4): the display matrix tag as a string,
+        # "0" when the file has none, and rotation_tag_suspect, the advisory
+        # boolean from CG.rotation_tag_suspect(): the exact function
+        # `cinegrade orient IN --json` prints through, so the clip list and
+        # the CLI never disagree about which files are worth a second look.
+        # Nothing here ever changes what gets rendered; "raw" (the mode "0"
+        # block just above, the file's own coded width and height before any
+        # tag is applied) is what the codec tell in that heuristic needs.
+        if "error" in entry:
+            entry.setdefault("rotation_tag", "0")
+            entry.setdefault("rotation_tag_suspect", False)
+        else:
+            entry["rotation_tag"] = str(int(entry.get("rotation") or 0))
+            raw_dims = entry.get("raw") or {}
+            entry["rotation_tag_suspect"] = CG.rotation_tag_suspect(
+                entry.get("rotation"), entry.get("codec"),
+                raw_dims.get("width"), raw_dims.get("height"))
         # The two dimension blocks above are the two the app has always shown
         # (autorotate and raw). Once a project exists, the rotation it stores
         # can be a quarter turn that is neither of them, so its size is
@@ -4654,6 +5347,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 VERBOSE = False
+# The request log is ON by default (contract G2): with several agents and a
+# person sharing one server, a silent server makes "who moved my picture" an
+# unanswerable question. --quiet turns it off for anybody who wants the old
+# silence back. VERBOSE is unrelated and keeps meaning what it meant.
+QUIET = False
+# Process start, for GET /api/health's uptime. Read at import so it is the
+# real start rather than the moment the port was bound.
+START_TIME = time.time()
 
 
 class StudioServer(ThreadingHTTPServer):
@@ -4811,7 +5512,7 @@ def _org_cli(args) -> bool:
 
 
 def main() -> None:
-    global VERBOSE, UPLOAD_MAX_BYTES, UPLOAD_QUOTA_BYTES
+    global VERBOSE, QUIET, UPLOAD_MAX_BYTES, UPLOAD_QUOTA_BYTES
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=7431)
@@ -4864,6 +5565,13 @@ def main() -> None:
                          "library's own root IS that folder, so without this "
                          "a test upload lands in real footage. Also settable "
                          "as STUDIO_FOOTAGE")
+    ap.add_argument("--cache-dir", metavar="DIR",
+                    help="put the frame, proxy and segment cache somewhere "
+                         "other than studio/cache. Defaults to "
+                         "<data-dir>/cache when --data-dir is given, so a "
+                         "temp server stops evicting the frames a real one "
+                         "is scrubbing through. Also settable as "
+                         "STUDIO_CACHE_DIR")
     ap.add_argument("--upload-max-bytes", type=int, default=UPLOAD_MAX_BYTES,
                     help="reject a single POST /api/upload larger than this "
                          "many bytes (default 8 GiB)")
@@ -4871,8 +5579,13 @@ def main() -> None:
                     help="reject an upload that would put one account's "
                          "footage folder over this many bytes total "
                          "(default 50 GiB)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="turn the one line per request log off. The log is "
+                         "on by default so a shared server can say who did "
+                         "what; --verbose is a separate, noisier thing")
     args = ap.parse_args()
     VERBOSE = args.verbose
+    QUIET = args.quiet
     UPLOAD_MAX_BYTES = args.upload_max_bytes
     UPLOAD_QUOTA_BYTES = args.upload_quota_bytes
 
@@ -4881,6 +5594,16 @@ def main() -> None:
         DB.set_data_dir(args.data_dir)
         AUTH.USERS_DIR = DB.DATA / "users"
         GRADES.USERS_DIR = DB.DATA / "users"
+
+    # And the cache, resolved once here so nothing downstream has to ask.
+    # --cache-dir wins over everything; otherwise a run with its own data
+    # folder gets a cache inside it, and a run without one keeps studio/cache
+    # exactly as before. The import time default already covered the two
+    # environment variables, so this only has to handle the flags.
+    if args.cache_dir:
+        set_cache_dir(args.cache_dir)
+    elif args.data_dir and not os.environ.get("STUDIO_CACHE_DIR", "").strip():
+        set_cache_dir(DB.DATA / "cache")
 
     # Same idea for the footage folder, and for the same reason: a test run
     # must not write into real work. Before ensure_dirs and before the first
@@ -4942,7 +5665,9 @@ def main() -> None:
         print("  logins  off (local use). Pass --auth to require one.",
               flush=True)
     print(f"  footage {FOOTAGE}\n  presets {PRESETS}\n  looks   {LOOKS}\n"
-          f"  out     {OUT}", flush=True)
+          f"  out     {OUT}\n  cache   {CACHE}\n  data    {DB.DATA}", flush=True)
+    print("  log     " + ("off (--quiet)" if QUIET else
+                          "one line per request on stderr"), flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

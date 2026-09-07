@@ -23,8 +23,14 @@ What it pins:
                   it there through POST /api/project/extra), a match whose body
                   says nothing about rectangles produces the SAME cube as the
                   explicit one, and says the rectangle came from the project.
-                  That is what lets an agent or the CLI match the way the
-                  person picked without being told.
+                  That is what lets the tab keep measuring the box the person
+                  drew on the call the page makes without repeating it.
+  who inherits    the fall back is for the browser tab only. A caller that
+                  sends X-Studio-Agent gets the whole image unless it sends a
+                  rectangle itself, because the stored rectangles sit on the
+                  shared project and an agent has no way to know whose they
+                  are; sending the box it read from GET /api/project puts it
+                  back on the tab's own cube.
   saying no       a body with ref_crop null means whole image even when the
                   project has a rectangle saved, so the tab's own readout can
                   never be a lie about what was measured.
@@ -75,10 +81,13 @@ def _get(url: str, timeout: float = 60.0):
         return json.loads(r.read())
 
 
-def _post(url: str, payload: dict, timeout: float = 180.0):
+def _post(url: str, payload: dict, timeout: float = 180.0, agent: str = ""):
+    headers = {"Content-Type": "application/json"}
+    if agent:
+        headers["X-Studio-Agent"] = agent
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -167,12 +176,12 @@ class MatchCropTest(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------
 
-    def _match(self, **extra):
+    def _match(self, agent: str = "", **extra):
         body = {"clip": self.clip, "ref": self.ref, "time": 0.5,
                 "config": {}, "method": "reinhard", "strength": 1.0,
                 "luma_preserve": True}
         body.update(extra)
-        result = _post(self.base + "/match", body)
+        result = _post(self.base + "/match", body, agent=agent)
         cube = Path(result["lut"]).read_bytes()
         return result, cube
 
@@ -261,6 +270,53 @@ class MatchCropTest(unittest.TestCase):
             cube_plain, cube_said_no,
             "a request that says null must measure the whole image even with "
             "a rectangle saved on the project")
+        self._store(None)
+
+    def test_an_agent_does_not_inherit_the_projects_rectangle(self):
+        """The fallback is a browser tab convenience, not a default.
+
+        The stored rectangles live on the PROJECT, which every caller shares
+        with logins off, so an agent that never drew a box was measuring
+        somebody else's rectangle without any way of knowing. A caller that
+        sends X-Studio-Agent now gets the whole image unless it sends a
+        rectangle itself; the bare caller in the same breath still falls back,
+        which is what keeps the tab's behaviour exactly as it was.
+        """
+        # One pinned name for every call here. The default name carries the
+        # caller's own user id (match_u0_... against match_u1_...), and that
+        # id is written into the cube's own TITLE line, so two cubes with
+        # identical numbers would still differ in their first bytes and the
+        # comparison would be about naming rather than about pixels.
+        pin = {"name": "crop_fallback_probe"}
+        self._store(None)
+        _plain, cube_plain = self._match(**pin)
+        self._store({self.ref: {"ref": LEFT_HALF}})
+
+        as_agent, cube_agent = self._match(agent="crop-fallback-probe", **pin)
+        self.assertEqual(as_agent["crops"]["ref_source"], "none",
+                         "an agent inherited the project's rectangle")
+        self.assertIsNone(as_agent["crops"]["ref"])
+        self.assertEqual(
+            cube_agent, cube_plain,
+            "an agent that sent no rectangle must measure the whole image, "
+            "byte for byte the same cube as a match with nothing saved")
+
+        as_tab, cube_tab = self._match(**pin)
+        self.assertEqual(as_tab["crops"]["ref_source"], "project",
+                         "the browser tab lost its own saved rectangle")
+        self.assertEqual(as_tab["crops"]["ref"]["box"], LEFT_HALF)
+        self.assertNotEqual(cube_tab, cube_plain,
+                            "this fixture only means something if the saved "
+                            "rectangle actually changes the cube")
+
+        # An agent that does want it reads it and sends it, and then the
+        # cube is the tab's cube again.
+        saved = _get(self.base + f"/project?clip={self.clip}")
+        box = saved["extras"]["match_crops"][self.ref]["ref"]
+        told, cube_told = self._match(agent="crop-fallback-probe",
+                                      ref_crop=box, **pin)
+        self.assertEqual(told["crops"]["ref_source"], "request")
+        self.assertEqual(cube_told, cube_tab)
         self._store(None)
 
     def test_a_rectangle_too_small_to_measure_is_refused_by_name(self):

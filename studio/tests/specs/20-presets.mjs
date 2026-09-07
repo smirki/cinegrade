@@ -155,8 +155,41 @@ export default async function run(ctx) {
       throw new Error("refusing to Load: #presetSelect could not be set to " + JSON.stringify(name)
         + " (it reads " + JSON.stringify(got) + ", so that option does not exist in the dropdown yet)");
     }
+    const before = await presetCalls("__presetLoads", name);
     await page.click("#loadPresetBtn");
-    await sleep(450);
+    await waitForPresetCall("__presetLoads", name, before,
+      'Load of "' + name + '": GET /api/preset never came back');
+  }
+
+  /* How many times this page has finished a preset request for NAME. See the
+     evaluateOnNewDocument block below for why the count exists; before that
+     block has been installed (this spec's first navigation) the arrays are
+     undefined and this reads 0, which is exactly the "nothing to wait for"
+     answer a caller wants then. */
+  async function presetCalls(bucket, name) {
+    return page.evaluate((b, n) => {
+      const rows = window[b] || [];
+      return rows.filter((x) => x === n).length;
+    }, bucket, name);
+  }
+
+  /* Wait for one more completed round trip for NAME, then let the page's own
+     handler for it run. The ceiling is generous on purpose: this is waiting on
+     a request queued behind up to a second of cold-cache frame rendering, and
+     a 20 s ceiling that never fires costs nothing while a 450 ms sleep that
+     is 50 ms short costs a false failure. The settle sleep after it is because
+     the count is incremented when the RESPONSE arrives, and app.js reads the
+     JSON body and applies it a moment later. */
+  async function waitForPresetCall(bucket, name, wasCount, whatFailed) {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      if ((await presetCalls(bucket, name)) > wasCount) {
+        await sleep(150);
+        return;
+      }
+      await sleep(50);
+    }
+    throw new Error(whatFailed + " within 20s");
   }
 
   function armDialogs(answers) {
@@ -176,6 +209,7 @@ export default async function run(ctx) {
   // save is a wait, not a false failure.
   async function saveAsUI(name, comment) {
     const armed = armDialogs([name, comment]);
+    const before = await presetCalls("__presetSaves", name);
     await page.click("#saveAsBtn");
     let ok = false;
     for (let i = 0; i < 30 && !ok; i++) {
@@ -184,6 +218,15 @@ export default async function run(ctx) {
       ok = list.some((p) => p.name === name);
     }
     armed.off();
+    // The loop above proves the FILE is there, which is what the case asserts;
+    // this waits for the page's own half of the same round trip (savePreset's
+    // handler is what sets S.presetName and #presetSelect, and the very next
+    // helper a caller reaches for, overwriteUI, refuses to click if that has
+    // not happened yet). Nothing to wait for if the save never landed.
+    if (ok) {
+      await waitForPresetCall("__presetSaves", name, before,
+        '"Save as" of "' + name + '": POST /api/preset never came back');
+    }
     return { ok, seen: armed.seen };
   }
 
@@ -198,8 +241,10 @@ export default async function run(ctx) {
       throw new Error("refusing to Overwrite: #presetSelect shows " + JSON.stringify(got)
         + ", expected " + JSON.stringify(expectedName) + " (a stray Overwrite could hit a real preset)");
     }
+    const before = await presetCalls("__presetSaves", expectedName);
     await page.click("#savePresetBtn");
-    await sleep(450);
+    await waitForPresetCall("__presetSaves", expectedName, before,
+      'Overwrite of "' + expectedName + '": POST /api/preset never came back');
   }
 
   async function toggleCheckbox(sel) {
@@ -231,13 +276,48 @@ export default async function run(ctx) {
   // navigation, same reason spec 12's __gradePuts probe does the same
   // thing) so this spec does one deliberate reload right after arming it,
   // to get a fresh boot with the patch live from the first script tag.
+  //
+  // It also counts the preset round trips this spec's own helpers have to wait
+  // for. Load and Overwrite are both a request to the server whose ANSWER is
+  // what lands (Load replaces the live config from the response; Overwrite is
+  // only on disk once the POST comes back), and a fixed sleep is not a wait for
+  // an answer. Measured on a server started with a fresh --data-dir, which is
+  // what run.mjs does and which since studio/server.py's _default_cache_dir
+  // means a COLD frame cache: the four scope/stats renders that follow every
+  // committed change take about a second each, Chrome's six-connections-per-host
+  // limit queues the next click's request behind them, and an Overwrite POST
+  // that the server handled in 4 ms did not reach it for 1049 ms. Counting
+  // completions is a NEUTRAL signal ("the request came back"), not a check on
+  // the value any case then asserts.
   await page.evaluateOnNewDocument(() => {
     window.__lutLookPosts = [];
     window.__sessionPosts = [];
+    window.__presetLoads = [];
+    window.__presetSaves = [];
     const orig = window.fetch;
     window.fetch = function (input, init) {
       const url = typeof input === "string" ? input : (input && input.url) || "";
       const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+      if (method === "GET" && /\/api\/preset\?/.test(url)) {
+        const m = /[?&]name=([^&]*)/.exec(url);
+        const who = m ? decodeURIComponent(m[1]) : "";
+        return orig.apply(this, arguments).then(function (r) {
+          window.__presetLoads.push(who);
+          return r;
+        });
+      }
+      if (method === "POST" && /\/api\/preset(\?|$)/.test(url)) {
+        let who = "";
+        try {
+          const bt = (init && init.body) || "";
+          const body = typeof bt === "string" ? JSON.parse(bt) : null;
+          who = (body && body.name) || "";
+        } catch (e) { /* not JSON, not ours */ }
+        return orig.apply(this, arguments).then(function (r) {
+          window.__presetSaves.push(who);
+          return r;
+        });
+      }
       if (method === "POST" && /\/api\/lut(\?|$)/.test(url)) {
         try {
           const bt = (init && init.body) || "";

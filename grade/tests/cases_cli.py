@@ -57,31 +57,37 @@ def test_still(ctx):
 
 
 def test_stats(ctx):
-    r = _cli(ctx, "stats", ["stats", SRC, "-p", "natural", "--time", str(H.TIME_A)],
-             expect_stdout=("YAVG", "mid-tone check", "8-bit code values"))
+    """`stats` now prints the studio strip (grade/stats.py's frame_stats),
+    the same numbers POST /api/stats returns, not ffmpeg signalstats. See
+    the `stats` test group (cases_stats.py) for the numeric fixture; this
+    test only pins that the CLI's own smoke output still looks like a real
+    measurement of the clip it was pointed at."""
+    r = _cli(ctx, "stats", ["stats", SRC, "-p", "natural", "--time", str(H.TIME_A),
+                            "--json"],
+             expect_stdout=("luma", "bands"))
     if r is None:
         return
-    # The numbers have to be real, not an empty table from a silently failed run.
-    vals = {}
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0].isupper():
-            try:
-                vals[parts[0]] = float(parts[1])
-            except ValueError:
-                pass
-    ctx.note(f"parsed {len(vals)} signalstats values: {vals}")
-    ctx.expect_ge("stats reported at least the Y and chroma set",
-                  float(len(vals)), 7.0)
-    if "YAVG" in vals:
-        ctx.expect_between("YAVG is a plausible 8-bit code", vals["YAVG"], 1.0, 254.0)
+    import json
+    out = json.loads(r.stdout)
+    ctx.expect_true("has key/size/stats", {"key", "size", "stats"} <= set(out),
+                    str(set(out)))
+    y = out["stats"]["luma"]["mean8"]
+    ctx.note(f"YAVG-equivalent (luma mean8): {y}")
+    ctx.expect_between("the mean is a plausible 8-bit code", y, 1.0, 254.0)
+    ctx.expect_true("bands are part of the strip", "bands" in out["stats"],
+                    str(set(out["stats"])))
 
 
 def test_render(ctx):
     out = H.WORK / "cli_render.mov"
-    _cli(ctx, "render", ["render", SRC, "-p", "natural", "-o", str(out),
-                         "-t", "0.12", "--no-audio"],
-         expect_stdout=("rendered ->",))
+    r = _cli(ctx, "render", ["render", SRC, "-p", "natural", "-o", str(out),
+                             "-t", "0.12", "--no-audio"],
+             expect_stdout=("rendered (input", "rotation", "->"))
+    # contract G9 friction 7: render now names the input transform it
+    # resolved and the rotation mode it applied, on its one line of output.
+    if r is not None:
+        ctx.expect_true("render names the resolved input",
+                        "input apple_log" in r.stdout, r.stdout)
     if not out.exists():
         ctx.check(False, "render: no file written")
         return

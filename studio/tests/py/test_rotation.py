@@ -17,10 +17,18 @@ What it pins:
   the setting    {"rotation": "90"} must come back with the width and height
                  swapped, which is the whole point of the feature: the
                  founder's camera tags landscape shots as -90.
-  precedence     rotation, then the legacy flag, then the open project's
-                 rotation, then auto. Checked directly against
-                 server.effective_rotation with a stubbed project store, so
-                 it holds before and after the project store lands.
+  precedence     rotation, then the legacy flag, then a non-auto
+                 config.rotation, then the open project's rotation, then
+                 auto (contract G4 added the config step). Checked directly
+                 against server.effective_rotation with a stubbed project
+                 store, so it holds before and after the project store lands.
+  in the grade   PresetAndGradeRotationTest: PUT /api/grade and POST
+                 /api/preset persist rotation because it is part of the
+                 config now, GET reads it back, an auto value never reaches
+                 the preset file on disk (config_diff strips it against
+                 DEFAULTS same as any other untouched default), and GET
+                 /api/preset always carries `comment` (previously stripped)
+                 plus `expanded: true` when asked for it.
 """
 
 from __future__ import annotations
@@ -72,6 +80,18 @@ def _post(url: str, payload: dict, timeout: float = 120.0):
         headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read(), dict(r.headers)
+
+
+def _put(url: str, payload: dict, timeout: float = 120.0):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="PUT")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), dict(r.headers)
+
+
+def _get_json(url: str, timeout: float = 60.0) -> dict:
+    return json.loads(_get(url, timeout)[0])
 
 
 class RotationServerTest(unittest.TestCase):
@@ -201,6 +221,28 @@ class RotationServerTest(unittest.TestCase):
         self.assertEqual(legacy, modern,
                          "the thumb strip's rot=0 and rotation=0 are one request")
 
+    def test_clips_carry_a_rotation_tag_and_a_suspect_flag(self):
+        """Contract G4: GET /api/state's clip list (here read through the
+        older GET /api/clips, which returns the same per-clip shape) gains
+        rotation_tag (a string, "0" when the file has none) and
+        rotation_tag_suspect (advisory, never applied automatically). This
+        class's own footage is real ProRes off the founder's camera, so the
+        tagged clip is expected to trip the heuristic's cinema-codec tell.
+        """
+        clips = json.loads(_get(self.base + "/clips")[0])["clips"]
+        mine = [c for c in clips if c["name"] == self.clip][0]
+        self.assertIn("rotation_tag", mine)
+        self.assertIsInstance(mine["rotation_tag"], str)
+        self.assertIn("rotation_tag_suspect", mine)
+        self.assertIsInstance(mine["rotation_tag_suspect"], bool)
+        self.assertEqual(mine["rotation_tag"], str(int(mine["rotation"] or 0)),
+                         "rotation_tag must describe the same tag the older "
+                         "'rotation' field already reports")
+        if abs(int(mine["rotation"] or 0)) in (90, 270) and mine.get("codec") == "prores":
+            self.assertTrue(mine["rotation_tag_suspect"],
+                            "a quarter turn tag on a ProRes file is exactly "
+                            "the C011 case the heuristic exists for")
+
 
 PRECEDENCE_SCRIPT = r'''
 import json, sys, types
@@ -226,6 +268,21 @@ out = {
     "project_when_nothing_asked": SRV.effective_rotation({}, 0),
     "auto_when_no_project": SRV.effective_rotation({}, 999),
     "auto_when_no_user": SRV.effective_rotation({}, None),
+    # Contract G4: a non-auto config.rotation (the grade or preset the
+    # request is already carrying whole) is the third place in line, after
+    # an explicit rotation and the legacy flag, before the project.
+    "config_beats_project": SRV.effective_rotation(
+        {"config": {"rotation": "90"}}, 0),
+    "config_auto_falls_through_to_project": SRV.effective_rotation(
+        {"config": {"rotation": "auto"}}, 0),
+    "config_missing_key_falls_through_to_project": SRV.effective_rotation(
+        {"config": {}}, 0),
+    "config_that_is_not_a_dict_is_ignored": SRV.effective_rotation(
+        {"config": "not-a-dict"}, 0),
+    "explicit_rotation_beats_config": SRV.effective_rotation(
+        {"rotation": "0", "config": {"rotation": "90"}}, 0),
+    "legacy_autorotate_beats_config": SRV.effective_rotation(
+        {"autorotate": False, "config": {"rotation": "90"}}, 0),
 }
 
 # And a store that blows up must not take a render down with it.
@@ -280,6 +337,188 @@ class EffectiveRotationPrecedenceTest(unittest.TestCase):
         self.assertEqual(got["auto_when_the_store_raises"], "auto",
                          "a project store that cannot be read is a reason to "
                          "fall back to auto, never a reason to fail a render")
+
+        # Contract G4: config.rotation is the third place in line.
+        self.assertEqual(got["config_beats_project"], "90",
+                         "a non-auto config.rotation must win over the open "
+                         "project's own rotation, or a grade posted whole "
+                         "would silently lose to whatever this account had "
+                         "the project set to")
+        self.assertEqual(got["config_auto_falls_through_to_project"], "180",
+                         "a config that never set a rotation (still auto "
+                         "after full_config's own defaults merge) must not "
+                         "shadow the project's rotation")
+        self.assertEqual(got["config_missing_key_falls_through_to_project"], "180")
+        self.assertEqual(got["config_that_is_not_a_dict_is_ignored"], "180",
+                         "a malformed config must not raise or panic a render, "
+                         "only fall through to the next source")
+        self.assertEqual(got["explicit_rotation_beats_config"], "0",
+                         "an explicit top level rotation still outranks the "
+                         "one riding along inside config")
+        self.assertEqual(got["legacy_autorotate_beats_config"], "0",
+                         "the legacy autorotate flag still outranks config "
+                         "too, exactly like an explicit rotation field")
+
+
+class PresetAndGradeRotationTest(unittest.TestCase):
+    """Contract G4: rotation persists because it is part of the config now.
+
+    Its own server and its own temp data dir: these tests write real preset
+    files to disk and read them back, and a fresh, empty presets folder is
+    what makes "on_disk" mean what it says rather than whatever an earlier
+    test in this file happened to leave behind.
+    """
+
+    proc = None
+    data_dir = None
+    base = ""
+    clip = ""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data_dir = tempfile.mkdtemp(prefix="studio-rotation-preset-data-")
+        port = _free_port()
+        cls.base = f"http://127.0.0.1:{port}/api"
+        env = dict(os.environ, STUDIO_DATA_DIR=cls.data_dir)
+        cls.proc = subprocess.Popen(
+            [PYTHON, SERVER, "--port", str(port), "--data-dir", cls.data_dir],
+            cwd=str(CONTENT), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.time() + 30.0
+        last = None
+        while time.time() < deadline:
+            if cls.proc.poll() is not None:
+                out, err = cls.proc.communicate()
+                raise RuntimeError("the studio server exited while starting:\n"
+                                   + err.decode("utf-8", "replace")[-2000:])
+            try:
+                _get(cls.base + "/state", timeout=5.0)
+                break
+            except Exception as exc:                          # noqa: BLE001
+                last = exc
+                time.sleep(0.25)
+        else:
+            cls._stop()
+            raise RuntimeError(f"the studio server never answered: {last}")
+
+        clips = json.loads(_get(cls.base + "/clips")[0])["clips"]
+        usable = [c for c in clips if not c.get("error")]
+        if not usable:
+            cls._stop()
+            raise unittest.SkipTest("no clip in footage/ to grade")
+        cls.clip = usable[0]["name"]
+
+    @classmethod
+    def _stop(cls):
+        if cls.proc is None:
+            return
+        # By the PID captured at spawn, never by a name pattern.
+        try:
+            cls.proc.terminate()
+            cls.proc.wait(timeout=10)
+        except Exception:                                     # noqa: BLE001
+            try:
+                cls.proc.kill()
+            except Exception:                                 # noqa: BLE001
+                pass
+        for pipe in (cls.proc.stdout, cls.proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        cls.proc = None
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._stop()
+        if cls.data_dir:
+            shutil.rmtree(cls.data_dir, ignore_errors=True)
+
+    def _preset_file(self, name: str) -> Path:
+        return Path(self.data_dir) / "users" / "0" / "presets" / f"{name}.json"
+
+    def test_preset_round_trip_of_rotation_and_comment(self):
+        name = "rotation_roundtrip_test"
+        saved, _ = _post(f"{self.base}/preset", {
+            "name": name, "config": {"rotation": "90"},
+            "comment": "sideways on purpose",
+        })
+        self.assertEqual(json.loads(saved)["saved"], f"{name}.json",
+                         "the route reports the file it wrote, extension "
+                         "included, not the bare preset name")
+
+        body = _get_json(f"{self.base}/preset?name={name}")
+        self.assertEqual(body["name"], name)
+        self.assertEqual(body["comment"], "sideways on purpose",
+                         "GET must return the comment POST wrote instead of "
+                         "the _comment/comment mismatch it used to strip")
+        self.assertEqual(body["config"]["rotation"], "90")
+        self.assertNotIn("expanded", body,
+                         "no expand=true means no expanded key: the shape "
+                         "stays what it was before this contract, plus comment")
+
+        expanded = _get_json(f"{self.base}/preset?name={name}&expand=true")
+        self.assertTrue(expanded["expanded"])
+        self.assertEqual(expanded["comment"], "sideways on purpose")
+        self.assertEqual(expanded["config"]["rotation"], "90")
+        # expand does not change what config already was: read_preset()
+        # already fills in every default, expand or not.
+        self.assertEqual(expanded["config"], body["config"])
+
+    def test_preset_get_without_a_comment_reads_back_empty_not_missing(self):
+        name = "rotation_no_comment_test"
+        _post(f"{self.base}/preset", {"name": name, "config": {"rotation": "0"}})
+        body = _get_json(f"{self.base}/preset?name={name}")
+        self.assertEqual(body["comment"], "",
+                         "comment is always present now, even when nothing "
+                         "was ever written")
+
+    def test_an_auto_rotation_is_not_written_to_the_preset_file(self):
+        """config_diff strips every key that still matches DEFAULTS; once
+        rotation is a DEFAULTS key, "auto" is stripped the same way an
+        untouched contrast or saturation always was, and a real value
+        survives for free. This is the "verify that" in contract G4."""
+        name = "rotation_auto_not_written_test"
+        _post(f"{self.base}/preset", {
+            "name": name,
+            "config": {"rotation": "auto", "primaries": {"contrast": 1.2}},
+        })
+        on_disk = json.loads(self._preset_file(name).read_text())
+        self.assertNotIn("rotation", on_disk,
+                         "an auto rotation must not be written, same as any "
+                         "other untouched default")
+        self.assertEqual(on_disk.get("primaries", {}).get("contrast"), 1.2,
+                         "a real change alongside it must still be written")
+        # GET still answers "auto": full_config fills in the default that
+        # was correctly never written to disk.
+        body = _get_json(f"{self.base}/preset?name={name}")
+        self.assertEqual(body["config"]["rotation"], "auto")
+
+    def test_a_non_auto_rotation_is_written_to_the_preset_file(self):
+        name = "rotation_non_auto_written_test"
+        _post(f"{self.base}/preset", {"name": name, "config": {"rotation": "270"}})
+        on_disk = json.loads(self._preset_file(name).read_text())
+        self.assertEqual(on_disk.get("rotation"), "270",
+                         "a real rotation must survive config_diff, same as "
+                         "any other real, non-default change")
+
+    def test_grade_round_trip_of_rotation_and_a_message_in_the_config(self):
+        """PUT /api/grade and GET /api/grade round trip rotation because it
+        is part of the config now, and a config that carries its own
+        _comment (a note some caller attached to the grade itself, distinct
+        from the commit `message` field PUT already takes) survives the
+        same round trip instead of being silently dropped."""
+        saved, _ = _put(f"{self.base}/grade", {
+            "clip": self.clip,
+            "config": {"rotation": "180", "_comment": "graded for the reel"},
+            "by": "test",
+        })
+        self.assertIn("key", json.loads(saved))
+
+        got = _get_json(f"{self.base}/grade?clip={self.clip}")
+        self.assertTrue(got["exists"])
+        self.assertEqual(got["config"]["rotation"], "180")
+        self.assertEqual(got["config"].get("_comment"), "graded for the reel",
+                         "a message riding along in the config must survive "
+                         "a PUT and GET round trip")
 
 
 if __name__ == "__main__":

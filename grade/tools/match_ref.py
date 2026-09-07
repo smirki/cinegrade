@@ -55,6 +55,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 import colorlib as C                                   # noqa: E402
 import cinegrade                                       # noqa: E402  (read only)
+from stats import bands as _bands                      # noqa: E402  (read only)
 
 LUT_LOOKS = ROOT / "luts" / "looks"
 
@@ -1071,6 +1072,18 @@ def _safe(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).lower()
 
 
+def _bands_u8(rgb01: np.ndarray) -> dict:
+    """bands() on this module's own float-[0,1] images.
+
+    grade/stats.bands() takes the uint8 0-255 array every ffmpeg rgb24 decode
+    in the studio and the CLI produces, the same convention frame_stats()
+    uses; this file's own images are float in [0, 1] (read_image's own
+    docstring), so the one conversion happens here rather than changing what
+    either side means by "an image".
+    """
+    return _bands(np.clip(rgb01 * 255.0, 0.0, 255.0).astype(np.uint8))
+
+
 def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
                     still: str | None = None, preset: str | None = None,
                     method: str = "reinhard", strength: float = 1.0,
@@ -1254,6 +1267,11 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         "method_info": minfo,
         "lut_health": health,
         "stats": {"reference": m_ref, "source_before": m_src},
+        # Per luma band colour for both images, the pixels already decoded
+        # and cropped above, no second decode. "the highlights are
+        # desaturated" against "the shot has less colour in it" is a number
+        # here, not a guess from a scope of everything.
+        "bands": {"reference": _bands_u8(ref_crop), "source_before": _bands_u8(src_img)},
         "distance": {"before": before},
         "warnings": warnings,
     }
@@ -1263,6 +1281,7 @@ def match_reference(ref: str, clip: str | None = None, time: float = 0.0,
         m_after = measure(after_img, reject_blown)
         after = stat_distance(m_after, m_ref)
         result["stats"]["source_after"] = m_after
+        result["bands"]["source_after"] = _bands_u8(after_img)
         result["distance"]["after"] = after
         result["distance"]["improved"] = bool(after["total"] < before["total"])
         result["distance"]["improved_colour"] = bool(

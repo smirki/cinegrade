@@ -21,10 +21,20 @@
  *      window is not disturbed by picking).
  *   7. A real match reports which rectangles it measured.
  *
- * The cube a match writes lands in grade/luts/looks, which is shared and not
- * under the harness's temp data dir, so this spec deletes any look that was
- * not there before it ran and leaves the rest alone.
+ * A match writes a cube, and by default it lands in grade/luts/looks, which is
+ * shared and NOT under the harness's temp data dir. Deleting it afterwards was
+ * not enough: any earlier failure in this spec returns before the cleanup, and
+ * a run that ended that way left a match_u0_img_2562_a001_09011336_c002_
+ * reinhard.cube in the founder's looks folder. So the match here is given an
+ * out_dir under the OS temp folder (injected into the request body page side,
+ * because the button itself has no such control) and the shared folder is
+ * never written to at all. This spec then asserts that, rather than tidying
+ * up after it, so the leak cannot come back quietly.
  */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 function fail(evidence) {
   return { status: "FAIL", evidence: evidence };
@@ -134,6 +144,32 @@ export default async function run(ctx) {
     .then((r) => r.json())
     .then((j) => new Set((j.looks || []).map((l) => l.name)))
     .catch(() => new Set());
+
+  /* Where step 7's cube goes instead of grade/luts/looks. Installed just
+   * before the match, not here, because step 5 reloads the page and a page
+   * side wrapper does not survive that. */
+  const matchOutDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-match-out-"));
+  async function sendMatchesToTempDir() {
+    await page.evaluate((dir) => {
+      if (window.__matchOutDirInstalled) return;
+      window.__matchOutDirInstalled = true;
+      const real = window.fetch;
+      window.fetch = function (input, init) {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        if (url.indexOf("/api/match") >= 0 && init && typeof init.body === "string") {
+          try {
+            const body = JSON.parse(init.body);
+            // Only the destination is added. Everything the panel decided
+            // (ref, clip, time, config, method, strength, the rectangles) is
+            // passed through untouched, so this still tests the real request.
+            body.out_dir = dir;
+            init = Object.assign({}, init, { body: JSON.stringify(body) });
+          } catch (e) { /* not JSON: leave the request exactly as it was */ }
+        }
+        return real.call(this, input, init);
+      };
+    }, matchOutDir);
+  }
 
   // --- select a reference -------------------------------------------------
   const refCount = await page.$$eval("#refList img", (els) => els.length);
@@ -330,6 +366,7 @@ export default async function run(ctx) {
   notes.push("the window overlay went back to on=" + overlayAfter.on + " after picking");
 
   // --- 7. a real match names the rectangles --------------------------------
+  await sendMatchesToTempDir();
   await page.click("#matchRefBtn");
   try {
     await page.waitForFunction(() => {
@@ -353,9 +390,10 @@ export default async function run(ctx) {
   }
   notes.push(measured);
 
-  /* Back to the shipped "flat" preset before the cube is deleted below, so
-   * no later spec (or a later run of this one) inherits a config pointing at
-   * a look LUT that is no longer on disk. */
+  /* Back to the shipped "flat" preset, so no later spec (or a later run of
+   * this one) inherits a config whose look names a cube that is not in the
+   * looks folder: the match applied its result by name, and this run's cube
+   * is in a temp folder. */
   try {
     const hasFlat = await page.$eval("#presetSelect", (el) =>
       Array.prototype.some.call(el.options, (o) => o.value === "flat"));
@@ -364,17 +402,29 @@ export default async function run(ctx) {
       await page.click("#loadPresetBtn");
       await new Promise((r) => setTimeout(r, 700));
     }
-  } catch (e) { /* the cleanup below is what matters */ }
+  } catch (e) { /* the checks below are what matter */ }
 
-  // Leave grade/luts/looks as it was found, minus nothing and plus nothing.
-  try {
-    const after = await fetch(ctx.baseUrl + "/api/looks").then((r) => r.json());
-    for (const l of after.looks || []) {
-      if (!looksBefore.has(l.name)) {
-        await fetch(ctx.baseUrl + "/api/look?name=" + encodeURIComponent(l.name), { method: "DELETE" });
-      }
-    }
-  } catch (e) { /* best effort: a leftover cube is not a test failure */ }
+  // The cube went where it was told, and grade/luts/looks was not touched.
+  // Asserted rather than tidied up: a delete that only runs when everything
+  // above passed is exactly how a cube was left behind in the first place.
+  const cubes = fs.existsSync(matchOutDir)
+    ? fs.readdirSync(matchOutDir).filter((n) => n.endsWith(".cube")) : [];
+  const looksAfter = await fetch(ctx.baseUrl + "/api/looks")
+    .then((r) => r.json())
+    .then((j) => (j.looks || []).map((l) => l.name))
+    .catch(() => []);
+  const added = looksAfter.filter((n) => !looksBefore.has(n));
+  fs.rmSync(matchOutDir, { recursive: true, force: true });
+  if (cubes.length !== 1) {
+    return fail("the match did not write its cube into the out_dir it was "
+      + "given: " + JSON.stringify(cubes));
+  }
+  if (added.length) {
+    return fail("the match wrote into the shared grade/luts/looks even with an "
+      + "out_dir: " + JSON.stringify(added));
+  }
+  notes.push("cube " + cubes[0] + " landed in the temp out_dir, "
+    + "grade/luts/looks unchanged");
 
   return { status: "PASS", evidence: notes.join("; ") };
 }

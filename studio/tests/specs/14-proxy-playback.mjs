@@ -9,7 +9,10 @@
  *   2. the timeline time advances,
  *   3. #stage is on the GPU layer while playing, never the video layer
  *      (mode 3 presents to #gpuCanvas, not to #playerVideo),
- *   4. stopping returns to the still path with the layer classes correct.
+ *   4. stopping returns to the still path with the layer classes correct,
+ *   5. the clip's resolved input reaches the proxy grade: omitting it is
+ *      pixel identical to naming apple_log, naming hlg is not, and a config
+ *      that names its own convert.input wins over both.
  *
  * SKIPs rather than fails when there is no footage or no usable GPU, since
  * neither is something this spec can assert anything about.
@@ -107,7 +110,75 @@ export default async function run(ctx) {
   const afterLabel = await page.evaluate(() => document.getElementById("playBtn").textContent);
   const badge = await page.evaluate(() => document.getElementById("rendererBadge").textContent);
 
+  /* 5. The clip's resolved input reaches proxy playback.
+   *
+   * playProxy, seekProxy and stepProxy all grade through renderProxyFrame,
+   * so exercising that one exported function covers all three. The proxy is
+   * still attached after Play was pressed a second time (only a clip change
+   * detaches it), so this costs three GPU renders and no decode.
+   *
+   * The harness footage is Apple Log, which is what makes the first two
+   * comparisons the interesting ones: leaving resolvedInput out has to be
+   * pixel identical to passing "apple_log", because that is the promise that
+   * nothing already on disk changed. Forcing "hlg" has to differ, because
+   * that is the wiring actually reaching the cube choice. And a config that
+   * names its own input has to win over resolvedInput, because an explicit
+   * convert.input is never second guessed.
+   *
+   * Sampling happens on the line right after each await with no yield in
+   * between, so the app's own still render cannot land on the canvas in the
+   * middle of a measurement. */
+  const probe = await page.evaluate(async () => {
+    function sample() {
+      const c = document.getElementById("gpuCanvas");
+      const copy = document.createElement("canvas");
+      const w = Math.min(48, c.width), h = Math.min(48, c.height);
+      copy.width = w; copy.height = h;
+      const g = copy.getContext("2d");
+      g.drawImage(c, 0, 0, w, h);
+      const d = g.getImageData(0, 0, w, h).data;
+      const bytes = [];
+      for (let i = 0; i < 192; i += 4) bytes.push(d[i], d[i + 1], d[i + 2]);
+      return bytes.join(",");
+    }
+    try {
+      const st = await fetch("/api/state").then((r) => r.json());
+      const auto = JSON.parse(JSON.stringify(st.defaults));
+      auto.convert.input = "auto";
+      const named = JSON.parse(JSON.stringify(st.defaults));
+      named.convert.input = "apple_log";
+      const out = {};
+      await StudioLive.renderProxyFrame(auto, {});
+      out.omitted = sample();
+      await StudioLive.renderProxyFrame(auto, { resolvedInput: "apple_log" });
+      out.appleLog = sample();
+      await StudioLive.renderProxyFrame(auto, { resolvedInput: "hlg" });
+      out.hlg = sample();
+      await StudioLive.renderProxyFrame(named, { resolvedInput: "hlg" });
+      out.explicitWins = sample();
+      return out;
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  });
+
   const problems = [];
+  if (probe.error) {
+    problems.push("the resolved input probe could not render a proxy frame: " + probe.error);
+  } else {
+    if (probe.omitted !== probe.appleLog) {
+      problems.push("leaving resolvedInput out no longer matches resolvedInput apple_log, "
+        + "so existing Apple Log playback changed pixels");
+    }
+    if (probe.hlg === probe.appleLog) {
+      problems.push("resolvedInput hlg rendered the same pixels as apple_log, so the "
+        + "resolved input never reaches the cube choice on the proxy path");
+    }
+    if (probe.explicitWins !== probe.appleLog) {
+      problems.push("a config that names convert.input apple_log was overridden by "
+        + "resolvedInput hlg, so an explicit input is being second guessed");
+    }
+  }
   if (during.head === before.head) {
     problems.push("the canvas did not change during playback (same first pixels, mean "
       + before.mean + " -> " + during.mean + ")");
@@ -134,7 +205,9 @@ export default async function run(ctx) {
     + " skipped, " + (stats ? stats.dropped : "?") + " dropped, mode "
     + (stats ? stats.mode : "?") + "), canvas " + before.mean + " -> " + during.mean
     + ", time " + timeBefore + "s -> " + timeDuring + "s, badge after stop "
-    + JSON.stringify(badge);
+    + JSON.stringify(badge)
+    + (probe.error ? ", resolved input probe errored" :
+       ", resolved input: omitted == apple_log, hlg differs, explicit convert.input wins");
 
   if (problems.length) {
     return { status: "FAIL", evidence: problems.join("; ") + " [" + evidence + "]" };

@@ -142,7 +142,7 @@ def init_schema() -> None:
 def _migrate(con) -> None:
     """The additive steps a CREATE TABLE IF NOT EXISTS cannot express.
 
-    Two of them, both from the library arc, both idempotent:
+    Three of them, all idempotent:
 
     1. Org 1 named `default` exists. Every account belongs to exactly one org
        and this is the one they all start in, so a server that has never
@@ -154,6 +154,15 @@ def _migrate(con) -> None:
        constant, which 1 is. The column is checked for first rather than
        added inside a try, because "duplicate column name" is an error string
        to parse and PRAGMA table_info is an answer.
+    3. `users.kind` exists, defaulting to `person` (contract G2). An agent
+       calling with an X-Studio-Agent header gets a row of its own so its
+       session, its open project and its saved crops are its own rather than
+       everybody's, and `kind` is what tells that row apart from an account a
+       human can sign in to. `person` for every existing row, so a database
+       from before this arc comes out of the migration saying exactly what it
+       already meant. It is deliberately not the `role` column: role is what
+       an account is allowed to do, kind is whether there is a human behind
+       it at all.
 
     Nothing here rewrites, drops or reorders an existing row or column, so
     running it against a real database cannot lose anything.
@@ -165,3 +174,6 @@ def _migrate(con) -> None:
     if "org_id" not in cols:
         con.execute("ALTER TABLE users ADD COLUMN org_id INTEGER NOT NULL "
                     "DEFAULT 1")
+    if "kind" not in cols:
+        con.execute("ALTER TABLE users ADD COLUMN kind TEXT NOT NULL "
+                    "DEFAULT 'person'")
