@@ -398,6 +398,13 @@
             </span>
             <span class="sep"></span>
             <button class="btn toggle" id="maskBtn" title="Show the selected layer's mask">Matte</button>
+            <!-- What the mask overlay is doing right now, in words, next to
+                 the button that shows the matte. This is where "matte lagging"
+                 appears (design rule 10: a matte frame that is not decoded yet
+                 reuses the last one and says so, rather than stalling the
+                 picture), and where "mask service not running" appears when
+                 the mask routes answer 503. Written only by masks.js. -->
+            <span id="maskStatus" class="mono muted" data-mask-status="off"></span>
             <button class="btn toggle" id="sheetBtn" title="Same config across every marked frame (C)">Contact sheet</button>
             <span class="spacer"></span>
             <!-- GPU preview (job: live GPU viewer). #rendererBadge is the
@@ -452,6 +459,17 @@
                    thing that ever swaps which of the two is visible. -->
               <div id="beforeLayer" class="layer"><img id="beforeImg" alt="ungraded frame" draggable="false"><canvas id="bypassCanvas"></canvas><b>before</b></div>
               <div id="splitHandle"></div>
+              <!-- The mask overlay tint (contract C1, acceptance A1). Its own
+                   canvas rather than a mode of #windowOverlay, for two
+                   reasons: #windowOverlay is hidden outright during playback
+                   (see #stage.playing in style.css, because an SVG shape
+                   cannot follow a moving picture), and a tracked matte is the
+                   one overlay that CAN follow it, frame by frame, which is the
+                   whole point of tracking it. Positioned and sized by masks.js
+                   against the picture's own rendered box, inside #stage so the
+                   viewer zoom's transform carries it for free. Empty and
+                   display:none until a layer's overlay mode is switched on. -->
+              <canvas id="maskOverlay" data-on="false" aria-hidden="true"></canvas>
               <div id="viewerMsg"></div>
             </div>
             <div id="refPane">
@@ -898,6 +916,13 @@
 <script src="/activity.js"></script>
 <script src="/app.js"></script>
 <script src="/window-editor.js"></script>
+<!-- The mask panel, the viewer overlay tint and the SAM job polling (contract
+     C1/C4). After window-editor.js because it calls into it for pick mode and
+     for the picture's rendered box, and after app.js because boot() hands it
+     the same small api object every other module here gets. It draws its own
+     panel into each layer's body through layers.js's one hook, so nothing in
+     schema.js or panels.js knows it exists. -->
+<script src="/masks.js"></script>
 <!-- Mobile mode (contract C8): the page bar, the floating preview mirror and
      the GridStack "stop being draggable" switch. Last on purpose. It reads the
      GridStack instance off #gridMid (GridStack stores itself there as

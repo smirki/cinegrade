@@ -55,10 +55,55 @@
    * scaleForPreview having a case for any of it. cx/cy are the centre, w/h
    * the FULL extent (not the half axis), rotation is degrees clockwise on
    * screen, softness is the feather width as a fraction of the shape radius. */
+  /* `angle` (C1's name for the direction a linear gradient runs in) is
+   * deliberately NOT a key here. cinegrade's WINDOW_TEMPLATE has no such
+   * field either, and _window_geometry reads it as
+   * win.get("angle", win.get("rotation", 0.0)): a linear component that
+   * carries only `rotation` is aimed by that rotation. Adding a default of 0
+   * would break the fallback and silently aim every such gradient at 0,
+   * which is why the merge base leaves the key absent and windowGeometry
+   * spells the fallback out. `h` is likewise ignored by the linear shape. */
   var WINDOW_DEFAULTS = {
     enabled: false, shape: "ellipse",
     cx: 0.5, cy: 0.5, w: 0.6, h: 0.6,
     rotation: 0.0, softness: 0.15, invert: false
+  };
+
+  /* The colour qualifier, mirrored from cinegrade's layer key block. Named
+   * because a mask component of type `key` carries the same fields, and a
+   * half written component has to resolve to the engine's numbers rather
+   * than to NaN the same way a half written layer does. */
+  var KEY_DEFAULTS = {
+    enabled: false, invert: false,
+    hue_center: 30.0, hue_width: 40.0, hue_soft: 15.0,
+    sat_low: 0.10, sat_high: 1.0, sat_soft: 0.10,
+    lum_low: 0.0, lum_high: 1.0, lum_soft: 0.10
+  };
+
+  /* One entry in a mask's component stack (C1).
+   *
+   * `op` combines this component with everything above it: add is max,
+   * intersect is a times b, subtract is a times (1 minus b). `invert` flips
+   * the component BEFORE the op and before the feather; `feather` is a
+   * gaussian blur radius as a fraction of the FRAME WIDTH, like every other
+   * length in this file. `type` picks which of the blocks below is read. */
+  /* Mirrors cinegrade.MASK_COMPONENT_DEFAULTS field for field, including the
+   * two inner `enabled` flags being TRUE: the component's own `enabled` is
+   * the switch, and a UI that leaves an inner flag at its default must not
+   * produce a component that silently selects nothing. */
+  var COMPONENT_DEFAULTS = {
+    id: "", type: "window", op: "add", enabled: true, invert: false,
+    feather: 0.0,
+    window: deepMerge(WINDOW_DEFAULTS, { enabled: true }),
+    key: deepMerge(KEY_DEFAULTS, { enabled: true }),
+    matte: { id: "", recipe: {} }
+  };
+
+  /* Matte finesse, applied to the COMBINED matte (C1). All four at their
+   * defaults is the exact identity, which is what lets a config carrying a
+   * finesse block render the bytes it rendered without one. */
+  var FINESSE_DEFAULTS = {
+    blur: 0.0, grow: 0.0, clean_black: 0.0, clean_white: 0.0
   };
 
   /* One layer, mirrored from cinegrade.LAYER_DEFAULTS.
@@ -78,12 +123,13 @@
     mask: {
       show: false, invert: false,
       window: WINDOW_DEFAULTS,
-      key: {
-        enabled: false, invert: false,
-        hue_center: 30.0, hue_width: 40.0, hue_soft: 15.0,
-        sat_low: 0.10, sat_high: 1.0, sat_soft: 0.10,
-        lum_low: 0.0, lum_high: 1.0, lum_soft: 0.10
-      }
+      key: KEY_DEFAULTS,
+      /* Mask model v2 (C1). Empty is the old behaviour EXACTLY: window times
+       * key with one invert over the pair, which is what every shipped preset
+       * and every approved render is. A non empty stack ignores the two
+       * blocks above and is evaluated by maskStack instead. */
+      components: [],
+      finesse: FINESSE_DEFAULTS
     },
     correct: {
       exposure: 0.0, contrast: 1.0, pivot: null, saturation: 1.0,
@@ -643,6 +689,15 @@
   function layerActive(layer) {
     if (!layer.enabled) return false;
     var m = layer.mask;
+    if (maskUsesComponents(m)) {
+      /* A stack that reaches nothing selects nothing: the accumulator starts
+       * at 0 and no finesse step can lift a matte that is 0 everywhere off 0.
+       * Inverted, the same stack is a matte of 1 everywhere, which is an
+       * ordinary global correction. Measured on stackComponents and not on
+       * the raw list, so this agrees with layer_active for the awkward case
+       * of a stack whose only component is an intersect or a subtract. */
+      return stackComponents(m).length > 0 || !!m.invert;
+    }
     if (m.invert && !m.window.enabled && !m.key.enabled) return false;
     return true;
   }
@@ -659,6 +714,9 @@
    * the window matte itself is left alone. */
   function layerWindow(layer) {
     var m = layer.mask, win = m.window;
+    // v2 masks build their matte from the component stack; the legacy window
+    // and key blocks are ignored entirely (C1).
+    if (maskUsesComponents(m)) return null;
     if (!win.enabled) return null;
     if (m.invert && !m.key.enabled) {
       return deepMerge(win, { invert: !win.invert });
@@ -675,6 +733,11 @@
    * where it is open, which is the factorisation above, exactly. */
   function layerBranches(layer) {
     var m = layer.mask;
+    /* A v2 mask never folds a colour matte into the cube: the key is a stack
+     * component now, the matte is explicit, and mask.invert is applied to the
+     * matte rather than by grading two branches. One cube, the whole
+     * correction. */
+    if (maskUsesComponents(m)) return ["one"];
     if (!m.invert) return [m.key.enabled ? "key" : "one"];
     if (m.window.enabled && m.key.enabled) return ["one", "inv"];
     return m.window.enabled ? ["one"] : ["inv"];
@@ -781,12 +844,27 @@
    * decimal place; none of the shipped shapes can produce one. */
   function qdec(x, places) { return parseFloat((+x).toFixed(places)); }
 
-  /* Fractions in, pixels out, rounded once. Mirrors _window_geometry. */
+  /* Fractions in, pixels out, rounded once. Mirrors _window_geometry.
+   *
+   * Three shapes, one function, because the engine has one: rect and ellipse
+   * are the shipped power window and `linear` is C1's gradient. A gradient is
+   * aimed by `angle` and falls back to `rotation` when the caller did not
+   * write one, which is what `win.get("angle", win.get("rotation", 0.0))`
+   * does on the engine side; WINDOW_DEFAULTS deliberately has no `angle` key
+   * so the fallback can still fire here. */
   function windowGeometry(win, width, height) {
+    var shape = String(win.shape);
+    if (shape !== "rect" && shape !== "linear") shape = "ellipse";
     var soft = Math.max(0, +win.softness);
-    var r = (+win.rotation) * Math.PI / 180;
+    var turn = shape === "linear"
+      ? +((win.angle === undefined || win.angle === null)
+          ? (win.rotation || 0) : win.angle)
+      : (+win.rotation);
+    var r = turn * Math.PI / 180;
     var g = {
-      rect: String(win.shape) === "rect",
+      shape: shape,
+      rect: shape === "rect",
+      linear: shape === "linear",
       invert: !!win.invert,
       soft: soft,
       cr: qdec(Math.cos(r), 12),
@@ -801,7 +879,439 @@
     // The feather edges, precomputed for the same reason: one rounding, shared.
     g.hi = qdec(1 + soft, 10);
     g.den = soft > 0 ? qdec(2 * soft, 10) : 0;
+    /* The gradient's own two numbers. `w` is the TRANSITION WIDTH as a
+     * fraction of frame WIDTH (not of the frame's own axis in the gradient's
+     * direction), so turning the gradient does not change how wide the
+     * transition is, and `softness` is the ease exponent of the S curve
+     * across it: 1 is a straight ramp, 2 eases both ends, 0.5 is snappier. */
+    g.wpx = qdec(Math.max(+win.w * width, 1), 10);
+    g.ease = qdec(Math.max(0.05, Math.min(8, soft)), 6);
     return g;
+  }
+
+  // ------------------------------------------------------------------
+  // mask model v2: the component stack (C1)
+  // ------------------------------------------------------------------
+
+  /* Everything below carries the matte as a 16 BIT CODE in 0..1, because
+   * that is what the engine's component stack runs on: every component
+   * becomes one gray16le stream at frame size and the whole fold, the
+   * feathers, the finesse and the merge happen at 65535 (M2's checkpoint,
+   * "Why gray16le rather than 8 bit gray" in cinegrade). Values here are
+   * floats on the k/65535 lattice, and every stage ends with the same
+   * rounding its ffmpeg filter uses:
+   *
+   *   window component   an 8 bit geq PNG lifted by 257, so k/255 exactly
+   *   key component      lut3d, truncating: floor(v * 65535)
+   *   feather and blur   gblur, lrintf: floor(v * 65535 + 0.5)
+   *   add                blend=lighten, max, exact
+   *   intersect          blend=multiply, MEASURED as floor(a * b / 65535)
+   *   subtract           negate then multiply, floor(a * (65535 - b) / 65535)
+   *   grow and shrink    dilation/erosion, integer max/min, exact
+   *   clean              geq, truncating: floor(65535 * m)
+   *   mask.invert        negate, 65535 - k, exact
+   *
+   * The multiply is measured, not assumed: ffmpeg 8.0 on this machine returns
+   * 13733 for 30000 x 30000 and 30518 for 40000 x 50000, which is the
+   * truncating integer divide by 65535 and NOT a rounded one. The same probe
+   * showed geq truncating (100.6 in, 100 out) and dilation processing the
+   * frame border with a clamped neighbourhood, which for a max or a min is
+   * the same answer edge replication gives.
+   *
+   * Quantising after every step means the two implementations can only differ
+   * if a FORMULA differs, which is a thing a test can catch.
+   *
+   * The functions ending in CPU are the DEFINITION: plain arrays, no GPU, no
+   * server, exported as StudioGPU.mask so studio/tests/mask-stack-ref.mjs can
+   * run them in node today, before the engine and the matte routes exist. The
+   * shaders further down are ports of them, and the parity fixtures are what
+   * proves the port. Same three-way arrangement cinegrade already uses for
+   * the window matte (numpy, geq, shader).
+   */
+
+  // The matte's full swing, and the cap on grow. Both mirror cinegrade.
+  var MASK_MAX = 65535;
+  var MASK_GROW_MAX = 32;
+
+  // An 8 bit code, floor(255*v + 0.5) clamped. The window matte's PNG.
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  function q8(v) {
+    var c = Math.floor(v * 255 + 0.5);
+    return c < 0 ? 0 : (c > 255 ? 255 : c);
+  }
+
+  // A 16 bit code the way gblur writes one back: lrintf, then clamp.
+  function q16r(v) {
+    var c = Math.floor(v * MASK_MAX + 0.5);
+    return c < 0 ? 0 : (c > MASK_MAX ? MASK_MAX : c);
+  }
+
+  // A 16 bit code the way lut3d and geq write one back: truncated.
+  function q16f(v) {
+    var c = Math.floor(v * MASK_MAX);
+    return c < 0 ? 0 : (c > MASK_MAX ? MASK_MAX : c);
+  }
+
+  /* blend=all_mode=multiply on gray16le, on two codes. Measured, see above:
+   * it is an integer divide, so 0.5 x 0.5 lands a code BELOW half. */
+  function mul16(a, b) { return Math.floor((a * b) / MASK_MAX); }
+
+  /* Python's round(), which is what finesse_filters uses to turn a grow
+   * fraction into a pass count. JavaScript's Math.round breaks halves upward
+   * and Python's breaks them to even, and a grow that lands exactly on a half
+   * pixel is not rare on a round working width. */
+  function pyRound(x) {
+    var f = Math.floor(x), d = x - f;
+    if (d > 0.5) return f + 1;
+    if (d < 0.5) return f;
+    return (f % 2 === 0) ? f : f + 1;
+  }
+
+  /* The stack this mask really has: every entry merged onto the defaults,
+   * disabled entries dropped. Order is array order, top to bottom. */
+  function maskComponents(mask) {
+    var list = (mask && mask.components) || [];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var c = deepMerge(COMPONENT_DEFAULTS, list[i] || {});
+      if (c.enabled) out.push(c);
+    }
+    return out;
+  }
+
+  /* Does this mask use the v2 path at all?
+   *
+   * The test is on the RAW list, not on the enabled ones: a stack whose
+   * entries are all switched off is still a v2 mask that selects nothing, not
+   * a legacy window-times-key mask. Anything else would make switching the
+   * last component off silently bring the old blocks back. */
+  /* The components that actually REACH the matte, mirroring cinegrade's
+   * stack_components: enabled, and after the first one that can contribute.
+   *
+   * Folding from zero means an `intersect` or a `subtract` at the top of the
+   * stack is zero times something and one times nothing, so it cannot change
+   * the answer. The engine drops those in one place rather than folding them,
+   * and this file does the same, for three reasons that are not about speed:
+   * `layerActive` has to agree with `layer_active` about whether the layer
+   * exists at all, the cube slot names have to agree about which component is
+   * which, and matte view of a stack that reaches nothing has to be the same
+   * picture on both sides.
+   *
+   * Each entry is {index, comp} with `index` the position in the RAW list, so
+   * a cube slot name survives a disabled component being added above it. */
+  function stackComponents(mask) {
+    var list = (mask && mask.components) || [];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var c = deepMerge(COMPONENT_DEFAULTS, list[i] || {});
+      if (!c.enabled) continue;
+      if (!out.length && String(c.op || "add") !== "add") continue;
+      out.push({ index: i, comp: c });
+    }
+    return out;
+  }
+
+  function maskUsesComponents(mask) {
+    return !!(mask && mask.components && mask.components.length);
+  }
+
+  function maskFinesse(mask) {
+    return deepMerge(FINESSE_DEFAULTS, (mask && mask.finesse) || {});
+  }
+
+  function finesseActive(f) {
+    return Math.abs(+f.blur) > 1e-9 || Math.abs(+f.grow) > 1e-9
+        || Math.abs(+f.clean_black) > 1e-9 || Math.abs(+f.clean_white) > 1e-9;
+  }
+
+  /* A component of type key needs the same baked matte cube the engine's
+   * matte view uses, so the GPU asks for a layer whose only mask is this key
+   * and whose show flag is on: cinegrade.layer_lut then returns the qualifier
+   * itself as a greyscale 33 cube, and lut3d applies it tetrahedrally on both
+   * sides. Computing the key analytically per pixel here instead would be a
+   * DIFFERENT function: a 33 cube interpolation of a hue window is not the
+   * hue window, and the two disagree by far more than a code on a hue edge. */
+  /* The qualifier a `key` or `luma` component keys on, mirroring
+   * cinegrade.component_key. `luma` is a key with the hue and saturation
+   * halves opened all the way (hue width 360 covers every angle, saturation 0
+   * to 1 covers every pixel), so what is left is the luminance range alone.
+   * Written as a real key rather than as a flag for the reason the engine
+   * gives: then one cube baker, one reference and one shader serve both.
+   *
+   * Missing this is not a subtle bug. lutRequests asks the server for the
+   * cube by the key block, so a luma component whose hue and sat were not
+   * opened would be baked as an ORANGE key at 40 degrees wide (the default
+   * hue window) and select almost nothing. */
+  function componentKey(comp) {
+    var k = deepMerge(KEY_DEFAULTS, (comp && comp.key) || {});
+    k.enabled = true;
+    if (String((comp && comp.type) || "").toLowerCase() === "luma") {
+      k.hue_center = 0.0; k.hue_width = 360.0; k.hue_soft = 1.0;
+      k.sat_low = 0.0; k.sat_high = 1.0; k.sat_soft = 0.1;
+    }
+    return k;
+  }
+
+  function keyMatteLayer(key) {
+    var L = clone(LAYER_DEFAULTS);
+    L.mask.show = true;
+    L.mask.invert = false;
+    L.mask.window = clone(WINDOW_DEFAULTS);
+    L.mask.components = [];
+    L.mask.finesse = clone(FINESSE_DEFAULTS);
+    L.mask.key = deepMerge(KEY_DEFAULTS, key || {});
+    // The component's own `enabled` is the switch; the key block inside it is
+    // always live, or layer_lut would bake a matte of 1 everywhere.
+    L.mask.key.enabled = true;
+    return L;
+  }
+
+  /* The linear gradient's geometry is the window's geometry: one function,
+   * because the engine has one (_window_geometry handles all three shapes).
+   * Kept as a name of its own only because callers and the export block read
+   * better for it. */
+  function linearGeometry(win, width, height) {
+    return windowGeometry(win, width, height);
+  }
+
+  /* The soft knee clean_black / clean_white apply, on one value in 0..1.
+   *
+   * THE formula is cinegrade's clean_geq / clean_curve, and this is a port of
+   * it rather than a second opinion:
+   *
+   *     lo   = min(0.999, max(0, clean_black))
+   *     hi   = max(lo + 1e-3, 1 - max(0, clean_white))
+   *     knee = min(1, max(0, clean_black + clean_white))
+   *     lo, den = hi - lo, knee   each through a 6 decimal round trip
+   *     t    = clip((v - lo) / den, 0, 1)
+   *     m    = t + (t*t*(3 - 2*t) - t) * knee
+   *
+   * The knee is BLENDED IN by how much cleaning was asked for rather than
+   * applied outright, so the control is continuous: at 0 and 0 it is the
+   * exact identity (and neither side emits a filter at all), and a small
+   * clean is a small move rather than a smoothstep appearing all at once.
+   * The 6 decimal round trip is there because the engine writes lo, den and
+   * knee into a geq string with `%.6f`, so ffmpeg never sees the full double
+   * and neither should this.
+   *
+   * The earlier draft of this file used `s = max(lo, 1 - hi)` for the knee
+   * amount and no clamps on lo and hi. That was the wrong function and it is
+   * gone: where the two disagreed, M2's ffmpeg formula wins by the arc's own
+   * rule, and it is also the better one (cb 0.5 with cw 0.5 has a knee of 1
+   * here, not of 0.5). */
+  function cleanParams(cb, cw) {
+    var lo = Math.min(0.999, Math.max(0, +cb || 0));
+    var hi = Math.max(lo + 1e-3, 1 - Math.max(0, +cw || 0));
+    var knee = Math.min(1, Math.max(0, (+cb || 0) + (+cw || 0)));
+    lo = qdec(lo, 6);
+    return { lo: lo, den: qdec(hi - lo, 6), knee: qdec(knee, 6) };
+  }
+
+  function softKnee(v, cb, cw) {
+    var p = cleanParams(cb, cw);
+    var t = (v - p.lo) / p.den;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    var m = t + (t * t * (3 - 2 * t) - t) * p.knee;
+    return m < 0 ? 0 : (m > 1 ? 1 : m);
+  }
+
+  /* --- the CPU reference ------------------------------------------- */
+
+  /* ffmpeg's gblur, as the same IIR recursion the shader runs, on a plain
+   * array. Two axes, one postscale of postscale^2 at the end, then the write
+   * back to 16 bit codes ffmpeg does with lrintf. */
+  function gblurCPU(src, W, H, sigma) {
+    var pr = gblurParams(fmt(sigma, 3), 1);
+    var buf = new Float64Array(src);
+    var x, y, i;
+    for (y = 0; y < H; y++) {
+      i = y * W;
+      buf[i] *= pr.boundaryscale;
+      for (x = 1; x < W; x++) buf[i + x] += pr.nu * buf[i + x - 1];
+      buf[i + W - 1] *= pr.boundaryscale;
+      for (x = W - 2; x >= 0; x--) buf[i + x] += pr.nu * buf[i + x + 1];
+    }
+    for (x = 0; x < W; x++) {
+      buf[x] *= pr.boundaryscale;
+      for (y = 1; y < H; y++) buf[y * W + x] += pr.nu * buf[(y - 1) * W + x];
+      buf[(H - 1) * W + x] *= pr.boundaryscale;
+      for (y = H - 2; y >= 0; y--) buf[y * W + x] += pr.nu * buf[(y + 1) * W + x];
+    }
+    var scale = pr.postscale * pr.postscale;
+    for (i = 0; i < buf.length; i++) buf[i] = q16r(buf[i] * scale) / MASK_MAX;
+    return buf;
+  }
+
+  /* Grow and shrink: a max or a min over a square of side 2n+1, which is
+   * exactly n iterations of ffmpeg's 3x3 dilation / erosion with default
+   * coefficients. A square structuring element is separable, so this is two
+   * one dimensional sweeps rather than n whole-image passes, and the shader
+   * does the same. Borders clamp (edge replication). */
+  function morphCPU(src, W, H, n, dilate) {
+    if (n < 1) return new Float64Array(src);
+    var mid = new Float64Array(W * H), out = new Float64Array(W * H);
+    var x, y, k, v, s;
+    for (y = 0; y < H; y++) {
+      for (x = 0; x < W; x++) {
+        v = src[y * W + x];
+        for (k = 1; k <= n; k++) {
+          s = src[y * W + Math.min(W - 1, x + k)];
+          v = dilate ? Math.max(v, s) : Math.min(v, s);
+          s = src[y * W + Math.max(0, x - k)];
+          v = dilate ? Math.max(v, s) : Math.min(v, s);
+        }
+        mid[y * W + x] = v;
+      }
+    }
+    for (y = 0; y < H; y++) {
+      for (x = 0; x < W; x++) {
+        v = mid[y * W + x];
+        for (k = 1; k <= n; k++) {
+          s = mid[Math.min(H - 1, y + k) * W + x];
+          v = dilate ? Math.max(v, s) : Math.min(v, s);
+          s = mid[Math.max(0, y - k) * W + x];
+          v = dilate ? Math.max(v, s) : Math.min(v, s);
+        }
+        out[y * W + x] = v;
+      }
+    }
+    return out;
+  }
+
+  /* One window component's matte, on plain arrays. A port of window_matte:
+   * the engine bakes this as an 8 BIT grey PNG and `format=gray16le` lifts it
+   * by 257, so k/255 and k*257/65535 are the same number and the 8 bit
+   * quantisation here is the 16 bit value exactly.
+   *
+   * The linear gradient runs along uy (the ROTATED vertical), so at angle 0
+   * the top of the frame is selected and the transition is centred on cy, and
+   * the selected side then turns clockwise with the angle. Its softness is an
+   * EASE EXPONENT across the transition, not a smoothstep blend: 1 is a
+   * straight ramp, 2 eases both ends, 0.5 is snappier. Both of those are M2's
+   * choices and this file used to disagree with them on both counts. */
+  function windowMatteCPU(win, W, H) {
+    var out = new Float64Array(W * H);
+    var g = windowGeometry(win, W, H);
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        var dx = x - g.cxp, dy = y - g.cyp, m;
+        var ux = dx * g.cr + dy * g.sr;
+        var uy = dy * g.cr - dx * g.sr;
+        if (g.linear) {
+          if (g.soft <= 0) {
+            m = uy <= 0 ? 1 : 0;
+          } else {
+            var t = 0.5 - uy / g.wpx;
+            t = t < 0 ? 0 : (t > 1 ? 1 : t);
+            // The ends are written out to match the shader, which cannot call
+            // pow at 0 without leaving the spec.
+            m = t <= 0 ? 0
+              : (t >= 1 ? 1
+              : (t <= 0.5 ? 0.5 * Math.pow(2 * t, g.ease)
+                          : 1 - 0.5 * Math.pow(2 * (1 - t), g.ease)));
+          }
+        } else {
+          var a = ux / g.ax, b = uy / g.ay;
+          var d = g.rect ? Math.max(Math.abs(a), Math.abs(b))
+                         : Math.sqrt(a * a + b * b);
+          m = g.den <= 0 ? (d <= 1 ? 1 : 0)
+                         : Math.max(0, Math.min(1, (g.hi - d) / g.den));
+        }
+        if (g.invert) m = 1 - m;
+        out[y * W + x] = q8(m) / 255;
+      }
+    }
+    return out;
+  }
+
+  /* The whole stack, evaluated on plain arrays. THE definition on this side,
+   * and a port of cinegrade's mask_stack_segments filter for filter.
+   *
+   * `sample` supplies the two component kinds this file cannot make on its
+   * own: `sample.key(component, x, y)` is the qualifier's value in 0..1 at
+   * that pixel (the baked matte cube, applied to the picture) and
+   * `sample.matte(component, x, y)` is the fetched matte frame's value. Both
+   * default to 0, which is what an absent matte means everywhere here.
+   *
+   * Returns a Uint16Array of W*H 16 bit codes.
+   *
+   * Two things here are the engine's rules and not obvious ones:
+   *
+   * 1. The fold starts at ZERO and runs top to bottom, so a leading
+   *    `intersect` or `subtract` contributes nothing. The engine reaches the
+   *    same answer by DROPPING those components in stack_components() rather
+   *    than folding them, which is cheaper but identical: 0 * b and
+   *    0 * (1 - b) are both 0, and max(0, b) is b.
+   * 2. Finesse runs clean, then grow, then blur. Cleaning fixes the levels,
+   *    growing decides where the edge is, and blurring softens what is left,
+   *    so the softness survives the other two. This file had the order
+   *    backwards until M2's checkpoint settled it.
+   */
+  function maskStackCPU(mask, W, H, sample) {
+    sample = sample || {};
+    var comps = stackComponents(mask);
+    var acc = new Float64Array(W * H);   // starts at 0 everywhere, per C1
+    var i, x, y, n = W * H;
+    for (var c = 0; c < comps.length; c++) {
+      var comp = comps[c].comp;
+      var m;
+      if (comp.type === "window") {
+        m = windowMatteCPU(comp.window, W, H);
+      } else if (comp.type === "matte") {
+        /* A matte frame is an 8 BIT grey PNG that gray16le lifts by 257, the
+         * same hop a window PNG takes, so it lands on the 8 bit lattice and
+         * NOT on an arbitrary 16 bit value. Truncating a k/255 float at
+         * 65535 would land a code low half the time, because k/255 * 65535 is
+         * 257k only to within a double's last bit. This models the frame
+         * served AT THE RENDER WIDTH, which is what gpu.js asks for; a frame
+         * the server could only give at another size is resampled, and that
+         * resampler is not the same one on the two sides either way. */
+        m = new Float64Array(n);
+        for (y = 0; y < H; y++) {
+          for (x = 0; x < W; x++) {
+            m[y * W + x] = q8(sample.matte ? +sample.matte(comp, x, y) || 0 : 0) / 255;
+          }
+        }
+      } else {
+        // A key comes back through lut3d, which truncates.
+        m = new Float64Array(n);
+        for (y = 0; y < H; y++) {
+          for (x = 0; x < W; x++) {
+            m[y * W + x] = q16f(sample.key ? +sample.key(comp, x, y) || 0 : 0) / MASK_MAX;
+          }
+        }
+      }
+      // invert BEFORE the feather: a blur and an invert commute in the
+      // interior but not at the frame border, so the order is pinned.
+      if (comp.invert) { for (i = 0; i < n; i++) m[i] = 1 - m[i]; }
+      var feather = +comp.feather || 0;
+      if (feather > 0) m = gblurCPU(m, W, H, feather * W);
+      for (i = 0; i < n; i++) {
+        var a16 = q16r(acc[i]), b16 = q16r(m[i]), v;
+        if (comp.op === "intersect") v = mul16(a16, b16);
+        else if (comp.op === "subtract") v = mul16(a16, MASK_MAX - b16);
+        else v = a16 > b16 ? a16 : b16;      // add, blend=lighten
+        acc[i] = v / MASK_MAX;
+      }
+    }
+    var f = maskFinesse(mask);
+    var cb = clamp01(+f.clean_black || 0), cw = clamp01(+f.clean_white || 0);
+    if (cb > 0 || cw > 0) {
+      // geq truncates its own output, measured, so this is q16f and not q16r.
+      for (i = 0; i < n; i++) acc[i] = q16f(softKnee(acc[i], cb, cw)) / MASK_MAX;
+    }
+    var grow = +f.grow || 0;
+    var steps = Math.min(MASK_GROW_MAX, pyRound(Math.abs(grow) * W));
+    if (steps >= 1) acc = morphCPU(acc, W, H, steps, grow > 0);
+    if (+f.blur > 0) acc = gblurCPU(acc, W, H, +f.blur * W);
+    var out = new Uint16Array(n);
+    var inv = !!(mask && mask.invert);
+    for (i = 0; i < n; i++) {
+      var code = q16r(acc[i]);
+      out[i] = inv ? MASK_MAX - code : code;
+    }
+    return out;
   }
 
   var STAGE_NOTES = {
@@ -845,6 +1355,39 @@
           + "after another in array order, each as its own pass, so a stack "
           + "of any length costs passes but no accuracy: every pass lands on "
           + "the same 16 bit lattice the fused chain lands on.",
+    mask_components: "Mask model v2 (C1): a stack of components combined with "
+          + "add (blend=lighten, max), intersect (blend=multiply) and "
+          + "subtract (negate then multiply), each with its own invert and "
+          + "feather, then finesse in the engine's order (clean black and "
+          + "clean white through the soft knee, then grow and shrink as a "
+          + "square dilate and erode capped at 32 passes, then blur) on the "
+          + "combined matte, then maskedmerge exactly as the power window "
+          + "merges. EVERY step runs at 16 bit on the k/65535 lattice, which "
+          + "is what the engine's stack runs on (gray16le), and each stage "
+          + "uses its own filter's rounding: lut3d and geq truncate, gblur "
+          + "rounds, blend=multiply is a truncating integer divide by 65535 "
+          + "(measured on this machine, not assumed). A window component is "
+          + "still an 8 bit grey PNG on the ffmpeg side, lifted into the "
+          + "stack by 257, so its 8 bit code is its 16 bit value exactly. "
+          + "The colour half of the layer "
+          + "is the same server baked 33 cube as always, with the qualifier "
+          + "NOT folded in (variant 'one'), because a key is a stack "
+          + "component now and has to survive the ops and the feather as a "
+          + "matte. A key component reads a second baked cube: the qualifier "
+          + "as greyscale, applied tetrahedrally, which is what lut3d does on "
+          + "the other side. Reported CLOSE rather than exact until the mask "
+          + "parity fixtures have been run against the engine: the formulas "
+          + "are ported from the engine but nothing has measured them "
+          + "together yet, the clean knee is a geq evaluated in double on "
+          + "the ffmpeg side and in 32 bit float here so a value sitting on "
+          + "an integer boundary can truncate the other way, and a matte "
+          + "component served at a size other than the render's is resampled "
+          + "by the card here and by swscale there. An absent or undecoded "
+          + "matte frame is 0, so an "
+          + "INVERTED matte component with nothing decoded selects the whole "
+          + "frame; ready() waits for the first frame of every matte to keep "
+          + "that off the screen, and the row says 'matte lagging' whenever "
+          + "the frame served is not the frame wanted.",
     look: "3D LUT, tetrahedral, then blend=normal, which is dst = lut*mix + "
         + "pre_lut*(1-mix). A second slot blends in PARALLEL: both slots read "
         + "the same pre-look signal, then balance crossfades slot 1's result "
@@ -903,7 +1446,7 @@
    *   off         not enabled by this config
    * `overall` is the worst status among the ACTIVE stages, so a caller can
    * show one indicator without walking the list. */
-  function stageReport(config) {
+  function stageReport(config, live) {
     var cfg = fullConfig(config);
     var plan = chainPlan(cfg);
     var p = cfg.primaries, cv = cfg.convert;
@@ -968,20 +1511,61 @@
       add("layers", "Layers", false, "exact");
     } else {
       lys.forEach(function (L, li) {
-        var bits = [];
-        if (L.mask.window.enabled) bits.push("power window");
-        if (L.mask.key.enabled) bits.push("colour key");
-        if (!bits.length) bits.push("no mask, so the whole frame");
+        var bits = [], on = layerActive(L), v2 = maskUsesComponents(L.mask);
+        var lag = [];
+        if (v2) {
+          maskComponents(L.mask).forEach(function (c) {
+            var b = c.op + " " + c.type;
+            if (c.type === "window") b += " " + c.window.shape;
+            if (c.type === "matte") {
+              var id = (c.matte && c.matte.id) || "(none)";
+              b += " " + id;
+              var st = live && live[id];
+              if (st) {
+                b += " [" + st.state + (st.lagging ? ", matte lagging" : "") + "]";
+                if (st.lagging) {
+                  lag.push(id + " wanted frame " + (st.want === null ? "?" : st.want)
+                    + (st.empty ? " and nothing is decoded yet"
+                                : ", serving frame " + st.got));
+                }
+              }
+            }
+            if (c.invert) b += " inverted";
+            if (+c.feather > 0) b += " feather " + fmt(+c.feather, 4);
+            bits.push(b);
+          });
+          if (!bits.length) bits.push("an empty stack, so nothing");
+          /* A component above the first `add` cannot change the answer, so
+           * both sides drop it. Said out loud rather than left as a silent
+           * no-op: "my subtract does nothing" is otherwise a very confusing
+           * afternoon. */
+          var dropped = maskComponents(L.mask).length - stackComponents(L.mask).length;
+          if (dropped > 0) {
+            bits.push(dropped + (dropped === 1 ? " component" : " components")
+              + " above the first add, which the stack folds from zero and so"
+              + " cannot use");
+          }
+          var f = maskFinesse(L.mask);
+          if (finesseActive(f)) {
+            bits.push("finesse blur " + fmt(+f.blur, 4) + ", grow " + fmt(+f.grow, 4)
+              + ", clean " + fmt(+f.clean_black, 3) + "/" + fmt(+f.clean_white, 3));
+          }
+        } else {
+          if (L.mask.window.enabled) bits.push("power window");
+          if (L.mask.key.enabled) bits.push("colour key");
+          if (!bits.length) bits.push("no mask, so the whole frame");
+        }
         if (L.mask.invert) bits.push("mask inverted");
         if (+L.correct.blur > 0) bits.push("blur " + fmt(+L.correct.blur, 3));
         if (L.mask.show) bits.push("matte view");
-        var on = layerActive(L);
         rows.push({
           id: "layer" + li,
           name: "Layer " + (li + 1) + (L.name ? " (" + L.name + ")" : ""),
-          active: on, status: on ? "exact" : "off",
-          note: STAGE_NOTES.layers + " This one runs " + L.placement
-              + ": " + bits.join(", ") + "."
+          active: on, status: on ? (v2 ? "close" : "exact") : "off",
+          lagging: lag.length ? lag : undefined,
+          note: (v2 ? STAGE_NOTES.mask_components : STAGE_NOTES.layers)
+              + " This one runs " + L.placement + ": " + bits.join(", ") + "."
+              + (lag.length ? " Matte lagging: " + lag.join("; ") + "." : "")
         });
       });
     }
@@ -1311,6 +1895,35 @@
    * not by a left shift of 8: the engine routes it through format=gray16le
    * for exactly this reason, because a shift tops the matte out at 65280 and
    * a fully open window would then apply 99.61% of the correction. */
+  /* The matte quantisation vocabulary and the merge under it, shared by the
+   * legacy window path and by every v2 component pass. One copy of the 257
+   * hop, one copy of floor(255*v + 0.5), one copy of ffmpeg's two 16 bit
+   * roundings, and one copy of blend=multiply's truncating divide.
+   *
+   * c16r is lrintf (gblur writes back that way), c16f is a plain truncation
+   * (lut3d and geq write back that way), and both return a CODE rather than a
+   * 0..1 value so the integer arithmetic below reads like the C does. */
+  var LIB_MERGE = [
+    "const float WCODE = 65535.0;",
+    "float q8(float v) { return clamp(floor(v * 255.0 + 0.5), 0.0, 255.0) / 255.0; }",
+    "float c16r(float v) { return clamp(floor(v * WCODE + 0.5), 0.0, WCODE); }",
+    "float c16f(float v) { return clamp(floor(v * WCODE), 0.0, WCODE); }",
+    "float mul16(float a, float b) { return float((uint(a) * uint(b)) / 65535u); }",
+    "vec3 winMerge16(vec3 base, vec3 over, float m16) {",
+    "  uint m = uint(m16);",
+    "  uvec3 bs = uvec3(floor(base * WCODE + 0.5));",
+    "  uvec3 os = uvec3(floor(over * WCODE + 0.5));",
+    "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
+    "  return vec3(r) / WCODE;",
+    "}",
+    // The legacy window matte is an 8 bit code and the engine lifts it into
+    // the merge by 257, not by a shift of 8 (a shift tops out at 65280 and a
+    // fully open window would then apply 99.61% of the correction).
+    "vec3 winMerge(vec3 base, vec3 over, float m8) {",
+    "  return winMerge16(base, over, m8 * 257.0);",
+    "}"
+  ];
+
   var LIB_WINDOW = [
     "uniform int uWinRect;",
     "uniform int uWinInvert;",
@@ -1318,7 +1931,6 @@
     "uniform vec2 uWinAxis;",       // the two half axes in pixels
     "uniform vec2 uWinRot;",        // (cos, sin) of the rotation
     "uniform vec2 uWinFeather;",    // (1+softness, 2*softness); y 0 is a hard edge
-    "const float WCODE = 65535.0;",
     "float winMatte(ivec2 q) {",
     "  float dx = float(q.x) - uWinCentre.x;",
     "  float dy = float(q.y) - uWinCentre.y;",
@@ -1331,13 +1943,6 @@
     "          : clamp((uWinFeather.x - d) / uWinFeather.y, 0.0, 1.0);",
     "  if (uWinInvert == 1) m = 1.0 - m;",
     "  return floor(m * 255.0 + 0.5);",
-    "}",
-    "vec3 winMerge(vec3 base, vec3 over, float m8) {",
-    "  uint m = uint(m8) * 257u;",
-    "  uvec3 bs = uvec3(floor(base * WCODE + 0.5));",
-    "  uvec3 os = uvec3(floor(over * WCODE + 0.5));",
-    "  uvec3 r = (bs * (65535u - m) + (os * m + 32767u)) / 65535u;",
-    "  return vec3(r) / WCODE;",
     "}"
   ];
 
@@ -1382,12 +1987,253 @@
     "uniform sampler2D uOver;",
     "uniform int uWinBlack;",
     "out vec4 oCol;"
-  ].concat(LIB_WINDOW).concat([
+  ].concat(LIB_MERGE).concat(LIB_WINDOW).concat([
     "void main() {",
     "  ivec2 p = ivec2(gl_FragCoord.xy);",
     "  vec3 base = uWinBlack == 1 ? vec3(0.0) : texelFetch(uBase, p, 0).rgb;",
     "  vec3 over = texelFetch(uOver, p, 0).rgb;",
     "  oCol = vec4(winMerge(base, over, winMatte(p)), 1.0);",
+    "}"
+  ]));
+
+  /* --- the v2 matte passes (C1) ------------------------------------
+   *
+   * Every one of these writes a 16 bit matte value, as a code over 65535,
+   * into all three channels of an RGBA32F target: three channels because
+   * gblur and the rest of the plumbing already work on vec3, 16 bit because
+   * that is what the engine's stack runs on (see the CPU reference above).
+   * A component's own `invert` is applied AFTER the quantisation, where
+   * 1 - k/65535 is exact on the lattice, and before the feather, so a blur at
+   * the frame border cannot depend on which way round the caller wrote the
+   * component. */
+
+  // The accumulator's starting value: 0 everywhere, per C1.
+  var FS_MATTE_CONST = src([
+    "#version 300 es",
+    "precision highp float;",
+    "uniform float uValue;",
+    "out vec4 oCol;",
+    "void main() { oCol = vec4(uValue, uValue, uValue, 1.0); }"
+  ]);
+
+  /* A window component. rect and ellipse are the engine's own matte formula,
+   * unchanged; linear is the new gradient (see linearGeometry). */
+  var FS_MATTE_WINDOW = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform int uShape;",        // 0 ellipse, 1 rect, 2 linear
+    "uniform int uInvert;",       // the window's own invert
+    "uniform int uCompInvert;",   // the component's invert
+    "uniform vec2 uCentre;",
+    "uniform vec2 uAxis;",
+    "uniform vec2 uRot;",
+    "uniform vec2 uFeather;",
+    "uniform float uSpan;",       // linear: w * frame width, in pixels (wpx)
+    "uniform float uEase;",       // linear: the ease exponent (0.05..8)
+    "uniform int uHard;",         // linear: 1 when softness is 0
+    "out vec4 oCol;"
+  ].concat(LIB_MERGE).concat([
+    "void main() {",
+    "  ivec2 q = ivec2(gl_FragCoord.xy);",
+    "  float dx = float(q.x) - uCentre.x;",
+    "  float dy = float(q.y) - uCentre.y;",
+    "  float m;",
+    "  float ux = dx * uRot.x + dy * uRot.y;",
+    "  float uy = dy * uRot.x - dx * uRot.y;",
+    "  if (uShape == 2) {",
+    // The gradient runs along the ROTATED vertical, so angle 0 selects the
+    // top of the frame and the selected side turns clockwise from there.
+    "    if (uHard == 1) {",
+    "      m = uy <= 0.0 ? 1.0 : 0.0;",
+    "    } else {",
+    "      float t = clamp(0.5 - uy / uSpan, 0.0, 1.0);",
+    // The two ends are written out rather than left to pow: GLSL leaves
+    // pow(0, y) undefined and some drivers return NaN for it, and both ends
+    // of this ramp evaluate pow at exactly 0. The values are the same ones
+    // the expression gives (0.5 * 0^k is 0, 1 - 0.5 * 0^k is 1).
+    "      if (t <= 0.0) m = 0.0;",
+    "      else if (t >= 1.0) m = 1.0;",
+    "      else m = t <= 0.5 ? 0.5 * pow(2.0 * t, uEase)",
+    "        : 1.0 - 0.5 * pow(2.0 * (1.0 - t), uEase);",
+    "    }",
+    "  } else {",
+    "    float a = ux / uAxis.x;",
+    "    float b = uy / uAxis.y;",
+    "    float d = uShape == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
+    "    m = uFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
+    "      : clamp((uFeather.x - d) / uFeather.y, 0.0, 1.0);",
+    "  }",
+    "  if (uInvert == 1) m = 1.0 - m;",
+    // The engine bakes this as an 8 bit PNG and gray16le lifts it by 257, so
+    // the 8 bit code IS the 16 bit value and there is nothing else to round.
+    "  m = q8(m);",
+    "  if (uCompInvert == 1) m = 1.0 - m;",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]));
+
+  /* A key component: the qualifier as a greyscale 33 cube, applied
+   * tetrahedrally to the picture entering this layer. Same table and same
+   * interpolation lut3d runs on the ffmpeg side. */
+  var FS_MATTE_KEY = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "precision highp sampler3D;",
+    "uniform sampler2D uSrc;",
+    "uniform sampler3D uLut;",
+    "uniform int uSize;",
+    "uniform int uCompInvert;",
+    "out vec4 oCol;"
+  ].concat(LIB_LUT3D).concat(LIB_MERGE).concat([
+    "void main() {",
+    "  vec3 c = texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0).rgb;",
+    "  float m = uSize > 0 ? tetra(uLut, uSize, c).r : 1.0;",
+    "  m = c16f(m) / WCODE;",
+    "  if (uCompInvert == 1) m = 1.0 - m;",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]));
+
+  /* A matte component: a frame fetched from GET /api/matte/<id>/frame.
+   *
+   * The frame is asked for at exactly this render's width, so the common case
+   * is a texel for texel read. When the server could only serve another size
+   * (a matte tracked at the working width against a bigger output) the
+   * texture is sampled with hardware bilinear instead, which is the "scaled
+   * to the output with a soft edge" of design rule 6. uHave 0 means nothing
+   * is decoded yet: the matte is 0 and the caller flags it. */
+  var FS_MATTE_TEX = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uTex;",
+    "uniform ivec2 uTexSize;",
+    "uniform ivec2 uSize;",
+    "uniform int uCompInvert;",
+    "uniform int uHave;",
+    "out vec4 oCol;"
+  ].concat(LIB_MERGE).concat([
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  float m = 0.0;",
+    "  bool oneToOne = uTexSize == uSize;",
+    "  if (uHave == 1) {",
+    "    if (oneToOne) m = texelFetch(uTex, p, 0).r;",
+    "    else m = texture(uTex, (gl_FragCoord.xy) / vec2(uSize)).r;",
+    "  }",
+    // Texel for texel the frame is an 8 bit PNG lifted by 257, so the 8 bit
+    // code is the answer. Scaled, the engine runs swscale bilinear at 16
+    // bits, so round to 16 and accept that the resampler is not the same one.
+    "  m = oneToOne ? q8(m) : c16r(m) / WCODE;",
+    "  if (uCompInvert == 1) m = 1.0 - m;",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]));
+
+  // add is max, intersect is a*b, subtract is a*(1-b). C1, verbatim.
+  var FS_MATTE_COMBINE = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uAcc;",
+    "uniform sampler2D uSrc;",
+    "uniform int uOp;",           // 0 add, 1 intersect, 2 subtract
+    "out vec4 oCol;"
+  ].concat(LIB_MERGE).concat([
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  float a = c16r(texelFetch(uAcc, p, 0).r);",
+    "  float b = c16r(texelFetch(uSrc, p, 0).r);",
+    "  float m = uOp == 1 ? mul16(a, b)",
+    "          : (uOp == 2 ? mul16(a, WCODE - b) : max(a, b));",
+    "  m = m / WCODE;",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]));
+
+  /* grow and shrink. One axis per pass: a max or a min over a square is
+   * separable, so two passes give the same answer as n iterations of a 3x3
+   * dilation. Borders clamp, which is edge replication. */
+  var FS_MATTE_MORPH = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uTex;",
+    "uniform ivec2 uDir;",
+    "uniform ivec2 uSize;",
+    "uniform int uRadius;",
+    "uniform int uMode;",         // 1 dilate, 0 erode
+    "out vec4 oCol;",
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  float m = texelFetch(uTex, p, 0).r;",
+    "  for (int i = 1; i <= uRadius; i++) {",
+    "    ivec2 o = uDir * i;",
+    "    float va = texelFetch(uTex, clamp(p + o, ivec2(0), uSize - 1), 0).r;",
+    "    float vb = texelFetch(uTex, clamp(p - o, ivec2(0), uSize - 1), 0).r;",
+    "    m = uMode == 1 ? max(m, max(va, vb)) : min(m, min(va, vb));",
+    "  }",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]);
+
+  /* clean_black / clean_white, the soft knee, as cinegrade's clean_geq. The
+   * three constants arrive already through their 6 decimal round trip (see
+   * cleanParams) because that is all ffmpeg ever parses out of the string,
+   * and geq truncates its own output, hence c16f and not c16r. */
+  var FS_MATTE_CLEAN = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uTex;",
+    "uniform float uLo;",
+    "uniform float uDen;",
+    "uniform float uKnee;",
+    "out vec4 oCol;"
+  ].concat(LIB_MERGE).concat([
+    "void main() {",
+    "  float v = texelFetch(uTex, ivec2(gl_FragCoord.xy), 0).r;",
+    "  float t = clamp((v - uLo) / uDen, 0.0, 1.0);",
+    "  float m = t + (t * t * (3.0 - 2.0 * t) - t) * uKnee;",
+    "  m = c16f(clamp(m, 0.0, 1.0)) / WCODE;",
+    "  oCol = vec4(m, m, m, 1.0);",
+    "}"
+  ]));
+
+  /* The merge under a v2 matte.
+   *
+   * mask.invert is applied here, to the finished matte, rather than by
+   * grading a second branch: with the matte explicit there is nothing to
+   * factorise. uShow draws the matte itself as grey, which is the whole
+   * selection rather than the legacy "colour matte times window matte against
+   * black". */
+  var FS_MATTE_MERGE = src([
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "uniform sampler2D uBase;",
+    "uniform sampler2D uOver;",
+    "uniform sampler2D uMatte;",
+    "uniform int uMaskInvert;",
+    "uniform int uShow;",
+    "out vec4 oCol;"
+  ].concat(LIB_MERGE).concat([
+    "void main() {",
+    "  ivec2 p = ivec2(gl_FragCoord.xy);",
+    "  float m16 = c16r(texelFetch(uMatte, p, 0).r);",
+    "  if (uMaskInvert == 1) m16 = WCODE - m16;",
+    // Matte view on the engine side is maskedmerge(black, white cube, matte),
+    // and (65535*m + 32767) / 65535 is m for every m, so it is the matte.
+    "  if (uShow == 1) {",
+    "    float g = m16 / WCODE;",
+    "    oCol = vec4(g, g, g, 1.0);",
+    "    return;",
+    "  }",
+    "  vec3 base = texelFetch(uBase, p, 0).rgb;",
+    "  vec3 over = texelFetch(uOver, p, 0).rgb;",
+    "  oCol = vec4(winMerge16(base, over, m16), 1.0);",
     "}"
   ]));
 
@@ -2174,6 +3020,20 @@
     this.lastTiming = null;
     this.apiBase = "";
     this.identityLut = null;
+    /* Matte frames (C4, design rule 10). `matteIndexes` is one index.json per
+     * matte id, `matteFrames` the LRU of decoded frames, `matteOrder` its
+     * recency list, `matteLast` the newest decoded frame per matte (what a
+     * lagging render falls back to) and `matteLive` what the stage report
+     * says about each matte on the last render. */
+    this.matteIndexes = {};
+    this.matteFrames = {};
+    this.matteOrder = [];
+    this.matteLast = {};
+    this.matteLive = {};
+    this.matteSeen = {};
+    this.matteInFlight = {};
+    this.playDir = 1;
+    this.time = 0;
   }
 
   Instance.prototype.dispose = function () {
@@ -2188,6 +3048,13 @@
       if (p && p.tex) gl.deleteTexture(p.tex);
     });
     this.grainPlates = {};
+    Object.keys(this.matteFrames).forEach(function (k) {
+      var f = self.matteFrames[k];
+      if (f && f.tex) gl.deleteTexture(f.tex);
+    });
+    this.matteFrames = {};
+    this.matteOrder = [];
+    this.matteLast = {};
   };
 
   Instance.prototype.setSource = function (u16, w, h) {
@@ -2273,6 +3140,20 @@
                     key: "layer:" + stableJson(layerCubeKey(L, v)),
                     body: { kind: "layer", config: L, variant: v } });
       });
+      /* One more cube per KEY component: the qualifier baked as a greyscale
+       * 33 cube (keyMatteLayer), which is the matte the shader reads. Keyed
+       * on the key block alone, so two layers selecting the same skin tone
+       * share one table and one fetch. */
+      if (maskUsesComponents(L.mask)) {
+        stackComponents(L.mask).forEach(function (e) {
+          var c = e.comp;
+          if (c.type !== "key" && c.type !== "luma") return;
+          var kl = keyMatteLayer(componentKey(c));
+          reqs.push({ slot: "layer" + i + ":comp" + e.index,
+                      key: "keymatte:" + stableJson(kl.mask.key),
+                      body: { kind: "layer", config: kl, variant: "key" } });
+        });
+      }
     });
     /* The hue curves + slice + tetra cube. Asked for only when something is
      * actually set, so a neutral stage costs no round trip, and keyed on both
@@ -2324,8 +3205,15 @@
   Instance.prototype.ready = function (config, opts) {
     var self = this;
     var cfg = this.prepareConfig(config, opts);
+    if (opts && opts.time !== undefined) this.setTime(opts.time);
     var reqs = lutRequests(cfg);
     var work = reqs.map(function (r) { return self.lut(r.key, r.body); });
+    /* Matte frames (C4). The first frame of every matte the config names is
+     * awaited here for the same reason the LUTs are: a render that starts
+     * without them would show a lagging matte on the very first frame, which
+     * is the one the user is looking at while they build the mask. */
+    var mw = (opts && opts.width) || (this.src && this.src.w);
+    if (mw) work.push(this.matteReady(cfg, mw, this.time));
     // Grain plate prefetch (C3). width/height come from opts when the
     // caller has not called setSource yet (render.js's worker loop calls
     // ready() before setSource16, so this.src is still null there) and fall
@@ -2481,6 +3369,288 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return tex;
+  };
+
+  // --- matte frames (C4, design rule 10) ------------------------------
+
+  /* How many decoded matte frames one instance holds, and how far ahead of
+   * the playhead it reads. 48 frames is about two seconds at 24 fps for one
+   * matte, which is enough for playback to stay ahead of a decode without
+   * holding a whole clip's worth of textures on the card. */
+  var MATTE_CACHE_MAX = 48;
+  var MATTE_PREFETCH = 8;
+
+  /* Every matte id this config actually READS, once.
+   *
+   * stackComponents and not maskComponents, matching cinegrade's mask_inputs:
+   * a matte component the fold cannot reach is not fetched, not waited on by
+   * ready() and not prefetched, because nothing would draw it. */
+  function configMattes(cfg) {
+    var out = [], seen = {};
+    configLayers(cfg).forEach(function (L) {
+      if (!layerActive(L) || !maskUsesComponents(L.mask)) return;
+      stackComponents(L.mask).forEach(function (e) {
+        var c = e.comp;
+        var id = c.matte && c.matte.id;
+        if (!id || seen[id]) return;
+        seen[id] = 1;
+        out.push(id);
+      });
+    });
+    return out;
+  }
+
+  /* The matte's own index.json, fetched once per id.
+   *
+   * It is what turns a TIME into a FRAME NUMBER, which is what makes both the
+   * cache and the prefetch possible: without an fps the browser cannot know
+   * that t=1.00 and t=1.01 are the same frame, nor which frame comes next. A
+   * server that only has the frame route still works: the index resolves to
+   * null, the cache falls back to keying on the requested time, and prefetch
+   * switches itself off. */
+  Instance.prototype.matteIndex = function (id) {
+    var self = this;
+    var hit = this.matteIndexes[id];
+    if (hit !== undefined) {
+      return (hit && hit.pending) ? hit.pending : Promise.resolve(hit);
+    }
+    var pending = fetch(this.apiBase + "/api/matte/" + encodeURIComponent(id))
+      .then(function (r) {
+        if (!r.ok) throw new Error("matte index " + id + ": " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        var info = {
+          fps: +j.fps || 0, frames: +j.frames || 0,
+          width: +j.width || 0, height: +j.height || 0,
+          state: j.state || "unknown"
+        };
+        self.matteIndexes[id] = info;
+        return info;
+      })
+      .catch(function () { self.matteIndexes[id] = null; return null; });
+    this.matteIndexes[id] = { pending: pending };
+    return pending;
+  };
+
+  Instance.prototype.matteInfo = function (id) {
+    var info = this.matteIndexes[id];
+    return (info && info.pending) ? null : (info || null);
+  };
+
+  /* round(time * fps), clamped, exactly as C2 defines the index. Null when
+   * there is no index to count in: the caller then keys on the time instead
+   * and does not prefetch.
+   *
+   * Module functions rather than methods so the tests can drive them without
+   * a WebGL context; the methods below are one line wrappers. */
+  function matteFrameIndexOf(info, time) {
+    if (!info || !(info.fps > 0)) return null;
+    var i = Math.round((+time || 0) * info.fps);
+    var last = info.frames > 0 ? info.frames - 1 : i;
+    return Math.max(0, Math.min(last, i));
+  }
+
+  function matteFrameKey(id, width, info, time) {
+    var idx = matteFrameIndexOf(info, time);
+    return id + ":" + width + ":"
+      + (idx === null ? "t" + (+time || 0).toFixed(3) : idx);
+  }
+
+  // Most recently used last.
+  function lruTouch(order, key) {
+    var i = order.indexOf(key);
+    if (i >= 0) order.splice(i, 1);
+    order.push(key);
+    return order;
+  }
+
+  /* Drop the least recently used entries until the cache is back under `max`.
+   * `drop` frees whatever the entry holds (a GL texture in the real thing, a
+   * counter in the test). An entry that was some matte's newest decoded frame
+   * stops being the fallback when it goes, or a lagging render would bind a
+   * deleted texture. */
+  function lruEvict(order, frames, last, max, drop) {
+    while (order.length > max) {
+      var k = order.shift();
+      var e = frames[k];
+      if (!e) continue;
+      if (last[e.id] === e) delete last[e.id];
+      if (drop) drop(e);
+      delete frames[k];
+    }
+    return order;
+  }
+
+  Instance.prototype.matteFrameIndex = function (info, time) {
+    return matteFrameIndexOf(info, time);
+  };
+
+  Instance.prototype.matteKey = function (id, width, time) {
+    return matteFrameKey(id, width, this.matteInfo(id), time);
+  };
+
+  Instance.prototype.matteTouch = function (key) {
+    lruTouch(this.matteOrder, key);
+  };
+
+  Instance.prototype.matteEvict = function () {
+    var gl = this.gl;
+    lruEvict(this.matteOrder, this.matteFrames, this.matteLast, MATTE_CACHE_MAX,
+             function (e) { gl.deleteTexture(e.tex); });
+  };
+
+  /* Fetch and decode ONE matte frame. Never called from the render path
+   * synchronously: the render reads matteLookup, which only ever looks in the
+   * cache and asks for a fetch in the background. */
+  Instance.prototype.matteFetch = function (id, width, time) {
+    var self = this;
+    var key = this.matteKey(id, width, time);
+    var hit = this.matteFrames[key];
+    if (hit) { this.matteTouch(key); return Promise.resolve(hit); }
+    if (this.matteInFlight[key]) return this.matteInFlight[key];
+    var url = this.apiBase + "/api/matte/" + encodeURIComponent(id)
+      + "/frame?time=" + encodeURIComponent(+time || 0) + "&width=" + width;
+    var state = "unknown", frame = -1;
+    var p = fetch(url).then(function (r) {
+      if (!r.ok) throw new Error("matte frame " + id + ": " + r.status);
+      state = r.headers.get("X-Matte-State") || "unknown";
+      frame = parseInt(r.headers.get("X-Matte-Frame"), 10);
+      return r.blob();
+    }).then(function (b) {
+      // colorSpaceConversion none: the matte is a coverage value, not a
+      // colour, and a browser that "corrects" it would move every code.
+      return createImageBitmap(b, {
+        colorSpaceConversion: "none", premultiplyAlpha: "none"
+      });
+    }).then(function (bmp) {
+      var entry = self.uploadMatte(bmp, id, key, state, isNaN(frame) ? -1 : frame);
+      if (bmp.close) bmp.close();
+      delete self.matteInFlight[key];
+      return entry;
+    }).catch(function (e) {
+      delete self.matteInFlight[key];
+      throw e;
+    });
+    this.matteInFlight[key] = p;
+    return p;
+  };
+
+  Instance.prototype.uploadMatte = function (bmp, id, key, state, frame) {
+    var gl = this.gl;
+    this.G.scratch();
+    var tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    /* The same three unpack settings live.js spells out for a video frame,
+     * and for the same reason: they are sticky GL state, so relying on the
+     * default means relying on nobody else having changed it. A matte is a
+     * coverage value, not a colour, so no colour management; not
+     * premultiplied, because there is no alpha to premultiply by; and row 0
+     * stays row 0, because every other pass in this file indexes the picture
+     * with gl_FragCoord as a top down pixel coordinate. */
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+    /* LINEAR so a matte served at another size scales with a soft edge
+     * (design rule 6). A matte at the render's own size is read with
+     * texelFetch, which ignores the filter entirely, so the common case is
+     * still texel for texel. */
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    var entry = { tex: tex, w: bmp.width, h: bmp.height, id: id, key: key,
+                  state: state, frame: frame };
+    this.matteFrames[key] = entry;
+    this.matteTouch(key);
+    this.matteLast[id] = entry;
+    this.matteEvict();
+    return entry;
+  };
+
+  /* What the render binds. Synchronous by contract: a frame that is not
+   * decoded yet NEVER stalls the picture. The most recent decoded frame of
+   * that matte is used instead, the state line says "matte lagging", and the
+   * missing frame is fetched in the background for next time. */
+  Instance.prototype.matteLookup = function (id, width, time) {
+    var info = this.matteInfo(id);
+    var key = this.matteKey(id, width, time);
+    var want = this.matteFrameIndex(info, time);
+    var hit = this.matteFrames[key];
+    if (hit) {
+      this.matteTouch(key);
+      this.matteLive[id] = { id: id, state: hit.state, want: want,
+                             got: hit.frame, lagging: false, empty: false };
+      return hit;
+    }
+    var last = this.matteLast[id] || null;
+    this.matteLive[id] = {
+      id: id, state: last ? last.state : (info ? info.state : "missing"),
+      want: want, got: last ? last.frame : null,
+      lagging: true, empty: !last
+    };
+    this.matteFetch(id, width, time).catch(function () { /* reported above */ });
+    return last;
+  };
+
+  /* Awaited by ready(): the first frame of every matte the config names, so
+   * the first render after a config change is never a lagging one. */
+  Instance.prototype.matteReady = function (cfg, width, time) {
+    var self = this;
+    var ids = configMattes(cfg);
+    if (!ids.length) return Promise.resolve([]);
+    return Promise.all(ids.map(function (id) {
+      return self.matteIndex(id).then(function () {
+        return self.matteFetch(id, width, time).catch(function () { return null; });
+      });
+    }));
+  };
+
+  /* Design rule 10: read ahead of the playhead along the play direction.
+   * Needs the index (a frame number to add to), so a server without the index
+   * route gets no prefetch rather than a guess. */
+  Instance.prototype.mattePrefetch = function (cfg, width, time) {
+    var self = this, dir = this.playDir >= 0 ? 1 : -1;
+    configMattes(cfg).forEach(function (id) {
+      var info = self.matteInfo(id);
+      if (!info || !(info.fps > 0)) return;
+      var base = self.matteFrameIndex(info, time);
+      if (base === null) return;
+      for (var k = 1; k <= MATTE_PREFETCH; k++) {
+        var idx = base + dir * k;
+        if (idx < 0) break;
+        if (info.frames > 0 && idx > info.frames - 1) break;
+        var key = id + ":" + width + ":" + idx;
+        if (self.matteFrames[key] || self.matteInFlight[key]) continue;
+        self.matteFetch(id, width, idx / info.fps)
+          .catch(function () { /* a prefetch that fails is not an error */ });
+      }
+    });
+  };
+
+  /* The playhead. A caller that drives playback should set it (or pass
+   * opts.time to ready and render); the direction is inferred from two
+   * consecutive times unless setPlayDirection says otherwise. */
+  Instance.prototype.setTime = function (t) {
+    t = +t || 0;
+    if (t > this.time) this.playDir = 1;
+    else if (t < this.time) this.playDir = -1;
+    this.time = t;
+    return t;
+  };
+
+  Instance.prototype.setPlayDirection = function (d) {
+    this.playDir = d < 0 ? -1 : 1;
+  };
+
+  // What the last render saw of each matte, for the stage report and the UI.
+  Instance.prototype.matteStatus = function () {
+    var self = this, out = {};
+    Object.keys(this.matteLive).forEach(function (k) {
+      out[k] = clone(self.matteLive[k]);
+    });
+    return out;
   };
 
   Instance.prototype.identity = function () {
@@ -2979,6 +4149,201 @@
     return out;
   };
 
+  /* --- the v2 matte pipeline (C1) -----------------------------------
+   *
+   * One pass per component, one per combine, one per finesse step, all on the
+   * ordinary RGBA32F targets the rest of the chain uses, all carrying an 8 bit
+   * value (see the CPU reference at the top of this file, which these are a
+   * port of). A stack of four components with a feather each is about a dozen
+   * passes plus the blurs, which is cheap next to the colour chain.
+   */
+
+  // The accumulator's starting value.
+  Instance.prototype.matteConst = function (value, W, H) {
+    var gl = this.gl;
+    var out = this.simple("matteconst", FS_MATTE_CONST, W, H, function (pr, G2) {
+      gl.uniform1f(G2.loc(pr, "uValue"), value);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  Instance.prototype.matteWindowPass = function (comp, W, H) {
+    var gl = this.gl;
+    var win = deepMerge(WINDOW_DEFAULTS, comp.window || {});
+    var g = windowGeometry(win, W, H);
+    var out = this.simple("mattewindow", FS_MATTE_WINDOW, W, H, function (pr, G2) {
+      gl.uniform1i(G2.loc(pr, "uShape"), g.linear ? 2 : (g.rect ? 1 : 0));
+      gl.uniform1i(G2.loc(pr, "uInvert"), g.invert ? 1 : 0);
+      gl.uniform1i(G2.loc(pr, "uCompInvert"), comp.invert ? 1 : 0);
+      gl.uniform2f(G2.loc(pr, "uCentre"), g.cxp, g.cyp);
+      gl.uniform2f(G2.loc(pr, "uAxis"), g.ax, g.ay);
+      // The gradient is rotated by the same pair of constants the shapes are,
+      // so there is one rotation in this shader and not two.
+      gl.uniform2f(G2.loc(pr, "uRot"), g.cr, g.sr);
+      gl.uniform2f(G2.loc(pr, "uFeather"), g.hi, g.den);
+      gl.uniform1f(G2.loc(pr, "uSpan"), g.wpx);
+      gl.uniform1f(G2.loc(pr, "uEase"), g.ease);
+      gl.uniform1i(G2.loc(pr, "uHard"), g.soft <= 0 ? 1 : 0);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  Instance.prototype.matteKeyPass = function (comp, entry, srcTex, W, H) {
+    var gl = this.gl, ident = this.identity();
+    var out = this.simple("mattekey", FS_MATTE_KEY, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uSrc", 0, srcTex);
+      G2.bindTex(pr, "uLut", 1, entry ? entry.tex : ident, "3d");
+      gl.uniform1i(G2.loc(pr, "uSize"), entry ? entry.size : 0);
+      gl.uniform1i(G2.loc(pr, "uCompInvert"), comp.invert ? 1 : 0);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  Instance.prototype.matteTexPass = function (comp, W, H) {
+    var gl = this.gl, self = this;
+    var id = (comp.matte && comp.matte.id) || "";
+    var hit = id ? this.matteLookup(id, W, this.time) : null;
+    var out = this.simple("mattetex", FS_MATTE_TEX, W, H, function (pr, G2) {
+      // Something valid always has to be bound, even on the branch that never
+      // samples it (see the SCRATCH_UNIT comment): the source will do.
+      G2.bindTex(pr, "uTex", 0, hit ? hit.tex : self.src.tex);
+      gl.uniform2i(G2.loc(pr, "uTexSize"), hit ? hit.w : 0, hit ? hit.h : 0);
+      gl.uniform2i(G2.loc(pr, "uSize"), W, H);
+      gl.uniform1i(G2.loc(pr, "uCompInvert"), comp.invert ? 1 : 0);
+      gl.uniform1i(G2.loc(pr, "uHave"), hit ? 1 : 0);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  Instance.prototype.combineMatte = function (acc, m, op, W, H) {
+    var gl = this.gl;
+    var out = this.simple("mattecombine", FS_MATTE_COMBINE, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uAcc", 0, acc.tex);
+      G2.bindTex(pr, "uSrc", 1, m.tex);
+      gl.uniform1i(G2.loc(pr, "uOp"), op);
+    });
+    this.passCount++;
+    return out;
+  };
+
+  Instance.prototype.morphMatte = function (input, radius, dilate, W, H) {
+    var gl = this.gl, G = this.G, self = this;
+    function axis(tex, dx, dy) {
+      var t = self.simple("mattemorph", FS_MATTE_MORPH, W, H, function (pr, G2) {
+        G2.bindTex(pr, "uTex", 0, tex);
+        gl.uniform2i(G2.loc(pr, "uDir"), dx, dy);
+        gl.uniform2i(G2.loc(pr, "uSize"), W, H);
+        gl.uniform1i(G2.loc(pr, "uRadius"), radius);
+        gl.uniform1i(G2.loc(pr, "uMode"), dilate ? 1 : 0);
+      });
+      self.passCount++;
+      return t;
+    }
+    var h = axis(input.tex, 1, 0);
+    G.release(input);
+    var v = axis(h.tex, 0, 1);
+    G.release(h);
+    return v;
+  };
+
+  Instance.prototype.cleanMatte = function (input, cb, cw, W, H) {
+    var gl = this.gl, G = this.G;
+    var cp = cleanParams(cb, cw);
+    var out = this.simple("matteclean", FS_MATTE_CLEAN, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uTex", 0, input.tex);
+      gl.uniform1f(G2.loc(pr, "uLo"), cp.lo);
+      gl.uniform1f(G2.loc(pr, "uDen"), cp.den);
+      gl.uniform1f(G2.loc(pr, "uKnee"), cp.knee);
+    });
+    G.release(input);
+    this.passCount++;
+    return out;
+  };
+
+  /* The whole stack plus finesse, as one matte texture. A port of
+   * maskStackCPU, step for step and quantisation for quantisation. */
+  Instance.prototype.maskMatte = function (srcTex, layer, slots, idx, W, H) {
+    var G = this.G, self = this;
+    var mask = layer.mask;
+    var comps = stackComponents(mask);
+    var acc = this.matteConst(0, W, H);
+    comps.forEach(function (e) {
+      var c = e.comp, m;
+      if (c.type === "key" || c.type === "luma") {
+        m = self.matteKeyPass(c, slots[idx + ":comp" + e.index], srcTex, W, H);
+      } else if (c.type === "matte") {
+        m = self.matteTexPass(c, W, H);
+      } else {
+        m = self.matteWindowPass(c, W, H);
+      }
+      var feather = +c.feather || 0;
+      if (feather > 0) {
+        var b = self.gblur(m.tex, W, H, fmt(feather * W, 3), 1, MASK_MAX);
+        G.release(m);
+        m = b;
+      }
+      var op = c.op === "intersect" ? 1 : (c.op === "subtract" ? 2 : 0);
+      var next = self.combineMatte(acc, m, op, W, H);
+      G.release(acc);
+      G.release(m);
+      acc = next;
+    });
+    // Finesse in cinegrade's order: clean, then grow, then blur. The two
+    // clean controls are clamped to 0..1 before the "is it on" test, exactly
+    // as finesse_filters does, so a config carrying a negative one emits no
+    // filter on either side rather than one filter on one side.
+    var f = maskFinesse(mask);
+    var cb = clamp01(+f.clean_black || 0), cw = clamp01(+f.clean_white || 0);
+    if (cb > 0 || cw > 0) acc = this.cleanMatte(acc, cb, cw, W, H);
+    var grow = +f.grow || 0;
+    var steps = Math.min(MASK_GROW_MAX, pyRound(Math.abs(grow) * W));
+    if (steps >= 1) acc = this.morphMatte(acc, steps, grow > 0, W, H);
+    if (+f.blur > 0) {
+      var fb = this.gblur(acc.tex, W, H, fmt(+f.blur * W, 3), 1, MASK_MAX);
+      G.release(acc);
+      acc = fb;
+    }
+    return acc;
+  };
+
+  /* One v2 layer: the stack's matte, the whole correction on one branch, one
+   * merge. mask.invert and the matte view both live in the merge shader. */
+  Instance.prototype.layerPassV2 = function (cur, entry, slots, W, H) {
+    var gl = this.gl, G = this.G;
+    var layer = entry.layer, idx = entry.index;
+    var show = !!layer.mask.show;
+    var matte = this.maskMatte(cur.tex, layer, slots, idx, W, H);
+    var over = null;
+    if (!show) {
+      over = this.layerLutPass(cur.tex, slots[idx + ":one"], W, H);
+      // The blur is a picture operation, so it is left out of matte view for
+      // the same reason it is on the legacy path.
+      var sigma = layerBlurSigma(layer, W);
+      if (sigma > 0) {
+        var b = this.gblur(over.tex, W, H, fmt(sigma, 3), 1, 65535);
+        G.release(over);
+        over = b;
+      }
+    }
+    var inv = !!layer.mask.invert;
+    var out = this.simple("mattemerge", FS_MATTE_MERGE, W, H, function (pr, G2) {
+      G2.bindTex(pr, "uBase", 0, cur.tex);
+      G2.bindTex(pr, "uOver", 1, over ? over.tex : cur.tex);
+      G2.bindTex(pr, "uMatte", 2, matte.tex);
+      gl.uniform1i(G2.loc(pr, "uMaskInvert"), inv ? 1 : 0);
+      gl.uniform1i(G2.loc(pr, "uShow"), show ? 1 : 0);
+    });
+    this.passCount++;
+    if (over) G.release(over);
+    G.release(matte);
+    G.release(cur);
+    return out;
+  };
+
   /* One layer: cube, optional blur, optional merge under the window matte.
    *
    * Mirrors build_layers filter for filter. A layer with no window is a
@@ -2989,6 +4354,12 @@
   Instance.prototype.layerPass = function (cur, entry, slots, W, H) {
     var G = this.G, self = this;
     var layer = entry.layer, idx = entry.index;
+    // A v2 mask takes the component path; everything below is the legacy
+    // window-times-key layer, untouched, which is what keeps every shipped
+    // preset byte identical.
+    if (maskUsesComponents(layer.mask)) {
+      return this.layerPassV2(cur, entry, slots, W, H);
+    }
     var win = layerWindow(layer);
     var show = !!layer.mask.show;
     /* The blur is a picture operation. In matte view there is no picture,
@@ -3266,11 +4637,20 @@
     if (!this.src) throw new Error("StudioGPU: setSource has not been called");
     var gl = this.gl, G = this.G;
     var cfg = this.prepareConfig(config, opts);
+    if (opts.time !== undefined) this.setTime(opts.time);
     var plan = chainPlan(cfg);
-    var report = stageReport(cfg);
     var W = this.src.w, H = this.src.h;
     this.passCount = 0;
     var t0 = now();
+    // Only the mattes this config names stay in the live report, so a layer
+    // that was deleted cannot leave a stale "lagging" line behind.
+    var keep = {}, live = {};
+    configMattes(cfg).forEach(function (id) { keep[id] = 1; });
+    var self0 = this;
+    Object.keys(this.matteLive).forEach(function (k) {
+      if (keep[k]) live[k] = self0.matteLive[k];
+    });
+    this.matteLive = live;
 
     /* The colour head, the layer stack and the look.
      *
@@ -3374,8 +4754,18 @@
     gl.finish();
     var ms = now() - t0;
     this.lastTiming = { ms: ms, passes: this.passCount, width: W, height: H };
+    /* The report is built AFTER the picture, not before it, because the matte
+     * rows carry what this render actually saw: which frame each matte served
+     * and whether it was lagging. Design rule 10 says the state line reports
+     * a lagging matte instead of stalling the picture, and this is where that
+     * line gets its facts. */
+    var report = stageReport(cfg, this.matteLive);
+    // Read ahead of the playhead for the next frame. Fire and forget: nothing
+    // in the grading loop waits on it (design rule 1).
+    this.mattePrefetch(cfg, W, this.time);
     return { ms: ms, passes: this.passCount, width: W, height: H,
-             config: cfg, plan: plan, report: report };
+             config: cfg, plan: plan, report: report,
+             mattes: this.matteStatus() };
   };
 
   /* rgb24, top row first, byte for byte comparable with the raw body of
@@ -3627,6 +5017,47 @@
     LAYER_DEFAULTS: LAYER_DEFAULTS,
     configLayers: configLayers,
     layerActive: layerActive,
+
+    /* Mask model v2 (C1), exposed for the UI, for the CLI's own reader and
+     * for studio/tests/mask-stack-ref.mjs, which runs `stack` on plain arrays
+     * in node with no GPU and no server. `stack` is the DEFINITION the
+     * shaders are a port of, so a test against it is a test of the contract
+     * rather than of one implementation. */
+    mask: {
+      COMPONENT_DEFAULTS: COMPONENT_DEFAULTS,
+      FINESSE_DEFAULTS: FINESSE_DEFAULTS,
+      KEY_DEFAULTS: KEY_DEFAULTS,
+      WINDOW_DEFAULTS: WINDOW_DEFAULTS,
+      components: maskComponents,
+      stackComponents: stackComponents,
+      usesComponents: maskUsesComponents,
+      finesse: maskFinesse,
+      finesseActive: finesseActive,
+      keyMatteLayer: keyMatteLayer,
+      componentKey: componentKey,
+      linearGeometry: linearGeometry,
+      windowGeometry: windowGeometry,
+      softKnee: softKnee,
+      cleanParams: cleanParams,
+      gblur: gblurCPU,
+      morph: morphCPU,
+      window: windowMatteCPU,
+      stack: maskStackCPU,
+      q8: q8,
+      q16r: q16r,
+      q16f: q16f,
+      mul16: mul16,
+      pyRound: pyRound,
+      MAX: MASK_MAX,
+      GROW_MAX: MASK_GROW_MAX,
+      // playback side (design rule 10), no GPU needed to test any of it
+      frameIndex: matteFrameIndexOf,
+      frameKey: matteFrameKey,
+      lruTouch: lruTouch,
+      lruEvict: lruEvict,
+      CACHE_MAX: MATTE_CACHE_MAX,
+      PREFETCH: MATTE_PREFETCH
+    },
 
     // Exposed for the parity harness, which reports what it compared.
     notes: STAGE_NOTES,

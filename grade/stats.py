@@ -55,7 +55,72 @@ CLIP_WHITE = 253
 DEFAULT_BAND_EDGES = [i / 8.0 for i in range(9)]
 
 
-def frame_stats(rgb: np.ndarray) -> dict:
+def _weighted_percentiles(values: np.ndarray, weight: np.ndarray, qs) -> list[float]:
+    """`qs` percentiles (0..100) of `values`, weighted by `weight`.
+
+    Both are already flat and the same length. The "linear" weighted
+    percentile: sort once, walk the weighted cumulative distribution (each
+    sample credited from the midpoint of its own weight, same convention
+    `np.percentile`'s default `linear` method uses on an unweighted array),
+    then `np.interp` the requested percentiles off that curve. An all-zero
+    weight (nothing selected: a matte with no coverage of this frame) has no
+    percentile to report, so the caller (`frame_stats`) checks for that
+    before calling this, not here.
+    """
+    order = np.argsort(values, kind="stable")
+    v = values[order]
+    w = weight[order].astype(np.float64)
+    total = float(w.sum())
+    cw = (np.cumsum(w) - 0.5 * w) / total * 100.0
+    return [float(x) for x in np.interp(qs, cw, v)]
+
+
+def _wmean(values: np.ndarray, weight: np.ndarray | None) -> float:
+    """mean(values), or the weighted mean when `weight` is given. `weight`
+    summing to zero (nothing selected) reads as 0.0 rather than raising:
+    the same "empty selection reads as zero" rule `bands()` already used
+    for a luma band nothing fell in."""
+    if weight is None:
+        return float(values.mean()) if values.size else 0.0
+    total = float(weight.sum())
+    if total <= 0:
+        return 0.0
+    return float(np.sum(values.astype(np.float64) * weight) / total)
+
+
+def _wsum_pct(selected: np.ndarray, weight: np.ndarray | None, total) -> float:
+    """The share of `total` (pixel count, or total weight) that falls in a
+    boolean selection, as a percentage: `sum(weight[selected]) / total * 100`
+    weighted, or `count(selected) / total * 100` unweighted, one formula
+    both `families` and `clipped` below share."""
+    if weight is None:
+        return float(selected.sum()) / total * 100.0
+    return float(weight[selected].sum()) / total * 100.0
+
+
+def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
+    """Luma, saturation, hue family and clipping numbers for one rgb24 frame.
+
+    `weight`, given, is an HxW float array in 0..1 the same size as `rgb`
+    (contract C6): every percentile, band and hue family below is measured
+    over `rgb` weighted by it instead of over the whole frame evenly, which
+    is what `cinegrade stats --matte ID` and `POST /api/stats {"matte": ID}`
+    use to measure "her face" or "the sky" as the matte says it moves,
+    rather than a fixed rectangle that has to be redrawn at every timestamp.
+    `region` and `weight` compose: crop `rgb` (and `weight`, to the same
+    rectangle) before calling this, this function itself does not crop.
+
+    `weight=None` (the default) is exactly today's unweighted behaviour,
+    computed by the original unweighted formulas rather than routed through
+    the weighted path with every weight equal to 1: the two give the same
+    numbers, but this way a caller that never passes `weight` gets output
+    that cannot drift from what it always was.
+
+    A `weight` that sums to zero (a matte with no coverage anywhere in this
+    frame, or in `region` if one was applied first) raises `StatsError`:
+    there is nothing to measure, and a percentile of an empty selection has
+    no honest answer to give back.
+    """
     a = rgb.astype(np.float32) / 255.0
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
     y = 0.2126 * r + 0.7152 * g + 0.0722 * b
@@ -75,7 +140,19 @@ def frame_stats(rgb: np.ndarray) -> dict:
     hue[i] = ((r - g)[i] / delta[i]) + 4.0
     hue = (hue * 60.0) % 360.0
 
-    total = float(y.size)
+    w = None
+    if weight is not None:
+        w = np.asarray(weight, dtype=np.float64)
+        if w.shape != y.shape:
+            raise StatsError(
+                f"weight shape {w.shape} does not match the frame {y.shape} "
+                f"(contract C6: weight is HxW at the picture's own size)")
+        if float(w.sum()) <= 0.0:
+            raise StatsError(
+                "weight sums to zero: nothing in this frame (or region) is "
+                "covered by the matte, so there is nothing to measure")
+
+    total = float(y.size) if w is None else float(w.sum())
     coloured = sat >= SAT_FLOOR
     families = {}
     for name, lo, hi in HUE_FAMILIES:
@@ -83,31 +160,40 @@ def frame_stats(rgb: np.ndarray) -> dict:
             sel = (hue >= lo) & (hue < hi)
         else:                                   # the warm family wraps past 360
             sel = (hue >= lo) | (hue < hi)
-        families[name] = round(float((sel & coloured).sum()) / total * 100.0, 2)
-    families["neutral"] = round(float((~coloured).sum()) / total * 100.0, 2)
+        families[name] = round(_wsum_pct(sel & coloured, w, total), 2)
+    families["neutral"] = round(_wsum_pct(~coloured, w, total), 2)
 
-    p5, p25, p50, p75, p95 = (float(v) for v in np.percentile(y, [5, 25, 50, 75, 95]))
+    if w is None:
+        p5, p25, p50, p75, p95 = (
+            float(v) for v in np.percentile(y, [5, 25, 50, 75, 95]))
+        sat_p95 = float(np.percentile(sat, 95))
+    else:
+        p5, p25, p50, p75, p95 = _weighted_percentiles(
+            y.ravel(), w.ravel(), [5, 25, 50, 75, 95])
+        (sat_p95,) = _weighted_percentiles(sat.ravel(), w.ravel(), [95])
     raw = rgb
-    clipped_black = float((raw.max(-1) <= CLIP_BLACK).sum()) / total * 100.0
-    clipped_white = float((raw.min(-1) >= CLIP_WHITE).sum()) / total * 100.0
+    clipped_black = _wsum_pct(raw.max(-1) <= CLIP_BLACK, w, total)
+    clipped_white = _wsum_pct(raw.min(-1) >= CLIP_WHITE, w, total)
 
     return {
         "luma": {
             "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),
             "p75": round(p75, 4), "p95": round(p95, 4),
-            "mean": round(float(y.mean()), 4),
-            "mean8": round(float(y.mean()) * 255.0, 1),
+            "mean": round(_wmean(y, w), 4),
+            "mean8": round(_wmean(y, w) * 255.0, 1),
             "min": round(float(y.min()), 4), "max": round(float(y.max()), 4),
         },
         "saturation": {
-            "mean": round(float(sat.mean()), 4),
-            "mean_coloured": round(float(sat[coloured].mean()) if coloured.any() else 0.0, 4),
-            "p95": round(float(np.percentile(sat, 95)), 4),
+            "mean": round(_wmean(sat, w), 4),
+            "mean_coloured": round(
+                _wmean(sat[coloured], None if w is None else w[coloured])
+                if coloured.any() else 0.0, 4),
+            "p95": round(sat_p95, 4),
         },
         "channels": {
-            "r": round(float(r.mean()), 4),
-            "g": round(float(g.mean()), 4),
-            "b": round(float(b.mean()), 4),
+            "r": round(_wmean(r, w), 4),
+            "g": round(_wmean(g, w), 4),
+            "b": round(_wmean(b, w), 4),
         },
         "families": families,
         "clipped": {
@@ -120,7 +206,7 @@ def frame_stats(rgb: np.ndarray) -> dict:
             "clip_white_code": CLIP_WHITE,
             "families": {n: [lo, hi] for n, lo, hi in HUE_FAMILIES},
         },
-        "bands": bands(rgb),
+        "bands": bands(rgb, weight=w),
     }
 
 
@@ -129,7 +215,8 @@ def frame_stats(rgb: np.ndarray) -> dict:
 # number instead of a guess from a scope of everything (bakeoff finding B6)
 # --------------------------------------------------------------------------
 
-def bands(rgb: np.ndarray, edges: list[float] | None = None) -> dict:
+def bands(rgb: np.ndarray, edges: list[float] | None = None,
+         weight: np.ndarray | None = None) -> dict:
     """Eight equal luma bands by default, each one's mean saturation, warm,
     tint and pixel count.
 
@@ -140,6 +227,16 @@ def bands(rgb: np.ndarray, edges: list[float] | None = None) -> dict:
     An empty band (no pixel of the frame falls in it) reports zeros rather
     than a NaN from an empty-slice mean, so a caller can print every band
     without checking count first.
+
+    `weight`, given (contract C6: HxW, same size as `rgb`, already validated
+    by `frame_stats` when it calls this), weights `saturation`, `warm` and
+    `tint` within each band by it. `count` stays the plain pixel count
+    either way, so it keeps meaning "how many pixels sit in this band" and
+    not "how much weight": a band a matte barely touches still shows its
+    real pixel count, with the weighted color numbers showing that the
+    matte itself contributed almost nothing. A band whose weight inside it
+    sums to zero (pixels present, but the matte covers none of them) reads
+    as empty the same way a band with zero pixels does.
 
     Measurement only: no band is flagged good or bad here, and nothing here
     compares one band against another.
@@ -166,13 +263,17 @@ def bands(rgb: np.ndarray, edges: list[float] | None = None) -> dict:
         sel = (y >= lo) & (y <= hi) if i == n - 1 else (y >= lo) & (y < hi)
         c = int(sel.sum())
         count.append(c)
-        if c == 0:
+        band_weight = None if weight is None else weight[sel]
+        empty = c == 0 or (band_weight is not None and float(band_weight.sum()) <= 0.0)
+        if empty:
             saturation.append(0.0)
             warm.append(0.0)
             tint.append(0.0)
             continue
-        saturation.append(round(float(sat[sel].mean()), 4))
-        rm, gm, bm = float(r[sel].mean()), float(g[sel].mean()), float(b[sel].mean())
+        saturation.append(round(_wmean(sat[sel], band_weight), 4))
+        rm = _wmean(r[sel], band_weight)
+        gm = _wmean(g[sel], band_weight)
+        bm = _wmean(b[sel], band_weight)
         warm.append(round(rm - bm, 4))
         tint.append(round(gm - 0.5 * (rm + bm), 4))
     return {

@@ -537,6 +537,17 @@ COVERED_ELSEWHERE = {
     # another layer, with the look, or with its own matte, which one parameter
     # swept between two values cannot show; the layers group renders them
     # against each other instead. The name is not read by the engine at all.
+    # The mask component stack (C1). A list, not a scalar, so leaf_paths
+    # stops at it and a lo/hi sweep has nothing to sweep: what a stack means
+    # is which pixels it selects, which is what the whole mask group renders
+    # and asserts against the numpy reference. The finesse controls are
+    # scalars, but each one is a no-op until there is a stack to apply it to,
+    # so they are asserted there too rather than against a bare layer here.
+    "layers.0.mask.components": "mask.add_is_the_union",
+    "layers.0.mask.finesse.blur": "mask.finesse_blur",
+    "layers.0.mask.finesse.grow": "mask.finesse_grow",
+    "layers.0.mask.finesse.clean_black": "mask.finesse_clean_renders",
+    "layers.0.mask.finesse.clean_white": "mask.finesse_clean_renders",
     "layers.0.name": "not rendered: the layer's label, carried for the UI",
     "layers.0.placement": "layers.after_look_differs_from_before_look",
     "layers.0.mask.invert": "layers.mask_invert_flips_which_pixels_change",

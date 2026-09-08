@@ -1572,8 +1572,31 @@ LAYER_DEFAULTS = {
         # colour matte over black through the window matte, so what comes out
         # is the product of the two: the selection the layer will really make.
         "show": False,
-        # Inverts the COMBINED matte (window times key), not either half.
+        # Inverts the COMBINED matte, not either half. On a legacy mask that
+        # is window times key; on a component stack it is the folded stack
+        # after finesse.
         "invert": False,
+        # Mask model v2 (contract C1). EMPTY means the legacy mask below is
+        # what the layer uses, and the engine emits exactly the graph it
+        # emitted before components existed. A non empty list means the
+        # component stack IS the mask and `window` and `key` below are
+        # ignored. See MASK_COMPONENT_DEFAULTS for one component's fields.
+        "components": [],
+        # Matte finesse, applied to the COMBINED matte of a component stack
+        # (DaVinci's matte finesse controls). Every value at its default is a
+        # no-op that emits no filter at all, so a mask that does not use them
+        # costs nothing. Ignored by the legacy path.
+        "finesse": {
+            # A gaussian on the finished matte, sigma as a fraction of frame
+            # width, so it means the same softness at every render size.
+            "blur": 0.0,
+            # Positive grows the matte, negative shrinks it, as a fraction of
+            # frame width. One pixel of radius is one dilation/erosion pass.
+            "grow": 0.0,
+            # Push the bottom of the matte to 0 and the top to 1, with a soft
+            # knee that grows with the amount. Both 0 is the identity.
+            "clean_black": 0.0, "clean_white": 0.0,
+        },
         # Every geometric value is a FRACTION of the frame, never a pixel
         # count. That is what lets a 960 wide preview and a 3840 wide render
         # agree without scale_for_preview needing a case for any of it: the
@@ -1641,6 +1664,38 @@ def _soft_window(x, low, high, soft):
     return np.minimum(up, down)
 
 
+def key_matte(k: dict, hue, sat, luma):
+    """The HSL qualifier's matte, for already-decomposed hue, sat and luma.
+
+    Lifted out of layer_lut unchanged (same operations in the same order, so
+    the cube it bakes is bit for bit the one it always baked) because a `key`
+    COMPONENT in a mask stack (C1) needs the same matte on a picture rather
+    than on a 33-cube grid, and two copies of a qualifier is exactly how the
+    engine and the GPU would drift apart.
+
+    `hue` is in degrees, `sat` and `luma` in 0..1, any shape as long as the
+    three agree. A disabled key selects everything, which is what makes it
+    the identity element of the stack rather than a hole in it.
+    """
+    import numpy as np
+    if not k.get("enabled"):
+        return np.ones(np.shape(hue), dtype=np.float64)
+    # Hue is circular, so distance has to wrap. Everything else is a plain
+    # range on a bounded quantity.
+    d = np.abs(((hue - float(k["hue_center"]) + 180.0) % 360.0) - 180.0)
+    half = max(1e-6, float(k["hue_width"]) / 2.0)
+    hs = max(1e-6, float(k["hue_soft"]))
+    w_hue = np.clip(((half + hs) - d) / hs, 0.0, 1.0)
+    w_sat = _soft_window(sat, float(k["sat_low"]), float(k["sat_high"]),
+                         float(k["sat_soft"]))
+    w_lum = _soft_window(luma, float(k["lum_low"]), float(k["lum_high"]),
+                         float(k["lum_soft"]))
+    m = w_hue * w_sat * w_lum
+    if k.get("invert"):
+        m = 1.0 - m
+    return m
+
+
 def config_layers(cfg) -> list[dict]:
     """Every layer in a config, each filled in from LAYER_DEFAULTS."""
     return [deep_merge(LAYER_DEFAULTS, layer or {})
@@ -1655,10 +1710,17 @@ def layer_active(layer: dict) -> bool:
     mask components: the matte of a layer with no mask is 1, inverting it
     gives 0, and a correction merged under a matte of 0 is the picture. It
     drops out rather than costing a cube lookup that cannot change a pixel.
+
+    A component stack folds from ZERO rather than from one (C1), so the same
+    rule reads the other way round there: a stack that reaches nothing is
+    inactive, and inverting that same stack selects the WHOLE frame, which is
+    a global correction and very much active.
     """
     if not layer.get("enabled"):
         return False
     mask = layer["mask"]
+    if has_components(layer):
+        return bool(stack_components(layer)) or bool(mask.get("invert"))
     if (mask.get("invert") and not mask["window"].get("enabled")
             and not mask["key"].get("enabled")):
         return False
@@ -1678,7 +1740,12 @@ def layer_window(layer: dict):
     the flipped block and one branch is enough. With the key ON as well,
     layer_branches() grades two branches instead and the window matte itself
     is left alone.
+
+    A component stack never gets here: its window components are components,
+    not this block, and its invert is one negate on the finished matte.
     """
+    if has_components(layer):
+        return None
     mask = layer["mask"]
     win = mask["window"]
     if not win.get("enabled"):
@@ -1703,7 +1770,13 @@ def layer_branches(layer: dict) -> list[str]:
     returns its first input where the matte is 0 and its second where it is
     maxval, which is precisely that arrangement, so the factorisation is exact
     rather than an approximation of it.
+
+    A component stack is always one branch: the matte carries every selection
+    the layer makes, including its own invert, so the cube is always the full
+    correction and the factoring above is a legacy-only subtlety.
     """
+    if has_components(layer):
+        return ["one"]
     mask = layer["mask"]
     if not mask.get("invert"):
         return ["key" if mask["key"].get("enabled") else "one"]
@@ -1784,22 +1857,7 @@ def layer_lut(layer: dict, variant: str = "key"):
     hue, sat, val = C.rgb_to_hsv(grid)
     luma = C.luma709(grid)[..., 0]
 
-    if not k.get("enabled"):
-        m = np.ones(grid.shape[:-1], dtype=np.float64)
-    else:
-        # Hue is circular, so distance has to wrap. Everything else is a plain
-        # range on a bounded quantity.
-        d = np.abs(((hue - float(k["hue_center"]) + 180.0) % 360.0) - 180.0)
-        half = max(1e-6, float(k["hue_width"]) / 2.0)
-        hs = max(1e-6, float(k["hue_soft"]))
-        w_hue = np.clip(((half + hs) - d) / hs, 0.0, 1.0)
-        w_sat = _soft_window(sat, float(k["sat_low"]), float(k["sat_high"]),
-                             float(k["sat_soft"]))
-        w_lum = _soft_window(luma, float(k["lum_low"]), float(k["lum_high"]),
-                             float(k["lum_soft"]))
-        m = w_hue * w_sat * w_lum
-        if k.get("invert"):
-            m = 1.0 - m
+    m = key_matte(k, hue, sat, luma)
     if variant == "one":
         m = np.ones(grid.shape[:-1], dtype=np.float64)
     elif variant == "inv":
@@ -1960,14 +2018,27 @@ def build_layers(cfg, info, placement, src_label, pending, out_label):
         blur = [f"gblur=sigma={sigma:.3f}"] if sigma > 0 else []
         cubes = [f"lut3d=file={esc(layer_lut(layer, v))}:interp=tetrahedral"
                  for v in layer_branches(layer)]
-        if win is None:
+        # A component stack builds its own matte here rather than arriving as
+        # one baked input, because a `key` component reads the PICTURE at this
+        # point in the tree (after the CST, the curves and every earlier
+        # layer), which is the only place that signal exists. The spatial
+        # components are still plain inputs; graph_with_mask labels them
+        # cm<layer>_<component> and this function consumes those labels.
+        keys = [(j, c) for j, c in stack_components(layer)
+                if component_type(c) == "key"]
+        stack = has_components(layer) and bool(stack_components(layer))
+        if win is None and not stack:
             chain += cubes[:1] + blur
             continue
         tag = f"ly{i}"
         segs.append(f"[{cur}]{','.join(chain) if chain else 'null'}[{tag}i]")
         chain = []
         cur = f"{tag}i"
-        segs.append(f"[{cur}]split=2[{tag}a][{tag}b]")
+        outs = "".join(f"[{tag}k{j}]" for j, _c in keys)
+        segs.append(f"[{cur}]split={2 + len(keys)}[{tag}a][{tag}b]{outs}")
+        if stack:
+            segs += mask_stack_segments(
+                layer, i, info, {j: f"{tag}k{j}" for j, _c in keys})
         if len(cubes) > 1:
             segs.append(f"[{tag}a]{','.join(cubes[:1] + blur)}[{tag}a2]")
             base = f"{tag}a2"
@@ -1990,6 +2061,773 @@ def build_layers(cfg, info, placement, src_label, pending, out_label):
         segs.append(f"[{cur}]{','.join(chain)}[{out_label}]")
         cur = out_label
     return segs, cur
+
+
+# --- mask components (contract C1: the mask model v2) ----------------------
+#
+# A layer's mask used to be exactly two things multiplied: one power window
+# and one colour key, with `invert` on the product. That is a Lightroom
+# "subject and nothing else" mask with no way to say "the sky, minus the
+# building, plus this gradient". The component stack says it: a list of
+# sources, each combined into the running matte with add (max), intersect
+# (multiply) or subtract (multiply by the complement).
+#
+# Three rules make the rest of the code readable:
+#
+#   1. `components` empty or absent IS the legacy mask, byte for byte. Every
+#      function above tests has_components() first and falls through to the
+#      code that shipped, so no existing preset can move by a code value.
+#   2. The stack folds from ZERO, top to bottom, exactly as C1 states. So the
+#      first component that actually contributes has to be an `add`, and
+#      anything before it is dropped once, in stack_components(), rather than
+#      three times in three places that could disagree.
+#   3. Every component becomes ONE greyscale stream at frame size in
+#      gray16le, whatever its type. Once they are all the same kind of thing
+#      the ops are three ffmpeg blend modes and nothing else.
+#
+# Why gray16le rather than 8 bit gray: the matte ends up in maskedmerge as
+# gbrp16le, and the hop gray -> gray16le -> gbrp16le is a multiply by 257
+# that reaches 65535 exactly (see graph_with_mask, where the 8-bit shortcut
+# cost 0.39% of every correction). Doing the whole fold at 16 bits keeps that
+# property through a stack of blurs and blends instead of quantising twice.
+
+MASK_FINESSE_DEFAULTS = LAYER_DEFAULTS["mask"]["finesse"]
+MASK_KEY_TEMPLATE = LAYER_DEFAULTS["mask"]["key"]
+
+# One component, filled in. `type` picks which of the three sub blocks is
+# read; the others are ignored rather than validated, so a UI can keep a
+# window it is not using while the user tries a text prompt.
+MASK_COMPONENT_DEFAULTS = {
+    "id": "",
+    # matte | key | luma | window
+    "type": "window",
+    # add | intersect | subtract, against the running matte
+    "op": "add",
+    "enabled": True,
+    # Flips THIS component before the op, which is not the same as flipping
+    # the finished matte: subtracting an inverted sky is not the same as
+    # inverting the result of subtracting the sky.
+    "invert": False,
+    # A gaussian on this component alone, sigma as a fraction of frame width.
+    "feather": 0.0,
+    "window": dict(LAYER_DEFAULTS["mask"]["window"], enabled=True),
+    "key": dict(LAYER_DEFAULTS["mask"]["key"], enabled=True),
+    # C1: the id names a matte in the registry, the recipe is the request
+    # that made it, so a preset carried to another clip can queue the track
+    # again instead of shipping somebody else's pixels.
+    "matte": {"id": "", "recipe": {}},
+}
+
+MASK_OPS = ("add", "intersect", "subtract")
+MASK_TYPES = ("matte", "key", "luma", "window")
+
+# How many dilation/erosion passes a grow is allowed to become. One pass is
+# one pixel of radius, and each is a real filter in the graph, so an
+# unbounded grow on a 4K frame would write hundreds of filters and run for
+# minutes. 32 pixels of grow at any sane working width is already a very
+# large move; past it the value clamps, which is a cap on the CONTROL and
+# not on the matte (a grow that big is a different tool: use a blur).
+MASK_GROW_MAX = 32
+
+# The full swing of the matte chain. Written out rather than taken from
+# ffmpeg's `maxval`, because ffmpeg's lut filter reports maxval as 65280 on
+# gray16le on this build and clips its own output there (measured), which is
+# why the clean knee below is a geq and not a lut.
+MASK_MAX = 65535
+
+
+def has_components(layer: dict) -> bool:
+    """True when this layer's mask is a component stack rather than the pair.
+
+    Deliberately "the list is not empty" and not "the list has an enabled
+    entry": a user who switches every component off has still chosen the
+    component model, and silently falling back to a legacy window and key
+    they cannot see would be a worse surprise than a mask that selects
+    nothing.
+    """
+    return bool((layer.get("mask") or {}).get("components"))
+
+
+def mask_components(layer: dict) -> list[dict]:
+    """Every component of a layer, each filled in from the template."""
+    comps = (layer.get("mask") or {}).get("components") or []
+    return [deep_merge(MASK_COMPONENT_DEFAULTS, c or {}) for c in comps]
+
+
+def stack_components(layer: dict) -> list[tuple]:
+    """(index, component) for the components that actually reach the matte.
+
+    Enabled, and after the first one that can contribute. Folding from zero
+    means an `intersect` or a `subtract` at the top of the stack is zero
+    times something and one times nothing: it cannot change the answer, so it
+    is dropped here rather than emitting an ffmpeg input and a blend that
+    multiply a black frame by another black frame.
+
+    Dropping them in ONE place is the point. The input list, the graph and
+    the numpy reference all walk this function, so they cannot disagree about
+    which components exist, and an input with no consumer is a hard ffmpeg
+    error rather than a slightly wrong picture.
+    """
+    out = []
+    for j, comp in enumerate(mask_components(layer)):
+        if not comp.get("enabled", True):
+            continue
+        if not out and str(comp.get("op") or "add") != "add":
+            continue
+        out.append((j, comp))
+    return out
+
+
+def component_type(comp: dict) -> str:
+    """The component's type, with `luma` folded into `key`.
+
+    C1 calls luma "a key with hue and sat disabled: a convenience the UI
+    writes as a key", so the engine has three real types and luma is spelled
+    out in component_key() rather than carried as a fourth branch through
+    every function below.
+    """
+    t = str(comp.get("type") or "window").lower()
+    if t not in MASK_TYPES:
+        raise GradeError(
+            f"mask component type {t!r} is not one of {', '.join(MASK_TYPES)}")
+    return "key" if t == "luma" else t
+
+
+def component_op(comp: dict) -> str:
+    op = str(comp.get("op") or "add").lower()
+    if op not in MASK_OPS:
+        raise GradeError(
+            f"mask component op {op!r} is not one of {', '.join(MASK_OPS)}")
+    return op
+
+
+def component_window(comp: dict) -> dict:
+    """The window block a `window` component describes.
+
+    Forced enabled: the component's own `enabled` is the switch, and a UI
+    that leaves the inner flag at its default should not produce a mask that
+    silently selects nothing.
+    """
+    return deep_merge(WINDOW_TEMPLATE, dict(comp.get("window") or {},
+                                            enabled=True))
+
+
+def component_key(comp: dict) -> dict:
+    """The qualifier a `key` or `luma` component keys on.
+
+    `luma` opens the hue and saturation halves all the way (hue width 360
+    covers every angle, saturation 0 to 1 covers every pixel), so what is
+    left is the luminance range alone. Written as a real key rather than as
+    a flag, because then the same cube baker, the same numpy reference and
+    the same GPU shader serve both and there is one qualifier in this engine,
+    not two.
+    """
+    k = deep_merge(MASK_KEY_TEMPLATE, dict(comp.get("key") or {}, enabled=True))
+    if str(comp.get("type") or "").lower() == "luma":
+        k = dict(k, hue_center=0.0, hue_width=360.0, hue_soft=1.0,
+                 sat_low=0.0, sat_high=1.0, sat_soft=0.1)
+    return k
+
+
+def component_matte_ref(comp: dict) -> dict:
+    return dict(comp.get("matte") or {})
+
+
+def key_matte_lut(key: dict):
+    """The qualifier baked as a GREYSCALE 33-cube: the matte, not a grade.
+
+    This is layer_lut's own matte view path, reached with a layer that is
+    nothing but this key and `show` on, so a key component's matte in the
+    engine is the exact table the matte view has always drawn and there is no
+    second implementation of the qualifier to keep in step.
+    """
+    return layer_lut({"mask": {"show": True, "key": dict(key, enabled=True)}},
+                     "key")
+
+
+def white_cube():
+    """A cube that maps every colour to white, cached once.
+
+    The second half of the matte view for a component stack: maskedmerge
+    between a blacked out branch and this one, under the matte, comes out as
+    the matte itself at full swing. Built through layer_lut with a canonical
+    layer so it is one file rather than one per layer that happens to have a
+    different key.
+    """
+    return layer_lut({"mask": {"show": True}}, "one")
+
+
+# --------------------------------------------------------------------------
+# the matte store, as an ffmpeg input
+# --------------------------------------------------------------------------
+
+def _mattes():
+    """grade/mattes.py, imported lazily.
+
+    Lazily because cinegrade is imported by tools that never touch a mask,
+    and because mattes.py imports numpy, which this module is careful to keep
+    out of its import time cost.
+    """
+    sys.path.insert(0, str(ROOT))
+    import mattes
+    return mattes
+
+
+def resolve_matte(ref, root=None):
+    """A component's matte reference to a MatteInfo, or None when it is not there.
+
+    Returns (info, reason). `reason` is None when the matte resolved, and a
+    sentence for the warnings list when it did not: no id yet (the component
+    is waiting for a pick), or an id that names nothing in the store.
+
+    Never raises for a missing matte. A preview of a grade whose track is
+    still queued has to draw something, and the policy about whether that is
+    good enough to RENDER lives in require_complete_mattes().
+    """
+    MT = _mattes()
+    matte_id = str((ref or {}).get("id") or "").strip()
+    if not matte_id:
+        return None, "matte component has no matte id yet (needs a pick or a track)"
+    try:
+        return MT.resolve(root if root is not None else MT.matte_root(),
+                          matte_id), None
+    except MT.MatteMissing:
+        return None, f"matte {matte_id} is not in the store"
+    except MT.MatteError as exc:
+        return None, f"matte {matte_id}: {exc}"
+
+
+def flat_mask(value: int, w: int, h: int):
+    """A cached constant grey still, the stand-in for a matte that is not there.
+
+    A matte component whose track has not written a frame yet renders as
+    black (the layer changes nothing) rather than failing the preview, and
+    the warning says why. Baked the same way window_mask bakes: one bounded
+    ffmpeg call, cached by size and value.
+    """
+    v = max(0, min(255, int(value)))
+    LUT_MASKS.mkdir(parents=True, exist_ok=True)
+    p = LUT_MASKS / f"flat_{v}_{w}x{h}.png"
+    if not p.exists():
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", f"color=c=black:s={w}x{h}:d=1",
+             "-vf", f"format=gray,geq=lum='{v}'",
+             "-frames:v", "1", str(p)], check=True)
+    return p
+
+
+def matte_input_args(ref, info: dict, seek=None, root=None) -> tuple:
+    """The ffmpeg input for one matte component, and any warning it carries.
+
+    Three shapes, decided by mattes.sequence_plan():
+
+      the frame at the seek is written    an image2 SEQUENCE, started at that
+                                          frame number and read at the
+                                          matte's own fps, so frame n of the
+                                          render reads frame start+n of the
+                                          matte. When the sequence runs out
+                                          ffmpeg's framesync holds the last
+                                          frame, which is exactly the nearest
+                                          written frame fallback C1 asks for.
+      it is not written                   the nearest written frame as a
+                                          single still, held for the whole
+                                          render. This is the "static until
+                                          tracked" state: a pick has one
+                                          frame and this is how it is used.
+      nothing is written at all           a flat black still, so the layer
+                                          contributes nothing and the render
+                                          still runs.
+
+    `seek` is the render's own start time in seconds, the same number that
+    goes to -ss, because the matte's frame numbering is round(t * fps) on the
+    CLIP's timeline and not on the output's.
+    """
+    MT = _mattes()
+    minfo, reason = resolve_matte(ref, root)
+    if minfo is None:
+        return ["-i", str(flat_mask(0, info["width"], info["height"]))], reason
+    fps = float(minfo.fps or 0.0)
+    if fps <= 0:
+        fps = float(info.get("fps") or 0.0) or 24.0
+    start = MT.frame_index(minfo, float(seek or 0.0))
+    plan = MT.sequence_plan(minfo, start)
+    if plan["mode"] == "sequence":
+        warn = None
+        if minfo.is_partial:
+            warn = (f"matte {minfo.matte_id} is {minfo.state}: "
+                    f"{minfo.written_count} of {minfo.total_frames} frames "
+                    f"written, {plan['available']} of them from frame {start}")
+        return (["-framerate", f"{fps:g}", "-start_number", str(start),
+                 "-i", plan["pattern"]], warn)
+    if plan["mode"] == "still":
+        return (["-i", str(plan["path"])],
+                f"matte {minfo.matte_id}: frame {start} is not tracked yet, "
+                f"holding frame {plan['start']} ({minfo.state}, "
+                f"{minfo.written_count} of {minfo.total_frames} frames)")
+    return (["-i", str(flat_mask(0, info["width"], info["height"]))],
+            f"matte {minfo.matte_id} has no frames written yet ({minfo.state})")
+
+
+def mask_inputs(cfg) -> list[dict]:
+    """Every generated still or sequence a config's masks need, in input order.
+
+    One list, walked by the input builder, by the index map and by the graph
+    builder, for the reason window_layers already gives: three places have to
+    agree on the order and disagreeing does not raise, it renders the wrong
+    picture in silence.
+
+    Array order by layer, then component order inside a layer. A layer with a
+    legacy window contributes one entry with `component` None; a component
+    stack contributes one per spatial component and none for its keys, which
+    read the picture instead of an input.
+    """
+    out = []
+    for i, layer in enumerate(config_layers(cfg)):
+        if not layer_active(layer):
+            continue
+        if has_components(layer):
+            for j, comp in stack_components(layer):
+                kind = component_type(comp)
+                if kind == "window":
+                    out.append({"layer": i, "component": j, "kind": "window",
+                                "window": component_window(comp)})
+                elif kind == "matte":
+                    out.append({"layer": i, "component": j, "kind": "matte",
+                                "matte": component_matte_ref(comp)})
+            continue
+        win = layer_window(layer)
+        if win is not None:
+            out.append({"layer": i, "component": None, "kind": "window",
+                        "window": win})
+    return out
+
+
+def mask_extra_inputs(cfg, info, seek=None, strict_mattes: bool = False,
+                      duration=None, root=None) -> list[str]:
+    """The `-i` arguments for every mask still and sequence, in order.
+
+    THE one function a caller outside this module should use for the mask
+    half of an input list. studio/server.py builds its own input lists twice
+    (the grade-only pass over a piped source frame, and the playback pass),
+    and both of them used to inline the window loop; calling this instead is
+    what keeps a component stack's inputs from being missing there, which
+    would not raise but would read the wrong input index and render a wrong
+    picture.
+
+    `seek` is the render's start time in seconds and matters only to matte
+    components; `duration` bounds how many frames the caller will actually
+    read, so a five second render off a partially tracked clip is refused for
+    the five seconds it wants rather than for the whole clip.
+    `strict_mattes` refuses a partial or missing matte instead of falling
+    back (see require_complete_mattes).
+    """
+    if strict_mattes:
+        require_complete_mattes(cfg, info, seek=seek, duration=duration,
+                                root=root)
+    args = []
+    for entry in mask_inputs(cfg):
+        if entry["kind"] == "window":
+            args += ["-i", str(window_mask(entry["window"], info["width"],
+                                           info["height"]))]
+        else:
+            more, _warn = matte_input_args(entry["matte"], info, seek, root)
+            args += more
+    return args
+
+
+def mask_warnings(cfg, info, seek=None, duration=None, root=None) -> list[dict]:
+    """What is wrong with this config's mattes, as the `warnings` list of C1.
+
+    One entry per matte component that cannot fully answer for the range
+    asked for, each with the layer and component it belongs to so a UI can
+    badge the right row:
+
+        {"layer": 2, "component": 0, "matte": "m_9f3c", "state": "running",
+         "kind": "missing" | "pending" | "partial", "message": "..."}
+
+    `kind` separates the three cases a caller treats differently: `missing`
+    is an id that names nothing (or no id at all: the component is waiting
+    for a pick), `pending` is a matte with no frames yet, and `partial` is a
+    matte that covers some of the range and not the rest.
+
+    Never raises. This is the report; the refusal is the next function.
+    """
+    MT = _mattes()
+    out = []
+    for entry in mask_inputs(cfg):
+        if entry["kind"] != "matte":
+            continue
+        ref = entry["matte"]
+        minfo, reason = resolve_matte(ref, root)
+        if minfo is None:
+            out.append({"layer": entry["layer"], "component": entry["component"],
+                        "matte": str(ref.get("id") or ""), "state": "missing",
+                        "kind": "missing", "message": reason})
+            continue
+        start = MT.frame_index(minfo, float(seek or 0.0))
+        count = None
+        if duration:
+            fps = float(minfo.fps or 0.0) or float(info.get("fps") or 0.0) or 24.0
+            count = max(1, int(math.ceil(float(duration) * fps)))
+        plan = MT.sequence_plan(minfo, start, count)
+        if plan["mode"] == "none":
+            out.append({"layer": entry["layer"], "component": entry["component"],
+                        "matte": minfo.matte_id, "state": minfo.state,
+                        "kind": "pending",
+                        "message": f"matte {minfo.matte_id} has no frames "
+                                   f"written yet ({minfo.state})"})
+            continue
+        if plan["missing"] > 0 or plan["mode"] == "still" or minfo.is_partial:
+            out.append({
+                "layer": entry["layer"], "component": entry["component"],
+                "matte": minfo.matte_id, "state": minfo.state, "kind": "partial",
+                "message": (
+                    f"matte {minfo.matte_id} covers {plan['available']} of "
+                    f"{plan['wanted']} frames from frame {start} "
+                    f"({minfo.state}, {minfo.written_count} of "
+                    f"{minfo.total_frames} written)")})
+    return out
+
+
+def require_complete_mattes(cfg, info, seek=None, duration=None, root=None):
+    """Refuse to render on a matte that does not cover the range (C1).
+
+    "An agent cannot ship a clip whose subject hold ran out at frame 200
+    without saying so." The refusal names the layer, the component and the
+    matte, so the fix (wait for the track, or pass allow_partial) is obvious
+    from the error alone.
+
+    Preview, stills and scopes never call this: a grade in progress is
+    supposed to show whatever the tracker has managed so far. Only a render
+    does, and only when the caller has not passed allow_partial.
+    """
+    bad = mask_warnings(cfg, info, seek=seek, duration=duration, root=root)
+    if not bad:
+        return []
+    lines = [f"  layer {w['layer']} component {w['component']}: {w['message']}"
+             for w in bad]
+    raise GradeError(
+        "this render needs a matte that is not finished:\n"
+        + "\n".join(lines)
+        + "\nwait for the track, or render with allow_partial to accept it.")
+
+
+# --------------------------------------------------------------------------
+# the component stack as a filter graph
+# --------------------------------------------------------------------------
+
+def component_label(layer_index: int, comp_index: int) -> str:
+    """The label graph_with_mask puts a spatial component's input on."""
+    return f"cm{layer_index}_{comp_index}"
+
+
+def clean_geq(clean_black: float, clean_white: float) -> str:
+    """The clean black / clean white knee, as a geq expression on the matte.
+
+    Definition, in 0..1 on the matte value v:
+
+        lo   = clean_black                 everything under this goes to 0
+        hi   = 1 - clean_white             everything over this goes to 1
+        t    = clip((v - lo) / (hi - lo), 0, 1)
+        knee = clip(clean_black + clean_white, 0, 1)
+        m    = t + (t*t*(3 - 2*t) - t) * knee
+
+    The knee is BLENDED IN by how much cleaning was asked for rather than
+    applied outright, so the control is continuous: at 0 and 0 the expression
+    is the identity (and the caller emits no filter at all), and a tiny clean
+    is a tiny move rather than a smoothstep suddenly appearing across the
+    whole matte. At full cleaning it is a smoothstep over the surviving
+    range, which is the soft knee the contract asks for.
+
+    A geq and not a lut: ffmpeg's lut filter reports maxval as 65280 on
+    gray16le and clips its own output there on this build, so a cleaned matte
+    would top out at 99.6% and quietly hold back 0.4% of every correction.
+    That exact class of bug is already recorded in graph_with_mask's comment;
+    this is the second time it has been worth paying a per pixel expression
+    to avoid it.
+    """
+    lo = min(0.999, max(0.0, float(clean_black)))
+    hi = max(lo + 1e-3, 1.0 - max(0.0, float(clean_white)))
+    knee = min(1.0, max(0.0, float(clean_black) + float(clean_white)))
+    den = hi - lo
+    # Rounded once, for the reason _window_geometry rounds once: the numpy
+    # reference and the expression have to read the same decimal string.
+    lo_s, den_s, knee_s = f"{lo:.6f}", f"{den:.6f}", f"{knee:.6f}"
+    # `;` and not `,` between the two halves: ffmpeg's expression language
+    # uses the semicolon as its sequence operator ("evaluate both, return the
+    # second"), and a comma there is a parse error. Single quotes around the
+    # whole expression are what keep that semicolon from being read as the
+    # filtergraph's own segment separator.
+    t = f"st(0,clip((p(X,Y)/{MASK_MAX}-{lo_s})/{den_s},0,1))"
+    m = f"ld(0)+(ld(0)*ld(0)*(3-2*ld(0))-ld(0))*{knee_s}"
+    return f"{t};clip({MASK_MAX}*({m}),0,{MASK_MAX})"
+
+
+def clean_curve(v, clean_black: float, clean_white: float):
+    """The numpy reference for clean_geq, on a 0..1 array."""
+    import numpy as np
+    lo = min(0.999, max(0.0, float(clean_black)))
+    hi = max(lo + 1e-3, 1.0 - max(0.0, float(clean_white)))
+    knee = min(1.0, max(0.0, float(clean_black) + float(clean_white)))
+    lo = float(f"{lo:.6f}")
+    den = float(f"{hi - lo:.6f}")
+    knee = float(f"{knee:.6f}")
+    t = np.clip((np.asarray(v, dtype=np.float64) - lo) / den, 0.0, 1.0)
+    return np.clip(t + (t * t * (3.0 - 2.0 * t) - t) * knee, 0.0, 1.0)
+
+
+def finesse_filters(finesse: dict, info: dict) -> list[str]:
+    """Matte finesse as a filter chain, in the order clean, grow, blur.
+
+    Clean first because it fixes the LEVELS, and levels are what the other
+    two spread around: cleaning after a blur would eat the softness the blur
+    was asked for. Grow next, because moving the edge is a decision about
+    where the matte ends. Blur last, so the softness survives.
+
+    Every control at its default emits nothing at all, so a mask that does
+    not use finesse costs not one filter, and a config that has never heard
+    of finesse renders the identical graph.
+    """
+    f = deep_merge(MASK_FINESSE_DEFAULTS, finesse or {})
+    width = float(info["width"])
+    out = []
+    cb = max(0.0, min(1.0, float(f.get("clean_black", 0.0) or 0.0)))
+    cw = max(0.0, min(1.0, float(f.get("clean_white", 0.0) or 0.0)))
+    if cb > 0 or cw > 0:
+        out.append(f"geq=lum='{clean_geq(cb, cw)}'")
+    grow = float(f.get("grow", 0.0) or 0.0)
+    passes = min(MASK_GROW_MAX, int(round(abs(grow) * width)))
+    if passes > 0:
+        out += ["dilation" if grow > 0 else "erosion"] * passes
+    blur = float(f.get("blur", 0.0) or 0.0)
+    if blur > 0:
+        out.append(f"gblur=sigma={blur * width:.3f}")
+    return out
+
+
+def mask_stack_segments(layer: dict, index: int, info: dict,
+                        key_labels: dict) -> list[str]:
+    """The segments that fold a component stack into the matte label lw<i>.
+
+    `key_labels` maps a key component's index to the picture branch
+    build_layers split off for it; every other component reads the input
+    label graph_with_mask made for it.
+
+    The three ops, on gray16le, measured exact at full swing:
+
+        add        blend=all_mode=lighten    max(a, b)
+        intersect  blend=all_mode=multiply   a * b / maxval
+        subtract   negate then multiply      a * (maxval - b) / maxval
+
+    ffmpeg's multiply truncates that divide rather than rounding it, so a
+    16 bit fold sits up to one part in 65535 below the exact product per op.
+    `mask_matte` below is the same arithmetic in float, and the gap between
+    them is a fiftieth of an 8 bit code value: the suite measures 0
+    disagreement between the two at 8 bit and asserts it.
+
+    Per component, in this order: the source, its own invert (negate), its
+    feather (a gaussian in fractions of frame width), then the op. Invert
+    before feather on purpose: feathering an inverted component softens the
+    edge of what it now selects, which is what the control means, whereas
+    the other order softens the edge of what it used to select and then
+    flips it, giving a matte that is 1 minus a soft edge instead of a soft
+    edge.
+
+    The finished matte then takes the finesse, then mask.invert, then the hop
+    into gbrp16le that maskedmerge needs.
+    """
+    segs = []
+    acc = None
+    for j, comp in stack_components(layer):
+        kind = component_type(comp)
+        chain = []
+        if kind == "key":
+            src = key_labels[j]
+            cube = key_matte_lut(component_key(comp))
+            # extractplanes rather than format=gray: a colour to luma
+            # conversion runs through swscale's range handling, which is
+            # worth up to 20 code values here (window_geq's docstring records
+            # the same trap). The cube writes the matte into all three
+            # channels, so ONE plane is the matte exactly, and setrange
+            # pins it full so the hop to gbrp16le at the end cannot decide
+            # to expand a limited range signal it never had.
+            chain += [f"lut3d=file={esc(cube)}:interp=tetrahedral",
+                      "extractplanes=g", "setrange=full"]
+        else:
+            src = component_label(index, j)
+        if comp.get("invert"):
+            chain.append("negate")
+        feather = float(comp.get("feather", 0.0) or 0.0)
+        if feather > 0:
+            chain.append(f"gblur=sigma={feather * float(info['width']):.3f}")
+        op = component_op(comp)
+        if op == "subtract":
+            chain.append("negate")
+        label = f"mc{index}_{j}"
+        segs.append(f"[{src}]{','.join(chain) if chain else 'null'}[{label}]")
+        if acc is None:
+            # stack_components guarantees the first one is an add, so the
+            # fold from zero starts here: max(0, c) is c.
+            acc = label
+            continue
+        mode = "lighten" if op == "add" else "multiply"
+        out = f"mo{index}_{j}"
+        segs.append(f"[{acc}][{label}]blend=all_mode={mode}[{out}]")
+        acc = out
+    if acc is None:
+        # No caller can build a matte out of nothing: with no component to
+        # start from there is no stream to attach the finesse to, and
+        # formatting the label anyway would emit a graph reading a filter
+        # named "None" and ffmpeg would fail somewhere far from the cause.
+        # build_layers already treats an empty stack as an inactive layer
+        # (or, with mask.invert, as a global correction); anyone else
+        # calling this has to check stack_components() the same way.
+        raise GradeError(
+            f"layer {index} has no enabled mask component to fold: "
+            "check stack_components() before calling mask_stack_segments "
+            "(a stack whose first enabled component is not an add folds to "
+            "nothing, because the fold starts at zero)")
+    tail = finesse_filters((layer.get("mask") or {}).get("finesse"), info)
+    if (layer.get("mask") or {}).get("invert"):
+        # After the finesse, because C1 says invert flips the RESULT: the
+        # user cleans up the matte they can see and then asks for everything
+        # else.
+        tail.append("negate")
+    tail += ["format=gbrp16le", "setsar=1"]
+    segs.append(f"[{acc}]{','.join(tail)}[lw{index}]")
+    return segs
+
+
+# --------------------------------------------------------------------------
+# the numpy reference for a whole mask
+# --------------------------------------------------------------------------
+
+def mask_matte(layer: dict, info: dict, rgb=None, time_s: float = 0.0,
+               root=None):
+    """The combined matte of one layer, in numpy, as float 0..1 (h, w).
+
+    The definition the ffmpeg graph is a port of, in the same role
+    window_matte plays for the window: the suite renders a stack through
+    ffmpeg and compares it against this, so a filter that quietly changed
+    meaning between ffmpeg versions is caught rather than believed.
+
+    `rgb` is the picture the key components see, float 0..1 (h, w, 3), in the
+    display referred Rec.709 signal a layer runs on. Without it a key
+    component reads as 1 (select everything), which is what lets a caller
+    that only has spatial components skip decoding a frame.
+    """
+    import numpy as np
+    sys.path.insert(0, str(ROOT / "tools"))
+    import colorlib as C
+    MT = _mattes()
+
+    w, h = int(info["width"]), int(info["height"])
+    mask = layer.get("mask") or {}
+    if not has_components(layer):
+        m = np.ones((h, w), dtype=np.float64)
+        win = mask.get("window") or {}
+        if win.get("enabled"):
+            m = window_matte(win, w, h).astype(np.float64) / 255.0
+        if rgb is not None and (mask.get("key") or {}).get("enabled"):
+            hue, sat, _v = C.rgb_to_hsv(np.asarray(rgb, dtype=np.float64))
+            luma = C.luma709(np.asarray(rgb, dtype=np.float64))[..., 0]
+            m = m * key_matte(mask["key"], hue, sat, luma)
+        return 1.0 - m if mask.get("invert") else m
+
+    acc = np.zeros((h, w), dtype=np.float64)
+    hsv = None
+    for _j, comp in stack_components(layer):
+        kind = component_type(comp)
+        if kind == "window":
+            c = window_matte(component_window(comp), w, h).astype(np.float64) / 255.0
+        elif kind == "matte":
+            minfo, _reason = resolve_matte(component_matte_ref(comp), root)
+            if minfo is None:
+                c = np.zeros((h, w), dtype=np.float64)
+            else:
+                try:
+                    arr, _served, _warn = MT.load_time(minfo, time_s, (w, h))
+                    c = arr.astype(np.float64)
+                except MT.MatteMissing:
+                    c = np.zeros((h, w), dtype=np.float64)
+        else:
+            if rgb is None:
+                c = np.ones((h, w), dtype=np.float64)
+            else:
+                if hsv is None:
+                    a = np.asarray(rgb, dtype=np.float64)
+                    hue, sat, _v = C.rgb_to_hsv(a)
+                    hsv = (hue, sat, C.luma709(a)[..., 0])
+                c = key_matte(component_key(comp), *hsv)
+        if comp.get("invert"):
+            c = 1.0 - c
+        feather = float(comp.get("feather", 0.0) or 0.0)
+        if feather > 0:
+            c = gaussian_blur2d(c, feather * w)
+        op = component_op(comp)
+        if op == "add":
+            acc = np.maximum(acc, c)
+        elif op == "intersect":
+            acc = acc * c
+        else:
+            acc = acc * (1.0 - c)
+
+    f = deep_merge(MASK_FINESSE_DEFAULTS, mask.get("finesse") or {})
+    cb = max(0.0, min(1.0, float(f.get("clean_black", 0.0) or 0.0)))
+    cw = max(0.0, min(1.0, float(f.get("clean_white", 0.0) or 0.0)))
+    if cb > 0 or cw > 0:
+        acc = clean_curve(acc, cb, cw)
+    grow = float(f.get("grow", 0.0) or 0.0)
+    passes = min(MASK_GROW_MAX, int(round(abs(grow) * w)))
+    if passes > 0:
+        acc = morph2d(acc, passes, grow > 0)
+    blur = float(f.get("blur", 0.0) or 0.0)
+    if blur > 0:
+        acc = gaussian_blur2d(acc, blur * w)
+    if mask.get("invert"):
+        acc = 1.0 - acc
+    return np.clip(acc, 0.0, 1.0)
+
+
+def gaussian_blur2d(a, sigma: float):
+    """A separable gaussian, written out because scipy is not a dependency.
+
+    Close to ffmpeg's gblur rather than identical to it: gblur approximates
+    the gaussian with a small number of box passes, so the suite compares the
+    two with a tolerance and asserts the SHAPE (a soft edge in the right
+    place, the interior untouched) rather than equal bytes.
+    """
+    import numpy as np
+    s = float(sigma)
+    if s <= 0:
+        return np.asarray(a, dtype=np.float64)
+    radius = max(1, int(round(s * 3.0)))
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    k = np.exp(-(x * x) / (2.0 * s * s))
+    k /= k.sum()
+    out = np.asarray(a, dtype=np.float64)
+    pad = np.pad(out, ((0, 0), (radius, radius)), mode="edge")
+    out = np.apply_along_axis(lambda r: np.convolve(r, k, mode="valid"), 1, pad)
+    pad = np.pad(out, ((radius, radius), (0, 0)), mode="edge")
+    out = np.apply_along_axis(lambda c: np.convolve(c, k, mode="valid"), 0, pad)
+    return out
+
+
+def morph2d(a, passes: int, grow: bool):
+    """N passes of a 3x3 max (grow) or min (shrink), ffmpeg's dilation/erosion.
+
+    The same neighbourhood ffmpeg's filters use, so the reference and the
+    render agree pass for pass rather than approximately.
+    """
+    import numpy as np
+    out = np.asarray(a, dtype=np.float64)
+    for _ in range(int(passes)):
+        pad = np.pad(out, 1, mode="edge")
+        stack = np.stack([pad[dy:dy + out.shape[0], dx:dx + out.shape[1]]
+                          for dy in (0, 1, 2) for dx in (0, 1, 2)])
+        out = stack.max(axis=0) if grow else stack.min(axis=0)
+    return out
 
 
 # --- power window (the shape half of a secondary) --------------------------
@@ -2051,10 +2889,18 @@ def _window_geometry(win: dict, width: int, height: int) -> dict:
     def q(x, places):
         return float(f"{float(x):.{places}f}")
 
-    r = math.radians(float(win.get("rotation", 0.0)))
+    shape = str(win.get("shape", "ellipse"))
+    shape = shape if shape in ("rect", "linear") else "ellipse"
+    # A linear gradient is aimed by `angle`, not by `rotation`: C1 names the
+    # field, and a gradient has a direction rather than a shape that has been
+    # turned. `rotation` is honoured as a fallback so a UI that only carries
+    # the one field still aims the gradient.
+    turn = (float(win.get("angle", win.get("rotation", 0.0)))
+            if shape == "linear" else float(win.get("rotation", 0.0)))
+    r = math.radians(turn)
     soft = max(0.0, float(win.get("softness", 0.0)))
     g = {
-        "shape": "rect" if str(win.get("shape", "ellipse")) == "rect" else "ellipse",
+        "shape": shape,
         "invert": bool(win.get("invert")),
         "soft": soft,
         "cr": q(math.cos(r), 12),
@@ -2069,6 +2915,13 @@ def _window_geometry(win: dict, width: int, height: int) -> dict:
     # The feather edges, precomputed for the same reason: one rounding, shared.
     g["hi"] = q(1.0 + soft, 10)
     g["den"] = q(2.0 * soft, 10) if soft > 0 else 0.0
+    # The linear gradient's own two numbers. `w` is the TRANSITION WIDTH as a
+    # fraction of frame WIDTH (not of the frame's own axis in the gradient's
+    # direction), so turning the gradient does not change how wide the
+    # transition is, and `softness` is the ease exponent of the S curve
+    # across it: 1 is a straight ramp, 2 eases both ends, 0.5 is snappier.
+    g["wpx"] = q(max(float(win.get("w", 0.6)) * width, 1.0), 10)
+    g["ease"] = q(max(0.05, min(8.0, soft)), 6)
     return g
 
 
@@ -2087,16 +2940,31 @@ def window_matte(cfg, width: int, height: int):
     dy = Y - g["cyp"]
     ux = dx * g["cr"] + dy * g["sr"]
     uy = dy * g["cr"] - dx * g["sr"]
-    if g["shape"] == "rect":
+    if g["shape"] == "linear":
+        # The gradient runs along uy, so at angle 0 the top of the frame is
+        # selected and the transition is centred on cy; the selected side
+        # then turns clockwise with the angle (90 selects the right of the
+        # frame), which is the same "degrees clockwise on screen" the shapes'
+        # rotation already means.
+        t = np.clip(0.5 - uy / g["wpx"], 0.0, 1.0)
+        if g["soft"] <= 0:
+            m = (uy <= 0.0).astype(np.float64)
+        else:
+            k = g["ease"]
+            m = np.where(t <= 0.5,
+                         0.5 * np.power(np.maximum(2.0 * t, 0.0), k),
+                         1.0 - 0.5 * np.power(np.maximum(2.0 * (1.0 - t), 0.0), k))
+    elif g["shape"] == "rect":
         d = np.maximum(np.abs(ux) / g["ax"], np.abs(uy) / g["ay"])
     else:
         # np.hypot and C's hypot() are the same libm call, which is why the
         # geq side can use hypot() and still match to the last bit.
         d = np.hypot(ux / g["ax"], uy / g["ay"])
-    if g["soft"] <= 0:
-        m = (d <= 1.0).astype(np.float64)
-    else:
-        m = np.clip((g["hi"] - d) / g["den"], 0.0, 1.0)
+    if g["shape"] != "linear":
+        if g["soft"] <= 0:
+            m = (d <= 1.0).astype(np.float64)
+        else:
+            m = np.clip((g["hi"] - d) / g["den"], 0.0, 1.0)
     if g["invert"]:
         m = 1.0 - m
     # floor(x + 0.5), not numpy's rint: rint rounds halves to even, ffmpeg's
@@ -2120,14 +2988,26 @@ def window_geq(cfg, width: int, height: int) -> str:
           f"+(Y-{g['cyp']:.10f})*{g['sr']:.12f})")
     uy = (f"((Y-{g['cyp']:.10f})*{g['cr']:.12f}"
           f"-(X-{g['cxp']:.10f})*{g['sr']:.12f})")
-    if g["shape"] == "rect":
+    if g["shape"] == "linear":
+        if g["soft"] <= 0:
+            m = f"lte({uy},0)"
+        else:
+            t = f"clip(0.5-({uy})/{g['wpx']:.10f},0,1)"
+            k = f"{g['ease']:.6f}"
+            # A semicolon sequence, for the reason clean_geq spells out.
+            m = (f"st(1,{t});if(lte(ld(1),0.5),"
+                 f"0.5*pow(2*ld(1),{k}),1-0.5*pow(2*(1-ld(1)),{k}))")
+    elif g["shape"] == "rect":
         d = f"max(abs({ux})/{g['ax']:.10f},abs({uy})/{g['ay']:.10f})"
+        m = None
     else:
         d = f"hypot({ux}/{g['ax']:.10f},{uy}/{g['ay']:.10f})"
-    if g["soft"] <= 0:
-        m = f"lte({d},1)"
-    else:
-        m = f"clip(({g['hi']:.10f}-({d}))/{g['den']:.10f},0,1)"
+        m = None
+    if g["shape"] != "linear":
+        if g["soft"] <= 0:
+            m = f"lte({d},1)"
+        else:
+            m = f"clip(({g['hi']:.10f}-({d}))/{g['den']:.10f},0,1)"
     if g["invert"]:
         m = f"(1-({m}))"
     return f"floor(255*({m})+0.5)"
@@ -2170,15 +3050,15 @@ def window_layers(cfg) -> list[tuple]:
     are graded at different points in the tree but their mattes are ordinary
     inputs, so keeping the input order tied to the array keeps it independent
     of anything the graph builder decides later.
+
+    LEGACY masks only. A layer whose mask is a component stack has its inputs
+    listed by mask_inputs() instead, one per spatial component, and this
+    function does not see it: layer_window() returns None for it. Every
+    caller that wants ALL the mask inputs (studio/server.py's two input
+    builders) should call mask_extra_inputs() rather than this loop.
     """
-    out = []
-    for i, layer in enumerate(config_layers(cfg)):
-        if not layer_active(layer):
-            continue
-        win = layer_window(layer)
-        if win is not None:
-            out.append((i, win))
-    return out
+    return [(e["layer"], e["window"]) for e in mask_inputs(cfg)
+            if e["kind"] == "window" and e["component"] is None]
 
 
 def mask_input_indices(cfg) -> dict:
@@ -2186,8 +3066,17 @@ def mask_input_indices(cfg) -> dict:
 
     Input 0 is the picture. Everything after it is appended in this order by
     ffmpeg_inputs, and build_graph and graph_with_mask read the indices back
-    from here rather than counting again by hand. "layers" maps a layer's
-    array index to the input its window matte lands on.
+    from here rather than counting again by hand.
+
+        "radial"      the radial blur ramp, when it is on
+        "layers"      {layer index: input} for a LEGACY window matte
+        "components"  {layer index: {component index: input}} for a stack's
+                      spatial components, in the same walk as mask_inputs()
+        "grain"       the grain plate, which is always last
+
+    A config with no component stacks produces exactly the map it always
+    did, with an empty "components", so nothing that reads the old keys has
+    to change.
     """
     idx = 1
     out = {}
@@ -2195,10 +3084,15 @@ def mask_input_indices(cfg) -> dict:
         out["radial"] = idx
         idx += 1
     windows = {}
-    for i, _win in window_layers(cfg):
-        windows[i] = idx
+    components = {}
+    for entry in mask_inputs(cfg):
+        if entry["component"] is None:
+            windows[entry["layer"]] = idx
+        else:
+            components.setdefault(entry["layer"], {})[entry["component"]] = idx
         idx += 1
     out["layers"] = windows
+    out["components"] = components
     out["grain"] = idx
     return out
 
@@ -2744,7 +3638,17 @@ def build_graph(cfg, info, out_label="vout", tail_extra=None, encode_out=True,
     return ";".join(segs), needs_mask
 
 
-def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
+def ffmpeg_inputs(src, cfg, info, seek=None, duration=None,
+                  strict_mattes: bool = False):
+    """The whole ffmpeg command up to the filter graph: input 0 and the stills.
+
+    `strict_mattes` is the render's refusal switch (C1: "render refuses a
+    partial matte unless allow_partial"). It defaults to False so every
+    existing caller - preview, stills, scopes, the suite - keeps rendering
+    whatever the tracker has managed so far, and only a caller that is
+    producing a finished file passes True. A render verb spells it
+    `strict_mattes=not args.allow_partial`.
+    """
     args = ["ffmpeg", "-v", "error", "-y"]
     # Must precede -i. Some clips carry a display matrix whose content is
     # already upright, in which case honouring the tag rotates it INTO being
@@ -2761,8 +3665,8 @@ def ffmpeg_inputs(src, cfg, info, seek=None, duration=None):
         rb = cfg["fx"]["radial_blur"]
         m = radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    for _i, win in window_layers(cfg):
-        args += ["-i", str(window_mask(win, info["width"], info["height"]))]
+    args += mask_extra_inputs(cfg, info, seek=seek, duration=duration,
+                              strict_mattes=strict_mattes)
     if cfg["grain"]["enabled"]:
         args += grain_input(cfg, info)
     return args
@@ -2822,6 +3726,22 @@ def graph_with_mask(cfg, info, out_label="vout", tail_extra=None, encode_out=Tru
         pre.append(f"[{idxs['radial']}:v]{WINDOW_MASK_FORMAT},setsar=1[mask]")
     for i, _win in window_layers(cfg):
         pre.append(f"[{idxs['layers'][i]}:v]{WINDOW_MASK_FORMAT},setsar=1[lw{i}]")
+    # A component stack's spatial inputs. Each one becomes a gray16le stream
+    # at frame size on the label build_layers reads (component_label), and
+    # the fold itself happens there because a key component needs the
+    # picture. setrange=full pins the swing so the hop into gbrp16le at the
+    # end of the fold cannot expand a range the matte never had; a matte from
+    # the store is also scaled here, which is where C1's "scaled to the
+    # output with a soft edge" comes from (bilinear, at 16 bits).
+    for entry in mask_inputs(cfg):
+        if entry["component"] is None:
+            continue
+        idx = idxs["components"][entry["layer"]][entry["component"]]
+        label = component_label(entry["layer"], entry["component"])
+        scale = ("" if entry["kind"] == "window" else
+                 f"scale={info['width']}:{info['height']}:flags=bilinear,")
+        pre.append(f"[{idx}:v]format=gray16le,setrange=full,"
+                   f"{scale}setsar=1[{label}]")
     if pre:
         graph = ";".join(pre) + ";" + graph
     if head_extra:
@@ -2999,7 +3919,8 @@ def cmd_render(a):
         src = "studiosrc"
     graph = graph_with_mask(rcfg, rinfo, src_label=src, head_extra=head)
     o = dict(cfg["output"], codec=codec)
-    args = ffmpeg_inputs(a.input, rcfg, rinfo, a.start, a.duration)
+    args = ffmpeg_inputs(a.input, rcfg, rinfo, a.start, a.duration,
+                         strict_mattes=not a.allow_partial)
     if a.duration:
         args += ["-t", str(a.duration)]
     args += ["-filter_complex", graph, "-map", "[vout]"]
@@ -3134,8 +4055,52 @@ def _measure_region_size(region, info, width=None) -> tuple[int, int]:
     return tw, th
 
 
+def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict):
+    """The HxW weight array `stats --matte ID` measures through, and any
+    warnings about the frame it actually used.
+
+    `stats` never talks to a server (unlike `mask`, `session`, `match` and
+    friends, it takes no `--port`/`--url`), so this reads the matte
+    straight off disk through `grade.mattes` (contract C6, owned by lane
+    M2): the same store `studio/server.py`'s `/api/matte*` routes read, and
+    the exact same nearest-written-frame fallback and warning
+    `mattes.load_time` already gives the engine and the server's own frame
+    route, so a partial matte reads the same way everywhere rather than
+    three hand rolled copies of "what if this frame is not written yet"
+    drifting apart. Region composes the way contract C4 describes it,
+    "region crops, then weight applies": the matte's own frame is read at
+    the FULL probed picture size first, then cropped to `region` with the
+    exact same pixel box `region_pixels` gives the picture itself, so the
+    two arrays line up pixel for pixel with no separate crop math to keep
+    in sync.
+    """
+    try:
+        import mattes as MT                                   # noqa: PLC0415
+    except ImportError as exc:
+        raise GradeError(
+            "grade.mattes is not on this branch yet (owned by lane M2, "
+            "contract C6); --matte cannot resolve a matte id until it "
+            "lands") from exc
+    try:
+        minfo = MT.resolve(MT.matte_root(), matte_id)
+        full, _served, warn = MT.load_time(
+            minfo, t, size=(int(info["width"]), int(info["height"])))
+    except MT.MatteMissing as exc:
+        raise GradeError(f"--matte {matte_id}: {exc}") from exc
+
+    warns = [warn] if warn else []
+    if not warn and getattr(minfo, "state", "done") != "done":
+        warns.append(f"matte {matte_id} is {minfo.state}, not done yet")
+
+    if region is not None:
+        reg = normalise_region(region)
+        x, y, cw, ch = region_pixels(reg, info)
+        full = full[y:y + ch, x:x + cw]
+    return full, warns
+
+
 def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
-                       width=None) -> dict:
+                       width=None, matte=None) -> dict:
     """One graded frame of `a.input`, measured through grade.stats.frame_stats.
 
     The same numbers `POST /api/stats` returns for the same clip, config,
@@ -3151,6 +4116,14 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
     `width` scales the measured frame down before it is read (round 2
     tooling note 3: `sweep` used to always measure at the source's full
     resolution); `None` measures at the source's own size, unchanged.
+
+    `matte`, a matte id, weights the measurement by it (contract C6/C5,
+    `cinegrade stats CLIP --matte ID`): `region` and `matte` compose,
+    `region` cropping the picture (and the matte weight array with it)
+    before `matte` weights what is left. Any warnings about the matte used
+    (a fallback to its nearest written frame, or a state short of `done`)
+    land on the returned row's own `"warnings"` list, the same field name
+    contract C1 uses for a partial matte on a frame response.
     """
     import numpy as np                                        # noqa: PLC0415
     from stats import frame_stats                            # noqa: PLC0415
@@ -3167,8 +4140,20 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
         raise GradeError("cinegrade could not measure that frame:\n"
                          + r.stderr.decode("utf-8", "replace")[-1200:])
     rgb = np.frombuffer(r.stdout[:want], np.uint8).reshape(h, w, 3)
-    return {"time": t, "key": f"{Path(src).name}@{t:g}s",
-            "size": [w, h], "stats": frame_stats(rgb)}
+    weight, warns = (None, [])
+    if matte:
+        weight, warns = _matte_weight_for_frame(matte, t, region, info)
+        if weight.shape != (h, w):
+            from PIL import Image                            # noqa: PLC0415
+            weight = np.asarray(
+                Image.fromarray((np.clip(weight, 0.0, 1.0) * 255.0)
+                                .astype("uint8")).resize((w, h), Image.BILINEAR),
+                dtype=np.float32) / 255.0
+    row = {"time": t, "key": f"{Path(src).name}@{t:g}s",
+          "size": [w, h], "stats": frame_stats(rgb, weight=weight)}
+    if warns:
+        row["warnings"] = warns
+    return row
 
 
 def _print_stats_block(label: str, row: dict) -> None:
@@ -3235,14 +4220,25 @@ def cmd_stats(a):
     if it were already graded). A clip positional that is itself one of
     those still formats is refused rather than quietly run through the
     default Apple Log path (round 2 tooling note 4): use `--image` for it.
+
+    `--matte ID` weights the measurement by that matte instead of over the
+    whole frame or `--region` alone (contract C5/C6): a clip only, refused
+    together with `--image`, since a matte tracks a clip's own frames and a
+    still has none to look up. `--region` and `--matte` compose, the region
+    cropping first and the matte weighting what is left (contract C4). See
+    "Masks" in `.claude/skills/studio-grading/SKILL.md` for how to pick,
+    track, verify and measure by a matte before relying on this flag.
     """
     from stats import frame_stats, decode_image              # noqa: PLC0415
 
     region = getattr(a, "region", None)
+    matte = getattr(a, "matte", None)
     if a.image and a.input:
         raise GradeError(
             f"stats got both a clip ({a.input!r}) and --image "
             f"({a.image!r}); use one or the other, not both")
+    if a.image and matte:
+        raise GradeError("--matte measures a clip; --image is one still")
     if a.image:
         if getattr(a, "times", None):
             raise GradeError("--times measures a clip; --image is one still")
@@ -3282,10 +4278,11 @@ def cmd_stats(a):
     info = probe(a.input, rotation=cli_rotation(a, cfg))
     if getattr(a, "times", None):
         times = [float(t) for t in a.times.split(",")]
-        results = [_grade_frame_stats(a, cfg, info, t, region) for t in times]
+        results = [_grade_frame_stats(a, cfg, info, t, region, matte=matte)
+                  for t in times]
         _print_stats(a, {"results": results})
         return
-    row = _grade_frame_stats(a, cfg, info, a.time, region)
+    row = _grade_frame_stats(a, cfg, info, a.time, region, matte=matte)
     # _grade_frame_stats always stamps "time" on, because the --times list
     # above needs it on every row; a single frame has no second row to tell
     # itself apart from, so it is dropped here to match --image's envelope
@@ -4366,6 +5363,415 @@ def cmd_grade(a):
 
 
 # --------------------------------------------------------------------------
+# mask: SAM 3.1 segmentation and tracking, contract C4/C5
+#
+# Plain HTTP to a running studio server, the exact same shape `match`,
+# `preset` and `grade` above already use: nothing here talks to the SAM
+# service (`sam/server.py`) directly, only to `studio/server.py`'s own
+# `/api/mask/*` and `/api/matte*` routes, which own the plain proxy, the
+# matte registry and the job queue. A pick (`segment`) is synchronous, the
+# same "one frame is interactive" design rule every studio route already
+# follows for a single frame; a track is a background job, contract C3's
+# "a clip is a job", with a state, progress, and a result cached on disk
+# that `mask list`/`mask show` read back without waiting on anything.
+# --------------------------------------------------------------------------
+
+def _mask_prompts(a) -> dict:
+    """`{"text": [...], "points": [{"x","y","label"}], "boxes": [[...]]}`
+    from `--text`/`--point`/`--box`, contract C3's own prompt shape.
+
+    A key is left out entirely rather than sent as an empty list when its
+    flag was never given: an absent `"points"` and an explicit `"points":
+    []` are not necessarily the same request to the service, so this never
+    manufactures the second out of nothing being asked for.
+    """
+    prompts: dict = {}
+    if getattr(a, "text", None):
+        prompts["text"] = list(a.text)
+    if getattr(a, "point", None):
+        points = []
+        for raw in a.point:
+            parts = [p.strip() for p in raw.split(",")]
+            if len(parts) not in (2, 3):
+                raise GradeError(f"--point wants x,y or x,y,neg, got {raw!r}")
+            if len(parts) == 3 and parts[2].lower() != "neg":
+                raise GradeError(
+                    f"--point's third value is 'neg' or left out, got "
+                    f"{parts[2]!r} in {raw!r}")
+            try:
+                x, y = float(parts[0]), float(parts[1])
+            except ValueError as exc:
+                raise GradeError(f"--point wants numbers, got {raw!r}") from exc
+            label = 0 if len(parts) == 3 else 1
+            points.append({"x": x, "y": y, "label": label})
+        prompts["points"] = points
+    if getattr(a, "box", None):
+        boxes = []
+        for raw in a.box:
+            parts = [p.strip() for p in raw.split(",")]
+            if len(parts) != 4:
+                raise GradeError(f"--box wants x0,y0,x1,y1, got {raw!r}")
+            try:
+                boxes.append([float(p) for p in parts])
+            except ValueError as exc:
+                raise GradeError(f"--box wants numbers, got {raw!r}") from exc
+        prompts["boxes"] = boxes
+    return prompts
+
+
+def _studio_raw_call(base: str, path: str, method: str = "GET",
+                     payload: dict | None = None, params: dict | None = None,
+                     headers: dict | None = None) -> tuple[bytes, dict]:
+    """Like `_studio_call` above, but for a route that answers an image
+    instead of JSON (a matte frame, a picture frame): returns `(bytes,
+    response_headers)` so a caller can read `X-Matte-State`/`X-Matte-Frame`
+    off a matte frame response, the same way `mask show --strip` verifies
+    which frame it actually got back for a partial matte.
+    """
+    import urllib.error                                     # noqa: PLC0415
+    import urllib.parse                                     # noqa: PLC0415
+    import urllib.request                                   # noqa: PLC0415
+
+    url = f"{base}/api/{path}"
+    if params:
+        clean = {k: v for k, v in params.items() if v is not None}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+    data = json.dumps(payload).encode() if payload is not None else None
+    sent = dict(headers or {})
+    if data is not None:
+        sent["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=sent, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read(), dict(r.headers.items())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        raise GradeError(f"studio refused it: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise GradeError(
+            f"no studio server answering at {base} ({exc.reason}). "
+            f"Start one with ./studio.sh, or pass --port/--url.") from exc
+
+
+def _fetch_bytes(base: str, url: str, headers: dict | None = None) -> bytes:
+    """One GET, raw bytes, for a url a mask route handed back (`overlay`/
+    `mask` on a segment instance). `url` is used as-is when it already
+    names a host, or joined onto `base` when it is server-relative: unlike
+    `_studio_raw_call` above, this does not assume the route lives under
+    `/api/`, because the shape of `overlay`/`mask` is the server's own
+    choice, not this file's."""
+    import urllib.error                                     # noqa: PLC0415
+    import urllib.request                                   # noqa: PLC0415
+
+    full = url if url.startswith("http://") or url.startswith("https://") \
+        else base.rstrip("/") + "/" + url.lstrip("/")
+    req = urllib.request.Request(full, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as exc:
+        raise GradeError(f"could not fetch {full}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise GradeError(f"could not fetch {full}: {exc.reason}") from exc
+
+
+def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
+    prompts = _mask_prompts(a)
+    if not prompts:
+        raise GradeError(
+            "mask segment needs at least one of --text, --point, --box")
+    payload = {"clip": a.clip, "time": a.time,
+              "rotation": cli_rotation(a), "prompts": prompts}
+    out = _studio_call(base, "mask/segment", "POST", payload, headers=hdr)
+    if a.output_dir:
+        outdir = Path(a.output_dir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        for inst in out.get("instances") or []:
+            iid = inst.get("id")
+            for field in ("overlay", "mask"):
+                url = inst.get(field)
+                if not url:
+                    continue
+                data = _fetch_bytes(base, url, headers=hdr)
+                ext = Path(str(url).split("?")[0]).suffix or ".png"
+                dest = outdir / f"{out.get('pick_id', 'pick')}-{iid}-{field}{ext}"
+                dest.write_bytes(data)
+                inst[f"{field}_file"] = str(dest)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(f"pick {out.get('pick_id')}  "
+         f"{len(out.get('instances') or [])} instance(s)")
+    for inst in out.get("instances") or []:
+        box = inst.get("box")
+        box_s = " ".join(f"{v:.3f}" for v in box) if box else "?"
+        line = (f"  id={inst.get('id')} score={inst.get('score')} "
+               f"area={inst.get('area')} box=[{box_s}]")
+        if inst.get("overlay_file"):
+            line += f"  overlay -> {inst['overlay_file']}"
+        print(line)
+
+
+def _cmd_mask_track(a, base: str, hdr: dict) -> None:
+    prompts = _mask_prompts(a)
+    using_pick = bool(a.pick)
+    if prompts and using_pick:
+        raise GradeError("mask track takes --text or --pick/--select, not both")
+    if not prompts and not using_pick:
+        raise GradeError("mask track needs --text, or --pick PICK --select IDS")
+    if using_pick and not a.select:
+        raise GradeError("mask track --pick needs --select too")
+    payload = {"clip": a.clip, "rotation": cli_rotation(a)}
+    if prompts:
+        payload["prompts"] = prompts
+    if using_pick:
+        payload["pick_id"] = a.pick
+        sel = a.select.strip()
+        payload["select"] = "all" if sel.lower() == "all" \
+            else [s.strip() for s in sel.split(",") if s.strip()]
+    if a.start is not None:
+        payload["start"] = a.start
+    if a.end is not None:
+        payload["end"] = a.end
+    if a.steady is not None:
+        payload["steady"] = a.steady
+    out = _studio_call(base, "mask/track", "POST", payload, headers=hdr)
+    job_id = out.get("job_id")
+    if a.wait:
+        if not job_id:
+            raise GradeError(
+                f"mask track did not return a job_id to wait on: {out}")
+        out = _mask_wait(base, hdr, job_id)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(f"job {job_id}  state={out.get('state', '?')}")
+    for m in out.get("mattes") or []:
+        print(f"  matte {m.get('matte_id')}  state={m.get('state')}")
+
+
+def _mask_wait(base: str, hdr: dict, job_id: str) -> dict:
+    """Poll `GET /api/mask/jobs/<id>` until it leaves `queued`/`running`,
+    printing one progress line per changed frame count to stderr, the same
+    "stderr while it runs, stdout only at the end" shape `render`'s own
+    `--verbose` progress uses. Raises `GradeError` (this whole process then
+    exits non zero, per contract C5) on `failed`, so `--wait`'s exit code
+    alone tells an agent whether the matte it just asked for is usable.
+    """
+    last_shown = None
+    while True:
+        job = _studio_call(base, f"mask/jobs/{job_id}", headers=hdr)
+        state = job.get("state")
+        done = job.get("done_frames")
+        total = job.get("total_frames")
+        if done is not None and done != last_shown:
+            rate = job.get("fps")
+            rate_s = f"  ({rate:.2f} fps)" if isinstance(rate, (int, float)) else ""
+            print(f"track {job_id} {done} of "
+                 f"{total if total is not None else '?'} frames{rate_s}  "
+                 f"state={state}", file=sys.stderr)
+            last_shown = done
+        if state in ("done", "failed", "cancelled", "canceled"):
+            if state == "failed":
+                raise GradeError(
+                    f"mask track job {job_id} failed: "
+                    f"{job.get('error') or '(no error message)'}")
+            return job
+        time.sleep(1.0)
+
+
+def _cmd_mask_jobs(a, base: str, hdr: dict) -> None:
+    out = _studio_call(base, "mask/jobs", headers=hdr)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    jobs = out.get("jobs") if isinstance(out, dict) else out
+    jobs = jobs or []
+    if not jobs:
+        print("no mask jobs")
+        return
+    for j in jobs:
+        jid = j.get("job_id", j.get("id", "?"))
+        print(f"{jid!s:<14} state={j.get('state', '?'):<10} "
+             f"clip={j.get('clip', '?'):<20} "
+             f"{j.get('done_frames', '?')}/{j.get('total_frames', '?')} frames")
+
+
+def _cmd_mask_list(a, base: str, hdr: dict) -> None:
+    import urllib.parse                                       # noqa: PLC0415
+    out = _studio_call(base, f"matte?clip={urllib.parse.quote(a.clip)}",
+                       headers=hdr)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    mattes = out.get("mattes") if isinstance(out, dict) else out
+    mattes = mattes or []
+    if not mattes:
+        print(f"no mattes for {a.clip}")
+        return
+    for m in mattes:
+        print(f"{m.get('matte_id', '?'):<22} state={m.get('state', '?'):<10} "
+             f"{m.get('done_frames', '?')}/{m.get('frames', '?')} frames "
+             f"model={m.get('model', '?')} backend={m.get('backend', '?')}")
+
+
+def _print_matte_index(idx: dict) -> None:
+    print(f"matte     {idx.get('matte_id')}")
+    print(f"clip      {idx.get('clip')}")
+    print(f"state     {idx.get('state')}")
+    print(f"frames    {idx.get('done_frames')}/{idx.get('frames')}  "
+         f"fps={idx.get('fps')}  {idx.get('width')}x{idx.get('height')}")
+    print(f"model     {idx.get('model')} ({idx.get('backend')})")
+    recipe = idx.get("recipe")
+    if recipe is not None:
+        print(f"recipe    {json.dumps(recipe)}")
+
+
+def _composite_matte_panel(pic_bytes: bytes, matte_bytes: bytes):
+    """One picture frame tinted red where its matte is nonzero, for `mask
+    show --strip`'s per second panels: what a matte "over" the picture
+    means here, since the picture format the wire uses (a JPEG frame, an
+    8 bit grey matte) has no alpha channel of its own to composite with."""
+    import io                                                  # noqa: PLC0415
+    from PIL import Image                                      # noqa: PLC0415
+
+    pic = Image.open(io.BytesIO(pic_bytes)).convert("RGB")
+    matte = Image.open(io.BytesIO(matte_bytes)).convert("L")
+    if matte.size != pic.size:
+        matte = matte.resize(pic.size, Image.BILINEAR)
+    tint = Image.new("RGB", pic.size, (235, 60, 60))
+    alpha = matte.point(lambda v: int(v * 0.55))
+    return Image.composite(tint, pic, alpha)
+
+
+def _draw_area_curve(width: int, height: int, areas: list, seconds: list,
+                     fps: float):
+    """The tracked area fraction, one point per matte frame, under the
+    strip's per second panels: `mask show --strip`'s way of showing drift
+    or a lost subject as a shape, not only as a picture at each sampled
+    second. A vertical tick marks each panel's own frame index."""
+    from PIL import Image, ImageDraw                           # noqa: PLC0415
+
+    img = Image.new("RGB", (max(1, int(width)), max(1, int(height))),
+                    (18, 18, 18))
+    d = ImageDraw.Draw(img)
+    if not areas:
+        d.text((6, height // 2 - 6), "no per frame area data in this matte",
+               fill=(200, 200, 200))
+        return img
+    n = len(areas)
+    mx = max(areas) if areas else 0.0
+    pad = 4
+    pts = []
+    for i, v in enumerate(areas):
+        x = pad + (width - 2 * pad) * (i / max(1, n - 1))
+        frac = (v / mx) if mx > 0 else 0.0
+        y = height - pad - (height - 2 * pad) * frac
+        pts.append((x, y))
+    if len(pts) > 1:
+        d.line(pts, fill=(120, 200, 255), width=2)
+    for t in seconds:
+        idx = min(n - 1, max(0, round(t * fps)))
+        x = pad + (width - 2 * pad) * (idx / max(1, n - 1))
+        d.line([(x, 0), (x, height)], fill=(70, 70, 70))
+    d.text((4, 2), f"tracked area, 0..{mx:.4f} shown, {n} frames",
+          fill=(200, 200, 200))
+    return img
+
+
+def _build_matte_strip(base: str, hdr: dict, matte_id: str, index: dict,
+                       out_path: str, panel_width: int) -> None:
+    from PIL import Image, ImageDraw, ImageFont                # noqa: PLC0415
+
+    fps = float(index.get("fps") or 0.0)
+    frames = int(index.get("frames") or 0)
+    if fps <= 0 or frames <= 0:
+        raise GradeError(
+            f"matte {matte_id} has no frames yet to strip "
+            f"(state={index.get('state')}); wait for it to run first")
+    duration = frames / fps
+    panel_w = max(64, int(panel_width or 220))
+    seconds = list(range(0, max(1, int(duration)) + 1))
+    clip = index.get("clip")
+    rotation = index.get("rotation") or "auto"
+
+    panels = []
+    for t in seconds:
+        m_bytes, m_hdrs = _studio_raw_call(
+            base, f"matte/{matte_id}/frame", "GET", headers=hdr,
+            params={"time": t, "width": panel_w})
+        pic_bytes, _ = _studio_raw_call(
+            base, "frame", "POST", headers=hdr,
+            payload={"clip": clip, "time": t, "width": panel_w,
+                    "mode": "flat", "config": {}, "rotation": rotation})
+        panel = _composite_matte_panel(pic_bytes, m_bytes)
+        panels.append((panel, t, m_hdrs.get("X-Matte-State", "?")))
+
+    label_h = 16
+    font = ImageFont.load_default()
+    row_h = panels[0][0].height + label_h
+    row_w = sum(p.width for p, _, _ in panels)
+    strip = Image.new("RGB", (row_w, row_h), (18, 18, 18))
+    d = ImageDraw.Draw(strip)
+    x = 0
+    for panel, t, state in panels:
+        strip.paste(panel, (x, label_h))
+        d.text((x + 3, 2), f"t={t}s {state}", fill=(230, 230, 230), font=font)
+        x += panel.width
+
+    curve = _draw_area_curve(row_w, 90, index.get("areas") or [], seconds, fps)
+    out_img = Image.new("RGB", (row_w, row_h + curve.height), (18, 18, 18))
+    out_img.paste(strip, (0, 0))
+    out_img.paste(curve, (0, row_h))
+    out_img.save(out_path)
+
+
+def _cmd_mask_show(a, base: str, hdr: dict) -> None:
+    out = _studio_call(base, f"matte/{a.id}", headers=hdr)
+    if a.strip:
+        if not a.output:
+            raise GradeError("mask show --strip needs -o OUT.jpg")
+        try:
+            import PIL  # noqa: F401
+        except ImportError as exc:
+            raise GradeError(
+                "mask show --strip needs Pillow: "
+                ".venv/bin/pip install pillow") from exc
+        _build_matte_strip(base, hdr, a.id, out, a.output, a.width)
+        print(f"matte {a.id} strip -> {a.output}")
+        if a.json:
+            print(json.dumps(out, indent=2))
+        return
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    _print_matte_index(out)
+
+
+def cmd_mask(a):
+    """Dispatch for the whole `mask` command group (contract C4/C5): every
+    subcommand is plain HTTP to a running studio server, the same shape
+    `session`/`project`/`match`/`preset`/`grade` above already use, and
+    inherits the same refusal an agent gets from every one of those when it
+    names itself but never names a server (`require_server`)."""
+    base = require_server(a)
+    hdr = studio_headers(a)
+    cmd = a.mask_cmd
+    if cmd == "segment":
+        return _cmd_mask_segment(a, base, hdr)
+    if cmd == "track":
+        return _cmd_mask_track(a, base, hdr)
+    if cmd == "jobs":
+        return _cmd_mask_jobs(a, base, hdr)
+    if cmd == "list":
+        return _cmd_mask_list(a, base, hdr)
+    if cmd == "show":
+        return _cmd_mask_show(a, base, hdr)
+    raise GradeError(f"unknown mask command {cmd!r}")
+
+
+# --------------------------------------------------------------------------
 # sheet: a labelled comparison image out of stills, frames or both
 # --------------------------------------------------------------------------
 
@@ -4679,6 +6085,14 @@ def main():
                          help="render at this fraction of the source width "
                               "(0.5 = half size), scaling the same "
                               "pixel-denominated FX params as --width")
+    r.add_argument("--allow-partial", action="store_true",
+                   help="render even though a mask component's matte is "
+                        "not fully tracked yet (queued, running, partial, "
+                        "or stale): the render uses whatever the tracker "
+                        "has written so far, holding the nearest written "
+                        "frame past the end of what is tracked. Without "
+                        "this flag the render refuses and names the "
+                        "layer, the component and the matte")
     r.set_defaults(fn=cmd_render)
 
     def region_flags(p):
@@ -4764,6 +6178,14 @@ def main():
                                     "single-frame {key, size, stats} "
                                     "envelope, one {time, key, size, stats} "
                                     "row per second (not with --image)")
+    st.add_argument("--matte", metavar="ID",
+                    help="weight the measurement by this matte id "
+                         "(contract C5/C6) instead of the whole frame or "
+                         "--region alone; composes with --region (the "
+                         "region crops first, the matte weights what is "
+                         "left); a clip only, refused with --image. Read "
+                         "off disk through grade/mattes.py, not a server "
+                         "call, so no --port/--url is needed for this flag")
     st.set_defaults(fn=cmd_stats)
 
     sw = sub.add_parser(
@@ -4995,6 +6417,111 @@ def main():
     grl.add_argument("--json", action="store_true")
     add_server_flags(grl)
     grl.set_defaults(fn=cmd_grade)
+
+    mk = sub.add_parser(
+        "mask",
+        help="SAM 3.1 segmentation and tracking through a running studio "
+             "server (contract C4/C5): a pick, a background track job, "
+             "the job queue, and a clip's saved mattes")
+    mask_sub = mk.add_subparsers(dest="mask_cmd", required=True)
+
+    mseg = mask_sub.add_parser(
+        "segment",
+        help="POST /api/mask/segment: one interactive pick on a single "
+             "frame, synchronous (a busy wait, never a job)")
+    mseg.add_argument("clip", help="a clip name from GET /api/state")
+    mseg.add_argument("--time", type=float, default=0.0)
+    mseg.add_argument("--text", action="append", metavar="PHRASE",
+                      help="a text prompt naming a concept, e.g. --text "
+                           "person; repeatable, every instance the model "
+                           "finds comes back as a candidate")
+    mseg.add_argument("--point", action="append", metavar="X,Y[,neg]",
+                      help="a point prompt, fractions of the frame; add "
+                           ",neg for a negative point (excludes that "
+                           "instance); repeatable")
+    mseg.add_argument("--box", action="append", metavar="X0,Y0,X1,Y1",
+                      help="a box prompt, fractions of the frame; "
+                           "repeatable")
+    mseg.add_argument("--rotate", choices=list(ROTATIONS),
+                      help="same meaning as every other command's "
+                           "--rotate; auto (the default) honours the "
+                           "clip's own display matrix")
+    mseg.add_argument("--json", action="store_true")
+    mseg.add_argument("-o", "--output-dir", dest="output_dir",
+                      help="save each candidate instance's overlay and "
+                           "mask preview images here, so a pick can be "
+                           "looked at before committing to one")
+    add_server_flags(mseg)
+    mseg.set_defaults(fn=cmd_mask)
+
+    mtr = mask_sub.add_parser(
+        "track",
+        help="POST /api/mask/track: track through the clip in the "
+             "background; returns a job_id immediately unless --wait")
+    mtr.add_argument("clip", help="a clip name from GET /api/state")
+    mtr.add_argument("--text", action="append", metavar="PHRASE",
+                     help="track every instance of this text prompt; "
+                          "repeatable; mutually exclusive with "
+                          "--pick/--select")
+    mtr.add_argument("--pick", metavar="PICK_ID",
+                     help="track the instance(s) chosen from an earlier "
+                          "mask segment's pick_id; needs --select too")
+    mtr.add_argument("--select", metavar="IDS",
+                     help="comma separated instance ids from that pick, "
+                          "or the literal word all")
+    mtr.add_argument("--start", type=float,
+                     help="seconds into the clip to start tracking "
+                          "(default the clip's own start)")
+    mtr.add_argument("--end", type=float,
+                     help="seconds into the clip to stop tracking "
+                          "(default the clip's own end)")
+    mtr.add_argument("--steady", type=int,
+                     help="temporal smoothing over N frames")
+    mtr.add_argument("--rotate", choices=list(ROTATIONS),
+                     help="same meaning as segment's --rotate above; "
+                          "needed here too since the server's own "
+                          "/api/mask/track request carries a rotation "
+                          "field (contract C4), even though it is not "
+                          "spelled out in contract C5's own usage line")
+    mtr.add_argument("--wait", action="store_true",
+                     help="block until the job finishes, printing "
+                          "progress lines to stderr the way render does, "
+                          "and exit non zero if the job fails")
+    mtr.add_argument("--json", action="store_true")
+    add_server_flags(mtr)
+    mtr.set_defaults(fn=cmd_mask)
+
+    mjb = mask_sub.add_parser(
+        "jobs", help="GET /api/mask/jobs: the whole queue, every caller's "
+                     "jobs (mattes and jobs are per clip, shared, not "
+                     "private to whoever queued them)")
+    mjb.add_argument("--json", action="store_true")
+    add_server_flags(mjb)
+    mjb.set_defaults(fn=cmd_mask)
+
+    mls = mask_sub.add_parser(
+        "list", help="GET /api/matte?clip=: every matte saved for a clip")
+    mls.add_argument("clip")
+    mls.add_argument("--json", action="store_true")
+    add_server_flags(mls)
+    mls.set_defaults(fn=cmd_mask)
+
+    msh = mask_sub.add_parser(
+        "show",
+        help="GET /api/matte/<id>: one matte's own index, or --strip to "
+             "render it against the picture for verification over time")
+    msh.add_argument("id")
+    msh.add_argument("--strip", action="store_true",
+                     help="one frame per second, matte tinted over the "
+                          "picture, with the tracked area curve "
+                          "underneath; needs -o")
+    msh.add_argument("--output", "-o", help="required with --strip")
+    msh.add_argument("--width", type=int, default=220,
+                     help="each strip panel's width in pixels "
+                          "(default 220)")
+    msh.add_argument("--json", action="store_true")
+    add_server_flags(msh)
+    msh.set_defaults(fn=cmd_mask)
 
     sh = sub.add_parser(
         "sheet",

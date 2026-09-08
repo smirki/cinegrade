@@ -2571,3 +2571,253 @@ html[data-mobile="on"] .sharerow { min-height: 40px; }
    a tall narrow screen leaves it showing two rows. */
 html[data-mobile="on"] .activitypanel { max-height: 45%; }
 html[data-mobile="on"] .activityrow { padding: 8px 10px; }
+
+/* ==== the mask stack, the pick overlay and the overlay tint (contract C1) ==
+   Everything lane M6 draws. Three separate places on screen and one block,
+   because they are one feature: the panel in each layer's body, the point and
+   box markers on the picture, and the tint canvas over it.
+
+   No new colours and no new tokens: --accent for anything the mask itself is,
+   --warn for "this is not finished yet", --danger for a failure, and the same
+   panel/raised/line ladder every other row in this file sits on. The panel
+   lives inside .layer-body in #params, which is the right SIDEBAR and not a
+   GridStack card, so none of this is in play for the .autosize model
+   described at length around line 735 above: no card's height is measured
+   from it and nothing here can make a grid card resize. */
+
+/* ---- the viewer: the overlay tint ---------------------------------------
+   z-index 3 is #windowOverlay's, and this sits just under it (2) so a window
+   being dragged is never hidden by a tint. Above #afterLayer either way, which
+   is what makes it draw over a still, the GPU canvas and a playing video
+   without knowing which of the three is on screen. Never takes a pointer: it
+   is a readout, and every control that acts on it is in the panel. */
+#maskOverlay {
+  position: absolute; left: 0; top: 0; display: none;
+  z-index: 2; pointer-events: none;
+  /* The tint is a diagnostic laid over a picture being judged for colour, so
+     it is deliberately not a flat paint: mix-blend-mode screen keeps the
+     luminance relationship under it readable while still saying clearly where
+     the matte is open. */
+  mix-blend-mode: screen;
+}
+/* Same rule as #windowOverlay: in before mode the graded layer is not the
+   picture on screen, so nothing of the grade's own is drawn on it. Unlike
+   #windowOverlay it deliberately SURVIVES playback, which is the whole point
+   of a tracked matte: it follows a moving subject frame by frame. */
+#stage.mode-before #maskOverlay { display: none !important; }
+
+/* ---- the viewer: SAM point and box prompts ------------------------------- */
+#windowOverlay .maskpick-catch { fill: transparent; pointer-events: none; }
+#windowOverlay.maskpicking .maskpick-catch { pointer-events: all; cursor: crosshair; }
+/* One mode at a time, and nothing is destroyed to show another: leaving mask
+   pick mode redraws whatever was on screen before it, the same guarantee the
+   crop pick above gives. */
+#windowOverlay.maskpicking .win-grp,
+#windowOverlay.maskpicking .pick-grp { display: none; }
+#windowOverlay:not(.maskpicking) .maskpick-grp { display: none; }
+#windowOverlay .maskpick-point {
+  fill: var(--accent); stroke: #fff; stroke-width: 1.5; pointer-events: none;
+}
+/* A negative point is a hole in the selection, so it reads as the danger
+   token rather than as a second shade of the accent: the two must never be
+   confusable at a glance on a picture that could be any colour. */
+#windowOverlay .maskpick-point.negative { fill: var(--danger); }
+#windowOverlay .maskpick-sign { stroke: #fff; stroke-width: 1.5; pointer-events: none; }
+/* Dashed and never filled, for the same reason the crop rectangle is: a wash
+   over a picture being judged for colour is the one thing this overlay must
+   not do. */
+#windowOverlay .maskpick-box,
+#windowOverlay .maskpick-live {
+  fill: none; stroke: var(--accent); stroke-width: 1.25;
+  stroke-dasharray: 6 4; pointer-events: none;
+}
+#windowOverlay .maskpick-live { opacity: 0.75; }
+
+/* ---- the viewer bar: the status line ------------------------------------ */
+#maskStatus { margin-left: 6px; white-space: nowrap; }
+/* "matte lagging" is a warning, not an error: the picture kept playing and
+   the matte is one frame behind, which is the designed behaviour under load
+   (design rule 10) rather than something broken. */
+#maskStatus[data-mask-status="lagging"] { color: var(--warn); }
+#maskStatus[data-mask-status="down"] { color: var(--danger); }
+#maskStatus[data-mask-status="picking"] { color: var(--accent); }
+
+/* ---- the panel ---------------------------------------------------------- */
+.masksec {
+  margin: 0 0 10px; padding: 0 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+.mask-head { display: flex; align-items: center; gap: 6px; padding: 2px 0 6px; }
+.mask-display { display: flex; gap: 4px; }
+.mask-display .btn { padding: 2px 8px; }
+
+.mask-service {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 4px 0 6px;
+}
+.mask-service-bad { color: var(--danger); font-size: 11px; }
+/* The start command out of the 503, shown so it can be read and copied rather
+   than described. Selectable on purpose: it is the one thing on screen a
+   person has to get into a terminal exactly. */
+.mask-cmd {
+  font-family: var(--mono); font-size: 10px;
+  background: var(--raised); border: 1px solid var(--line2);
+  border-radius: var(--radius-sm); padding: 2px 6px;
+  user-select: all; overflow-wrap: anywhere;
+}
+
+.mask-comps { display: flex; flex-direction: column; gap: 6px; }
+.mask-empty {
+  color: var(--text-dim); font-size: 11px; line-height: 1.35; padding: 2px 0 6px;
+}
+.mask-comp {
+  border: 1px solid var(--line2); border-radius: var(--radius-sm);
+  padding: 6px 8px 8px; background: var(--panel);
+}
+/* A row waiting on a request it started (a track being queued). Not a spinner:
+   the row stays readable and stays where it is, it only stops looking
+   pressable, because the answer lands in well under a second and a spinner
+   that flashes for 200ms is noise. */
+.mask-comp.busy { opacity: 0.6; pointer-events: none; }
+.mask-comp[data-mask-state="failed"] { border-color: var(--danger); }
+.mask-comp[data-mask-state="stale"],
+.mask-comp[data-mask-state="needs_pick"],
+.mask-comp[data-mask-state="partial"] { border-color: var(--warn); }
+
+.mask-comp-head { display: flex; align-items: center; gap: 6px; }
+/* A fixed box, so a row's height does not jump between a matte that has a
+   frame to show and one that does not. */
+.mask-thumb {
+  width: 40px; height: 26px; flex: none; border-radius: 3px;
+  background: var(--raised); image-rendering: auto;
+}
+.mask-comp-name {
+  flex: 1 1 auto; min-width: 32px;
+  border-color: transparent; background: transparent;
+}
+.mask-comp-name:hover, .mask-comp-name:focus {
+  background: var(--panel2); border-color: var(--line2);
+}
+.mask-comp-type { flex: none; }
+
+.mask-comp-ctrls {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 6px 0 2px;
+}
+.mask-op {
+  font-size: 10px; padding: 1px 4px; height: 20px;
+  background: var(--raised); border: 1px solid var(--line2);
+  border-radius: var(--radius-full); color: var(--text);
+}
+.mask-toggle {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--text-dim); cursor: pointer;
+}
+.mask-toggle-label { user-select: none; }
+
+/* The state badge. One shape, the colour carried by the state, so the eye
+   learns one place to look for "is this matte real yet". */
+.mask-badge {
+  font-family: var(--mono); font-size: 10px; line-height: 1.6;
+  padding: 0 7px; border-radius: var(--radius-full);
+  background: var(--raised); color: var(--text-dim);
+  border: 1px solid var(--line2); white-space: nowrap;
+}
+.mask-badge[data-state="done"] { color: var(--accent); border-color: var(--accent); }
+.mask-badge[data-state="running"],
+.mask-badge[data-state="queued"],
+.mask-badge[data-state="partial"] { color: var(--warn); border-color: var(--warn); }
+.mask-badge[data-state="failed"] { color: var(--danger); border-color: var(--danger); }
+.mask-badge[data-state="stale"],
+.mask-badge[data-state="needs_pick"] { color: var(--warn); border-color: var(--warn); }
+
+.mask-matte, .mask-shape { padding: 4px 0 0; }
+.mask-line {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 2px 0; font-size: 11px; line-height: 1.35;
+}
+.mask-needs { color: var(--text-dim); }
+.mask-reason { color: var(--danger); overflow-wrap: anywhere; }
+.mask-acts { padding-top: 4px; }
+.mask-acts .btn { padding: 2px 8px; }
+
+/* Done of total as a bar, plus the same numbers in words next to it. The bar
+   alone cannot say a rate and the words alone are hard to read at a glance
+   while doing something else, which is exactly what a background job is for. */
+.mask-bar {
+  flex: none; width: 88px; height: 4px; border-radius: var(--radius-full);
+  background: var(--raised); overflow: hidden;
+}
+.mask-bar > i {
+  display: block; height: 100%; background: var(--accent);
+  transition: width 200ms linear;
+}
+.mask-steady-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.mask-steady {
+  width: 44px; font-family: var(--mono); font-size: 10px; text-align: right;
+}
+
+.mask-addwrap { padding: 8px 0 0; }
+/* In the flow, not floating over it. A dropdown positioned absolutely inside
+   #params is clipped by that sidebar's own scrollport the moment the button
+   sits near the bottom of it, which is most of the time once a layer has a
+   few components. Pushing the rest of the panel down instead cannot be
+   clipped, scrolls with everything else, and needs no z-index race with the
+   viewer. */
+.mask-menu {
+  display: none; margin-top: 4px;
+  background: var(--panel2); border: 1px solid var(--line2);
+  border-radius: var(--radius-sm); padding: 4px;
+}
+.mask-menu.open { display: block; }
+.mask-menu-head {
+  font-size: 10px; color: var(--text-dim); padding: 6px 6px 2px;
+  text-transform: lowercase;
+}
+.mask-menu-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: 0; color: var(--text);
+  font-family: var(--ui); font-size: 11px; padding: 4px 6px;
+  border-radius: 4px; cursor: pointer;
+}
+.mask-menu-item:hover { background: var(--accent-wash); color: var(--text-hi); }
+.mask-menu-ask { display: flex; gap: 4px; padding: 2px 6px 4px; }
+.mask-menu-ask input { flex: 1 1 auto; min-width: 0; font-size: 11px; }
+
+/* The candidates a pick came back with. Each chip is the SERVER's own tinted
+   overlay of that instance, not a redraw of it here: what is chosen has to be
+   what was seen. */
+.mask-cands { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 2px; }
+.mask-cand {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 3px; background: var(--raised);
+  border: 1px solid var(--line2); border-radius: var(--radius-sm);
+  cursor: pointer; color: var(--text-dim);
+}
+.mask-cand:hover { border-color: var(--accent); color: var(--text-hi); }
+.mask-cand img {
+  width: 68px; height: 44px; object-fit: cover; border-radius: 3px; display: block;
+}
+.mask-cand-all {
+  justify-content: center; min-height: 54px; padding: 0 10px;
+  font-family: var(--ui); font-size: 11px;
+}
+.mask-pick { border-top: 1px dashed var(--line2); margin-top: 6px; padding-top: 4px; }
+.mask-pick-hint { color: var(--accent); }
+
+.mask-note {
+  color: var(--text-dim); font-size: 10px; line-height: 1.35; padding: 6px 0 0;
+}
+
+/* ---- mobile (contract C8, spec 22) --------------------------------------
+   The panel is inside #params, which mobile mode already lays out as a full
+   width page, so it needs no layout of its own here. Two things do change:
+   a touch target smaller than about 28px is not reliably hittable, and a
+   floating menu positioned under its button can end up off screen on a narrow
+   page, so it becomes a full width sheet under the button instead. */
+html[data-mobile="on"] .mask-comp { padding: 8px 10px 10px; }
+html[data-mobile="on"] .mask-display .btn,
+html[data-mobile="on"] .mask-acts .btn { padding: 6px 12px; }
+html[data-mobile="on"] .mask-menu { max-height: 50vh; }
+html[data-mobile="on"] .mask-menu-item { padding: 8px 8px; font-size: 12px; }
+html[data-mobile="on"] .mask-cand img { width: 84px; height: 54px; }

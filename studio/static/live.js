@@ -47,6 +47,16 @@
   // other mode's stale frame under a config that looks right but is not.
   var uploadedTag = null;
 
+  // The most recent render's own matte report (Instance.matteStatus(), the
+  // "lagging" flag gpu.js keeps for its own decoded-matte-frame cache): a
+  // still render and a proxy playback frame both update it, so a caller
+  // that only wants to know "is the GPU's own matte cache behind right now"
+  // can ask lastMattesReport() without threading a callback through every
+  // render path. renderStill and playProxy's onFrame used to drop this
+  // field on the floor entirely (see plan/2026-09-08-studio-masks
+  // checkpoints/M6.md section 3): both are forwarded below.
+  var lastMattesReport_ = null;
+
   function init(canvas, opts) {
     inst = StudioGPU.create(canvas, opts || {});
     initReason = StudioGPU.lastError;
@@ -229,12 +239,14 @@
       }
       return inst.ready(cfg, { pixelScale: factor }).then(function () {
         var r = inst.render(cfg, { pixelScale: factor });
+        lastMattesReport_ = r.mattes || null;
         return {
           ms: r.ms, passes: r.passes, width: r.width, height: r.height,
           // Not check.grainOnly: a still renders exactly one frame, which is
           // exactly what the grain plate this preview fetched covers, so
           // there is no caveat left to report here (see checkStages above).
-          grain: false, report: check.report
+          grain: false, report: check.report,
+          mattes: r.mattes
         };
       });
     });
@@ -688,9 +700,11 @@
     uploadVideoFrame(proxyVideo);
     return inst.ready(cfg, { pixelScale: factor }).then(function () {
       var r = inst.render(cfg, { pixelScale: factor });
+      lastMattesReport_ = r.mattes || null;
       return {
         ms: r.ms, passes: r.passes, width: r.width, height: r.height,
-        time: proxyVideo.currentTime, grain: check.grainOnly, report: check.report
+        time: proxyVideo.currentTime, grain: check.grainOnly, report: check.report,
+        mattes: r.mattes
       };
     });
   }
@@ -802,7 +816,12 @@
             frames: proxyStats.frames,
             skipped: proxyStats.skipped,
             dropped: proxyStats.dropped,
-            grain: r.grain
+            grain: r.grain,
+            // gpu.js's own per-matte cache report (id -> {state, lagging,
+            // ...}), the same field lastMattesReport() exposes; forwarded
+            // here too so a caller already wired to onFrame does not have
+            // to poll a second getter for the same number.
+            mattes: r.mattes
           });
         }
         if (loopEnd != null && clipTime >= loopEnd - loopFrame) wrap();
@@ -971,6 +990,17 @@
                      Object.assign({}, opts || {}, { rawSeek: true }));
   }
 
+  // gpu.js's own last matte-cache report (id -> {state, want, got, lagging,
+  // empty}), from whichever render ran most recently, still or playing.
+  // Null before anything with a mask component has rendered. A caller that
+  // wants to know "is the GPU engine's own matte cache behind right now"
+  // (as opposed to a masks.js overlay-tint cache, which is a separate
+  // thing) reads this rather than threading a new callback through every
+  // render path.
+  function lastMattesReport() {
+    return lastMattesReport_;
+  }
+
   // Frames per second this renderer achieved, what it skipped, and what the
   // decoder dropped underneath it. Null until something has played.
   function proxyPlaybackStats() {
@@ -1028,6 +1058,7 @@
     seekProxy: seekProxy,
     stepProxy: stepProxy,
     proxyPlaybackStats: proxyPlaybackStats,
+    lastMattesReport: lastMattesReport,
     stopProxy: stopProxy
   };
 })(typeof window !== "undefined" ? window : this);

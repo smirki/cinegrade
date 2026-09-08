@@ -431,6 +431,11 @@
     // hooking it is what keeps the overlay and the layer's Window group's
     // sliders showing the same shape without either one polling the other.
     if (window.WindowEditor) window.WindowEditor.sync();
+    // The mask overlay tint (masks.js) reads the same two things and for the
+    // same reason: it draws the selected layer's tracked mattes at the
+    // playhead, so it redraws wherever the config or the time moved. One
+    // call, no state of app.js's crossing over.
+    if (window.Masks) window.Masks.sync();
     // Every codepath that changes the config or the playhead (a slider
     // drag, a preset load, undo/redo, an outside session patch, setTime)
     // already funnels through here before asking the server for a fresh
@@ -4750,6 +4755,25 @@
           getConfig: cfg,
           onChange: onParamChange,
           refreshPanels: function () { Panels.refresh(cfg(), S.defaults); }
+        });
+      }
+
+      // The mask panel and its viewer overlay (contract C1/C4). Same shape
+      // as every other module here: functions of this file's, no reach into
+      // S, so masks.js cannot become a second source of truth for the clip,
+      // the playhead, the rotation or the config. It builds its own panel
+      // into each layer through layers.js, so nothing else here knows it is
+      // there.
+      if (window.Masks) {
+        window.Masks.init({
+          getConfig: cfg,
+          onChange: onParamChange,
+          refreshPanels: function () { Panels.refresh(cfg(), S.defaults); },
+          getClip: function () { return S.clip; },
+          getTime: function () { return S.time; },
+          getRotation: function () { return S.rotation; },
+          rerender: function () { scheduleRender(0); },
+          toast: toast
         });
       }
 

@@ -110,6 +110,8 @@ import grades as GRADES  # noqa: E402  (same reason)
 import library as LIB  # noqa: E402  (same reason)
 import projects as PROJECTS  # noqa: E402  (same reason)
 import render_gpu as RG  # noqa: E402  (same reason)
+import sam_client as SAMC  # noqa: E402  (same reason; the SAM service client, C3/C4)
+import mattes as MT  # noqa: E402  (same reason; grade/mattes.py, contract C6, owned by M2)
 
 # render_gpu drives ffmpeg and the browser worker through this module's own
 # helpers (clip_info, scale_for_preview, Job). Handing it the module object is
@@ -464,10 +466,16 @@ def set_cache_dir(path) -> Path:
     browser worker, a tool imported from this module) lands in the same
     place rather than quietly falling back to studio/cache.
     """
-    global CACHE, SEGMENTS, PROXY
+    global CACHE, SEGMENTS, PROXY, MASK_PROXY, MASK_FRAME_CACHE, MASK_PICK_CACHE
     CACHE = Path(path).expanduser().resolve()
     SEGMENTS = CACHE / "segments"
     PROXY = CACHE / "proxy"
+    # Masks (C4): rebound here for the same reason SEGMENTS and PROXY are, so
+    # a test server pointed at its own cache dir never touches another run's
+    # plain proxies or pick previews.
+    MASK_PROXY = CACHE / "mask_proxy"
+    MASK_FRAME_CACHE = CACHE / "mask_frame"
+    MASK_PICK_CACHE = CACHE / "mask_pick"
     os.environ["STUDIO_CACHE_DIR"] = str(CACHE)
     return CACHE
 
@@ -556,8 +564,9 @@ def ensure_dirs() -> None:
     # the whole folder is gitignored because it is user owned data.
     for d in (CACHE / "frames", CACHE / "img", CACHE / "thumbs", CACHE / "refs",
               CACHE / "src", CACHE / "segments", CACHE / "proxy", CACHE / "grain",
+              CACHE / "mask_proxy", CACHE / "mask_frame", CACHE / "mask_pick",
               STUDIO_TOOLS, OUT, PRESETS, LOOKS,
-              DB.DATA, AUTH.USERS_DIR):
+              DB.DATA, AUTH.USERS_DIR, MT.matte_root()):
         d.mkdir(parents=True, exist_ok=True)
     # Per clip grades keep their own tables in the same SQLite file the
     # accounts use. Created here rather than lazily on the first request, so a
@@ -976,16 +985,25 @@ def source_frame(clip: str, time_s: float, width: int,
     return arr, dict(meta)
 
 
-def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
+def _grade_inputs(width: int, height: int, cfg: dict, info: dict,
+                  seek: float | None = None) -> list[str]:
     """The non-source ffmpeg inputs for the grade-only pass.
 
-    Mirrors cinegrade.ffmpeg_inputs' own tail (radial mask, then one window
-    matte per layer that has one, then grain) so the extra inputs land at the
-    same index the filter graph expects:
-    input 0 is the normalised source piped in over stdin here instead of ffmpeg
-    decoding the clip itself, but everything after it has to stay in the same
-    order or the graph reads the wrong input and produces a wrong picture
-    silently. CG.mask_input_indices is the one place that order is decided.
+    Mirrors cinegrade.ffmpeg_inputs' own tail (radial mask, then CG.
+    mask_extra_inputs for every window AND component-stack matte, then
+    grain) so the extra inputs land at the same index the filter graph
+    expects: input 0 is the normalised source piped in over stdin here
+    instead of ffmpeg decoding the clip itself, but everything after it has
+    to stay in the same order or the graph reads the wrong input and
+    produces a wrong picture, or ffmpeg refuses outright with "Invalid file
+    index" when a component stack's matte input is missing entirely.
+    CG.mask_input_indices is the one place that order is decided; calling
+    CG.mask_extra_inputs (not the legacy window-only loop) is what keeps this
+    in step with it, since that is the same walk (mask_inputs) both use.
+    `strict_mattes` stays False here on purpose: this is a preview/still
+    path (the viewer, scopes, stats), not a finished render, so a partial or
+    still queued matte falls back to its nearest written frame instead of
+    refusing (design rule 4's refusal belongs to start_render only).
     """
     args = ["-f", "rawvideo", "-pix_fmt", "rgb48le",
             "-s", f"{width}x{height}", "-i", "-"]
@@ -993,8 +1011,7 @@ def _grade_inputs(width: int, height: int, cfg: dict, info: dict) -> list[str]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    for _i, win in CG.window_layers(cfg):
-        args += ["-i", str(CG.window_mask(win, info["width"], info["height"]))]
+    args += CG.mask_extra_inputs(cfg, info, seek=seek)
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -1122,7 +1139,7 @@ def render_raw(clip: str, time_s: float, width: int, cfg: dict,
                                    tail_extra=["format=rgb24"],
                                    src_label="0:v", src_normalised=True)
         args = ["ffmpeg", "-v", "error", "-y"]
-        args += _grade_inputs(width, height, pcfg, pinfo)
+        args += _grade_inputs(width, height, pcfg, pinfo, seek=time_s)
         args += ["-filter_complex", graph, "-map", "[vout]", "-frames:v", "1",
                  "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
 
@@ -1691,25 +1708,28 @@ def _play_params(payload: dict, user_id=None) -> dict:
             "info": info, "pinfo": pinfo, "fps": fps}
 
 
-def _play_extra_inputs(cfg: dict, info: dict) -> list[str]:
+def _play_extra_inputs(cfg: dict, info: dict, seek: float | None = None,
+                       duration: float | None = None) -> list[str]:
     """The mask/grain -i args for a preview-scaled segment.
 
-    Mirrors _grade_inputs' own tail above: same order (radial mask, the
-    layers' window mattes, grain), same reason (build_graph fixes those input
-    indices, so the
-    order here has to match what the filter graph expects). Kept as its own
-    small copy rather than shared with _grade_inputs, because that function's
-    first input is a rawvideo pipe from an already-decoded source frame and
-    this one decodes the clip itself as input 0; the two pipelines only share
-    what comes after input 0.
+    Mirrors _grade_inputs' own tail above: same order (radial mask, then
+    CG.mask_extra_inputs for every window AND component-stack matte, then
+    grain), same reason (build_graph fixes those input indices, so the order
+    here has to match what the filter graph expects, and a component stack
+    with no matching -i is an ffmpeg "Invalid file index" refusal, not a
+    silently wrong picture). Kept as its own small copy rather than shared
+    with _grade_inputs, because that function's first input is a rawvideo
+    pipe from an already-decoded source frame and this one decodes the clip
+    itself as input 0; the two pipelines only share what comes after input 0.
+    strict_mattes stays False: a play preview falls back to the nearest
+    written frame the same as the still viewer, it does not refuse.
     """
     args = []
     if cfg["fx"]["radial_blur"]["enabled"]:
         rb = cfg["fx"]["radial_blur"]
         m = CG.radial_mask(info["width"], info["height"], rb["start"], rb["end"])
         args += ["-i", str(m)]
-    for _i, win in CG.window_layers(cfg):
-        args += ["-i", str(CG.window_mask(win, info["width"], info["height"]))]
+    args += CG.mask_extra_inputs(cfg, info, seek=seek, duration=duration)
     if cfg["grain"]["enabled"]:
         args += CG.grain_input(cfg, info)
     return args
@@ -1734,7 +1754,8 @@ def _play_ffmpeg_args(params: dict) -> list[str]:
 
     args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(params["rotation"])
     args += ["-ss", str(params["start"]), "-i", str(clip_path(params["clip"]))]
-    args += _play_extra_inputs(pcfg, pinfo)
+    args += _play_extra_inputs(pcfg, pinfo, seek=params["start"],
+                               duration=params["duration"])
     # An output option here (it comes after every -i), so it caps how much
     # ENCODED output ffmpeg produces no matter how long the source clip
     # runs on: the house rule this project already broke once, at 2.6GB, is
@@ -2099,15 +2120,22 @@ class Job:
         self.finished = None
         self.proc: subprocess.Popen | None = None
         self.log: list[str] = []
+        # Additive, kind specific fields (mask_track's matte_ids, for one)
+        # that do not belong on every job, merged into as_dict() below so a
+        # kind agnostic reader still gets one flat dict.
+        self.extra: dict = {}
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "id": self.id, "kind": self.kind, "label": self.label,
             "status": self.status, "progress": round(self.progress, 4),
             "message": self.message, "output": self.output,
             "started": self.started, "finished": self.finished,
             "log": self.log[-12:],
         }
+        if self.extra:
+            out.update(self.extra)
+        return out
 
 
 JOBS: dict[str, Job] = {}
@@ -2135,14 +2163,22 @@ def start_render(payload: dict, user_id=None) -> Job:
     # when the request only carried the legacy flag or nothing at all.
     rotation = effective_rotation(payload, user_id)
     payload = dict(payload, rotation=rotation)
-    if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
-        return RG.start_gpu_render(payload, user_id=user_id)
     clip = payload["clip"]
     cfg = full_config(payload.get("config"))
     info = clip_info(clip, rotation)
     start = float(payload.get("start") or 0.0)
     duration = payload.get("duration")
     duration = float(duration) if duration not in (None, "") else None
+    # Design rule 4: a render refuses a matte that has not finished covering
+    # the range it is asked for, unless the caller says allow_partial. One
+    # call, ahead of both engines, using the policy function the engine
+    # already owns (grade/cinegrade.py's require_complete_mattes, C1) rather
+    # than a second copy of the same walk here; it raises CG.GradeError,
+    # which _dispatch already turns into a 400 naming the layer and matte.
+    if not payload.get("allow_partial"):
+        CG.require_complete_mattes(cfg, info, seek=start, duration=duration)
+    if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
+        return RG.start_gpu_render(payload, user_id=user_id)
     scale = payload.get("scale")            # optional preview downscale
     name = safe_name(payload.get("name") or f"studio_{int(time.time())}")
     codec = cfg["output"]["codec"]
@@ -2523,6 +2559,877 @@ def proxy_state(params: dict) -> dict:
     if job is not None:
         out["job"] = job.as_dict()
     return out
+
+
+# --------------------------------------------------------------------------
+# masks (SAM 3.1): the plain proxy, the matte store, picking and tracking
+#
+# Contracts C2 (the matte store), C3 (the SAM service, sam/server.py, its own
+# process on its own port), C4 (this section, and the routes below). The
+# split that matters: the SAM service WRITES matte frames, this file only
+# ever registers a matte (a bootstrap index.json the instant a track is
+# accepted, before the service has written a single frame) and mirrors the
+# service's own progress onto it while a background thread polls. Reading a
+# matte once it exists is grade/mattes.py (M2, contract C6), imported as MT
+# and not duplicated here.
+# --------------------------------------------------------------------------
+
+MASK_WORKING_WIDTH = int(os.environ.get("STUDIO_MASK_WIDTH") or 1280)
+
+
+def set_mask_width(width: int) -> int:
+    """--mask-width / STUDIO_MASK_WIDTH: the fixed width the plain proxy and
+    every SAM call use, independent of whatever the browser happens to be
+    previewing at (design rule 1: nothing the model reads is the picture).
+    """
+    global MASK_WORKING_WIDTH
+    MASK_WORKING_WIDTH = max(160, int(width))
+    return MASK_WORKING_WIDTH
+
+
+MASK_PROXY = CACHE / "mask_proxy"
+MASK_FRAME_CACHE = CACHE / "mask_frame"
+MASK_PICK_CACHE = CACHE / "mask_pick"
+
+# Smaller cap than the playback proxy: this file is per clip per rotation,
+# never per grade, and nobody watches it, so a session touches at most a
+# handful of them.
+MASK_PROXY_CACHE_MAX_BYTES = 800_000_000
+MASK_PROXY_CRF = 20
+MASK_PROXY_GOP = 48
+MASK_PROXY_VERSION = "1"
+
+_mask_proxy_jobs: dict[str, str] = {}
+_mask_proxy_lock = threading.Lock()
+
+
+def _mask_proxy_path(key: str) -> Path:
+    return MASK_PROXY / f"{key}.mp4"
+
+
+def _mask_proxy_params(clip: str, rotation) -> dict:
+    """Resolve a plain Rec.709 proxy request: fixed working width, the whole
+    clip (a track names its own range later, at track time, not at proxy
+    time), one file per clip per rotation.
+
+    Deliberately not `_proxy_params`'s file: that one is keyed to whatever
+    live.js's playback knobs currently ask for and is the picture, not the
+    source. This mirrors its shape (same normalisation, same bounded ffmpeg
+    pass, same Job machinery) so the mask routes get the same guarantees
+    (bounded, cached, visible in the jobs panel) without inventing a second
+    way to encode a clip.
+    """
+    rot = CG.normalise_rotation(rotation)
+    info = clip_info(clip, rot)
+    width, height = _preview_dims(info, MASK_WORKING_WIDTH)
+    if width % 2:
+        width -= 1
+    fps = _proxy_fps(clip, info)
+    duration = float(info.get("duration") or 0.0)
+    if not duration > 0:
+        duration = 3600.0          # bounded even when the probe says nothing
+    matrix = CG.source_matrix(info)
+    key = hashlib.sha1(json.dumps({
+        "clip": clip, "w": width, "h": height, "rot": rot,
+        "dur": round(duration, 3), "matrix": matrix,
+        "src_range": info["color_range"], "v": MASK_PROXY_VERSION,
+    }, sort_keys=True).encode()).hexdigest()
+    return {"key": key, "clip": clip, "rotation": rot, "width": width,
+            "height": height, "duration": duration, "fps": fps,
+            "matrix": matrix, "info": info}
+
+
+def _mask_proxy_ffmpeg_args(params: dict, out_path: Path) -> list[str]:
+    """One bounded pass: the exact source_frame/flat_config normalisation,
+    baked into a plain Rec.709 file with nothing studio specific in it. Full
+    range in, tv range out, same as the playback proxy's own middle step;
+    unlike that one this file is never shown to a person, so there is no
+    "what does the browser assume" question and no range CHOICE to make.
+    """
+    info = params["info"]
+    vf = (f"{CG.rotate_prefix(info)}"
+          f"scale={params['width']}:{params['height']}:flags=bilinear,setsar=1,"
+          f"scale=in_color_matrix={params['matrix']}"
+          f":in_range={info['color_range']}:out_range=full,format=gbrp16le,"
+          f"scale=out_color_matrix=bt709:out_range=limited,format=yuv420p")
+    args = ["ffmpeg", "-v", "error", "-y"] + CG.rotate_args(params["rotation"])
+    args += ["-i", str(clip_path(params["clip"]))]
+    args += ["-t", str(params["duration"])]
+    args += ["-vf", vf, "-an", "-sn", "-dn"]
+    args += [
+        "-c:v", "libx264", "-crf", str(MASK_PROXY_CRF), "-preset", "veryfast",
+        "-g", str(MASK_PROXY_GOP), "-keyint_min", str(MASK_PROXY_GOP),
+        "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+        "-color_range", "tv", "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats", "-f", "mp4", str(out_path),
+    ]
+    return args
+
+
+def start_mask_proxy(params: dict) -> Job:
+    """Encode one plain proxy in the background, through the same Job
+    machinery as everything else that shells out to ffmpeg (design rule 7:
+    the queue is visible)."""
+    key = params["key"]
+    with _mask_proxy_lock:
+        existing = _mask_proxy_jobs.get(key)
+        if existing:
+            job = JOBS.get(existing)
+            if job is not None and job.status == "running":
+                return job
+    cache_path = _mask_proxy_path(key)
+    tmp_path = MASK_PROXY / f"{key}.{uuid.uuid4().hex[:8]}.partial"
+    args = _mask_proxy_ffmpeg_args(params, tmp_path)
+    label = f"mask proxy {params['clip']} {params['width']}px"
+    job = _register(Job("mask_proxy", label))
+    job.output = str(cache_path)
+    total = max(0.1, params["duration"])
+    with _mask_proxy_lock:
+        _mask_proxy_jobs[key] = job.id
+
+    def worker():
+        try:
+            with FFMPEG_SLOTS:
+                job.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True)
+                for line in job.proc.stdout:
+                    line = line.strip()
+                    if line.startswith("out_time_us="):
+                        try:
+                            secs = int(line.split("=", 1)[1]) / 1e6
+                            job.progress = min(1.0, secs / total)
+                            job.message = f"{secs:.1f}s of {total:.1f}s"
+                        except ValueError:
+                            pass
+                job.proc.wait()
+                err = job.proc.stderr.read()
+            ok = job.proc.returncode == 0 and tmp_path.exists() \
+                and tmp_path.stat().st_size > 0
+            if job.status == "cancelled" or not ok:
+                tmp_path.unlink(missing_ok=True)
+                if job.status != "cancelled":
+                    job.status = "failed"
+                    job.message = (err or "ffmpeg failed").strip()[-600:]
+            else:
+                tmp_path.replace(cache_path)
+                _prune_cache_bytes("mask_proxy", MASK_PROXY_CACHE_MAX_BYTES)
+                job.status = "done"
+                job.progress = 1.0
+                size = cache_path.stat().st_size if cache_path.exists() else 0
+                job.message = f"{size / 1e6:.1f} MB"
+        except Exception as exc:                              # noqa: BLE001
+            tmp_path.unlink(missing_ok=True)
+            job.status = "failed"
+            job.message = f"{exc}"
+        finally:
+            job.finished = time.time()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job
+
+
+def mask_proxy_state(params: dict) -> dict:
+    key = params["key"]
+    path = _mask_proxy_path(key)
+    ready = path.exists() and path.stat().st_size > 0
+    job = None
+    if ready:
+        os.utime(path, None)
+    else:
+        job = start_mask_proxy(params)
+    out = {"key": key, "ready": ready, "path": str(path),
+           "width": params["width"], "height": params["height"],
+           "duration": params["duration"], "fps": params["fps"]}
+    if job is not None:
+        out["job"] = job.as_dict()
+    return out
+
+
+def ensure_mask_proxy_ready(clip: str, rotation, timeout: float = 600.0
+                            ) -> tuple[Path, dict]:
+    """Blocking wait for the plain Rec.709 proxy (design rule 6: made once
+    by a bounded ffmpeg job). Called from a mask route's own handler thread,
+    not from playback: this is the one place in this file allowed to wait on
+    an encode, because a pick or a track cannot start without the file the
+    SAM service is going to read.
+
+    Cheap on every call after the first: `_mask_proxy_params` hashes the
+    clip, rotation, size and encode settings into `key`, so a second call
+    for the same clip finds the file already on disk and returns at once.
+    """
+    params = _mask_proxy_params(clip, rotation)
+    state = mask_proxy_state(params)
+    if state["ready"]:
+        return _mask_proxy_path(state["key"]), params
+    job_id = state["job"]["id"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+        if job is None:
+            raise StudioError("the plain proxy job disappeared before it finished")
+        if job.status == "done":
+            return _mask_proxy_path(params["key"]), params
+        if job.status in ("failed", "cancelled"):
+            raise StudioError(f"could not prepare the plain proxy for masking: "
+                              f"{job.message or job.status}")
+        time.sleep(0.2)
+    raise HttpError(504, f"the plain proxy for {clip} did not finish within "
+                    f"{timeout:.0f}s")
+
+
+# --------------------------------------------------------------------------
+# the matte store (contract C2). The SAM service writes matte frames; this
+# file only ever writes an index.json (the bootstrap entry a track needs to
+# exist before the service has written a single frame, and the progress
+# mirror while it runs). Reading is entirely grade/mattes.py (MT), imported
+# once at the top of this file and not duplicated here.
+# --------------------------------------------------------------------------
+
+_matte_index_locks: dict[str, threading.Lock] = {}
+_matte_jobs: dict[str, str] = {}         # recipe hash -> this run's job id
+
+
+def mask_clip_key(clip: str) -> str:
+    """The content key a matte is filed under (C2): the same clip_key
+    projects and saved grades already use, so a matte and a project agree on
+    which clip they are about even across a rename or a move.
+    """
+    return GRADES.clip_key(clip_path(clip))
+
+
+def _matte_dir(clip_key: str, matte_id: str) -> Path:
+    return MT.matte_root() / clip_key / matte_id
+
+
+def _write_matte_index(clip_key: str, matte_id: str, **fields) -> dict:
+    """Atomic merge write of one matte's index.json.
+
+    The SAM service is the normal writer of this file (contract C2): it is
+    handed clip/clip_key/rotation/width/recipe on the wire and keeps state,
+    done_frames and error current on its own. Studio calls this only for a
+    matte the service's own response never described (an old or --stub
+    service) and when the service goes unreachable mid job, where nothing
+    else will ever write a terminal state. Read-modify-write under a lock
+    keyed by the matte's own directory, so a concurrent write from this
+    process cannot interleave into a half written JSON file. MT.forget_cache()
+    afterwards, so the next MT.resolve() sees this write immediately instead
+    of the dataclass cache from before it.
+    """
+    d = _matte_dir(clip_key, matte_id)
+    d.mkdir(parents=True, exist_ok=True)
+    lock = _matte_index_locks.setdefault(str(d), threading.Lock())
+    with lock:
+        p = d / MT.INDEX_NAME
+        try:
+            raw = json.loads(p.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = {}
+        raw.update(fields)
+        raw.setdefault("matte_id", matte_id)
+        raw.setdefault("clip_key", clip_key)
+        raw.setdefault("created", time.time())
+        tmp = d / f".{MT.INDEX_NAME}.{uuid.uuid4().hex[:8]}.tmp"
+        tmp.write_text(json.dumps(raw, allow_nan=False))
+        tmp.replace(p)
+    MT.forget_cache()
+    return raw
+
+
+def _matte_info(matte_id: str):
+    try:
+        return MT.resolve(MT.matte_root(), matte_id)
+    except MT.MatteMissing as exc:
+        raise HttpError(404, str(exc)) from exc
+
+
+def list_all_mattes() -> list:
+    root = MT.matte_root()
+    out = []
+    if not root.is_dir():
+        return out
+    for clip_dir in root.iterdir():
+        if not clip_dir.is_dir():
+            continue
+        for matte_dir in clip_dir.iterdir():
+            if not (matte_dir / MT.INDEX_NAME).is_file():
+                continue
+            try:
+                out.append(MT.info_from_dir(matte_dir, matte_dir.name))
+            except MT.MatteError:
+                continue
+    return out
+
+
+def list_clip_mattes(clip_key: str) -> list:
+    root = MT.matte_root() / clip_key
+    out = []
+    if not root.is_dir():
+        return out
+    for matte_dir in root.iterdir():
+        if not (matte_dir / MT.INDEX_NAME).is_file():
+            continue
+        try:
+            out.append(MT.info_from_dir(matte_dir, matte_dir.name))
+        except MT.MatteError:
+            continue
+    return out
+
+
+def _matte_summary(info) -> dict:
+    return {
+        "matte_id": info.matte_id, "clip": info.clip, "clip_key": info.clip_key,
+        "rotation": info.rotation, "fps": info.fps, "frames": info.frames,
+        "width": info.width, "height": info.height, "state": info.state,
+        "done_frames": info.done_frames, "written_count": info.written_count,
+        "total_frames": info.total_frames, "is_partial": info.is_partial,
+        "recipe": info.recipe, "areas": info.areas, "scores": info.scores,
+        "created": info.created, "model": info.model, "backend": info.backend,
+        # Not one of MatteInfo's own dataclass fields; index.json carries it
+        # straight from the service on a failed matte ("no instance for text
+        # 'shirt'"), and a caller (the jobs panel, a UI badge) needs it to
+        # say more than just "failed".
+        "object_id": info.raw.get("object_id"), "label": info.raw.get("label"),
+        "kind": info.raw.get("kind"), "error": info.raw.get("error"),
+    }
+
+
+def matte_frame_png(matte_id: str, time_s: float, width: int | None
+                    ) -> tuple[bytes, dict]:
+    """PNG bytes and headers for GET /api/matte/<id>/frame (C4): the matte at
+    a moment, with M2's own nearest-written-frame fallback for a still
+    running (partial) matte.
+    """
+    info = _matte_info(matte_id)
+    size = None
+    if width:
+        w = max(1, int(width))
+        h = max(1, round(w * info.height / max(1, info.width)))
+        size = (w, h)
+    try:
+        arr, served, warning = MT.load_time(info, time_s, size)
+    except MT.MatteMissing as exc:
+        raise HttpError(404, str(exc)) from exc
+    tmp = MASK_FRAME_CACHE / f"_tmp_{uuid.uuid4().hex}.png"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        MT.write_gray_png(tmp, arr)
+        png = tmp.read_bytes()
+    finally:
+        tmp.unlink(missing_ok=True)
+    headers = {"X-Matte-State": info.state, "X-Matte-Frame": str(served)}
+    if warning:
+        headers["X-Matte-Warning"] = warning
+    return png, headers
+
+
+# --------------------------------------------------------------------------
+# recipes, cached (design rule 5): a track is keyed by clip identity,
+# rotation, the working width and the recipe itself, so the same request
+# never runs twice. `<clip-key>/_recipe_cache.json` maps that hash to the
+# matte ids it produced, alongside (not instead of) the matte directories
+# themselves, because a text prompt can come back as more than one instance
+# and the service, not this file, decides how many.
+# --------------------------------------------------------------------------
+
+_RECIPE_CACHE_NAME = "_recipe_cache.json"
+
+
+def _recipe_cache_path(clip_key: str) -> Path:
+    return MT.matte_root() / clip_key / _RECIPE_CACHE_NAME
+
+
+def _norm_prompts(prompts) -> dict:
+    """Only the fields C3's prompts object defines, in a stable order, so a
+    hash built from this never differs because of dict insertion order or an
+    extra unknown field a client happened to pass through.
+    """
+    if not isinstance(prompts, dict):
+        return {}
+    out = {}
+    if prompts.get("text"):
+        out["text"] = list(prompts["text"])
+    if prompts.get("points"):
+        out["points"] = prompts["points"]
+    if prompts.get("boxes"):
+        out["boxes"] = prompts["boxes"]
+    if prompts.get("exemplars"):
+        out["exemplars"] = prompts["exemplars"]
+    return out
+
+
+def _normalise_track_recipe(prompts, select, steady) -> dict:
+    return {"prompts": _norm_prompts(prompts),
+            "select": select if select is not None else "all",
+            "steady": int(steady) if steady else None}
+
+
+def _recipe_hash(clip_key: str, rotation: str, recipe: dict) -> str:
+    payload = json.dumps({"clip_key": clip_key, "rotation": rotation,
+                          "width": MASK_WORKING_WIDTH, "recipe": recipe},
+                         sort_keys=True)
+    return hashlib.sha1(payload.encode()).hexdigest()[:20]
+
+
+def _recipe_cache_get(clip_key: str, rhash: str) -> list[str] | None:
+    p = _recipe_cache_path(clip_key)
+    try:
+        raw = json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    ids = raw.get(rhash)
+    if not ids:
+        return None
+    good = []
+    for mid in ids:
+        try:
+            good.append(MT.resolve(MT.matte_root(), mid).matte_id)
+        except MT.MatteMissing:
+            continue           # a matte this cache remembers was deleted since
+    return good or None
+
+
+def _recipe_cache_put(clip_key: str, rhash: str, matte_ids: list) -> None:
+    d = MT.matte_root() / clip_key
+    d.mkdir(parents=True, exist_ok=True)
+    lock = _matte_index_locks.setdefault(str(d) + "/_recipe_cache",
+                                         threading.Lock())
+    with lock:
+        p = _recipe_cache_path(clip_key)
+        try:
+            raw = json.loads(p.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = {}
+        raw[rhash] = [str(m) for m in matte_ids]
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(raw, allow_nan=False))
+        tmp.replace(p)
+
+
+# --------------------------------------------------------------------------
+# picking and tracking (C3/C4)
+# --------------------------------------------------------------------------
+
+PICKS: dict[str, dict] = {}
+PICKS_LOCK = threading.Lock()
+PICKS_MAX = 64
+
+
+def _tint_overlay(rgb: np.ndarray, mask01: np.ndarray,
+                  color=(0, 200, 255), alpha: float = 0.5) -> np.ndarray:
+    """A quick preview: `rgb` (uint8 HxWx3) with `mask01` (0..1 HxW) tinted
+    on top, so a pick's instances are tellable apart at a glance without the
+    caller decoding a raw greyscale matte itself.
+    """
+    m = np.clip(mask01, 0.0, 1.0).astype(np.float32)[..., None]
+    tint = np.array(color, dtype=np.float32)
+    out = rgb.astype(np.float32) * (1.0 - m * alpha) + tint * (m * alpha)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
+                 max_instances=None) -> dict:
+    """POST /api/mask/segment (C4): one frame, synchronous. The plain
+    Rec.709 frame at the working width (flat_config: the technical
+    conversion and nothing creative, same definition the rest of the studio
+    already uses for "before"), handed to the SAM service, instances handed
+    back with an overlay and a raw mask preview a caller can look at before
+    spending a track on one of them.
+    """
+    rot = CG.normalise_rotation(rotation)
+    cfg = flat_config(full_config({}), False)
+    rgb, _meta = render_region(clip, float(time_s), MASK_WORKING_WIDTH, cfg,
+                               rot, None, None)
+    norm_prompts = _norm_prompts(prompts)
+    if not norm_prompts:
+        raise StudioError("mask segment needs at least one prompt: text, "
+                          "points, boxes or exemplars")
+    frame_key = uuid.uuid4().hex[:12]
+    MASK_FRAME_CACHE.mkdir(parents=True, exist_ok=True)
+    frame_path = MASK_FRAME_CACHE / f"{frame_key}.jpg"
+    frame_path.write_bytes(encode_jpeg(rgb, f"mask_pick_{frame_key}"))
+    try:
+        resp = SAMC.client().segment(str(frame_path), norm_prompts, max_instances)
+    except SAMC.SamUnavailable as exc:
+        raise HttpError(503, str(exc)) from exc
+    except SAMC.SamError as exc:
+        raise StudioError(f"the SAM service refused this pick: {exc}") from exc
+    # The pick id is the SAM service's own (it keeps the last 32 in memory,
+    # per C3): a track later naming this pick has to send back the exact id
+    # the service gave out, not one studio made up itself, or the service
+    # has never heard of it. Only a bare `uuid4` fallback for an old or stub
+    # response that omits pick_id, so this route still answers something.
+    pick_id = str(resp.get("pick_id") or uuid.uuid4().hex[:12])
+    entry = {"clip": clip, "rotation": rot, "time": float(time_s),
+             "prompts": norm_prompts, "frame": str(frame_path),
+             "created": time.time(), "instances": {}}
+    instances_out = []
+    MASK_PICK_CACHE.mkdir(parents=True, exist_ok=True)
+    for inst in (resp.get("instances") or []):
+        inst_id = str(inst.get("id"))
+        mask_path = inst.get("mask")
+        overlay_url = mask_url = None
+        if mask_path and Path(str(mask_path)).is_file():
+            mask_arr = MT.read_gray_png(Path(str(mask_path)))
+            full = 65535.0 if mask_arr.dtype == np.uint16 else 255.0
+            mask01 = mask_arr.astype(np.float32) / full
+            if mask01.shape != rgb.shape[:2]:
+                mask01 = MT.resize_bilinear(mask01, rgb.shape[1], rgb.shape[0])
+            overlay = _tint_overlay(rgb, mask01)
+            overlay_path = MASK_PICK_CACHE / f"{pick_id}_{inst_id}_overlay.jpg"
+            mask_out_path = MASK_PICK_CACHE / f"{pick_id}_{inst_id}_mask.png"
+            overlay_path.write_bytes(
+                encode_jpeg(overlay, f"mask_pick_{pick_id}_{inst_id}_ov"))
+            MT.write_gray_png(mask_out_path, mask01)
+            entry["instances"][inst_id] = {"overlay": str(overlay_path),
+                                           "mask": str(mask_out_path)}
+            overlay_url = f"/api/mask/pick/{pick_id}/{inst_id}/overlay"
+            mask_url = f"/api/mask/pick/{pick_id}/{inst_id}/mask"
+        instances_out.append({"id": inst_id, "score": inst.get("score"),
+                              "box": inst.get("box"), "area": inst.get("area"),
+                              "overlay": overlay_url, "mask": mask_url})
+    with PICKS_LOCK:
+        PICKS[pick_id] = entry
+        if len(PICKS) > PICKS_MAX:
+            oldest = sorted(PICKS.items(), key=lambda kv: kv[1]["created"])
+            for pid, _entry in oldest[:-PICKS_MAX]:
+                PICKS.pop(pid, None)
+    return {"pick_id": pick_id, "instances": instances_out,
+            "elapsed_s": resp.get("elapsed_s")}
+
+
+_POLL_INTERVAL = 1.0
+
+
+def _poll_sam_job(job: Job, clip_key: str, sam_job_id) -> None:
+    """Mirrors the SAM service's own job state onto the studio Job (visible
+    in the jobs panel, design rule 7: the queue is visible). Runs until the
+    service reports a terminal job state, or stops answering.
+
+    Deliberately does NOT write a matte's own index.json in the normal case:
+    the SAM service is the sole writer of that file (contract C2, "clip,
+    clip_key, rotation, recipe stored verbatim by the service", "index.json
+    rewritten atomically... while a job runs"), and `queue_mask_track`
+    already handed the service everything it needs to do that from the
+    start. Two writers on one file is exactly the race this avoids. The one
+    exception is when the service itself goes unreachable mid job: nothing
+    else will ever finalise that matte's state then, so this falls back to
+    writing "failed" itself, same as `_write_matte_index`'s docstring always
+    described as its purpose.
+    """
+    matte_ids = job.extra.get("matte_ids", [])
+    if not sam_job_id:
+        # A --stub or a synchronous backend can finish inside the enqueue
+        # call itself and hand back no job id at all: nothing to poll, the
+        # track is already done. queue_mask_track already trusted the
+        # service's own synchronous response for the matte index in this
+        # case (or wrote a fallback bootstrap entry if the response did not
+        # carry one), so this is just the studio Job bookkeeping.
+        job.status = "done"
+        job.progress = 1.0
+        job.finished = time.time()
+        return
+    while True:
+        if job.status == "cancelled":
+            try:
+                SAMC.client().job_cancel(sam_job_id)
+            except (SAMC.SamUnavailable, SAMC.SamError) as exc:
+                # Could not even ask the service to stop: nobody else will
+                # ever finalise this matte's state, so studio has to.
+                job.message = str(exc)
+                job.finished = time.time()
+                for mid in matte_ids:
+                    _write_matte_index(clip_key, mid, state="failed",
+                                       error=f"could not cancel: {exc}")
+                return
+            # Cancellation was accepted; keep polling below for the terminal
+            # state the service settles on (partial if it wrote any frame,
+            # failed with error "cancelled" otherwise, per C3), rather than
+            # guessing it here. "cancelled" is checked again each loop, so a
+            # second cancel request while this is still running is harmless.
+        try:
+            state = SAMC.client().job(sam_job_id)
+        except (SAMC.SamUnavailable, SAMC.SamError) as exc:
+            job.status = "failed"
+            job.message = str(exc)
+            job.finished = time.time()
+            for mid in matte_ids:
+                _write_matte_index(clip_key, mid, state="failed", error=str(exc))
+            return
+        st = str(state.get("state") or "running")
+        done_frames = state.get("done_frames") or 0
+        total_frames = state.get("total_frames") or 0
+        job.message = f"{done_frames} of {total_frames} frames"
+        if total_frames:
+            job.progress = min(1.0, done_frames / total_frames)
+        job.extra["sam_state"] = state
+        # Per matte state, kept for the jobs panel only (_mask_job_view):
+        # one text slot can fail ("no instance for text 'shirt'") while its
+        # siblings finish, and the job as a whole is not "failed" for that.
+        # The matte's own GET /api/matte/<id> reads index.json, which the
+        # service is keeping current on its own.
+        if state.get("mattes"):
+            job.extra["mattes"] = state["mattes"]
+        if st in ("done", "failed", "cancelled"):
+            job.status = "done" if st == "done" else "failed"
+            if st == "done":
+                job.progress = 1.0
+            job.finished = time.time()
+            return
+        time.sleep(_POLL_INTERVAL)
+
+
+def queue_mask_track(clip: str, rotation, prompts=None, select=None,
+                     steady=None, pick_id=None, start=None, end=None) -> dict:
+    """POST /api/mask/track's implementation (C3/C4).
+
+    Two request shapes fold into one recipe: a bare prompts dict (the
+    portable, auto-queueable text case, design rule 8) and a pick_id +
+    select (the pixel specific case). The pick's own remembered prompts are
+    kept in the STORED recipe (index.json, the recipe cache) so the recipe
+    stays remakeable after this process restarts, but the WIRE call to the
+    SAM service sends `pick` + `select`, not those prompts again: a pick
+    names the exact instance a person already chose from `/segment`'s own
+    boxes, and re-sending prompts would ask the service to detect fresh
+    instead of tracking the one already picked (per C3, "either prompts or
+    pick + select").
+
+    `start`/`end` are seconds, matching what `Studio.track()` sends; frame
+    indices for the wire call are computed from the mask proxy's own fps
+    once it is ready, clamped to the proxy's actual frame range.
+
+    Synchronous up to the point the SAM service has ENQUEUED the job (its own
+    /track call is meant to be quick, "queued, not run inline", per C3): this
+    call blocks for that, plus for the plain proxy if this is the first
+    request for this clip and rotation, then returns. The actual multi-frame
+    tracking work happens on a background thread this function starts before
+    returning. The matte's own index.json is written by the SAM service
+    itself (contract C2: clip, clip_key, rotation, width and recipe are
+    handed to it on the wire so it can do that from the start), not by
+    studio; the one exception is a matte the response did not describe at
+    all, when a fallback bootstrap write here is the only thing keeping
+    GET /api/matte/<id> from 404ing on something the track call did accept.
+
+    Returns {"job_id": str|None, "mattes": [...]}. job_id is None only on a
+    pure cache hit: design rule 5 means that call cost nothing, there is no
+    fresh job, and the caller reads the existing matte's own state instead.
+    """
+    rot = CG.normalise_rotation(rotation)
+    clip_key = mask_clip_key(clip)
+    use_pick = None
+    if pick_id:
+        with PICKS_LOCK:
+            entry = PICKS.get(str(pick_id))
+        if not entry:
+            raise StudioError(f"no such pick: {pick_id}")
+        prompts = entry.get("prompts") or {}
+        use_pick = str(pick_id)
+    recipe = _normalise_track_recipe(prompts, select, steady)
+    p = recipe["prompts"]
+    if not (p.get("text") or p.get("points") or p.get("boxes") or p.get("exemplars")):
+        raise StudioError("mask track needs at least one prompt (text, "
+                          "points, boxes or exemplars) or a pick_id")
+    rhash = _recipe_hash(clip_key, rot, recipe)
+
+    cached_ids = _recipe_cache_get(clip_key, rhash)
+    if cached_ids:
+        infos = []
+        for mid in cached_ids:
+            try:
+                infos.append(MT.resolve(MT.matte_root(), mid))
+            except MT.MatteMissing:
+                continue
+        return {"job_id": _matte_jobs.get(rhash),
+                "mattes": [{"matte_id": i.matte_id, "recipe": i.recipe,
+                            "state": i.state} for i in infos]}
+
+    path, params = ensure_mask_proxy_ready(clip, rot)
+    out_dir = MT.matte_root() / clip_key
+    # end_frame is an EXCLUSIVE upper bound (C3: "frames (=end_frame,
+    # exclusive upper bound)"), so the full clip is [0, total_frames), not
+    # [0, total_frames - 1] as an inclusive last index would read.
+    total_frames = max(1, int(round(params["duration"] * params["fps"])))
+    start_frame = 0
+    if start is not None:
+        start_frame = min(total_frames, max(0, int(round(float(start) * params["fps"]))))
+    end_frame = total_frames
+    if end is not None:
+        end_frame = min(total_frames, max(start_frame, int(round(float(end) * params["fps"]))))
+    try:
+        resp = SAMC.client().track(
+            str(path), str(out_dir), fps=params["fps"],
+            start_frame=start_frame, end_frame=end_frame,
+            prompts=None if use_pick else recipe["prompts"], pick=use_pick,
+            select=recipe["select"], steady=recipe["steady"],
+            clip=clip, clip_key=clip_key, rotation=rot,
+            # `clip` above is the bare name stored verbatim in the matte's
+            # own index.json (contract C2, and test_matte_list_get_and_frame
+            # pins that shape); it is not a path the SAM service can ffprobe
+            # from its own working directory. `rotation_probe_path` is a
+            # SEPARATE field, the real absolute file this clip actually is,
+            # purely so the service's rotation="auto" resolution
+            # (sam/server.py's resolve_rotation, C3) can read the clip's own
+            # display-matrix tag when studio sends "auto" (its own default,
+            # effective_rotation()) rather than a concrete quarter turn.
+            # Without this a track queued at the studio's default rotation
+            # wrote a matte whose index.json rotation (silently resolved to
+            # 0, the fallback for a tag that could not be probed) disagreed
+            # with the working proxy's own portrait pixels: found and fixed
+            # in INTEGRATION-A while cross checking `stats --matte` against
+            # a real tracked matte end to end.
+            rotation_probe_path=str(clip_path(clip)),
+            width=params["width"], recipe=recipe)
+    except SAMC.SamUnavailable as exc:
+        raise HttpError(503, str(exc)) from exc
+    except SAMC.SamError as exc:
+        raise StudioError(f"the SAM service refused this track: {exc}") from exc
+
+    sam_job_id = resp.get("job_id")
+    sam_mattes = resp.get("mattes") or []
+    matte_ids = [str(m.get("matte_id")) for m in sam_mattes if m.get("matte_id")]
+    if not matte_ids:
+        matte_ids = [str(m) for m in (resp.get("matte_ids") or [])]
+    if not matte_ids:
+        raise StudioError("the SAM service accepted this track but returned "
+                          "no matte ids to watch")
+    label = f"mask track {clip} {','.join(matte_ids)[:60]}"
+    job = _register(Job("mask_track", label))
+    job.extra = {"matte_ids": matte_ids, "clip": clip, "clip_key": clip_key,
+                "rotation": rot, "sam_job_id": sam_job_id, "mattes": sam_mattes}
+    _matte_jobs[rhash] = job.id
+    _recipe_cache_put(clip_key, rhash, matte_ids)
+
+    by_id = {str(m.get("matte_id")): m for m in sam_mattes if m.get("matte_id")}
+    mattes_out = []
+    for mid in matte_ids:
+        m = by_id.get(mid)
+        if m is not None:
+            mattes_out.append({"matte_id": mid, "recipe": recipe,
+                               "state": m.get("state", "queued"),
+                               "object_id": m.get("object_id"),
+                               "label": m.get("label"), "kind": m.get("kind")})
+        else:
+            # The response did not describe this matte (an older or --stub
+            # service): only then does studio write index.json itself, so
+            # the store has something to answer GET /api/matte/<id> with.
+            raw = _write_matte_index(
+                clip_key, mid, clip=clip, rotation=rot, fps=params["fps"],
+                width=params["width"], height=params["height"],
+                state="queued", done_frames=0, recipe=recipe)
+            mattes_out.append({"matte_id": mid, "recipe": recipe, "state": raw["state"]})
+
+    threading.Thread(target=_poll_sam_job, args=(job, clip_key, sam_job_id),
+                     daemon=True).start()
+    return {"job_id": job.id, "mattes": mattes_out}
+
+
+def _mask_job_view(job: Job) -> dict:
+    """The C3-mirrored single job shape GET /api/mask/jobs/<id> answers with,
+    built from the studio Job plus the SAM state the poller last saw.
+
+    `mattes` carries each matte's OWN state (object_id, label, kind, state,
+    done_frames, error): the service can finish one text slot while another
+    fails ("no instance for text 'shirt'"), and the job as a whole is not
+    "failed" just because one of several matte slots was. A caller wanting
+    one matte's authoritative state still reads GET /api/matte/<id>, which
+    the service keeps current directly; this is the jobs-panel view.
+    """
+    sam_state = job.extra.get("sam_state") or {}
+    state = ("cancelled" if job.status == "cancelled" else
+             "failed" if job.status == "failed" else
+             "done" if job.status == "done" else "running")
+    error = None
+    if state == "failed":
+        error = sam_state.get("error") or job.message or None
+    return {
+        "id": job.id, "label": job.label, "state": state,
+        "progress": round(job.progress, 4), "message": job.message,
+        "matte_ids": job.extra.get("matte_ids", []),
+        "mattes": job.extra.get("mattes", []),
+        "clip": job.extra.get("clip"), "clip_key": job.extra.get("clip_key"),
+        "rotation": job.extra.get("rotation"),
+        "sam_job_id": job.extra.get("sam_job_id"),
+        "done_frames": sam_state.get("done_frames"),
+        "total_frames": sam_state.get("total_frames"),
+        "fps": sam_state.get("fps"), "elapsed_s": sam_state.get("elapsed_s"),
+        "queue_position": sam_state.get("queue_position"),
+        "error": error, "started": job.started, "finished": job.finished,
+    }
+
+
+def _matte_weight_for(info, time_s: float, meta: dict):
+    """The HxW weight array for `frame_stats`'s `weight` argument (C6): full
+    frame size first, so the matte and the picture agree on where a pixel
+    is, THEN the same region crop `resolve_stats_frame` already applied
+    (region crops first, then the matte weights what is left).
+    """
+    full_w = meta.get("full_width", meta["width"])
+    full_h = meta.get("full_height", meta["height"])
+    try:
+        arr, served, warning = MT.load_time(info, time_s, (full_w, full_h))
+    except MT.MatteMissing as exc:
+        raise StudioError(str(exc)) from exc
+    if "region_pixels" in meta:
+        x, y, w, h = meta["region_pixels"]
+        arr = np.ascontiguousarray(arr[y:y + h, x:x + w])
+    return arr, served, warning
+
+
+def resolve_preset_mask_recipes(clip: str, rotation, cfg: dict) -> tuple[dict, list]:
+    """"Recipe resolution on preset load" (C4), the I/O half of
+    projects.py's pure `resolve_mask_recipes`: this function is the
+    `lookup` PROJECTS calls per mask.matte component, and the thing that
+    actually queues a track for every portable (text only) recipe it could
+    not resolve to an existing matte.
+
+    `lookup` tries the component's own saved matte id first (only good when
+    it names a matte that belongs to THIS clip: a preset is reusable across
+    clips, so a matte id saved against a different clip is exactly the
+    "needs a fresh pick" case, not a hit), then the recipe cache for a
+    matte this exact clip, rotation and recipe already produced.
+    """
+    rot = CG.normalise_rotation(rotation)
+    clip_key = mask_clip_key(clip)
+
+    def lookup(recipe, existing_id):
+        norm = _normalise_track_recipe(
+            (recipe or {}).get("prompts", recipe),
+            (recipe or {}).get("select"), (recipe or {}).get("steady"))
+        if existing_id:
+            try:
+                info = MT.resolve(MT.matte_root(), str(existing_id))
+                if info.clip_key == clip_key:
+                    return info.matte_id
+            except MT.MatteMissing:
+                pass
+        cached = _recipe_cache_get(clip_key, _recipe_hash(clip_key, rot, norm))
+        return cached[0] if cached else None
+
+    resolved, to_queue = PROJECTS.resolve_mask_recipes(cfg, lookup)
+    queued = []
+    for item in to_queue:
+        recipe = item["recipe"] or {}
+        prompts = recipe.get("prompts", recipe)
+        try:
+            result = queue_mask_track(clip, rot, prompts, recipe.get("select"),
+                                      recipe.get("steady"))
+        except (StudioError, HttpError) as exc:
+            queued.append({"layer": item["layer"], "component": item["component"],
+                           "error": str(exc)})
+            continue
+        # Stamp the matte id straight onto the resolved config so a caller
+        # sees it without a second round trip back to this same route.
+        mattes = result.get("mattes") or []
+        if mattes:
+            layer = resolved.get("layers", [])[item["layer"]]
+            for comp in (layer.get("mask", {}).get("components") or []):
+                if comp.get("id") == item["component"] and comp.get("type") == "matte":
+                    comp["matte"]["id"] = mattes[0]["matte_id"]
+                    comp["matte"]["needs_pick"] = False
+        queued.append({"layer": item["layer"], "component": item["component"],
+                       "job_id": result.get("job_id"), "mattes": mattes})
+    return resolved, queued
 
 
 # --------------------------------------------------------------------------
@@ -4785,29 +5692,61 @@ class Handler(BaseHTTPRequestHandler):
             # clip form touches this account's read guard.
             if payload.get("path") is None and payload.get("ref") is None:
                 self._guard_read(payload.get("clip"))
+            # C6, "measure by matte": weights every percentile, band and hue
+            # family by the matte's value at that frame instead of measuring
+            # the whole picture flat. Resolved once, outside the times loop,
+            # since the matte itself does not change per requested time.
+            matte_param = payload.get("matte")
+            matte_info = None
+            if matte_param:
+                matte_info = _matte_info(str(matte_param))
+                self._guard_read(matte_info.clip)
             times = payload.get("times")
             if times:
                 results = []
                 for t in times:
                     rgb, meta = resolve_stats_frame(payload, self._uid(), float(t))
-                    row = {"time": float(t), "key": meta["key"],
-                          "stats": frame_stats(rgb),
-                          "size": [meta.get("width", rgb.shape[1]),
-                                   meta.get("height", rgb.shape[0])]}
+                    row = {"time": float(t), "key": meta["key"]}
+                    weight = None
+                    if matte_info is not None:
+                        weight, _served, warn = _matte_weight_for(
+                            matte_info, float(t), meta)
+                        if warn:
+                            row["warnings"] = [warn]
+                    try:
+                        row["stats"] = frame_stats(rgb, weight=weight)
+                    except StatsError as exc:
+                        raise StudioError(str(exc)) from exc
+                    row["size"] = [meta.get("width", rgb.shape[1]),
+                                   meta.get("height", rgb.shape[0])]
                     if "region" in meta:
                         row["region"] = meta["region"]
                         row["region_pixels"] = meta["region_pixels"]
                     results.append(row)
                 self._json({"results": results})
                 return
-            rgb, meta = resolve_stats_frame(payload, self._uid(),
-                                            float(payload.get("time", 0)))
-            out = {"key": meta["key"], "stats": frame_stats(rgb),
+            time_used = float(payload.get("time", 0))
+            rgb, meta = resolve_stats_frame(payload, self._uid(), time_used)
+            weight = None
+            warnings = []
+            if matte_info is not None:
+                weight, _served, warn = _matte_weight_for(matte_info, time_used, meta)
+                if warn:
+                    warnings.append(warn)
+            try:
+                stats_out = frame_stats(rgb, weight=weight)
+            except StatsError as exc:
+                raise StudioError(str(exc)) from exc
+            out = {"key": meta["key"], "stats": stats_out,
                    "size": [meta.get("width", rgb.shape[1]),
                             meta.get("height", rgb.shape[0])]}
             if "region" in meta:
                 out["region"] = meta["region"]
                 out["region_pixels"] = meta["region_pixels"]
+            if matte_info is not None:
+                out["matte"] = matte_info.matte_id
+            if warnings:
+                out["warnings"] = warnings
             self._json(out)
             return
 
@@ -4857,11 +5796,27 @@ class Handler(BaseHTTPRequestHandler):
         if route == "preset" and method == "GET":
             name = q["name"]
             uid = self._presets_uid()
+            cfg = read_preset(name, uid)
             body = {"name": name,
                     "comment": read_preset_comment(name, uid),
-                    "config": read_preset(name, uid)}
+                    "config": cfg}
             if str(q.get("expand", "")).strip().lower() in ("1", "true", "yes"):
                 body["expanded"] = True
+            # "Recipe resolution on preset load" (C4): optional, additive.
+            # Every existing caller (no `clip` on the query) sees exactly
+            # today's response; a caller that names the clip it is applying
+            # this preset to gets its mask components resolved against that
+            # clip's own matte store, with a portable (text only) recipe
+            # queued to track right away instead of waiting for a person to
+            # notice a "needs pick" badge that does not apply to it.
+            clip = q.get("clip")
+            if clip and isinstance(cfg, dict):
+                self._guard_read(clip)
+                rotation = effective_rotation(q, self._uid())
+                resolved, queued = resolve_preset_mask_recipes(clip, rotation, cfg)
+                body["config"] = resolved
+                if queued:
+                    body["mask_queued"] = queued
             self._json(body)
             return
 
@@ -5068,6 +6023,132 @@ class Handler(BaseHTTPRequestHandler):
             name = route[len("proxy/"):]
             self._guard_read_key(name[:-4] if name.endswith(".mp4") else name)
             self._serve_proxy(name)
+            return
+
+        # --- masks: SAM 3.1, contracts C3/C4 ------------------------------
+        #
+        # /api/mask/* is picking and tracking, ephemeral except for the
+        # matte ids and jobs it produces. /api/matte/* reads and manages the
+        # matte store itself (C2). Neither touches the live session or the
+        # project history: a matte is per clip and shared, not per caller
+        # (design rule: "per caller session untouched").
+
+        if route == "mask/status" and method == "GET":
+            try:
+                health = SAMC.client().health()
+                ok = bool(health.get("ok", True))
+            except SAMC.SamUnavailable as exc:
+                health = {"ok": False, "error": str(exc)}
+                ok = False
+            with JOBS_LOCK:
+                jobs = [j.as_dict() for j in JOBS.values()
+                       if j.kind in ("mask_track", "mask_proxy")]
+            self._json({"ok": ok, "service": health, "jobs": jobs})
+            return
+
+        if route == "mask/segment" and method == "POST":
+            payload = self._body()
+            self._guard_read(payload.get("clip"))
+            rotation = effective_rotation(payload, self._uid())
+            self._json(mask_segment(
+                payload["clip"], float(payload.get("time", 0)), rotation,
+                payload.get("prompts") or {}, payload.get("max_instances")))
+            return
+
+        if route == "mask/track" and method == "POST":
+            payload = self._body()
+            self._guard_read(payload.get("clip"))
+            rotation = effective_rotation(payload, self._uid())
+            self._json(queue_mask_track(
+                payload["clip"], rotation, payload.get("prompts"),
+                payload.get("select"), payload.get("steady"),
+                payload.get("pick_id"), payload.get("start"), payload.get("end")))
+            return
+
+        if route.startswith("mask/pick/") and method == "GET":
+            # /api/mask/pick/<pick_id>/<instance_id>/<overlay|mask>: the
+            # preview images GET /api/mask/segment's own response points at.
+            parts = route[len("mask/pick/"):].split("/")
+            if len(parts) != 3:
+                raise StudioError(f"no route for {method} {path}")
+            pick_id, inst_id, kind = parts
+            with PICKS_LOCK:
+                entry = PICKS.get(pick_id)
+            if not entry:
+                raise HttpError(404, f"no such pick: {pick_id}")
+            self._guard_read(entry.get("clip"))
+            inst = entry.get("instances", {}).get(inst_id)
+            if not inst or kind not in ("overlay", "mask"):
+                raise HttpError(404, f"no {kind} for pick {pick_id} instance {inst_id}")
+            p = Path(inst[kind])
+            if not p.is_file():
+                raise HttpError(404, f"{kind} image for pick {pick_id} instance "
+                                f"{inst_id} is gone")
+            ctype = "image/jpeg" if kind == "overlay" else "image/png"
+            self._send(200, p.read_bytes(), ctype)
+            return
+
+        if route == "mask/jobs" and method == "GET":
+            # The whole queue, every caller's mask track jobs together
+            # (README's own CLI table row for `mask jobs`, and the shape
+            # `cinegrade mask jobs` has always parsed): the same per job
+            # view GET /api/mask/jobs/<id> gives, one entry per still
+            # queued or running (or recently finished, same 30 job cap as
+            # every other job list) mask_track job, so a caller reads one
+            # shape whether it asks for one job or all of them.
+            with JOBS_LOCK:
+                jobs = [_mask_job_view(j) for j in JOBS.values()
+                       if j.kind == "mask_track"]
+            self._json({"jobs": jobs})
+            return
+
+        if route.startswith("mask/jobs/") and method == "GET":
+            job_id = route[len("mask/jobs/"):]
+            job = JOBS.get(job_id)
+            if not job or job.kind != "mask_track":
+                raise HttpError(404, f"no mask track job: {job_id}")
+            self._json(_mask_job_view(job))
+            return
+
+        if route == "matte" and method == "GET":
+            clip = q.get("clip")
+            if clip:
+                self._guard_read(clip)
+                infos = list_clip_mattes(mask_clip_key(clip))
+            else:
+                infos = list_all_mattes()
+            self._json({"mattes": [_matte_summary(i) for i in infos]})
+            return
+
+        if route.startswith("matte/") and route.endswith("/frame") and method == "GET":
+            matte_id = route[len("matte/"):-len("/frame")]
+            info = _matte_info(matte_id)
+            self._guard_read(info.clip)
+            width = q.get("width")
+            png, headers = matte_frame_png(
+                matte_id, float(q.get("time", 0)), int(width) if width else None)
+            self._send(200, png, "image/png", headers)
+            return
+
+        if route.startswith("matte/") and method == "GET":
+            matte_id = route[len("matte/"):]
+            info = _matte_info(matte_id)
+            self._guard_read(info.clip)
+            self._json(_matte_summary(info))
+            return
+
+        if route.startswith("matte/") and method == "DELETE":
+            matte_id = route[len("matte/"):]
+            info = _matte_info(matte_id)
+            self._guard_read(info.clip)
+            # Design rule: mattes are shared by every caller, so deleting one
+            # needs admin whenever logins are on; with logins off (the local
+            # and the agent case both) this is a no-op, same as every other
+            # admin gate in this file.
+            self._require_admin()
+            shutil.rmtree(info.path, ignore_errors=True)
+            MT.forget_cache()
+            self._json({"deleted": matte_id})
             return
 
         raise StudioError(f"no route for {method} {path}")
@@ -5618,11 +6699,25 @@ def main() -> None:
                     help="turn the one line per request log off. The log is "
                          "on by default so a shared server can say who did "
                          "what; --verbose is a separate, noisier thing")
+    ap.add_argument("--sam-url", metavar="URL",
+                    help="base URL of the SAM masking service (contract C3). "
+                         "Also settable as STUDIO_SAM_URL. Default "
+                         f"{SAMC.DEFAULT_SAM_URL}")
+    ap.add_argument("--mask-width", type=int, default=None,
+                    help="working width for the plain Rec.709 proxy the mask "
+                         f"routes hand to the SAM service (default "
+                         f"{MASK_WORKING_WIDTH}, pending the spike's own "
+                         "number). Also settable as STUDIO_MASK_WIDTH")
     args = ap.parse_args()
     VERBOSE = args.verbose
     QUIET = args.quiet
     UPLOAD_MAX_BYTES = args.upload_max_bytes
     UPLOAD_QUOTA_BYTES = args.upload_quota_bytes
+    if args.sam_url:
+        os.environ["STUDIO_SAM_URL"] = args.sam_url
+        SAMC.reset_default()
+    if args.mask_width:
+        set_mask_width(args.mask_width)
 
     # Before anything opens the database, including --create-user below.
     if args.data_dir:
@@ -5701,6 +6796,8 @@ def main() -> None:
               flush=True)
     print(f"  footage {FOOTAGE}\n  presets {PRESETS}\n  looks   {LOOKS}\n"
           f"  out     {OUT}\n  cache   {CACHE}\n  data    {DB.DATA}", flush=True)
+    print(f"  sam     {SAMC.client().base} (mask width {MASK_WORKING_WIDTH}px)",
+          flush=True)
     print("  log     " + ("off (--quiet)" if QUIET else
                           "one line per request on stderr"), flush=True)
     try:

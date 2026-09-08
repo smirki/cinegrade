@@ -26,6 +26,26 @@ const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
 const PORT_MIN = 20000;
 const PORT_MAX = 60000;
 
+// Lane M7's own addition: the real SAM masking service (contract C3), always
+// started in --stub mode (no weights, synthetic drifting ellipses, the
+// project's own uv-managed interpreter) so the masks specs drive the real
+// studio/server.py -> sam/server.py round trip rather than a fake standing
+// in for either half. --no-model-lock skips the machine-wide
+// /tmp/fixxr-sam-model.lock (a test-only flag sam/server.py documents for
+// exactly this): the founder's own real SAM service, if one happens to be
+// running, is never touched or blocked by this harness. --stub-delay-ms
+// gives a track real wall-clock time per frame, the same reason M7's Python
+// suite uses it, so a spec polling queued/running actually has a window to
+// observe those states rather than always landing on "done" first read.
+const SAM_PYTHON = path.join(CONTENT_DIR, "sam", ".venv", "bin", "python");
+const SAM_SERVER = path.join(CONTENT_DIR, "sam", "server.py");
+// The panel never restricts a track's own start/end (design: a person names
+// a selection and it tracks the whole clip), so the delay times the WHOLE
+// fixture clip's frame count, not a slice of it: kept small so a real
+// queued/running/done cycle stays observable without a spec waiting tens of
+// seconds for it.
+const SAM_STUB_DELAY_MS = "60";
+
 const SPEC_FILES = [
   "01-input-probe.mjs",
   "02-boot.mjs",
@@ -52,6 +72,11 @@ const SPEC_FILES = [
   "23-files.mjs",
   "24-playback-render.mjs",
   "25-viewer-zoom-frames.mjs",
+  // 26 is reserved for the timeline arc (M6/M7's own briefs both say so);
+  // masks starts at 27, lane M7 (tests).
+  "27-masks-panel.mjs",
+  "28-masks-pick-and-track.mjs",
+  "29-masks-fixture-states.mjs",
 ];
 
 /* Chasing one failing spec through a whole run costs minutes of GPU work, so
@@ -181,6 +206,31 @@ async function main() {
   const baseUrl = "http://127.0.0.1:" + port;
   console.log("[run] port " + port);
 
+  // The SAM masking service (contract C3), real, --stub, its own data dir,
+  // started before studio/server.py so --sam-url points at something
+  // already listening rather than something studio has to retry into
+  // existing. findFreePort is called again rather than reused: the two
+  // servers must never be told to share one port, and a second independent
+  // call (which binds and releases before returning) is how every other
+  // free port in this harness is chosen too. PORT_MIN/PORT_MAX (20000 to
+  // 60000) keeps this, like the studio port, nowhere near 7431 (the
+  // founder's live studio), 7560 (the SAM service's own default port), 7614
+  // or 7615: the four ports this whole arc treats as permanently off limits.
+  const samPort = await findFreePort(PORT_MIN, PORT_MAX, 40);
+  const samBase = "http://127.0.0.1:" + samPort;
+  const samDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-sam-test-"));
+  console.log("[run] SAM stub port " + samPort + ", data dir " + samDataDir);
+  const samLog = { stdout: [], stderr: [] };
+  const samServer = spawn(SAM_PYTHON, [SAM_SERVER, "--port", String(samPort),
+    "--data-dir", samDataDir, "--stub", "--no-model-lock",
+    "--stub-delay-ms", SAM_STUB_DELAY_MS], {
+    cwd: CONTENT_DIR,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  samServer.stdout.on("data", (d) => pushLog(samLog.stdout, d));
+  samServer.stderr.on("data", (d) => pushLog(samLog.stderr, d));
+  samServer.on("error", (e) => pushLog(samLog.stderr, "spawn error: " + e.message + "\n"));
+
   // studio/data/studio.db and studio/data/users/<id>/presets are somebody's
   // real accounts, grades and presets, not test fixtures. --data-dir (server.py,
   // also STUDIO_DATA_DIR) is exactly the escape hatch server.py documents for
@@ -225,7 +275,8 @@ async function main() {
 
   const serverLog = { stdout: [], stderr: [] };
   const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
-    "--data-dir", dataDir, "--footage", footageDir, "--cache-dir", cacheDir], {
+    "--data-dir", dataDir, "--footage", footageDir, "--cache-dir", cacheDir,
+    "--sam-url", samBase], {
     cwd: CONTENT_DIR,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -237,8 +288,30 @@ async function main() {
   const rows = [];
   let hardFailure = null;
   let savedGrades = [];
+  let samStopped = false;
+
+  // A spec proving the service-down badge (contract C4's 503, the start
+  // command it carries) needs the real SAM stub to actually stop answering,
+  // not a mock of "down". Exposed on ctx rather than reaching for the
+  // process directly, so a spec kills it by the one handle this file
+  // captured at spawn, same discipline as every other kill in this harness.
+  // Idempotent and safe to call again from the finally block below: PID
+  // only, never a name pattern, and only ever this one process.
+  async function stopSam() {
+    if (samStopped) return;
+    samStopped = true;
+    if (samServer && samServer.exitCode === null && !samServer.killed) {
+      samServer.kill("SIGTERM");
+      await sleep(500);
+      try { samServer.kill("SIGKILL"); } catch (e) { /* already gone */ }
+    }
+  }
 
   try {
+    console.log("[run] waiting for " + samBase + "/health ...");
+    await waitForHttp200(samBase + "/health", 20000, 250);
+    console.log("[run] SAM stub is up");
+
     console.log("[run] waiting for " + baseUrl + "/api/state ...");
     await waitForHttp200(baseUrl + "/api/state", 20000, 250);
     console.log("[run] server is up");
@@ -286,6 +359,10 @@ async function main() {
       firstClip,
       waitForBootComplete: (t) => waitForBootComplete(page, t),
       state: {},
+      samBase,
+      samPort,
+      samDataDir,
+      stopSam,
     };
 
     for (const file of SPECS_TO_RUN) {
@@ -326,11 +403,18 @@ async function main() {
     }
     try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
     try { fs.rmSync(footageDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+    // stopSam() is idempotent: a spec that already killed it for the
+    // service-down check (samStopped set) makes this a no-op, and any other
+    // ending (a hard failure before that spec ran, an early throw) still
+    // gets the SAM stub killed by the one PID captured at spawn.
+    await stopSam();
+    try { fs.rmSync(samDataDir, { recursive: true, force: true }); } catch (e) { /* best effort */ }
   }
 
   if (hardFailure) {
     console.error("[run] harness could not complete the run: " + (hardFailure.stack || hardFailure));
     console.error("[run] server stderr tail:\n" + serverLog.stderr.join("").slice(-4000));
+    console.error("[run] SAM stub stderr tail:\n" + samLog.stderr.join("").slice(-4000));
     process.exit(1);
   }
 

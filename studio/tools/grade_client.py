@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -124,7 +125,7 @@ def _url(base: str, path: str, params: dict | None = None) -> str:
 def request(method: str, base: str, path: str, token: str | None = None,
            params: dict | None = None, body: dict | None = None,
            want_json: bool = True, timeout: float = 60.0,
-           headers: dict | None = None):
+           headers: dict | None = None, return_headers: bool = False):
     """One HTTP call against a studio server.
 
     Free standing on purpose: `studio/tools/agent_grade.py` called exactly
@@ -134,6 +135,11 @@ def request(method: str, base: str, path: str, token: str | None = None,
     remembers a base URL, a token and the agent/attach/rotation headers so a
     caller does not have to repeat them on every call; every one of its
     methods still ends up here.
+
+    `return_headers=True` (contract C5, for reading `X-Matte-State` /
+    `X-Matte-Frame` off a matte frame response) makes this return
+    `(payload, response_headers)` instead of just `payload`; every existing
+    caller leaves it False and gets exactly the return shape it always did.
 
     Raises StudioError on a 4xx/5xx or a connection failure; never returns a
     half read body.
@@ -150,17 +156,15 @@ def request(method: str, base: str, path: str, token: str | None = None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
+            resp_headers = dict(resp.headers.items())
     except urllib.error.HTTPError as exc:
         msg = _server_message(exc.read())
         raise StudioError(msg, exc.code, f"{method} {path}") from None
     except urllib.error.URLError as exc:
         raise StudioError(f"could not reach {base}: {exc.reason}",
                           None, f"{method} {path}") from None
-    if not want_json:
-        return raw
-    if not raw:
-        return {}
-    return json.loads(raw)
+    payload = raw if not want_json else (json.loads(raw) if raw else {})
+    return (payload, resp_headers) if return_headers else payload
 
 
 # --------------------------------------------------------------------------
@@ -212,12 +216,14 @@ class Studio:
         return headers
 
     def request(self, method: str, path: str, params: dict | None = None,
-               body: dict | None = None, want_json: bool = True):
+               body: dict | None = None, want_json: bool = True,
+               return_headers: bool = False):
         """The escape hatch: any route, wrapped or not, through this
         object's base URL, token and agent/attach headers."""
         return request(method, self.base, path, token=self.token,
                       params=params, body=body, want_json=want_json,
-                      timeout=self.timeout, headers=self._headers())
+                      timeout=self.timeout, headers=self._headers(),
+                      return_headers=return_headers)
 
     def _with_rotation(self, body: dict | None) -> dict:
         body = dict(body or {})
@@ -307,12 +313,20 @@ class Studio:
 
     def stats(self, clip: str | None = None, time: float = 0.0,
              config: dict | None = None, width: int = 640, region=None,
-             path: str | None = None) -> dict:
+             path: str | None = None, matte: str | None = None) -> dict:
         """POST /api/stats: {"key", "stats", "size"} for one frame.
 
         Same argument shape as `frame` on purpose (a measure and a look are
         meant to be one line apart): `clip`/`path`, `time`, `config`,
-        `width` and `region` all mean what they mean there.
+        `width` and `region` all mean what they mean there. `matte` (a
+        matte id from `track`) weights every percentile, band and hue
+        family by that matte's value instead of measuring the whole frame
+        flat (contract C4: `region` crops first, `matte` weights what is
+        left, same order `cinegrade stats --region --matte` uses); a server
+        old enough to answer `mask`/`matte` routes but not yet the `matte`
+        field on `/api/stats` answers as if `matte` was never sent, so
+        check the response's own `"stats"` dict for the weighting asked
+        for rather than assuming silence means it ran.
         """
         body = self._with_rotation({"time": time, "width": width,
                                     "config": config or {}})
@@ -322,10 +336,12 @@ class Studio:
             body["clip"] = clip
         if region is not None:
             body["region"] = region
+        if matte is not None:
+            body["matte"] = matte
         return self.request("POST", "/api/stats", body=body)
 
     def stats_at(self, clip: str, times, config: dict | None = None,
-                width: int = 640) -> dict:
+                width: int = 640, matte: str | None = None) -> dict:
         """POST /api/stats with a `times` list (contract G3): one call, one
         render per time, returns the route's own envelope unchanged,
         `{"results": [...]}`, each entry `{time, key, size, stats}` (round 2
@@ -334,9 +350,12 @@ class Studio:
         what the route answers; `cinegrade stats --times --json` prints
         this identical shape). On a server that has not shipped this route
         yet, `"results"` is simply absent from what comes back: check for it
-        rather than assuming the key is always there."""
+        rather than assuming the key is always there. `matte` weights every
+        one of those measurements the same way it does on `stats` above."""
         body = self._with_rotation({"clip": clip, "times": list(times),
                                     "width": width, "config": config or {}})
+        if matte is not None:
+            body["matte"] = matte
         return self.request("POST", "/api/stats", body=body)
 
     def ref_stats(self, name: str, region=None) -> dict:
@@ -385,6 +404,142 @@ class Studio:
         if out_dir is not None:
             body["out_dir"] = out_dir
         return self.request("POST", "/api/match", body=body)
+
+    # -- masks (contract C5) -----------------------------------------------
+
+    def segment(self, clip: str, time: float = 0.0, prompts: dict | None = None,
+               text=None, points=None, boxes=None, exemplars=None,
+               rotation: str | None = None) -> dict:
+        """POST /api/mask/segment: SAM's synchronous "pick" on one frame.
+
+        Same idea as `cinegrade mask segment`: a prompt in, one or more
+        candidate instances back, nothing tracked or saved yet. Pass a
+        ready made `prompts` dict (`{"text": [...], "points": [...],
+        "boxes": [...]}`, contract C1's own shape) or the individual
+        `text`/`points`/`boxes`/`exemplars` pieces and this assembles it;
+        `prompts` wins if both are given. Returns `{"pick_id", "instances":
+        [{"id", "score", "box", "area", "overlay", "mask"}, ...]}`; fetch
+        `overlay`/`mask` yourself (`self.request("GET", url, want_json=False)`,
+        joining onto `self.base` if the url is server relative) if you want
+        the actual images, the same way `mask segment -o DIR` does.
+        """
+        p = dict(prompts) if prompts is not None else {}
+        if text is not None:
+            p.setdefault("text", list(text) if not isinstance(text, str) else [text])
+        if points is not None:
+            p.setdefault("points", list(points))
+        if boxes is not None:
+            p.setdefault("boxes", list(boxes))
+        if exemplars is not None:
+            p.setdefault("exemplars", list(exemplars))
+        if not p:
+            raise StudioError(
+                "segment needs at least one of prompts/text/points/boxes")
+        body = self._with_rotation({"clip": clip, "time": time, "prompts": p})
+        if rotation is not None:
+            body["rotation"] = rotation
+        return self.request("POST", "/api/mask/segment", body=body)
+
+    def track(self, clip: str, text=None, pick_id: str | None = None,
+             select=None, start: float | None = None, end: float | None = None,
+             steady: bool | None = None, rotation: str | None = None,
+             prompts: dict | None = None) -> dict:
+        """POST /api/mask/track: start a background SAM track over a clip.
+
+        Returns immediately with `{"job_id", "mattes": [{"matte_id",
+        "recipe", "state"}, ...]}`; the matte(s) are `queued` (or already
+        `running`) until `self.wait(job_id)` (or `mask jobs`/`mask list`)
+        says otherwise. Start this as early as an agent can (a track a few
+        minutes ahead of when its matte is actually needed costs nothing to
+        wait on later), the same steer `cinegrade mask track` and the
+        Masks section of the studio-grading skill both give.
+
+        Either `text` (fresh SAM prompt) or `pick_id` (track exactly the
+        instance(s) a prior `segment()` call proposed, `select` an id, a
+        list of ids, or `"all"`) chooses what gets tracked; give one, not
+        both. `prompts` is the same escape hatch `segment` takes, for a
+        point/box prompt instead of text.
+        """
+        using_pick = pick_id is not None
+        p = dict(prompts) if prompts is not None else {}
+        if text is not None:
+            p.setdefault("text", list(text) if not isinstance(text, str) else [text])
+        if p and using_pick:
+            raise StudioError("track takes text/prompts or pick_id, not both")
+        if not p and not using_pick:
+            raise StudioError("track needs text/prompts, or pick_id and select")
+        body = self._with_rotation({"clip": clip})
+        if p:
+            body["prompts"] = p
+        if using_pick:
+            body["pick_id"] = pick_id
+            body["select"] = select if select is not None else "all"
+        for key, value in (("start", start), ("end", end), ("steady", steady)):
+            if value is not None:
+                body[key] = value
+        if rotation is not None:
+            body["rotation"] = rotation
+        return self.request("POST", "/api/mask/track", body=body)
+
+    def wait(self, job_id: str, poll: float = 1.0, timeout: float | None = None,
+             on_progress=None) -> dict:
+        """Block until `GET /api/mask/jobs/<id>` leaves `queued`/`running`.
+
+        `on_progress(job)` is called once per poll (the full job dict:
+        `state`, `done_frames`, `total_frames`, `fps`, `matte_ids`) if
+        given, the same "notice, do not silently sit" job `mask track
+        --wait` prints to stderr on its own. Raises `StudioError` (message
+        includes the job's own `error` field, when the server sent one) if
+        the job's state is `failed`; returns the job dict unchanged on
+        `done`/`cancelled`. `timeout=None` waits forever, matching
+        `--wait`'s own CLI behavior; pass a number of seconds to give up
+        instead of raising `StudioError`.
+        """
+        started = time.time()
+        while True:
+            job = self.request("GET", f"/api/mask/jobs/{job_id}")
+            if on_progress is not None:
+                on_progress(job)
+            state = job.get("state")
+            if state in ("done", "failed", "cancelled", "canceled"):
+                if state == "failed":
+                    raise StudioError(
+                        f"mask track job {job_id} failed: "
+                        f"{job.get('error') or '(no error message)'}",
+                        route=f"GET /api/mask/jobs/{job_id}")
+                return job
+            if timeout is not None and time.time() - started > timeout:
+                raise StudioError(
+                    f"mask track job {job_id} did not finish within "
+                    f"{timeout}s (state={state})",
+                    route=f"GET /api/mask/jobs/{job_id}")
+            time.sleep(poll)
+
+    def matte_frame(self, matte_id: str, time: float = 0.0,
+                    width: int | None = None, out=None) -> dict:
+        """GET /api/matte/<id>/frame: one grey matte frame.
+
+        Returns `{"data": bytes, "state": ..., "frame": ...}`, `state` and
+        `frame` read off the response's own `X-Matte-State`/`X-Matte-Frame`
+        headers (a partial matte serves its nearest already written frame
+        for a time past the track's own progress, and this is how a caller
+        tells that happened without re-parsing a warning string). Pass
+        `out` to also write the bytes to a path and get that `Path` back
+        under `"path"`.
+        """
+        params = {"time": time}
+        if width is not None:
+            params["width"] = width
+        data, headers = self.request("GET", f"/api/matte/{matte_id}/frame",
+                                     params=params, want_json=False,
+                                     return_headers=True)
+        result = {"data": data, "state": headers.get("X-Matte-State"),
+                 "frame": headers.get("X-Matte-Frame")}
+        if out is not None:
+            out_path = Path(out)
+            out_path.write_bytes(data)
+            result["path"] = out_path
+        return result
 
     # -- saving -----------------------------------------------------------
 

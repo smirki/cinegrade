@@ -61,6 +61,14 @@
   var grp = null;
   var pgrp = null;          /* the picked rectangle's group, untransformed */
   var pick = null;          /* {frac: [x0,y0,x1,y1] or null, onChange: fn} */
+  var mgrp = null;          /* the mask pick's group, untransformed */
+  var mpick = null;         /* {points, boxes, onPoint, onBox}, see setMaskPick */
+
+  /* A press that moves less than this fraction of the picture is a CLICK (a
+     SAM point), not a drag (a SAM box). A fraction rather than pixels so it
+     means the same thing zoomed in as zoomed out; about 8px across a 1000px
+     wide picture, which is inside the slop a normal click already has. */
+  var MASK_CLICK_SLOP = 0.008;
   var el = {};
   var drag = null;
   var forced = false;       /* the toolbar button: draw before the window is on */
@@ -322,6 +330,39 @@
       if (pick) onDown("pick-new", el.pickCatch, ev);
     });
 
+    /* Mask picking (contract C3's point and box prompts, driven by masks.js).
+       A third thing this overlay can draw, and the third one for the same
+       reason as the crop rectangle above: the picture's own rendered rect,
+       the pointer capture, and the observers are all already solved here.
+
+       It is deliberately NOT the crop pick reused. A crop is one rectangle
+       that is dragged and reshaped; a SAM pick is a growing LIST of points
+       (positive and negative) and boxes that are only ever added and
+       cleared, and it answers to a different caller. Sharing one `pick`
+       between them would mean masks.js and the Match panel fighting over the
+       same overlay state, so they are two modes and only one is ever on.
+
+       Like the crop pick it writes nothing into the config: the points go to
+       whoever called setMaskPick, so leaving pick mode puts back exactly the
+       window that was on screen before it. */
+    mgrp = mk("g", "maskpick-grp", svg);
+    el.maskCatch = mk("rect", "maskpick-catch", mgrp);
+    el.maskCatch.setAttribute("x", "0");
+    el.maskCatch.setAttribute("y", "0");
+    el.maskCatch.setAttribute("width", "100%");
+    el.maskCatch.setAttribute("height", "100%");
+    el.maskLive = mk("rect", "maskpick-live", mgrp);   // the box being dragged
+    el.maskMarks = mk("g", "maskpick-marks", mgrp);    // one child per point/box
+    el.maskCatch.addEventListener("pointerdown", function (ev) {
+      if (mpick) onDown("maskpick-new", el.maskCatch, ev);
+    });
+    /* Alt is the "exclude this" modifier and the browser's own context menu
+       is not wanted over the picture while picking, so a right click can be
+       the same thing on a trackpad with no alt to hand. */
+    el.maskCatch.addEventListener("contextmenu", function (ev) {
+      if (mpick) ev.preventDefault();
+    });
+
     bindHandle(el.centreRing, "centre");
     el.hw.forEach(function (c) { bindHandle(c, c.dataset.role); });
     bindHandle(el.rot, "rot");
@@ -420,6 +461,12 @@
          handle drag is computed against it rather than accumulated frame to
          frame, exactly like every branch of compute() below. */
       pick: role.indexOf("pick") === 0,
+      /* A mask pick is one press that has not decided yet what it is: under
+         MASK_CLICK_SLOP of movement it becomes a point, past it a box. So
+         both the anchor and the modifier have to be remembered from the
+         press itself, because by the release the alt key may be back up. */
+      maskpick: role.indexOf("maskpick") === 0,
+      negative: !!(ev.altKey || ev.button === 2),
       anchor: pickPoint(g, ev),
       startBox: (pick && pick.frac) ? pick.frac.slice() : null,
       box: null
@@ -472,9 +519,23 @@
     if (pick.onChange) pick.onChange(box ? box.slice() : null, !!commit);
   }
 
+  /* The pointer's distance from where the press started, as a fraction of
+     the picture: the one number that decides point versus box. */
+  function maskDrift(ev) {
+    var p = pickPoint(drag.g, ev);
+    return Math.max(Math.abs(p[0] - drag.anchor[0]), Math.abs(p[1] - drag.anchor[1]));
+  }
+
   function onMove(ev) {
     if (!drag || ev.pointerId !== drag.id) return;
     ev.preventDefault();
+    if (drag.maskpick) {
+      if (maskDrift(ev) < MASK_CLICK_SLOP) { drag.box = null; drawMaskLive(null); return; }
+      var p = pickPoint(drag.g, ev);
+      drag.box = normBox([drag.anchor[0], drag.anchor[1], p[0], p[1]]);
+      drawMaskLive(drag.box);
+      return;
+    }
     if (drag.pick) {
       var box = computePick(ev);
       if (!box) return;
@@ -495,6 +556,28 @@
     try {
       if (node.hasPointerCapture(ev.pointerId)) node.releasePointerCapture(ev.pointerId);
     } catch (e) { /* same as the capture above */ }
+    if (drag.maskpick) {
+      var negative = drag.negative;
+      var box = drag.box;
+      var anchor = drag.anchor;
+      drag = null;
+      svg.classList.remove("dragging");
+      drawMaskLive(null);
+      if (!mpick) { sync(); return; }
+      if (box) {
+        mpick.boxes.push(box);
+        if (mpick.onBox) mpick.onBox(box.slice());
+      } else {
+        /* {x, y, label} fractions, which is exactly the shape
+           sam/backends/base.py normalises prompts.points to, so nothing
+           between here and the model reshapes it. */
+        var pt = { x: anchor[0], y: anchor[1], label: negative ? 0 : 1 };
+        mpick.points.push(pt);
+        if (mpick.onPoint) mpick.onPoint({ x: pt.x, y: pt.y, label: pt.label });
+      }
+      sync();
+      return;
+    }
     if (drag.pick) {
       /* Same rule as the window below: a press with no movement is not an
          edit, so a plain click on the picture leaves whatever rectangle was
@@ -670,6 +753,56 @@
     });
   }
 
+  /* The box currently being dragged out, or null to hide it. Its own node
+     rather than a marker in the list below, because it is redrawn on every
+     pointermove and the markers are only redrawn when the list changes. */
+  function drawMaskLive(box) {
+    if (!el.maskLive) return;
+    var g = box ? geometry() : null;
+    show(el.maskLive, !!g);
+    if (!g) return;
+    el.maskLive.setAttribute("x", (g.ox + box[0] * g.pw).toFixed(2));
+    el.maskLive.setAttribute("y", (g.oy + box[1] * g.ph).toFixed(2));
+    el.maskLive.setAttribute("width", Math.max((box[2] - box[0]) * g.pw, 1).toFixed(2));
+    el.maskLive.setAttribute("height", Math.max((box[3] - box[1]) * g.ph, 1).toFixed(2));
+  }
+
+  /* Every point and box collected so far. Rebuilt wholesale rather than
+     patched: the list only ever grows by one or is emptied, so there is
+     nothing to reconcile and a rebuild cannot drift out of step with the
+     array masks.js is about to send to the service. */
+  function drawMaskPick(g) {
+    var marks = el.maskMarks;
+    while (marks.firstChild) marks.removeChild(marks.firstChild);
+    (mpick.boxes || []).forEach(function (b) {
+      var r = mk("rect", "maskpick-box", marks);
+      r.setAttribute("x", (g.ox + b[0] * g.pw).toFixed(2));
+      r.setAttribute("y", (g.oy + b[1] * g.ph).toFixed(2));
+      r.setAttribute("width", Math.max((b[2] - b[0]) * g.pw, 1).toFixed(2));
+      r.setAttribute("height", Math.max((b[3] - b[1]) * g.ph, 1).toFixed(2));
+    });
+    (mpick.points || []).forEach(function (p) {
+      var neg = Number(p.label) === 0;
+      var x = g.ox + p.x * g.pw, y = g.oy + p.y * g.ph;
+      var c = mk("circle", "maskpick-point" + (neg ? " negative" : ""), marks);
+      c.setAttribute("cx", x.toFixed(2));
+      c.setAttribute("cy", y.toFixed(2));
+      c.setAttribute("r", "6");
+      c.dataset.label = neg ? "0" : "1";
+      /* A plus for "include this", a minus for "leave this out": the sign is
+         the whole difference between the two and colour alone would not say
+         it on a picture that might be any colour. */
+      var h = mk("line", "maskpick-sign", marks);
+      h.setAttribute("x1", (x - 3).toFixed(2)); h.setAttribute("y1", y.toFixed(2));
+      h.setAttribute("x2", (x + 3).toFixed(2)); h.setAttribute("y2", y.toFixed(2));
+      if (!neg) {
+        var v = mk("line", "maskpick-sign", marks);
+        v.setAttribute("x1", x.toFixed(2)); v.setAttribute("y1", (y - 3).toFixed(2));
+        v.setAttribute("x2", x.toFixed(2)); v.setAttribute("y2", (y + 3).toFixed(2));
+      }
+    });
+  }
+
   /* The one entry point app.js calls whenever the config may have moved:
      scheduleRender, which every config change from anywhere funnels through
      (a slider, an undo, a preset, a clip switch, an outside session patch).
@@ -677,6 +810,24 @@
   function sync() {
     if (!svg) return;
     svg.classList.toggle("picking", !!pick);
+    svg.classList.toggle("maskpicking", !!mpick);
+    if (mpick) {
+      /* Mask picking owns the overlay while it is on, ahead of the crop pick
+         and the window, and for the same reason: it is a mode a person asked
+         for. Nothing about the layer is touched, so switching it off falls
+         through to whichever branch below was already true. Picking during
+         playback is not offered: the frame under the pointer is not the frame
+         the request would be for. */
+      var stageM = byId("stage");
+      var busyM = !!(stageM && stageM.classList.contains("playing"));
+      var gm = busyM ? null : geometry();
+      svg.classList.toggle("on", !!gm);
+      if (gm) drawMaskPick(gm);
+      return;
+    }
+    if (el.maskMarks) {
+      while (el.maskMarks.firstChild) el.maskMarks.removeChild(el.maskMarks.firstChild);
+    }
     if (pick) {
       /* Pick mode owns the overlay for as long as it is on. The window's
          own state (forced, and the selected layer's mask.window) is not
@@ -748,8 +899,54 @@
     return (pick && pick.frac) ? pick.frac.slice() : null;
   }
 
+  /* Mask pick mode on and off (contract C3's point and box prompts).
+
+       setMaskPick({points: [...], boxes: [...], onPoint: fn, onBox: fn})
+       setMaskPick(null)
+
+     The two arrays are the CALLER's own: this file appends to them and draws
+     them, and the callbacks only say "that changed", so there is one copy of
+     the prompt rather than two that can disagree. A click appends
+     {x, y, label: 1}, an alt click (or a right click) {x, y, label: 0}, and
+     a drag appends [x0, y0, x1, y1]; every number is a fraction of the
+     picture, which is what the SAM service's own prompts are in. */
+  function setMaskPick(opts) {
+    build();
+    if (!opts) {
+      mpick = null;
+    } else {
+      mpick = {
+        points: opts.points || [],
+        boxes: opts.boxes || [],
+        onPoint: opts.onPoint || null,
+        onBox: opts.onBox || null
+      };
+    }
+    drawMaskLive(null);
+    sync();
+  }
+
+  /* The picture's rendered box in #stage's own unscaled units, which is what
+     an element positioned INSIDE #stage needs (the zoom is one transform on
+     #stage, so anything inside it is already scaled). masks.js's overlay
+     canvas is such an element; exported rather than copied so there is one
+     definition of where the picture is, and a fix to pictureRect (the wipe
+     mode case, the not yet decoded <img> case) reaches both. */
+  function pictureBox() {
+    var stage = byId("stage");
+    var pic = pictureRect();
+    if (!stage || !pic) return null;
+    var sr = stage.getBoundingClientRect();
+    var z = stageScale();
+    return { x: (pic.left - sr.left) / z, y: (pic.top - sr.top) / z,
+             w: pic.width / z, h: pic.height / z, z: z };
+  }
+
   global.WindowEditor = {
     init: init, sync: sync, setPick: setPick, getPick: getPick,
-    picking: function () { return !!pick; }
+    picking: function () { return !!pick; },
+    setMaskPick: setMaskPick,
+    maskPicking: function () { return !!mpick; },
+    pictureBox: pictureBox
   };
 })(window);

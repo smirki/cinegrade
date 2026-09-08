@@ -535,12 +535,13 @@ example).
 `--agent`/`--attach`/`--if-rev`, and `--port`/`--url` (env `STUDIO_PORT`/
 `STUDIO_URL`), are documented under "Per caller identity" in Agent API
 below, since they only apply to `session`, `whoami`, `project`, `match`,
-`preset` and `grade`, the six commands that talk to a running server rather
-than grading a file directly. One rule worth repeating here since it is easy
-to trip on a mixed command line: naming `--agent`/`STUDIO_AGENT` on any of
-those six without also naming a server (`--port`, `--url`, `STUDIO_PORT` or
-`STUDIO_URL`) is refused before any request goes out, rather than silently
-landing on the port 7431 default, which is a human's own live studio.
+`preset`, `grade` and `mask`, the seven commands that talk to a running
+server rather than grading a file directly. One rule worth repeating here
+since it is easy to trip on a mixed command line: naming `--agent`/
+`STUDIO_AGENT` on any of those seven without also naming a server
+(`--port`, `--url`, `STUDIO_PORT` or `STUDIO_URL`) is refused before any
+request goes out, rather than silently landing on the port 7431 default,
+which is a human's own live studio.
 
 | Command | Flags beyond the shared set | What it does |
 | --- | --- | --- |
@@ -549,7 +550,7 @@ landing on the port 7431 default, which is a human's own live studio.
 | `compare IN -o OUT` | `--time`; `--width` (default 560); `--region`, `--zoom`; `--looks a,b,c`; `--presets a,b,c`; `--open` (Preview.app) | a grid of the same frame under several looks or presets |
 | `scopes IN -o OUT` | `--time`; `--width` (default 700); `--open` | histogram, waveform, parade and vectorscope as one image |
 | `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect, rotation_tag_note, ...}` instead of rendering the default sheet; see "Rotation" above); `--sheet OUT.jpg` (a labelled 2x2 of the four fixed candidates, 0/90/180/270; independent of `--json`, both together write both and the JSON dict gains a `"sheet"` key naming the path) | the default hand drawn row sheet, a labelled 2x2, the JSON facts, or (with both flags) all of the JSON plus the 2x2; `rotation_tag_suspect` is a prompt to go look, not a verdict, and `rotation_tag_note` says why in one sentence, see "Rotation" |
-| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
+| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`); `--matte ID` (weights every percentile, band and hue family by that matte's value, resolved straight off disk under `grade/mattes.py`, no running server needed; `region` crops first, then `matte` weights what is left; refused together with `--image`, a matte measures a clip over time, a still is one frame; a time past what the matte has tracked so far falls back to its nearest written frame and the response gains a `warnings` field saying so; a matte that covers nothing at the requested region and time is refused rather than silently averaged to nothing) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
 | `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order; a leading negative parses unquoted, `--values -0.1,0,0.1`, as well as with an `=`); `--width` (default 640, scaled down from the source, matching `POST /api/stats`'s own default; this used to always measure at the source's full resolution); `--json` (stdout stays pure JSON even with `--sheet`, which then prints its path to stderr instead); `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
 | `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input); `--region X0 Y0 X1 Y1` (crops each panel to fractions of ITS OWN size, after loading, before the shared height is solved; no `--zoom`, a cropped panel is already rescaled to the shared height afterwards) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
 | `docs [SECTION]` | `SECTION` (a heading's text, matched case insensitively at any level, skipping headings inside fenced code blocks; omit to list); `--list` (list every heading and exit; a `SECTION` that matches nothing also lists them, rather than failing) | prints one section of this file, or the whole table of contents |
@@ -559,6 +560,11 @@ landing on the port 7431 default, which is a human's own live studio.
 | `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--rotate {auto,0,90,180,270}` (sent as this call's own `rotation` field; falls back to `--preset`'s own config `rotation`, then `auto`, same order every other subcommand's `--rotate` falls back through; `match` previously had no rotation handling at all); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
 | `preset {save,load} NAME` | `save NAME -p grade.json --comment TEXT`; `load NAME [--expand] [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `POST`/`GET /api/preset`: the shared, named grade store, read and written by every account and agent alike |
 | `grade {save,load} CLIP` | `save CLIP -p grade.json --message TEXT`; `load CLIP [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `PUT`/`GET /api/grade` (contract C3): one clip's own per clip grade, distinct from the shared `preset` above and from `session patch` (the live config a browser tab is watching; `grade save` never wakes it) |
+| `mask segment CLIP` | `--time` (default 0); `--text "PROMPT"` (repeatable); `--point X,Y[,neg]` (repeatable, fraction of the frame, trailing `,neg` for a negative point); `--box X0,Y0,X1,Y1` (repeatable); `--rotate`; `-o DIR` (downloads every instance's `overlay`/`mask` preview image); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/segment` (contract C4): SAM's synchronous pick on one frame, `{"pick_id", "instances": [{"id", "score", "box", "area", "overlay", "mask"}, ...]}`, nothing tracked or saved yet, look at the previews before choosing an id to track |
+| `mask track CLIP` | `--text "PROMPT"` (repeatable) or `--pick PICK --select IDS` (comma separated ids, or `all`), not both; `--start`, `--end` (seconds); `--steady N` (temporal smoothing frames); `--rotate`; `--wait` (blocks, prints progress to stderr the way `render` does, exits non zero on a `failed` job); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/track`: starts a background SAM track, returns `{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...]}` immediately unless `--wait`; cached by clip identity, rotation and recipe, a repeat request is free |
+| `mask jobs` | `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/mask/jobs`: every queued or running track job, visible to every caller |
+| `mask list CLIP` | `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte?clip=`: that clip's mattes with state and progress; mattes belong to the clip, shared by every caller |
+| `mask show ID` | `--strip` (one frame per second, matte tinted over the picture, with the tracked area curve underneath, needs `-o` and Pillow); `-o/--output OUT.jpg` (required with `--strip`); `--width N` (default 220, panel width for `--strip`); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte/<id>`: one matte's index (state, frame count, recipe); with `--strip`, the verification pass to run before grading on a matte, see the Masks section of `.claude/skills/studio-grading/SKILL.md` |
 
 ## How a preview frame is made
 
@@ -1317,6 +1323,100 @@ row); clicking a row's header selects it. The Window button (`#windowBtn`)
 over the picture targets the selected layer: with no layers at all it
 creates one and selects it, otherwise it just makes sure a real layer is
 selected, the same as clicking that layer's own header would.
+
+### The mask panel: the component stack, SAM picks and tracking
+
+Every layer's body opens with a **Mask stack** panel
+(`studio/static/masks.js`). It is the whole user side of contract C1's
+`mask.components`: the list of components that make the layer's matte, the
+SAM 3.1 selections that get tracked through the clip, and the two ways of
+looking at the result. The legacy Window and Key folds below it stay, and
+their summaries say `not in use, the mask stack replaces it` whenever the
+stack is not empty, because that is exactly what both engines do with them.
+
+Every number the panel writes goes out through `Layers.emit`, the same per
+layer write a slider in the Window group makes, so undo, the per clip
+autosave, the session publish and the re-render cover a mask edit the way
+they cover a slider drag. Nothing in this panel is a second definition of the
+mask: the matte itself is rendered by `grade/cinegrade.py` for a real render
+and by `gpu.js` for the preview.
+
+**The stack.** One row per component, folded top to bottom from 0. Each row
+has a thumbnail (the matte at the playhead, or a sketch of the shape), an
+editable name, the type, the op (`add` takes the larger of the two,
+`intersect` multiplies them, `subtract` takes this one away), `invert` (which
+flips THIS component before it combines, not the finished matte), `enabled`,
+`feather` (a gaussian on this component alone, as a fraction of frame width),
+move up, move down and delete. Reorder and delete write the whole array in
+one go, so each is one undo step.
+
+**The add menu** offers, in order: Select subject, Sky, Background; People,
+Face, Hair, Lips, Eyes, Teeth, Clothes; Object (click or box on the picture),
+Text phrase; then Colour range, Luminance range, Linear gradient, Radial
+gradient and Rectangle, which are the keys and windows the studio already had,
+written as components so they combine with the SAM ones through the same
+three ops. Everything in the first two groups is a text prompt, so choosing
+one queues its track straight away: the model is slow and the useful thing to
+do with a named selection is to get it running while the grade happens.
+
+**Picking on the picture.** Object (click or box) starts in `needs_pick` and
+puts the viewer into pick mode: a click adds a positive point, an alt click
+(or a right click) a negative one, and a drag makes a box. `Find` sends them
+to `POST /api/mask/segment` and the instances come back as chips showing the
+server's own tinted overlay of each one; clicking a chip tracks that
+instance, `use all N` tracks every one of them and each becomes its own
+component with op `add`, so they can then be feathered or subtracted
+separately. Nothing about the layer is touched while picking, so leaving pick
+mode puts back exactly the window that was on screen before it.
+
+**Tracking.** `Track` starts a background job. Nothing in the grading loop
+waits on it: the row shows done of total, the MEASURED rate (`done_frames /
+elapsed_s`, not the clip's fps, which on the real model are 0.06 and 24 and
+must never be confused), how long is left at that rate, the service's own
+window and resident memory from `/api/mask/status`, and a `Cancel`. While the
+matte is not finished the badge reads **static until tracked**: the engines
+hold the nearest written frame, so the correction still works, it just stops
+moving past the tip of the track. A cancelled track leaves a partial matte and
+the row says how far it got (`tracked to 26 of 120 frames, held past there`).
+When a job finishes, the matte id on the component has not changed, so the
+layer swaps to the tracked matte with no click. `steady` is the temporal
+smoothing width on the track, centred on the frame so the matte does not lag
+the picture; 1 is off.
+
+**The states the panel shows**, all from the server, never guessed:
+`queued`, `running`, `done`, `failed` (with the service's own reason on the
+row), `partial`, `stale`, `needs_pick`, and the service being down at all. A
+matte is stale when it was tracked at a different rotation or for a different
+clip, and the row says which; the fix is `Track again`. "auto" is not a
+rotation but "honour the file's own tag", so it is resolved to that tag before
+the two are compared: clicking the rotation a clip was already tagged with
+changes no pixels and does not make anything stale. With the service
+down, the panel says `mask service not running` and shows the start command
+carried by the 503 itself (so the instruction cannot drift from the code that
+prints it), with a `Retry`; `Track` and `Find` go dead and everything already
+tracked keeps working, because a matte on disk needs no service.
+
+**Finesse** (`mask.finesse`, on the COMBINED matte, in the order clean, then
+grow, then blur): blur, grow (negative shrinks), clean black, clean white.
+Feather is per component and lives in its own row, because that is where C1
+puts it.
+
+**Display modes**, three buttons at the top of the panel:
+
+- **Off**: nothing over the picture.
+- **Overlay**: `#maskOverlay`, a canvas over the picture tinted with the
+  theme accent where the layer's tracked mattes are open. It follows the
+  playhead on its own animation frame loop, so it moves with the subject
+  under BOTH playback engines (the server `<video>` and the GPU proxy). It
+  decodes each matte frame once, caches 48 of them and reads 8 ahead along the
+  play direction; a frame that has not arrived reuses the last one and writes
+  `matte lagging` into the status line next to the Matte button rather than
+  stalling the picture. It draws the union of the ENABLED matte components
+  only, so with keys, shapes, ops other than add, or finesse in the stack it
+  is the quick answer and the panel says so.
+- **Matte**: the black and white matte itself. This writes the layer's own
+  `mask.show`, which both engines already render, so it is the EXACT combined
+  matte and it plays in sync with the picture with nothing drawn on top.
 
 ### Migrating an old preset or grade
 
@@ -2433,6 +2533,76 @@ its own is not readable) so proving two agents have different clips open
 needs no second call. All of them take the same `by` this section already
 describes.
 
+**`POST /api/mask/segment`**: `{"clip": NAME, "time": SECONDS, "rotation":
+R, "prompts": {"text": [...], "points": [{"x", "y", "label"}], "boxes":
+[[x0, y0, x1, y1]]}}` runs SAM's synchronous pick on one frame and returns
+`{"pick_id", "instances": [{"id", "score", "box", "area", "overlay": URL,
+"mask": URL}, ...]}`, nothing tracked or saved to the matte store yet. Look
+at the `overlay`/`mask` previews before choosing an instance to track,
+especially on a text prompt (`"person"` can match more than one thing in a
+crowded frame; a point or box prompt is unambiguous by construction).
+
+**`POST /api/mask/track`**: `{"clip": NAME, "rotation": R, "prompts": {...}
+| "pick_id": ID, "select": [ids] | "all", "start": SECONDS, "end": SECONDS,
+"steady": N}` starts a background SAM track over the clip and returns
+`{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...]}` immediately;
+it does not block. `steady` is temporal smoothing over that many frames.
+Object instances tracked together each get their own matte id, all reported
+under the same job. Cached by clip identity, rotation and recipe: the same
+request twice returns the already running or already finished matte rather
+than starting a duplicate job, so firing every track a grade will need as
+early as possible costs nothing extra.
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+  -d '{"clip": "A001.MOV", "prompts": {"text": ["person"]}}' \
+  http://127.0.0.1:7431/api/mask/track
+```
+
+**`GET /api/mask/status`**: the SAM service's own health plus its queue
+(`{ok, backend, model, loaded, busy, queue}`), the first thing to check
+before assuming a stuck job is a problem with this clip rather than the
+service being down or out of capacity.
+
+**`GET /api/mask/jobs`**, **`GET /api/mask/jobs/<id>`** (`{"state",
+"done_frames", "total_frames", "fps", "elapsed_s", "matte_ids", "error"}`,
+`state` one of `queued`, `running`, `done`, `failed`, `cancelled`),
+**`POST /api/mask/jobs/<id>/cancel`**: the queue view, all jobs visible to
+every caller (jobs are not per identity; mattes belong to the clip, the same
+way footage does).
+
+**`GET /api/matte?clip=`** (list), **`GET /api/matte/<id>`** (one index:
+`matte_id`, `clip`, `clip_key`, `rotation`, `fps`, `frames`, `width`,
+`height`, `recipe`, `state`, `done_frames`, `areas`, `scores`, `created`,
+`model`, `backend`), **`DELETE /api/matte/<id>`** (admin only, with logins
+on): a matte's own record, `state` one of `queued`, `running`, `done`,
+`failed`, `stale` (its recipe no longer matches anything live) alongside
+`queued`/`running`'s own `partial` reading (servable by its nearest already
+written frame, never empty).
+
+**`GET /api/matte/<id>/frame?time=&width=`**: one grey PNG matte frame,
+nearest written frame served when `time` is past what a still-running track
+has reached, with `X-Matte-State` (the matte's state) and `X-Matte-Frame`
+(the index actually served) as response headers, so a caller can tell a
+fallback happened without re-parsing anything. `cinegrade mask show ID
+--strip` builds a whole clip's worth of these, one per second, tinted over
+the picture, as a single verification image.
+
+**`POST /api/stats`** also accepts `"matte": ID` alongside `region`
+(contract C4): weights every percentile, band and hue family by that
+matte's value instead of measuring the whole frame flat, `region` crops
+first and `matte` weights what is left, and `times` works with it the same
+way it does without a matte. `POST /api/frame`'s shape is unchanged; a
+`warnings` field may name a matte that fell back to its nearest written
+frame.
+
+`cinegrade mask segment|track|jobs|list|show` and `cinegrade stats --matte`
+are the CLI equivalents ("CLI reference" above); `.claude/skills/
+studio-grading/SKILL.md`'s Masks section covers the method: verifying a
+matte over time before grading on it, starting tracks early, a hold by
+matte following the subject, a matte intersect key for skin, measuring by
+matte, and what to do when the service is down or a job fails.
+
 ### The first party client module
 
 `studio/tools/grade_client.py` (stdlib plus numpy; Pillow optional, only for
@@ -2465,10 +2635,24 @@ studio.grade_save(clip, {"primaries": {"saturation": 1.1}}, message="warmer")
 ```
 
 Methods: `state`, `health`, `whoami`, `project_open(clip, rotation=None,
-by=None)`, `project`, `frame`, `stats`, `stats_at(clip, times, ...)`,
-`ref_stats`, `match`, `preset_save`/`preset_load`, `grade_save`/`grade_load`,
-`session_get`/`session_patch`, `sweep`, and the escape hatch `request(method,
-path, ...)` for anything not wrapped yet. `project_open` and `project` both
+by=None)`, `project`, `frame`, `stats(..., matte=None)`, `stats_at(clip,
+times, ..., matte=None)`, `ref_stats`, `match`, `segment(clip, time=0.0,
+prompts=None, text=None, points=None, boxes=None, exemplars=None,
+rotation=None)`, `track(clip, text=None, pick_id=None, select=None,
+start=None, end=None, steady=None, rotation=None, prompts=None)`,
+`wait(job_id, poll=1.0, timeout=None, on_progress=None)`, `matte_frame(id,
+time=0.0, width=None, out=None)`, `preset_save`/`preset_load`,
+`grade_save`/`grade_load`, `session_get`/`session_patch`, `sweep`, and the
+escape hatch `request(method, path, ...)` for anything not wrapped yet.
+`segment`/`track` return the routes' own shapes unchanged (`{"pick_id",
+"instances"}` and `{"job_id", "mattes"}`); `wait` polls `GET
+/api/mask/jobs/<id>` until it leaves `queued`/`running`, calling
+`on_progress(job)` once per poll if given, and raises `StudioError` on a
+`failed` job rather than returning it, so a caller does not have to check
+`state` itself just to find out a track it is blocking on already failed;
+`matte_frame` returns `{"data": bytes, "state", "frame"}`, `state` and
+`frame` read off that response's own `X-Matte-State`/`X-Matte-Frame`
+headers. `project_open` and `project` both
 return the project dict at the top level with the clip under `"name"`, the
 same shape `GET`/`POST /api/project*` return on the wire ("The routes an
 agent actually needs" above): this module is the one place that shape is

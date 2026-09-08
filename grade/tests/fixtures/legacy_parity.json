@@ -1,0 +1,716 @@
+{
+ "defaults": {
+  "files": {
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_after_look": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]null[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_disabled": {
+  "files": {
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_global_then_windowed": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<LAYERS>/layer_c9eb11478477c6c6.cube": "60490e12fc2cd093",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw1];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral,lut3d=file=<LAYERS>/layer_c9eb11478477c6c6.cube:interp=tetrahedral,gblur=sigma=0.333[ly1i];[ly1i]split=2[ly1a][ly1b];[ly1b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly1b2];[ly1a][ly1b2][lw1]maskedmerge[ly1o];[ly1o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_key_only": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral,lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_mask_invert_both": {
+  "files": {
+   "<LAYERS>/layer_0bd07e6cd83b4466.cube": "e8f09bbdacf3d491",
+   "<LAYERS>/layer_14076392d310010f.cube": "0ebc14f44f3d763c",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0a]lut3d=file=<LAYERS>/layer_14076392d310010f.cube:interp=tetrahedral,gblur=sigma=0.333[ly0a2];[ly0b]lut3d=file=<LAYERS>/layer_0bd07e6cd83b4466.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a2][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_mask_invert_key_only": {
+  "files": {
+   "<LAYERS>/layer_0bd07e6cd83b4466.cube": "e8f09bbdacf3d491",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral,lut3d=file=<LAYERS>/layer_0bd07e6cd83b4466.cube:interp=tetrahedral,gblur=sigma=0.333[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_mask_invert_neither": {
+  "files": {
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_mask_invert_window_only": {
+  "files": {
+   "<LAYERS>/layer_c9eb11478477c6c6.cube": "60490e12fc2cd093",
+   "<MASKS>/window_320x180_b4f36f3606896c55.png": "3cbd1d634cbbdb89",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c9eb11478477c6c6.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_b4f36f3606896c55.png"
+  ]
+ },
+ "layer_none": {
+  "files": {
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "layer_show_mask": {
+  "files": {
+   "<LAYERS>/layer_2eaeee401f1daa3c.cube": "f6413ea796286fd0",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0a]colorchannelmixer=rr=0:gg=0:bb=0[ly0a2];[ly0b]lut3d=file=<LAYERS>/layer_2eaeee401f1daa3c.cube:interp=tetrahedral[ly0b2];[ly0a2][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_two_stacked": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<LAYERS>/layer_c9eb11478477c6c6.cube": "60490e12fc2cd093",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png": "79aab2f914f9ce2e",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[2:v]format=gray16le,format=gbrp16le,setsar=1[lw1];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]null[ly1i];[ly1i]split=2[ly1a][ly1b];[ly1b]lut3d=file=<LAYERS>/layer_c9eb11478477c6c6.cube:interp=tetrahedral,gblur=sigma=0.333[ly1b2];[ly1a][ly1b2][lw1]maskedmerge[ly1o];[ly1o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png",
+   "-i",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png"
+  ]
+ },
+ "layer_window_and_key": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_window_inverted": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<MASKS>/window_320x180_b4f36f3606896c55.png": "3cbd1d634cbbdb89",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_b4f36f3606896c55.png"
+  ]
+ },
+ "layer_window_only": {
+  "files": {
+   "<LAYERS>/layer_c9eb11478477c6c6.cube": "60490e12fc2cd093",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c9eb11478477c6c6.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png"
+  ]
+ },
+ "layer_window_rect_hard": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png": "79aab2f914f9ce2e",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png"
+  ]
+ },
+ "layers_with_radial_and_grain": {
+  "files": {
+   "<LAYERS>/layer_c144f31f70fa1751.cube": "cff215dd3c3a68ae",
+   "<LAYERS>/layer_c9eb11478477c6c6.cube": "60490e12fc2cd093",
+   "<MASKS>/radial_320x180_0.55_1.00.png": "72b0828c72bd2bb6",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png": "28ae273611cb1789",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png": "79aab2f914f9ce2e",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[2:v]format=gray16le,format=gbrp16le,setsar=1[lw0];[3:v]format=gray16le,format=gbrp16le,setsar=1[lw1];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[ly0i];[ly0i]split=2[ly0a][ly0b];[ly0b]lut3d=file=<LAYERS>/layer_c144f31f70fa1751.cube:interp=tetrahedral,gblur=sigma=0.333[ly0b2];[ly0a][ly0b2][lw0]maskedmerge[ly0o];[ly0o]null[ly1i];[ly1i]split=2[ly1a][ly1b];[ly1b]lut3d=file=<LAYERS>/layer_c9eb11478477c6c6.cube:interp=tetrahedral,gblur=sigma=0.333[ly1b2];[ly1a][ly1b2][lw1]maskedmerge[ly1o];[ly1o]split=2[rs1][rf2];[rf2]gblur=sigma=9.000[rf2b];[rs1][rf2b][mask]maskedmerge[rx3];[4:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[rx3][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5000[gx];[gx]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.55_1.00.png",
+   "-i",
+   "<MASKS>/window_320x180_40f27a9bb6cc63b8.png",
+   "-i",
+   "<MASKS>/window_320x180_dbf8cf81353f945c.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=40:c0f=t+u"
+  ]
+ },
+ "preset_blockbuster": {
+  "files": {
+   "<ROOT>/luts/looks/blockbuster.cube": "89c7576879c841d2",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.006794*maxval,0,maxval)':g='clip(val+0.006794*maxval,0,maxval)':b='clip(val+0.006794*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)',curves=all='0.0000/0.0040 0.0672/0.0691 0.1344/0.1353 0.2016/0.2020 0.2688/0.2689 0.3360/0.3360 0.4688/0.4674 0.6016/0.5955 0.7344/0.7194 0.8672/0.8370 1.0000/0.9400':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/blockbuster.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6800*maxval)*3.1250,0,maxval)':g='clip((val-0.6800*maxval)*3.1250,0,maxval)':b='clip((val-0.6800*maxval)*3.1250,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=6.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.340:bb=0.140[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.420[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7800*maxval)*4.5455,0,maxval)':g='clip((val-0.7800*maxval)*4.5455,0,maxval)':b='clip((val-0.7800*maxval)*4.5455,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=10.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.880[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.180[bx8];[bx8]vignette=angle=0.6180:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.500,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_blockbuster_max": {
+  "files": {
+   "<ROOT>/luts/looks/blockbuster_max.cube": "8d97f33fb0256700",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.006794*maxval,0,maxval)':g='clip(val+0.006794*maxval,0,maxval)':b='clip(val+0.006794*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)',curves=all='0.0000/0.0040 0.0672/0.0691 0.1344/0.1353 0.2016/0.2020 0.2688/0.2689 0.3360/0.3360 0.4688/0.4674 0.6016/0.5955 0.7344/0.7194 0.8672/0.8370 1.0000/0.9400':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/blockbuster_max.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6800*maxval)*3.1250,0,maxval)':g='clip((val-0.6800*maxval)*3.1250,0,maxval)':b='clip((val-0.6800*maxval)*3.1250,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=6.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.340:bb=0.140[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.420[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7800*maxval)*4.5455,0,maxval)':g='clip((val-0.7800*maxval)*4.5455,0,maxval)':b='clip((val-0.7800*maxval)*4.5455,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=10.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.880[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.180[bx8];[bx8]vignette=angle=0.6950:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.500,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_blue_hour": {
+  "files": {
+   "<ROOT>/luts/looks/blue_hour.cube": "4d09b24ddbf3331e",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.009341*maxval,0,maxval)':g='clip(val+0.009341*maxval,0,maxval)':b='clip(val+0.009341*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0060 0.0672/0.0701 0.1344/0.1358 0.2016/0.2022 0.2688/0.2689 0.3360/0.3360 0.4688/0.4669 0.6016/0.5933 0.7344/0.7140 0.8672/0.8263 1.0000/0.9200':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/blue_hour.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6200*maxval)*2.6316,0,maxval)':g='clip((val-0.6200*maxval)*2.6316,0,maxval)':b='clip((val-0.6200*maxval)*2.6316,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=8.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.360:bb=0.140[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.380[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.6800*maxval)*3.1250,0,maxval)':g='clip((val-0.6800*maxval)*3.1250,0,maxval)':b='clip((val-0.6800*maxval)*3.1250,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=13.750,scale=320:180:flags=bicubic,colorchannelmixer=rr=0.900:gg=0.950:bb=1.000[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.240[bx8];[bx8]vignette=angle=0.5080:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.400,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_cinekit": {
+  "files": {
+   "<MASKS>/radial_320x180_0.62_1.05.png": "2b4f168d9b7de1fd",
+   "<ROOT>/luts/looks/warm_film.cube": "b2f1f983b5ab1c3d",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.002548*maxval,0,maxval)':g='clip(val+0.000000*maxval,0,maxval)':b='clip(val+-0.002548*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)',colorchannelmixer=rr=1.01575:rg=-0.01430:rb=-0.00144:gr=-0.00425:gg=1.00570:gb=-0.00144:br=-0.00425:bg=-0.01430:bb=1.01856,vibrance=intensity=0.1000,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/warm_film.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.8000[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6200*maxval)*2.6316,0,maxval)':g='clip((val-0.6200*maxval)*2.6316,0,maxval)':b='clip((val-0.6200*maxval)*2.6316,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=6.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.340:bb=0.160[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.500[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7500*maxval)*4.0000,0,maxval)':g='clip((val-0.7500*maxval)*4.0000,0,maxval)':b='clip((val-0.7500*maxval)*4.0000,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=8.750,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.970:bb=0.920[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.220[bx8];[bx8]split=2[rs9][rf10];[rf10]gblur=sigma=8.000[rf10b];[rs9][rf10b][mask]maskedmerge[rx11];[rx11]rgbashift=rh=2:bh=-2[cx12];[cx12]vignette=angle=0.6180:mode=forward[vx13];[2:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx13][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5000[gx];[gx]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.62_1.05.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=5:c0f=t+u"
+  ]
+ },
+ "preset_cinematic": {
+  "files": {
+   "<MASKS>/radial_320x180_0.66_1.05.png": "ff6b1a60e542313e",
+   "<ROOT>/luts/looks/blockbuster.cube": "89c7576879c841d2",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.101904*maxval,0,maxval)':g='clip(val+0.101904*maxval,0,maxval)':b='clip(val+0.101904*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)',vibrance=intensity=0.1000,curves=all='0.0000/0.0140 0.0672/0.0740 0.1344/0.1378 0.2016/0.2030 0.2688/0.2691 0.3360/0.3360 0.4688/0.4666 0.6016/0.5921 0.7344/0.7111 0.8672/0.8208 1.0000/0.9100':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/blockbuster.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.5200*maxval)*2.0833,0,maxval)':g='clip((val-0.5200*maxval)*2.0833,0,maxval)':b='clip((val-0.5200*maxval)*2.0833,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=11.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.300:bb=0.120[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.700[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.5800*maxval)*2.3810,0,maxval)':g='clip((val-0.5800*maxval)*2.3810,0,maxval)':b='clip((val-0.5800*maxval)*2.3810,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=17.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.940:bb=0.860[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.400[bx8];[bx8]split=2[rs9][rf10];[rf10]gblur=sigma=6.000[rf10b];[rs9][rf10b][mask]maskedmerge[rx11];[rx11]rgbashift=rh=3:bh=-3[cx12];[cx12]vignette=angle=0.6180:mode=forward[vx13];[2:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx13][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5200[gx];[gx]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.800,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.66_1.05.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=55:c0f=t+u"
+  ]
+ },
+ "preset_clean": {
+  "files": {
+   "<ROOT>/luts/looks/kodak2383.cube": "60545fc245aedee0",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.005520*maxval,0,maxval)':g='clip(val+0.004246*maxval,0,maxval)':b='clip(val+0.002972*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0800+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0800+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0800+0.3360*maxval,0,maxval)',vibrance=intensity=0.2200,curves=all='0.0000/0.0040 0.0672/0.0691 0.1344/0.1353 0.2016/0.2020 0.2688/0.2689 0.3360/0.3360 0.4688/0.4680 0.6016/0.5982 0.7344/0.7259 0.8672/0.8500 1.0000/0.9650':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/kodak2383.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.3500[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.7400*maxval)*3.8462,0,maxval)':g='clip((val-0.7400*maxval)*3.8462,0,maxval)':b='clip((val-0.7400*maxval)*3.8462,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=4.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.360:bb=0.160[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.220[hx4];[hx4]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.100,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_commercial": {
+  "files": {
+   "<ROOT>/luts/looks/commercial.cube": "8e04da84a260578d",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.004246*maxval,0,maxval)':g='clip(val+0.004246*maxval,0,maxval)':b='clip(val+0.004246*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0000 0.0672/0.0672 0.1344/0.1344 0.2016/0.2016 0.2688/0.2688 0.3360/0.3360 0.4688/0.4679 0.6016/0.5977 0.7344/0.7246 0.8672/0.8474 1.0000/0.9600':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/commercial.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.8000*maxval)*5.0000,0,maxval)':g='clip((val-0.8000*maxval)*5.0000,0,maxval)':b='clip((val-0.8000*maxval)*5.0000,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=4.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.400:bb=0.200[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.160[hx4];[hx4]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.600,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_film_portrait": {
+  "files": {
+   "<ROOT>/luts/looks/film_portrait.cube": "5b93b4524cd0ba46",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.005944*maxval,0,maxval)':g='clip(val+0.005944*maxval,0,maxval)':b='clip(val+0.005944*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0000 0.0672/0.0672 0.1344/0.1344 0.2016/0.2016 0.2688/0.2688 0.3360/0.3360 0.4688/0.4674 0.6016/0.5955 0.7344/0.7194 0.8672/0.8370 1.0000/0.9400':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/film_portrait.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.7200*maxval)*3.5714,0,maxval)':g='clip((val-0.7200*maxval)*3.5714,0,maxval)':b='clip((val-0.7200*maxval)*3.5714,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=5.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.380:bb=0.180[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.280[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.8000*maxval)*5.0000,0,maxval)':g='clip((val-0.8000*maxval)*5.0000,0,maxval)':b='clip((val-0.8000*maxval)*5.0000,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=11.250,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.960:bb=0.900[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.140[bx8];[bx8]vignette=angle=0.3760:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.400,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_film_tungsten": {
+  "files": {
+   "<ROOT>/luts/looks/film_tungsten.cube": "8eaf26ae03672008",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.009341*maxval,0,maxval)':g='clip(val+0.009341*maxval,0,maxval)':b='clip(val+0.009341*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0040 0.0672/0.0691 0.1344/0.1353 0.2016/0.2020 0.2688/0.2689 0.3360/0.3360 0.4688/0.4669 0.6016/0.5933 0.7344/0.7140 0.8672/0.8263 1.0000/0.9200':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/film_tungsten.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6400*maxval)*2.7778,0,maxval)':g='clip((val-0.6400*maxval)*2.7778,0,maxval)':b='clip((val-0.6400*maxval)*2.7778,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=7.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.300:bb=0.120[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.440[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7400*maxval)*3.8462,0,maxval)':g='clip((val-0.7400*maxval)*3.8462,0,maxval)':b='clip((val-0.7400*maxval)*3.8462,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=12.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=0.920:gg=0.960:bb=1.000[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.180[bx8];[bx8]vignette=angle=0.4420:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.400,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_flat": {
+  "files": {
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_forest": {
+  "files": {
+   "<MASKS>/radial_320x180_0.55_1.05.png": "98bb71ff1186d5ea",
+   "<ROOT>/luts/looks/forest.cube": "c0da90d48362bb8b",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+-0.001698*maxval,0,maxval)':g='clip(val+0.000000*maxval,0,maxval)':b='clip(val+0.001698*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0400+0.3360*maxval,0,maxval)',colorchannelmixer=rr=0.96850:rg=0.02861:rb=0.00289:gr=0.00850:gg=0.98861:gb=0.00289:br=0.00850:bg=0.02861:bb=0.96289,vibrance=intensity=0.1000,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/forest.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.8000[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6600*maxval)*2.9412,0,maxval)':g='clip((val-0.6600*maxval)*2.9412,0,maxval)':b='clip((val-0.6600*maxval)*2.9412,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=7.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.400:bb=0.200[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.400[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7800*maxval)*4.5455,0,maxval)':g='clip((val-0.7800*maxval)*4.5455,0,maxval)':b='clip((val-0.7800*maxval)*4.5455,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=10.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=0.950:gg=1.000:bb=0.980[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.200[bx8];[bx8]split=2[rs9][rf10];[rf10]gblur=sigma=10.000[rf10b];[rs9][rf10b][mask]maskedmerge[rx11];[rx11]rgbashift=rh=2:bh=-2[cx12];[cx12]vignette=angle=0.8820:mode=forward[vx13];[2:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx13][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5000[gx];[gx]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.55_1.05.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=6:c0f=t+u"
+  ]
+ },
+ "preset_golden_haze": {
+  "files": {
+   "<MASKS>/radial_320x180_0.60_1.05.png": "8119701f8619987a",
+   "<ROOT>/luts/looks/golden_haze.cube": "164589930d78f836",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_filmic_rec709a.cube": "ad56e6a1432cce2d"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.017833*maxval,0,maxval)':g='clip(val+0.012738*maxval,0,maxval)':b='clip(val+0.007643*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*0.9800+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*0.9800+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*0.9800+0.3360*maxval,0,maxval)',vibrance=intensity=0.1000,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_filmic_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/golden_haze.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.8500[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.5500*maxval)*2.2222,0,maxval)':g='clip((val-0.5500*maxval)*2.2222,0,maxval)':b='clip((val-0.5500*maxval)*2.2222,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=10.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.450:bb=0.220[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.620[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.6200*maxval)*2.6316,0,maxval)':g='clip((val-0.6200*maxval)*2.6316,0,maxval)':b='clip((val-0.6200*maxval)*2.6316,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=12.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.860[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.340[bx8];[bx8]split=2[rs9][rf10];[rf10]gblur=sigma=7.000[rf10b];[rs9][rf10b][mask]maskedmerge[rx11];[rx11]vignette=angle=0.5300:mode=forward[vx12];[2:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx12][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5000[gx];[gx]format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.60_1.05.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=5:c0f=t+u"
+  ]
+ },
+ "preset_interior": {
+  "files": {
+   "<ROOT>/luts/looks/interior.cube": "d3541f40b9a024f7",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.005944*maxval,0,maxval)':g='clip(val+0.005944*maxval,0,maxval)':b='clip(val+0.005944*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0200+0.3360*maxval,0,maxval)',curves=all='0.0000/0.0000 0.0672/0.0672 0.1344/0.1344 0.2016/0.2016 0.2688/0.2688 0.3360/0.3360 0.4688/0.4674 0.6016/0.5955 0.7344/0.7194 0.8672/0.8370 1.0000/0.9400':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/interior.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6600*maxval)*2.9412,0,maxval)':g='clip((val-0.6600*maxval)*2.9412,0,maxval)':b='clip((val-0.6600*maxval)*2.9412,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=7.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.380:bb=0.180[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.400[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.7200*maxval)*3.5714,0,maxval)':g='clip((val-0.7200*maxval)*3.5714,0,maxval)':b='clip((val-0.7200*maxval)*3.5714,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=12.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.860[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.200[bx8];[bx8]vignette=angle=0.4640:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.500,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_natural": {
+  "files": {
+   "<ROOT>/luts/looks/natural.cube": "fd85a559e7e55849",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.005944*maxval,0,maxval)':g='clip(val+0.005944*maxval,0,maxval)':b='clip(val+0.005944*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0500+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0500+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0500+0.3360*maxval,0,maxval)',vibrance=intensity=0.1000,curves=all='0.0000/0.0060 0.0672/0.0701 0.1344/0.1358 0.2016/0.2022 0.2688/0.2689 0.3360/0.3360 0.4688/0.4676 0.6016/0.5966 0.7344/0.7221 0.8672/0.8423 1.0000/0.9500':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/natural.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.8000[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.7200*maxval)*3.5714,0,maxval)':g='clip((val-0.7200*maxval)*3.5714,0,maxval)':b='clip((val-0.7200*maxval)*3.5714,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=5.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.360:bb=0.160[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.300[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.8000*maxval)*5.0000,0,maxval)':g='clip((val-0.8000*maxval)*5.0000,0,maxval)':b='clip((val-0.8000*maxval)*5.0000,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=11.250,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.960:bb=0.900[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.140[bx8];[bx8]vignette=angle=0.4200:mode=forward[vx9];[vx9]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.400,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_premium": {
+  "files": {
+   "<MASKS>/radial_320x180_0.58_1.05.png": "359df596a55abc0b",
+   "<ROOT>/luts/looks/premium.cube": "a813fc81384350d8",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[1:v]format=gray16le,format=gbrp16le,setsar=1[mask];[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.016135*maxval,0,maxval)':g='clip(val+0.014436*maxval,0,maxval)':b='clip(val+0.012738*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,lut=r='clip((val-0.3360*maxval)*1.0600+0.3360*maxval,0,maxval)':g='clip((val-0.3360*maxval)*1.0600+0.3360*maxval,0,maxval)':b='clip((val-0.3360*maxval)*1.0600+0.3360*maxval,0,maxval)',vibrance=intensity=0.1200,curves=all='0.0000/0.0120 0.0672/0.0731 0.1344/0.1373 0.2016/0.2028 0.2688/0.2691 0.3360/0.3360 0.4688/0.4678 0.6016/0.5971 0.7344/0.7234 0.8672/0.8449 1.0000/0.9550':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]split=2[lka][lkb];[lkb]lut3d=file=<ROOT>/luts/looks/premium.cube:interp=tetrahedral[lkc];[lkc][lka]blend=all_mode=normal:all_opacity=0.7500[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.5800*maxval)*2.3810,0,maxval)':g='clip((val-0.5800*maxval)*2.3810,0,maxval)':b='clip((val-0.5800*maxval)*2.3810,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=8.500,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.380:bb=0.180[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.580[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.5400*maxval)*2.1739,0,maxval)':g='clip((val-0.5400*maxval)*2.1739,0,maxval)':b='clip((val-0.5400*maxval)*2.1739,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=16.250,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.870[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.400[bx8];[bx8]split=2[rs9][rf10];[rf10]gblur=sigma=9.000[rf10b];[rs9][rf10b][mask]maskedmerge[rx11];[rx11]rgbashift=rh=2:bh=-2[cx12];[cx12]vignette=angle=0.7280:mode=forward[vx13];[2:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx13][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.5000[gx];[gx]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.600,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-i",
+   "<MASKS>/radial_320x180_0.58_1.05.png",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=6:c0f=t+u"
+  ]
+ },
+ "preset_punch": {
+  "files": {
+   "<ROOT>/luts/looks/punch.cube": "c942d024d632bc03",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.005095*maxval,0,maxval)':g='clip(val+0.005095*maxval,0,maxval)':b='clip(val+0.005095*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0000 0.0672/0.0672 0.1344/0.1344 0.2016/0.2016 0.2688/0.2688 0.3360/0.3360 0.4688/0.4676 0.6016/0.5966 0.7344/0.7221 0.8672/0.8423 1.0000/0.9500':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/punch.cube:interp=tetrahedral[lk];[lk]vignette=angle=0.3540:mode=forward[vx1];[vx1]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.900,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ },
+ "preset_reels": {
+  "files": {
+   "<ROOT>/luts/looks/reels.cube": "ed9c4c43b41edabe",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.092563*maxval,0,maxval)':g='clip(val+0.092563*maxval,0,maxval)':b='clip(val+0.092563*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0000 0.0672/0.0672 0.1344/0.1344 0.2016/0.2016 0.2688/0.2688 0.3360/0.3360 0.4688/0.4663 0.6016/0.5909 0.7344/0.7082 0.8672/0.8152 1.0000/0.9000':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/reels.cube:interp=tetrahedral[lk];[lk]split=2[hb1][hl2];[hl2]lut=r='clip((val-0.6000*maxval)*2.5000,0,maxval)':g='clip((val-0.6000*maxval)*2.5000,0,maxval)':b='clip((val-0.6000*maxval)*2.5000,0,maxval)',scale=80:45:flags=bilinear,gblur=sigma=10.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.340:bb=0.140[ho3];[hb1][ho3]blend=all_mode=screen:all_opacity=0.420[hx4];[hx4]split=2[bb5][bl6];[bl6]lut=r='clip((val-0.6600*maxval)*2.9412,0,maxval)':g='clip((val-0.6600*maxval)*2.9412,0,maxval)':b='clip((val-0.6600*maxval)*2.9412,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=15.000,scale=320:180:flags=bicubic,colorchannelmixer=rr=1.000:gg=0.950:bb=0.880[bo7];[bb5][bo7]blend=all_mode=screen:all_opacity=0.260[bx8];[bx8]vignette=angle=0.4860:mode=forward[vx9];[1:v]scale=320:180:flags=bilinear,format=gbrp16le,setsar=1[grainplate];[vx9][grainplate]blend=all_mode=overlay:shortest=1:all_opacity=0.3400[gx];[gx]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.600,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV",
+   "-f",
+   "lavfi",
+   "-i",
+   "color=c=gray:s=106x60:r=24:d=20.000,noise=c0s=34:c0f=t+u"
+  ]
+ },
+ "preset_silverblue": {
+  "files": {
+   "<ROOT>/luts/looks/silverblue.cube": "fbd75e39705c409b",
+   "<ROOT>/luts/technical/AppleLog_to_DWG.cube": "21730ea41c4b294d",
+   "<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube": "a816b42691049bf1"
+  },
+  "graph": "[0:v]scale=in_color_matrix=bt2020:in_range=tv:out_range=full,format=gbrp16le,lut=r='clip(val+0.006794*maxval,0,maxval)':g='clip(val+0.006794*maxval,0,maxval)':b='clip(val+0.006794*maxval,0,maxval)',lut3d=file=<ROOT>/luts/technical/AppleLog_to_DWG.cube:interp=tetrahedral,curves=all='0.0000/0.0040 0.0672/0.0691 0.1344/0.1353 0.2016/0.2020 0.2688/0.2689 0.3360/0.3360 0.4688/0.4674 0.6016/0.5955 0.7344/0.7194 0.8672/0.8370 1.0000/0.9400':interp=pchip,lut3d=file=<ROOT>/luts/technical/DWG_to_Rec709_aces_rec709a.cube:interp=tetrahedral[cst];[cst]lut3d=file=<ROOT>/luts/looks/silverblue.cube:interp=tetrahedral[lk];[lk]split=2[bb1][bl2];[bl2]lut=r='clip((val-0.7400*maxval)*3.8462,0,maxval)':g='clip((val-0.7400*maxval)*3.8462,0,maxval)':b='clip((val-0.7400*maxval)*3.8462,0,maxval)',scale=40:22:flags=bilinear,gblur=sigma=13.750,scale=320:180:flags=bicubic,colorchannelmixer=rr=0.940:gg=0.970:bb=1.000[bo3];[bb1][bo3]blend=all_mode=screen:all_opacity=0.200[bx4];[bx4]vignette=angle=0.5300:mode=forward[vx5];[vx5]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.500,format=yuv422p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709[vout]",
+  "inputs": [
+   "ffmpeg",
+   "-v",
+   "error",
+   "-y",
+   "-ss",
+   "1.5",
+   "-i",
+   "SOURCE.MOV"
+  ]
+ }
+}

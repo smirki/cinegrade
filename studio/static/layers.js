@@ -447,13 +447,31 @@
     return changed.length ? changed.join(", ") : "default";
   }
 
+  // A component stack (mask.components, contract C1) REPLACES the single
+  // window and the single key: both engines read the stack when it is not
+  // empty and ignore mask.window / mask.key entirely. These two folds are
+  // still shown, because a layer made before the stack existed is edited
+  // through them, but their summary has to say when they have stopped
+  // affecting the picture, otherwise a person drags a softness slider that
+  // does nothing and blames the render.
+  function componentsIgnoreLegacy(layer) {
+    var list = layer && layer.mask && layer.mask.components;
+    return !!(Array.isArray(list) && list.length);
+  }
+
   function foldSummary(spec, layer) {
     if (spec.id === "window") {
       var w = (layer && layer.mask && layer.mask.window) || {};
+      if (componentsIgnoreLegacy(layer)) {
+        return spec.label + ": not in use, the mask stack replaces it";
+      }
       return spec.label + ": " + (w.enabled ? "on" : "off");
     }
     if (spec.id === "key") {
       var k = (layer && layer.mask && layer.mask.key) || {};
+      if (componentsIgnoreLegacy(layer)) {
+        return spec.label + ": not in use, the mask stack replaces it";
+      }
       return spec.label + ": " + (k.enabled ? "on" : "off");
     }
     if (spec.id === "correct") return spec.label + ": " + correctSummary(layer);
@@ -668,6 +686,23 @@
 
     var body = document.createElement("div");
     body.className = "layer-body";
+
+    // The mask stack goes FIRST in the body, above the schema's own controls:
+    // it is what a person reaches for (pick a subject, track it) before any
+    // slider under it, and the legacy Window/Key folds it replaces are
+    // collapsed further down. masks.js owns everything inside it; this is the
+    // only place layers.js knows the panel exists, and it degrades to nothing
+    // if masks.js is not loaded.
+    if (global.Masks && global.Masks.buildSection) {
+      try {
+        body.appendChild(global.Masks.buildSection(idx, layer));
+      } catch (e) {
+        // A broken mask panel must never take the whole layer list with it:
+        // the rest of this layer's controls still build.
+        if (global.console) console.error("mask panel failed to build", e);
+      }
+    }
+
     (stageSpec.itemControls || []).forEach(function (spec) {
       var el = makeItemControl(spec, idx, layer, defLayer);
       if (el) body.appendChild(el);
@@ -739,6 +774,9 @@
     listEl.innerHTML = "";
     itemRoots = [];
     var defLayer = newLayer("");
+    // Every mask section is about to be thrown away and built again, so tell
+    // masks.js to drop its list of them rather than let it grow per rebuild.
+    if (global.Masks && global.Masks.beginRebuild) global.Masks.beginRebuild();
 
     if (!layers.length) {
       var empty = document.createElement("div");
@@ -754,6 +792,9 @@
       });
     }
     applySelectionClasses();
+    // The panel has been rebuilt, so the overlay's own idea of which layer it
+    // is drawing and what the status line says can be stale by one frame.
+    if (global.Masks && global.Masks.sync) global.Masks.sync();
   }
 
   // Called once by panels.js's build(), right after the stage's note is

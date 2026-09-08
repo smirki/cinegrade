@@ -26,10 +26,20 @@
      "distortion correction. These need multi frame analysis, and both render " +
      "engines treat every frame as an independent graph, ffmpeg's filter " +
      "chain or gpu.js's, with nothing carried from one frame to the next."],
-    ["No tracking.",
-     "Nothing can follow a subject across a shot. Same reason: a tracker needs " +
-     "to carry state from frame to frame, and there is no place in a stateless " +
-     "per frame filter graph to keep it."],
+    ["No tracking inside the render.",
+     "This entry used to read \"no tracking\" full stop, on the reasoning that " +
+     "a tracker has to carry state from frame to frame and a stateless per " +
+     "frame graph has nowhere to keep it. The reasoning still holds; the " +
+     "conclusion no longer does, because the state was moved OUT of the graph. " +
+     "A mask component of type matte reads a grey frame per source frame that " +
+     "a separate segmentation service wrote to disk ahead of time, so a " +
+     "correction can follow a subject through a shot while both render engines " +
+     "stay exactly as stateless as they were: they look a frame up, they do " +
+     "not compute it. What is genuinely not possible here is tracking DURING a " +
+     "render or a preview. The model is not realtime and nothing in the " +
+     "grading loop waits on it, so a matte that has not been tracked yet is " +
+     "held on its picked frame, and one that is still being tracked shows the " +
+     "last frame it has while the state line says the matte is lagging."],
     ["No compositing.",
      "No alpha, no blend modes, no blending two clips together. Every graph " +
      "has one picture input. The layer stack is not a contradiction of this: " +
@@ -283,6 +293,54 @@
   ];
 
   var BROKEN = [
+    ["A tracked matte can lag the picture during playback.",
+     "works, with a stated failure mode",
+     "Matte frames are PNGs the preview fetches and decodes one at a time. It " +
+     "keeps a small cache of decoded frames and reads ahead of the playhead " +
+     "along the direction of play, but a seek, a scrub or a slow disk can " +
+     "still put the playhead in front of the decode. When that happens the " +
+     "preview reuses the last frame it has and says \"matte lagging\" in the " +
+     "state line rather than stalling the picture: a frozen matte on a moving " +
+     "subject is visibly wrong, which is the point, whereas a stalled preview " +
+     "just looks like the app hung. Stop and the correct frame arrives. This " +
+     "affects the PREVIEW only; a render reads the same frames off disk with " +
+     "no deadline, and refuses a partial matte outright unless it is told to " +
+     "allow one."],
+    ["The component mask is not yet measured against the render.",
+     "ported, not yet proven",
+     "The preview's whole claim to be trusted is the parity harness: every " +
+     "stage says exact, close or unsupported, and the number behind that word " +
+     "was measured against ffmpeg on this machine. The mask component stack " +
+     "(add, intersect, subtract, per component feather and invert, the linear " +
+     "gradient, matte finesse) is ported and reports itself CLOSE rather than " +
+     "exact, because at the time of writing most of its parity fixtures " +
+     "cannot run: the engine builds the filter graph for a component stack " +
+     "but the studio server does not yet pass that graph the extra image " +
+     "inputs it names, so those renders fail before a pixel is compared. " +
+     "Three rows DO measure exact already, and they are the three that need " +
+     "no extra input: a colour key component, a luma component, and an " +
+     "inverted stack with nothing switched on. What else HAS been measured " +
+     "is the arithmetic: the three " +
+     "combine modes, the clean expression's rounding and the way the grow " +
+     "step treats the frame border were all probed against ffmpeg on this " +
+     "machine and this preview matches them, so those are no longer guesses. " +
+     "Two places are still expected to move by a code and cannot be checked " +
+     "until the fixtures run: the clean black and clean white knee is " +
+     "evaluated in double precision by ffmpeg and in single precision here, " +
+     "so a value sitting exactly on a whole code can round the other way, and " +
+     "a matte served at a size other than the render's is resampled by the " +
+     "graphics card here and by swscale there, which are different " +
+     "resamplers. Legacy masks (a power window and a colour key) are " +
+     "unaffected and still measure exactly as they did."],
+    ["An inverted matte component with nothing decoded selects everything.",
+     "known trap",
+     "A matte component whose frame has not arrived reads as 0, meaning " +
+     "\"selects nothing\", which is the only honest value for a matte that is " +
+     "not there. Inverted, that same absence reads as 1 and the layer's " +
+     "correction covers the whole frame. The preview waits for the first frame " +
+     "of every matte before its first render, so this normally cannot be seen; " +
+     "it shows up when the matte is missing or failed rather than merely slow, " +
+     "and in that case the layer's row says so."],
     ["RGB split lands on whole pixels only.",
      "partially works",
      "ffmpeg's rgbashift takes an integer pixel offset, so the amount is rounded " +

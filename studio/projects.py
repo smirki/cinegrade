@@ -50,6 +50,7 @@ import re
 import sys
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 
 STUDIO = Path(__file__).resolve().parent
@@ -1342,3 +1343,108 @@ def state(key: str) -> dict | None:
                         "is_current": r["name"] == proj["branch"]}
                        for r in brows]
     return out
+
+
+# --------------------------------------------------------------------------
+# mask recipe resolution, contract C4: "Presets: on load for a clip, every
+# matte.recipe with only text prompts and no matte for this clip is queued
+# automatically; point and box recipes mark the component needs_pick."
+#
+# Pure by design: this module knows the config shape but not the SAM service
+# and not the matte registry, both of which are server.py's (contract C2/C4,
+# lane M5's own files). server.py supplies `lookup`, a plain function, so
+# this file never imports sam_client and never touches a filesystem outside
+# what init_schema already opened.
+# --------------------------------------------------------------------------
+
+def _recipe_prompts(recipe) -> dict:
+    """The C3 prompts block a recipe carries, whichever of the two shapes
+    it was written in: `{"prompts": {...}, "select": ..., "steady": ...}`
+    (a track recipe, contract C4's own shape) or a bare prompts dict
+    (`{"text": [...]}`), which is the shape a hand written preset is most
+    likely to use. A recipe that is not a dict at all reads as empty rather
+    than raising: a malformed recipe is a needs_pick candidate, not a crash
+    on project load.
+    """
+    if not isinstance(recipe, dict):
+        return {}
+    p = recipe.get("prompts")
+    return p if isinstance(p, dict) else recipe
+
+
+def recipe_is_portable(recipe) -> bool:
+    """True when a recipe carries only TEXT prompts (contract C4).
+
+    A text prompt names a CONCEPT ("person", "sky in the background"), which
+    means the same thing on any clip, so a preset built on one clip can queue
+    the same track on another without anybody picking anything first. Points,
+    boxes and exemplars are pixel coordinates or crops taken from the clip
+    the recipe was made on; they mean nothing on a different clip, so a
+    recipe carrying any of them is never portable even if it also carries
+    text (a mixed recipe still needs the clip specific part re-picked).
+    """
+    p = _recipe_prompts(recipe)
+    has_text = bool(p.get("text"))
+    has_pixels = bool(p.get("points") or p.get("boxes") or p.get("exemplars"))
+    return has_text and not has_pixels
+
+
+def resolve_mask_recipes(config: dict, lookup) -> tuple[dict, list[dict]]:
+    """Resolve every matte-type mask component against THIS clip.
+
+    `lookup(recipe, existing_id)` is supplied by the caller (server.py, which
+    owns the SAM service and the matte registry) and answers with a matte id
+    already valid for this clip and this recipe, or None when there is
+    nothing to reuse. `existing_id` is whatever `matte.get("id")` already
+    says, in case it already belongs to this clip (a point pick made here
+    earlier needs no re-resolving); a text recipe ported from another clip
+    passes it too, purely as a hint the caller is free to ignore. This
+    function performs no I/O itself and never calls the SAM service: it only
+    reports what `lookup` already knows, and what is still missing.
+
+    Returns `(new_config, to_queue)`:
+
+      new_config  a deep copy of `config`. Every matte-type component this
+                  function visits gets `matte["id"]` set from `lookup` when
+                  there is one, and `matte["needs_pick"]` explicitly set
+                  (True or False) so the UI never trusts a flag left over
+                  from a stale copy of the config.
+
+      to_queue    one entry per TEXT-only recipe `lookup` could not resolve:
+                  `{"layer": i, "component": component_id, "recipe": recipe}`.
+                  The caller queues a track for each of these (contract C4:
+                  "queued automatically"); queuing is I/O, so it happens
+                  outside this function, never inside it.
+
+    A component with no recipe at all (no `matte` key, or `matte` with
+    nothing under `recipe`) is left untouched: there is nothing to resolve,
+    and an empty selector is the UI's own placeholder state, not a missing
+    pick this function should be flagging.
+    """
+    out = deepcopy(config or {})
+    to_queue: list[dict] = []
+    layers = out.get("layers") or []
+    for i, layer in enumerate(layers):
+        if not isinstance(layer, dict):
+            continue
+        mask = layer.get("mask") or {}
+        for comp in (mask.get("components") or []):
+            if not isinstance(comp, dict) or comp.get("type") != "matte":
+                continue
+            matte = comp.get("matte")
+            if not isinstance(matte, dict) or not matte.get("recipe"):
+                continue
+            recipe = matte["recipe"]
+            found = lookup(recipe, matte.get("id"))
+            if found:
+                matte["id"] = found
+                matte["needs_pick"] = False
+                continue
+            matte.pop("id", None)
+            if recipe_is_portable(recipe):
+                matte["needs_pick"] = False
+                to_queue.append({"layer": i, "component": comp.get("id"),
+                                 "recipe": recipe})
+            else:
+                matte["needs_pick"] = True
+    return out, to_queue
