@@ -517,6 +517,249 @@ def sequence_plan(info: MatteInfo, start_index: int, count: int | None = None
 
 
 # --------------------------------------------------------------------------
+# the span a matte really covers, and what happens outside it
+# --------------------------------------------------------------------------
+
+def span(info: MatteInfo) -> dict:
+    """The window of the clip this matte actually answers for.
+
+    Written frames, not the declared `frames` count: a track queued for
+    `--start 0 --end 6` writes frames 0..143 and declares 144, and a track
+    that stopped at 259 of 384 declares 384 but answers for 259. Both are
+    normal; the number a caller needs before trusting a matte at a moment is
+    "which seconds are really tracked", and that is this.
+
+    Outside `[start_s, end_s)` the engines hold the nearest written frame
+    (`nearest_written`, and ffmpeg's own framesync past the end of a
+    sequence). That is deliberate, not a bug: it is what keeps a correction
+    working while a track is still running. It does mean the mask stops
+    MOVING out there, so `frozen_outside_span` is stated in every summary
+    that carries a span, and every human readable printout says it in words.
+    """
+    idx = info.written_indices()
+    fps = float(info.fps or 0.0)
+    first = int(idx[0]) if idx else 0
+    last = int(idx[-1]) if idx else -1
+    end = last + 1
+    return {
+        "start_frame": first,
+        "end_frame": end,                       # exclusive, like C3's end_frame
+        "written": len(idx),
+        "declared_frames": int(info.total_frames),
+        "contiguous": bool(idx) and (last - first + 1) == len(idx),
+        "start_s": round(first / fps, 4) if fps else 0.0,
+        "end_s": round(end / fps, 4) if (fps and idx) else 0.0,
+        "frozen_outside_span": True,
+    }
+
+
+# --------------------------------------------------------------------------
+# per frame quality flags (checkpoint gap 18)
+#
+# The M8 grader tracked "face", got a matte that lost the face for two
+# seconds, latched onto a tree, then tracked the whole person from three
+# seconds on, and measured skin luma against it without knowing: nothing in
+# `mask list`, `mask show`, the job or the matte route said a word. These
+# three rules turn that into something a caller can see before it grades.
+#
+# The rules, each against the PREVIOUS WRITTEN frame (so a gap in a partial
+# matte compares across the gap rather than inventing a break):
+#
+#   zero_area   the tracked area is 0 inside the span: the subject is gone
+#               and the matte holds nothing, which reads as "no correction
+#               here" rather than as an error anywhere else.
+#   area_jump   the area changed by more than `area_jump` as a FRACTION of
+#               the previous frame's area: a face becoming a whole person
+#               is a jump of about 1.1, a tree grab is a jump of 13.
+#   low_iou     the mask's overlap with the previous frame fell under
+#               `min_iou`: the shape moved somewhere else entirely, which
+#               an area test alone misses when the new thing happens to be
+#               the same size as the old one.
+#
+# Defaults measured on the four real mattes under
+# bakeoff/masks/studio-data/mattes (M8's own run, 1280x720, 24fps):
+#
+#   matte     frames  area jump p50 / p90 / max     flags at 0.5
+#   sky       144     0.018 / 0.046 / 0.094         0
+#   pavement  144     0.028 / 0.095 / 0.781         3 jumps + 15 zeros
+#   person    384     0.026 / 0.068 / 13.58         3 jumps (its real
+#                                                   t=1.2-2.0s trough)
+#   face      144     0.026 / 0.074 / 1.124         1 jump + 44 zeros
+#
+# so 0.5 flags the face's own latch onto the tree (1.124) and the person's
+# genuine occlusion dip, and leaves the sky (max 0.094) alone entirely.
+# `min_iou` 0.3 is the shape half of the same call: two masks of the same
+# size in different places overlap far below it, while frame to frame
+# tracking of one steady object on this footage stays well above it.
+# --------------------------------------------------------------------------
+
+SUSPECT_AREA_JUMP = 0.5
+SUSPECT_MIN_IOU = 0.3
+
+# Reasons, spelled once so a caller can switch on them rather than on prose.
+SUSPECT_REASONS = ("zero_area", "area_jump", "low_iou")
+
+
+def quality_thresholds(area_jump=None, min_iou=None) -> dict:
+    """The thresholds `quality()` will use, resolved the way `matte_root`
+    resolves its own path: an explicit argument, then the environment
+    (`CINEGRADE_MATTE_AREA_JUMP`, `CINEGRADE_MATTE_MIN_IOU`), then the
+    measured defaults above. Returned as part of every report so a number
+    can never be read without the threshold it was judged against.
+    """
+    def pick(value, env_name, fallback):
+        if value is not None:
+            return float(value)
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+        return float(fallback)
+
+    return {"area_jump": pick(area_jump, "CINEGRADE_MATTE_AREA_JUMP",
+                              SUSPECT_AREA_JUMP),
+            "min_iou": pick(min_iou, "CINEGRADE_MATTE_MIN_IOU",
+                            SUSPECT_MIN_IOU)}
+
+
+def frame_ious(info: MatteInfo, width: int = 128) -> dict:
+    """Intersection over union with the previous written frame, per frame.
+
+    Read off disk, downsampled to `width` first (the shape question is "is
+    this the same thing in the same place", which survives a small raster;
+    a full 1280x720 read of 384 frames costs about a second and a half and
+    buys nothing here). Returns `{index: iou}` for every written frame after
+    the first.
+
+    Only called when a caller asks for it (`quality(..., compute_iou=True)`,
+    which is `mask show` and the strip, one matte at a time). A list of a
+    clip's mattes never pays for this: the SAM service writes its own
+    `ious` into index.json as it tracks, and `quality()` prefers those.
+    """
+    idx = info.written_indices()
+    out: dict[int, float] = {}
+    prev = None
+    for i in idx:
+        try:
+            arr = load_frame(info, i)
+        except MatteError:
+            prev = None
+            continue
+        h = max(1, round(arr.shape[0] * width / max(1, arr.shape[1])))
+        small = resize_bilinear(arr, max(1, int(width)), h) \
+            if arr.shape[1] != width else arr
+        cur = (small >= 0.5)
+        if prev is not None:
+            union = float(np.logical_or(prev, cur).sum())
+            inter = float(np.logical_and(prev, cur).sum())
+            out[int(i)] = round(inter / union, 4) if union > 0 else 1.0
+        prev = cur
+    return out
+
+
+def quality(info: MatteInfo, area_jump=None, min_iou=None,
+            compute_iou: bool = False, ious=None, limit: int | None = None
+            ) -> dict:
+    """Per frame quality flags for one matte, and the summary of them.
+
+        {"thresholds": {"area_jump", "min_iou"},
+         "checked": 144, "iou_source": "index"|"frames"|"none",
+         "suspect_count": 45, "suspect_frames": [...],
+         "first_suspect_index": 4, "first_suspect_time": 0.1667,
+         "reasons": {"zero_area": 44, "area_jump": 1, "low_iou": 0},
+         "truncated": false}
+
+    Each entry in `suspect_frames` is `{"index", "time", "reasons": [...],
+    "area", "prev_area", "jump", "iou"}`; `jump` and `iou` are None when
+    that rule had nothing to compare against.
+
+    `ious` (a list aligned to `areas`, or a dict of index to value) comes
+    from index.json when the SAM service wrote one. `compute_iou` reads the
+    frames off disk instead, for a matte tracked before the service started
+    writing them. With neither, the IoU rule simply does not run and
+    `iou_source` says `"none"`: an absent rule is stated, never silently
+    passed.
+
+    `limit` caps `suspect_frames` (the counts and the first suspect are
+    always the true ones) so a route that lists many mattes cannot answer
+    with a hundred rows per matte.
+    """
+    th = quality_thresholds(area_jump, min_iou)
+    fps = float(info.fps or 0.0)
+    areas = list(info.areas or [])
+    written = set(info.written_indices())
+
+    iou_by_index: dict[int, float] = {}
+    iou_source = "none"
+    if ious is None:
+        ious = info.raw.get("ious")
+    if isinstance(ious, dict) and ious:
+        iou_by_index = {int(k): float(v) for k, v in ious.items()
+                        if v is not None}
+        iou_source = "index"
+    elif isinstance(ious, (list, tuple)) and any(v is not None for v in ious):
+        iou_by_index = {i: float(v) for i, v in enumerate(ious)
+                        if v is not None}
+        iou_source = "index"
+    elif compute_iou:
+        iou_by_index = frame_ious(info)
+        iou_source = "frames" if iou_by_index else "none"
+
+    # Every frame the matte really answers for: a written frame, or one
+    # index.json recorded an area for. The two agree on a healthy matte and
+    # the union is the honest set when they do not.
+    indices = sorted(written | {i for i, v in enumerate(areas)
+                                if v is not None})
+    counts = {r: 0 for r in SUSPECT_REASONS}
+    flagged: list[dict] = []
+    prev_area = None
+    for i in indices:
+        area = areas[i] if i < len(areas) else None
+        reasons = []
+        jump = None
+        if area is not None:
+            if float(area) <= 0.0:
+                reasons.append("zero_area")
+            if prev_area is not None and prev_area > 0 and area is not None:
+                jump = abs(float(area) - prev_area) / prev_area
+                if jump > th["area_jump"]:
+                    reasons.append("area_jump")
+        iou = iou_by_index.get(i)
+        if iou is not None and iou < th["min_iou"]:
+            reasons.append("low_iou")
+        if reasons:
+            for r in reasons:
+                counts[r] += 1
+            flagged.append({
+                "index": int(i),
+                "time": round(i / fps, 4) if fps else None,
+                "reasons": reasons,
+                "area": None if area is None else round(float(area), 6),
+                "prev_area": None if prev_area is None else round(prev_area, 6),
+                "jump": None if jump is None else round(jump, 4),
+                "iou": None if iou is None else round(float(iou), 4),
+            })
+        if area is not None:
+            prev_area = float(area)
+
+    first = flagged[0] if flagged else None
+    shown = flagged if limit is None else flagged[:max(0, int(limit))]
+    return {
+        "thresholds": th,
+        "checked": len(indices),
+        "iou_source": iou_source,
+        "suspect_count": len(flagged),
+        "suspect_frames": shown,
+        "truncated": len(shown) < len(flagged),
+        "first_suspect_index": None if first is None else first["index"],
+        "first_suspect_time": None if first is None else first["time"],
+        "reasons": counts,
+    }
+
+
+# --------------------------------------------------------------------------
 # reading a PNG without depending on anything
 # --------------------------------------------------------------------------
 

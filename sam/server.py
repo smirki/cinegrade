@@ -29,8 +29,6 @@ import argparse
 import atexit
 import json
 import os
-import resource
-import subprocess
 import signal
 import sys
 import threading
@@ -54,6 +52,7 @@ from backends import (Cancelled, KNOWN, load_backend, normalize_prompts,   # noq
                       plan_objects, split_mask_score)
 from backends.base import recipe_digest                                    # noqa: E402
 from frames import FrameSource, VideoError, probe_rotation_tag, read_image  # noqa: E402
+import memstat                                                             # noqa: E402
 from modellock import ModelLock                                            # noqa: E402
 from store import MatteWriter, utc_now                                     # noqa: E402
 
@@ -144,37 +143,31 @@ class Job:
         }
 
 
-_MEMORY_CACHE = {"at": 0.0, "value": None}
+_PEAK_FOOTPRINT = {"mb": 0.0}
 
 
 def memory() -> dict:
     """What this process is costing the machine right now.
 
     On /health because the honest answer to "why is this taking minutes" is
-    usually memory: the model is about 5 GB resident on a 16 GB Mac, and once
-    it swaps, everything (this service, the studio, ffmpeg) crawls together.
-    Peak comes from getrusage, which is free; the current figure comes from
-    `ps`, which is not, so it is cached for a couple of seconds because the
-    studio polls health while a job runs.
+    usually memory: the model is about 1.7 GB of weights on a 16 GB Mac, and
+    once the machine swaps, everything (this service, the studio, ffmpeg)
+    crawls together.
+
+    `rss_mb` used to be the headline here and it was actively misleading: MLX
+    allocates through Metal, which does not appear in RSS at all, so this
+    process read 150 MB while `top` read 13 GB. `footprint_mb` is the real
+    number (the one Activity Monitor calls Memory) and `rss_mb` is kept
+    beside it because the gap between the two is itself the diagnosis. Both
+    come from one `task_info` syscall, so unlike the `ps` call this replaced
+    there is nothing to cache.
     """
-    now = time.time()
-    if _MEMORY_CACHE["value"] is not None and now - _MEMORY_CACHE["at"] < 2.0:
-        return _MEMORY_CACHE["value"]
-    rss_mb = None
-    try:
-        out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
-                             capture_output=True, text=True, timeout=2)
-        rss_mb = round(int(out.stdout.strip()) / 1024, 1)
-    except Exception:                                          # noqa: BLE001
-        pass
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # ru_maxrss is bytes on macOS and kilobytes on Linux. This runs on the
-    # founder's Mac, but the wrong divisor turns 44 MB into 43 GB, which
-    # would be read as a memory leak, so it is worth being explicit.
-    peak_mb = round(peak / (1048576 if sys.platform == "darwin" else 1024), 1)
-    value = {"rss_mb": rss_mb, "peak_rss_mb": peak_mb}
-    _MEMORY_CACHE.update(at=now, value=value)
-    return value
+    out = memstat.snapshot()
+    footprint = out.get("footprint_mb")
+    if footprint is not None and footprint > _PEAK_FOOTPRINT["mb"]:
+        _PEAK_FOOTPRINT["mb"] = footprint
+    out["peak_footprint_mb"] = round(_PEAK_FOOTPRINT["mb"], 1) or None
+    return out
 
 
 def resolve_rotation(value, clip_path: str | None) -> int:
@@ -314,6 +307,28 @@ class Service:
         waiting = self.queued_jobs()
         return waiting.index(job) + 1 if job in waiting else None
 
+    def memory_report(self) -> dict:
+        """One block on /health that answers "what is this costing me".
+
+        Three layers, because they answer different questions: the process
+        numbers say what the machine sees, `backend` says what MLX (or torch)
+        thinks it is holding and under which limits, and `windows` says what
+        each window of the running track peaked at. The last one is the only
+        way to tell a service that grows from one that is simply big: a flat
+        peak across windows is bounded memory, a rising one is not.
+        """
+        out = memory()
+        if self.backend is not None:
+            try:
+                out["backend"] = self.backend.memory()
+            except Exception as exc:                           # noqa: BLE001
+                out["backend"] = {"error": f"{type(exc).__name__}: {exc}"}
+            try:
+                out["windows"] = self.backend.window_stats()
+            except Exception:                                  # noqa: BLE001
+                out["windows"] = None
+        return out
+
     def health(self) -> dict:
         running = self.current.id if self.current else None
         return {
@@ -330,7 +345,7 @@ class Service:
                          for j in list(self.jobs.values())[-20:][::-1]],
             },
             "window": getattr(self.backend, "window", None) if self.backend else None,
-            "memory": memory(),
+            "memory": self.memory_report(),
             "backend_errors": self.backend_errors,
             "data_dir": str(self.data_dir),
             "uptime_s": round(time.time() - self.started_at, 1),
@@ -455,6 +470,11 @@ class Service:
         log(f"[job {job.id}] {state}: {job.done_frames}/{expected} frames in "
             f"{job.elapsed_s:.1f}s ({job.rate_fps} frames/s)"
             + (f" -- {error}" if error else ""))
+        # Every job hands back what it borrowed, whether it finished, failed
+        # or was cancelled. Without this the next job starts on top of the
+        # last one's allocator cache, which is how a service that is fine for
+        # one clip is 13 GB after four.
+        self._release_backend(f"job {job.id}")
 
     # -- segment -----------------------------------------------------------
 
@@ -633,10 +653,20 @@ class Service:
         }
 
         job_id = "j_" + uuid.uuid4().hex[:8]
+        # `matte_ids` ({object_id: matte_id}) is a resume (checkpoint gap
+        # 12). The derived id below includes `start` and `end`, so a caller
+        # re-queueing only the missing tail of a cancelled track would get a
+        # NEW matte and orphan the frames already written. Naming the id
+        # keeps the tail landing in the same directory; MatteWriter carries
+        # that matte's own areas/scores/ious forward rather than blanking
+        # them. Ignored for any slot it does not name.
+        resume_ids = {str(k): str(v)
+                      for k, v in (body.get("matte_ids") or {}).items()}
         mattes = []
         for slot in slots:
-            matte_id = "m_" + recipe_digest(clip_key, rotation, source.width,
-                                            recipe, slot.id, steady, start, end)
+            matte_id = resume_ids.get(str(slot.id)) or \
+                "m_" + recipe_digest(clip_key, rotation, source.width,
+                                     recipe, slot.id, steady, start, end)
             header = {
                 "clip": str(body.get("clip") or source.path),
                 "clip_key": clip_key,
@@ -691,6 +721,28 @@ class Service:
         if job.state == "queued":
             self._end_job(job, "cancelled", "cancelled while queued")
         return {"ok": True, "job_id": job_id, "state": job.state}
+
+    def _release_backend(self, why: str) -> None:
+        """Drop everything that is not the model, and say what it bought.
+
+        The line is logged rather than kept quiet because MLX returns the
+        memory to the OS a couple of seconds after `clear_cache()`, so the
+        "after" figure here is usually still on its way down: the number that
+        matters is the one on the NEXT job's first window, and having both in
+        the log is what makes that readable.
+        """
+        if self.backend is None:
+            return
+        before = memstat.snapshot().get("footprint_mb")
+        try:
+            self.backend.release()
+        except Exception as exc:                               # noqa: BLE001
+            log(f"[memory] {why}: release failed: {type(exc).__name__}: {exc}")
+            return
+        after = memstat.snapshot().get("footprint_mb")
+        if before is not None and after is not None:
+            log(f"[memory] {why} released: footprint {before:.0f} MB -> "
+                f"{after:.0f} MB")
 
     def _no_backend(self) -> str:
         reasons = "; ".join(f"{e['backend']}: {e['error']}" for e in self.backend_errors)
@@ -846,7 +898,40 @@ def build_parser() -> argparse.ArgumentParser:
                         help="where picks and mattes go when the caller does not say")
     parser.add_argument("--model", default=None, help="override the weights repo id")
     parser.add_argument("--chunk-frames", type=int, default=None,
-                        help="frames per tracker chunk (memory against restarts)")
+                        help="frames per tracker window (default 48). Halving "
+                             "it halves the preprocessed frames a window holds "
+                             "(about 12 MB a frame) at the cost of one re-seed "
+                             "per window boundary.")
+    parser.add_argument("--mlx-cache-limit-mb", type=int, default=None,
+                        help="how much freed Metal memory MLX may keep for "
+                             "reuse. Default 1024. 0 disables reuse; a "
+                             "negative number leaves MLX's own default, which "
+                             "on this Mac is 15564 MB, i.e. the whole machine, "
+                             "and is what made the service grow to 13 GB.")
+    parser.add_argument("--mlx-memory-limit-mb", type=int, default=None,
+                        help="the level at which MLX reclaims from its cache "
+                             "before allocating. Default 0, meaning the GPU's "
+                             "own max recommended working set; a negative "
+                             "number leaves MLX's default (1.5x that).")
+    parser.add_argument("--mlx-attention-chunk", type=int, default=None,
+                        help="how many queries at a time the tracker's memory "
+                             "attention runs (default 512; 0 runs it whole). "
+                             "At this model's head_dim MLX has no fused "
+                             "attention kernel and the fallback allocates the "
+                             "entire 5.2 GB attention matrix, which was the "
+                             "13.4 GB transient. Splitting the query axis "
+                             "cannot change a mask (the softmax is over keys, "
+                             "and it is measured mask by mask). It cuts a "
+                             "window's MLX peak from about 13.4 GB to about "
+                             "4.8 GB and speeds tracking up by about 20 "
+                             "percent, not memory alone.")
+    parser.add_argument("--mlx-layer-eval", dest="mlx_layer_eval",
+                        action="store_true", default=None,
+                        help="put an mx.eval after every ViT trunk layer. OFF, "
+                             "because measured on the real model it moved the "
+                             "peak by 9 MB and cost 23% of the time: the trunk "
+                             "was never where the memory went. Here so that "
+                             "can be re-measured rather than re-argued.")
     parser.add_argument("--no-model-lock", action="store_true",
                         help="do not take /tmp/fixxr-sam-model.lock (tests only)")
     parser.add_argument("--lock-retry-s", type=float, default=20.0)
@@ -880,6 +965,14 @@ def main(argv=None) -> int:
             backend_kwargs["repo_id"] = args.model
         if args.chunk_frames:
             backend_kwargs["chunk_frames"] = args.chunk_frames
+        if args.mlx_cache_limit_mb is not None:
+            backend_kwargs["cache_limit_mb"] = args.mlx_cache_limit_mb
+        if args.mlx_memory_limit_mb is not None:
+            backend_kwargs["memory_limit_mb"] = args.mlx_memory_limit_mb
+        if args.mlx_layer_eval is not None:
+            backend_kwargs["layer_eval"] = args.mlx_layer_eval
+        if args.mlx_attention_chunk is not None:
+            backend_kwargs["attention_chunk"] = args.mlx_attention_chunk
     elif backend_name == "stub":
         if args.stub_delay_ms:
             backend_kwargs["delay_ms"] = args.stub_delay_ms

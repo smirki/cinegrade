@@ -33,6 +33,7 @@ SUITES = [
     ("test_stub_backend.py", "the prompt planner and the stub backend (C7)"),
     ("test_torch_adapter.py", "the torch adapter's windowing and id mapping"),
     ("test_rotation.py", "the studio's \"auto\" rotation resolved from a clip's tag"),
+    ("test_memory.py", "the memory readings, the window meter and the MLX limits"),
     ("service_e2e.py", "the service over real HTTP (C3)"),
 ]
 

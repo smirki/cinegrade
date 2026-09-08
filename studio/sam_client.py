@@ -130,6 +130,7 @@ class SamClient:
               steady: int | None = None, clip: str | None = None,
               clip_key: str | None = None, rotation=None, width: int | None = None,
               recipe: dict | None = None, rotation_probe_path: str | None = None,
+              matte_ids: dict | None = None,
               timeout: float = 15.0) -> dict:
         """`POST /track` -> {job_id, matte_ids, mattes, state, total_frames,
         fps}, per M1's checkpoint. Answers as soon as the job is accepted and
@@ -152,6 +153,14 @@ class SamClient:
         can resolve `rotation="auto"` against the clip's own display-matrix
         tag (contract C3) when `clip` alone is not a path the service's own
         process can open (INTEGRATION-A).
+
+        `matte_ids` is `{object_id: matte_id}` and is how a RESUME is asked
+        for (checkpoint gap 12): the service normally derives a matte id
+        from the recipe AND the frame range, so re-queueing only the missing
+        tail of a cancelled track would otherwise write a second, different
+        matte and orphan the frames already on disk. Naming the ids keeps
+        the resumed frames landing in the same matte directory, next to the
+        ones that survived, with that matte's own index carried forward.
         """
         body: dict = {"video": video, "out_dir": out_dir}
         if fps is not None:
@@ -183,6 +192,8 @@ class SamClient:
             body["recipe"] = recipe
         if rotation_probe_path is not None:
             body["rotation_probe_path"] = rotation_probe_path
+        if matte_ids:
+            body["matte_ids"] = {str(k): str(v) for k, v in matte_ids.items()}
         return self._call("POST", "/track", body, timeout=timeout)
 
     def job(self, job_id: str, timeout: float = 10.0) -> dict:

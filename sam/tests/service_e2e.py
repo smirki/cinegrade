@@ -136,6 +136,59 @@ def main() -> int:
               "browser spec will assert in the viewer", moved > 0.02,
               f"centroid moved {moved:.3f}")
 
+        print("\ntrack: matte_ids is a resume, not a new matte (gap 12)")
+        existing_id = job["matte_ids"][0]
+        out_dir = tmp / "data" / "mattes" / "C015-rot0"
+        resumed = call(base, "/track", {
+            "video": str(frames_dir), "fps": 24,
+            "prompts": {"text": ["person"]},
+            "clip": "/footage/C015.mov", "clip_key": "C015-rot0", "rotation": 0,
+            "steady": 3, "out_dir": str(out_dir),
+            # Only the tail. Without the override below the derived id would
+            # differ (it hashes the frame range too), so these frames would
+            # land in a second directory and the first twelve would be
+            # orphaned: the whole reason this parameter exists.
+            "start_frame": 12, "end_frame": 24,
+            "matte_ids": {index["object_id"]: existing_id},
+        })
+        check("a named matte id is used instead of the derived one",
+              resumed["matte_ids"] == [existing_id],
+              str(resumed["matte_ids"]))
+        check("so the tail is written into the same directory",
+              Path(resumed["mattes"][0]["path"]) == matte_dir,
+              resumed["mattes"][0]["path"])
+        check("and the matte goes back to queued or running, not left dead",
+              resumed["mattes"][0]["state"] in ("queued", "running"),
+              resumed["mattes"][0]["state"])
+        resumed_done = wait_for_job(base, resumed["job_id"], 60)
+        check("the resumed job finishes", resumed_done["state"] == "done",
+              str(resumed_done.get("error")))
+        check("it only did the frames it was asked for",
+              resumed_done["total_frames"] == 12,
+              str(resumed_done["total_frames"]))
+        resumed_index = json.loads((matte_dir / "index.json").read_text())
+        check("every frame is still on disk, head and tail together",
+              len(sorted(matte_dir.glob("*.png"))) == 24)
+        check("done_frames counts what is on disk, not just this run's 12",
+              resumed_index["done_frames"] == 24,
+              str(resumed_index["done_frames"]))
+        check("the head's own areas survived the resume",
+              all(a is not None for a in resumed_index["areas"]),
+              str(resumed_index["areas"][:3]))
+        check("start_frame keeps the earlier attempt's start, so the span a "
+              "caller already read does not move",
+              resumed_index["start_frame"] == 0,
+              str(resumed_index["start_frame"]))
+        check("the per frame ious are written too (gap 18)",
+              isinstance(resumed_index.get("ious"), list)
+              and len(resumed_index["ious"]) == 24
+              and any(v is not None for v in resumed_index["ious"]),
+              str((resumed_index.get("ious") or [])[:4]))
+        check("an ellipse drifting across the frame overlaps itself heavily "
+              "from one frame to the next, so nothing here reads as a jump",
+              all(v > 0.5 for v in resumed_index["ious"] if v is not None),
+              str(min(v for v in resumed_index["ious"] if v is not None)))
+
         print("\ntrack: rotation \"auto\" (the studio's own default; used to "
               "raise ValueError out of int(\"auto\"))")
         auto_job = call(base, "/track", {
@@ -271,7 +324,7 @@ def main() -> int:
         filtered = call(base, "/jobs?clip_key=C015-rot0")
         check("and can be filtered to one clip",
               all(j["clip_key"] == "C015-rot0" for j in filtered["jobs"])
-              and len(filtered["jobs"]) == 2, str(len(filtered["jobs"])))
+              and len(filtered["jobs"]) == 3, str(len(filtered["jobs"])))
         check("an unknown job is a 404", call(base, "/jobs/j_nope")["status"] == 404)
         check("cancelling a finished job is not an error",
               call(base, f"/jobs/{after['job_id']}/cancel", {}, method="POST")["state"] == "done")

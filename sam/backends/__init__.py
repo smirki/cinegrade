@@ -32,7 +32,8 @@ def make_backend(name: str, log=print, outer_lock_held: bool = True, **kwargs) -
     if name == "stub":
         from .stub import StubBackend
         return StubBackend(delay_ms=kwargs.get("delay_ms", 0.0),
-                           chunk_frames=kwargs.get("chunk_frames") or 48)
+                           chunk_frames=kwargs.get("chunk_frames") or 48,
+                           log=log)
     if name == "mlx":
         from .mlx_backend import MlxBackend
         return MlxBackend(log=log, **kwargs)

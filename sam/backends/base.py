@@ -16,10 +16,22 @@ ids and tracked objects would drift apart, so there is exactly one function.
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 import numpy as np
+
+# `sam/` is on sys.path when the service runs (server.py puts it there) but
+# not when a test imports `backends` on its own, so this file makes sure of
+# it rather than leaving every backend to guess. Same pattern server.py uses.
+_SAM_DIR = str(Path(__file__).resolve().parent.parent)
+if _SAM_DIR not in sys.path:
+    sys.path.insert(0, _SAM_DIR)
+
+from memstat import (StageMeter, WindowMeter, mlx_memory,   # noqa: E402
+                     snapshot, stage_meter)
 
 __all__ = [
     "Backend",
@@ -28,13 +40,24 @@ __all__ = [
     "Cancelled",
     "Instance",
     "ObjectSlot",
+    "StageMeter",
     "TrackedMask",
+    "WindowMeter",
     "mask_area",
     "mask_box",
+    "mlx_memory",
     "normalize_prompts",
     "plan_objects",
+    "snapshot",
     "split_mask_score",
+    "stage_meter",
+    "window_meter",
 ]
+
+
+def window_meter(log=None, mx=None) -> WindowMeter:
+    """One per backend: the per window memory record C3's /health reports."""
+    return WindowMeter(mx=mx, log=log)
 
 
 class BackendError(RuntimeError):
@@ -340,6 +363,26 @@ class Backend:
 
     def close(self) -> None:
         """Release the model and anything else held."""
+
+    # -- memory, added by the 2026-09-08 memory fix -------------------------
+    #
+    # Optional and additive: a backend that implements neither behaves as it
+    # did before. The service calls `release()` when a job ends and puts
+    # `memory()` and `meter.stats()` on /health, so the founder can see what
+    # a window cost without running `top` against the pid.
+
+    #: A `memstat.WindowMeter`, or None on a backend that does not window.
+    meter = None
+
+    def memory(self) -> dict:
+        """The backend's own view of its memory. Empty when it has none."""
+        return {}
+
+    def release(self) -> None:
+        """Give back everything that is not the model. Called between jobs."""
+
+    def window_stats(self) -> dict | None:
+        return self.meter.stats() if self.meter is not None else None
 
     # Small conveniences shared by every backend.
 

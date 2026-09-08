@@ -45,6 +45,11 @@ CONTENT = ROOT.parent
 LUT_TECH = ROOT / "luts" / "technical"
 LUT_LOOKS = ROOT / "luts" / "looks"
 PRESETS = ROOT / "presets"
+# This CLI's own footage root, the fallback for a bare clip name. A studio
+# server started with --footage points somewhere else entirely, which is
+# checkpoint gap 4: resolve_clip_input() below asks the server named by
+# STUDIO_URL for its root before falling back to this one.
+FOOTAGE = CONTENT / "footage"
 
 # Apple Log code-value delta per stop of exposure, from the published curve
 # (gamma * log2(2) where gamma = 0.08492 over the log segment).
@@ -201,6 +206,117 @@ DEFAULTS = {
 }
 
 
+# --------------------------------------------------------------------------
+# where a bare name and a matte id resolve (checkpoint gaps 4 and 5)
+#
+# The CLI and the server each had their own default for two paths and neither
+# knew the other's: the CLI looked for footage under content/footage and for
+# mattes under studio/data/mattes, while the server the same agent was
+# talking to had been started with --footage and --data-dir somewhere else.
+# The symptoms were a raw ffprobe CalledProcessError for a clip that was
+# right there, and "matte not found" for a matte that had just been tracked,
+# both fixed by exporting an environment variable the caller had no way to
+# know about.
+#
+# Precedence, for both, stated once here and in studio/README.md:
+#
+#   1. an explicit value (an existing path for a clip, CINEGRADE_MATTE_ROOT
+#      or STUDIO_DATA_DIR for the matte store): always wins
+#   2. the server named by STUDIO_URL, asked once per process via
+#      GET /api/health (footage_dir, data_dir)
+#   3. this CLI's own defaults, content/footage and studio/data/mattes
+#
+# Only ever consulted while running AS the CLI (`main()` sets RUNNING_AS_CLI),
+# so studio/server.py importing this module can never end up asking a server
+# (possibly itself) where its own data lives.
+# --------------------------------------------------------------------------
+
+RUNNING_AS_CLI = False
+_SERVER_PATHS: dict | None = None
+
+
+def _server_paths() -> dict:
+    """`{footage_dir, data_dir, matte_root}` from the studio STUDIO_URL names.
+
+    One request per process, cached including the empty answer, so a command
+    that resolves several clips or mattes does not make several calls and a
+    server that is down costs one failed connection rather than one per
+    lookup.
+    """
+    global _SERVER_PATHS
+    if _SERVER_PATHS is not None:
+        return _SERVER_PATHS
+    _SERVER_PATHS = {}
+    if not RUNNING_AS_CLI:
+        return _SERVER_PATHS
+    base = _env_studio_base()
+    if not base:
+        return _SERVER_PATHS
+    try:
+        health = _studio_call(base, "health", headers=_env_studio_headers())
+    except GradeError:
+        return _SERVER_PATHS
+    if isinstance(health, dict):
+        _SERVER_PATHS = {k: str(health[k]) for k in
+                         ("footage_dir", "data_dir", "matte_root")
+                         if health.get(k)}
+    return _SERVER_PATHS
+
+
+def resolve_clip_input(name: str | None) -> str | None:
+    """A clip positional to a real file, or a message naming where it looked.
+
+    An existing path (absolute or relative to the shell's own directory) is
+    returned untouched, which is every current caller. A bare name that is
+    not a file is looked for under the studio's own footage root first and
+    this CLI's own second, and if neither has it the refusal names both
+    instead of letting ffprobe raise CalledProcessError from inside probe().
+    """
+    if not name:
+        return name
+    p = Path(name).expanduser()
+    if p.exists():
+        return str(name)
+    if p.is_absolute() or len(p.parts) > 1:
+        # A path was meant, not a name in a footage folder: say so plainly
+        # rather than hunting for a basename somewhere else.
+        raise GradeError(f"no such file: {name}")
+    roots = []
+    server_footage = _server_paths().get("footage_dir")
+    if server_footage:
+        roots.append(Path(server_footage))
+    roots.append(FOOTAGE)
+    for root in roots:
+        candidate = root / name
+        if candidate.exists():
+            return str(candidate)
+    where = ", ".join(str(r) for r in roots)
+    raise GradeError(
+        f"clip not found: {name}. Looked in the shell's own directory and "
+        f"then {where}. Pass the full path, or set STUDIO_URL so a bare name "
+        f"resolves through the server's own --footage root.")
+
+
+def ensure_matte_root_from_server() -> str:
+    """Point `mattes.matte_root()` at the running studio's data folder.
+
+    Called by the two CLI paths that read a matte off disk (`stats --matte`
+    and a render whose layer holds one). Does nothing when the caller already
+    said where the store is, so an explicit CINEGRADE_MATTE_ROOT or
+    STUDIO_DATA_DIR still wins outright; otherwise it sets STUDIO_DATA_DIR
+    for this process only, which is the variable `mattes.matte_root()`
+    already reads, so nothing else has to be plumbed.
+    """
+    for name in ("CINEGRADE_MATTE_ROOT", "STUDIO_DATA_DIR"):
+        if os.environ.get(name, "").strip():
+            return os.environ[name].strip()
+    data = _server_paths().get("data_dir")
+    if data:
+        os.environ["STUDIO_DATA_DIR"] = data
+        return data
+    return ""
+
+
 def deep_merge(base: dict, override: dict) -> dict:
     out = deepcopy(base)
     for k, v in (override or {}).items():
@@ -211,23 +327,138 @@ def deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_preset(name_or_path: str | None) -> dict:
+# --preset's own namespaces, and the order they are tried in (checkpoint gap
+# 17). `--preset NAME` used to mean two unrelated things with no way to say
+# which: a file, or one of the built-in looks under grade/presets/. A name
+# saved through a running studio (`preset save`, POST /api/preset, which
+# writes under <data-dir>/users/<id>/presets) was not reachable at all and
+# failed with "available: blockbuster, blockbuster_max, ..." as if it had
+# never existed. Now:
+#
+#   file      an existing path, which is unambiguous, so it always wins
+#   studio    that name saved through the server named by STUDIO_URL
+#   catalog   grade/presets/NAME.json, the looks bundled with the tool
+#
+# and the source that answered is printed to stderr on every resolution that
+# was not a plain file, so a render's own log says which of the two a bare
+# name meant. `--preset-from file|studio|catalog` forces one and refuses
+# rather than falling through.
+PRESET_SOURCES = ("auto", "file", "studio", "catalog")
+PRESET_SOURCE = "auto"
+
+
+def set_preset_source(source: str | None) -> str:
+    """Fix which namespace `--preset NAME` reads, for this process."""
+    global PRESET_SOURCE
+    PRESET_SOURCE = (source or "auto").strip().lower()
+    if PRESET_SOURCE not in PRESET_SOURCES:
+        raise GradeError(f"--preset-from is one of {', '.join(PRESET_SOURCES)}, "
+                         f"got {source!r}")
+    return PRESET_SOURCE
+
+
+def _env_studio_base() -> str:
+    """The studio this shell already points at, or "".
+
+    `STUDIO_URL` only: `--port`/`--url` live on the subcommands that talk to
+    a server, and `render`/`still`/`stats` are not among them. An agent that
+    exported STUDIO_URL (the skill tells every agent to) gets the saved
+    preset namespace; a plain local run with nothing exported keeps exactly
+    the old two-namespace behaviour.
+    """
+    return (os.environ.get("STUDIO_URL") or "").strip().rstrip("/")
+
+
+def _env_studio_headers() -> dict:
+    agent = os.environ.get("STUDIO_AGENT", "").strip()
+    return {"X-Studio-Agent": agent} if agent else {}
+
+
+def _studio_saved_preset(name: str) -> dict | None:
+    """`GET /api/preset?name=` on the server STUDIO_URL names, or None.
+
+    None for every reachable-but-no-such-preset answer and for no server at
+    all, so `auto` can fall through to the catalog. A caller that wanted the
+    studio specifically says `--preset-from studio` and gets the refusal.
+    """
+    import urllib.parse                                       # noqa: PLC0415
+    base = _env_studio_base()
+    if not base:
+        return None
+    try:
+        out = _studio_call(
+            base, f"preset?name={urllib.parse.quote(name)}&expand=true",
+            headers=_env_studio_headers())
+    except GradeError:
+        return None
+    cfg = out.get("config") if isinstance(out, dict) else None
+    return cfg if isinstance(cfg, dict) else None
+
+
+def load_preset(name_or_path: str | None, source: str | None = None) -> dict:
+    """`--preset NAME_OR_PATH` to a full config, saying where it came from.
+
+    Resolution order and the `--preset-from` override are described at
+    PRESET_SOURCES above. The chosen source is printed to stderr (never
+    stdout, which carries `--json`) whenever a bare name resolved, so a
+    checkpoint that records the command also records which preset it got.
+    """
     if not name_or_path:
         return deepcopy(DEFAULTS)
+    want = (source or PRESET_SOURCE or "auto").strip().lower()
+    if want not in PRESET_SOURCES:
+        raise GradeError(f"--preset-from is one of {', '.join(PRESET_SOURCES)}, "
+                         f"got {want!r}")
     p = Path(name_or_path)
-    if not p.exists():
-        p = PRESETS / f"{name_or_path}.json"
-    if not p.exists():
-        avail = sorted(x.stem for x in PRESETS.glob("*.json"))
+
+    if p.exists() and want in ("auto", "file"):
+        # migrate_layers runs on the file's own contents, BEFORE the merge
+        # with DEFAULTS, because DEFAULTS always supplies an empty `layers`
+        # and the migration's rule is "old keys and no layers key". Not
+        # because any shipped preset carries a secondary or a window (none
+        # do), but because a preset on disk is exactly the kind of thing
+        # someone saved before layers existed. The file itself is never
+        # rewritten.
+        return deep_merge(DEFAULTS, migrate_layers(json.loads(p.read_text())))
+    if want == "file":
         raise GradeError(
-            f"preset not found: {name_or_path}. available: {', '.join(avail)}")
-    # migrate_layers runs on the file's own contents, BEFORE the merge with
-    # DEFAULTS, because DEFAULTS always supplies an empty `layers` and the
-    # migration's rule is "old keys and no layers key". Not because any
-    # shipped preset carries a secondary or a window (none do), but because a
-    # preset on disk is exactly the kind of thing someone saved before layers
-    # existed. The file itself is never rewritten.
-    return deep_merge(DEFAULTS, migrate_layers(json.loads(p.read_text())))
+            f"--preset-from file, but there is no file at {name_or_path}")
+
+    if want in ("auto", "studio"):
+        cfg = _studio_saved_preset(str(name_or_path))
+        if cfg is not None:
+            print(f"preset {name_or_path}: read from the studio at "
+                 f"{_env_studio_base()} (saved presets). Use --preset-from "
+                 f"catalog for the built-in look of that name.",
+                 file=sys.stderr)
+            return deep_merge(DEFAULTS, migrate_layers(cfg))
+        if want == "studio":
+            base = _env_studio_base()
+            raise GradeError(
+                f"--preset-from studio, but "
+                + (f"{base} has no saved preset named {name_or_path}"
+                   if base else "STUDIO_URL is not set, so there is no "
+                                "studio to ask"))
+
+    catalog = PRESETS / f"{name_or_path}.json"
+    if catalog.exists():
+        if want == "auto" and _env_studio_base():
+            # Only worth saying when both namespaces were actually in play.
+            # With no STUDIO_URL there is nothing a bare name could have
+            # meant instead, and this command's output is unchanged.
+            print(f"preset {name_or_path}: no saved preset of that name on "
+                 f"{_env_studio_base()}, read from the built-in catalog "
+                 f"({catalog}).", file=sys.stderr)
+        return deep_merge(DEFAULTS, migrate_layers(json.loads(catalog.read_text())))
+
+    avail = sorted(x.stem for x in PRESETS.glob("*.json"))
+    where = "a file path, the built-in catalog"
+    base = _env_studio_base()
+    where += f", or a preset saved on {base}" if base else \
+        " (set STUDIO_URL to also look at a studio's saved presets)"
+    raise GradeError(
+        f"preset not found: {name_or_path}. Looked in {where}. "
+        f"catalog: {', '.join(avail)}")
 
 
 # --------------------------------------------------------------------------
@@ -2288,6 +2519,8 @@ def resolve_matte(ref, root=None):
     matte_id = str((ref or {}).get("id") or "").strip()
     if not matte_id:
         return None, "matte component has no matte id yet (needs a pick or a track)"
+    if root is None:
+        ensure_matte_root_from_server()          # checkpoint gap 5
     try:
         return MT.resolve(root if root is not None else MT.matte_root(),
                           matte_id), None
@@ -2444,12 +2677,25 @@ def mask_warnings(cfg, info, seek=None, duration=None, root=None) -> list[dict]:
     badge the right row:
 
         {"layer": 2, "component": 0, "matte": "m_9f3c", "state": "running",
-         "kind": "missing" | "pending" | "partial", "message": "..."}
+         "kind": "missing" | "pending" | "partial" | "unfinished",
+         "blocking": True, "message": "..."}
 
-    `kind` separates the three cases a caller treats differently: `missing`
-    is an id that names nothing (or no id at all: the component is waiting
-    for a pick), `pending` is a matte with no frames yet, and `partial` is a
-    matte that covers some of the range and not the rest.
+    `kind` separates the cases a caller treats differently: `missing` is an
+    id that names nothing (or no id at all: the component is waiting for a
+    pick), `pending` is a matte with no frames yet, `partial` is a matte
+    that covers some of the requested range and not the rest, and
+    `unfinished` is a matte that covers the whole requested range while its
+    own track is still short of finishing.
+
+    `blocking` is what `require_complete_mattes` refuses on, and it is False
+    for `unfinished`. That distinction is the fix for the successor lane's
+    finding: the refusal used to key on the matte's DECLARED state, so a
+    render of 0 to 10.79 seconds off a matte with 259 of 384 frames written
+    was refused even though all 259 frames it needed were there, and
+    `--allow-partial` was required to ship a fully covered window. Coverage
+    of the window asked for is the only thing that can refuse now; a partial
+    matte that covers it renders without the flag, and `--allow-partial`
+    still exists for the genuinely uncovered case.
 
     Never raises. This is the report; the refusal is the next function.
     """
@@ -2463,7 +2709,7 @@ def mask_warnings(cfg, info, seek=None, duration=None, root=None) -> list[dict]:
         if minfo is None:
             out.append({"layer": entry["layer"], "component": entry["component"],
                         "matte": str(ref.get("id") or ""), "state": "missing",
-                        "kind": "missing", "message": reason})
+                        "kind": "missing", "blocking": True, "message": reason})
             continue
         start = MT.frame_index(minfo, float(seek or 0.0))
         count = None
@@ -2474,19 +2720,32 @@ def mask_warnings(cfg, info, seek=None, duration=None, root=None) -> list[dict]:
         if plan["mode"] == "none":
             out.append({"layer": entry["layer"], "component": entry["component"],
                         "matte": minfo.matte_id, "state": minfo.state,
-                        "kind": "pending",
+                        "kind": "pending", "blocking": True,
                         "message": f"matte {minfo.matte_id} has no frames "
                                    f"written yet ({minfo.state})"})
             continue
-        if plan["missing"] > 0 or plan["mode"] == "still" or minfo.is_partial:
+        if plan["missing"] > 0 or plan["mode"] == "still":
             out.append({
                 "layer": entry["layer"], "component": entry["component"],
                 "matte": minfo.matte_id, "state": minfo.state, "kind": "partial",
+                "blocking": True,
                 "message": (
                     f"matte {minfo.matte_id} covers {plan['available']} of "
                     f"{plan['wanted']} frames from frame {start} "
                     f"({minfo.state}, {minfo.written_count} of "
                     f"{minfo.total_frames} written)")})
+            continue
+        if minfo.is_partial:
+            out.append({
+                "layer": entry["layer"], "component": entry["component"],
+                "matte": minfo.matte_id, "state": minfo.state,
+                "kind": "unfinished", "blocking": False,
+                "message": (
+                    f"matte {minfo.matte_id} covers all {plan['wanted']} "
+                    f"frames this render asks for from frame {start}, but its "
+                    f"own track is {minfo.state} ({minfo.written_count} of "
+                    f"{minfo.total_frames} written): the window renders, the "
+                    f"matte holds its last written frame past it")})
     return out
 
 
@@ -2501,8 +2760,14 @@ def require_complete_mattes(cfg, info, seek=None, duration=None, root=None):
     Preview, stills and scopes never call this: a grade in progress is
     supposed to show whatever the tracker has managed so far. Only a render
     does, and only when the caller has not passed allow_partial.
+
+    Refuses on COVERAGE OF THE WINDOW ASKED FOR, not on the matte's declared
+    state: an `unfinished` warning (the window is covered, the track is not
+    done) is reported by `mask_warnings` and does not refuse. See that
+    function's own docstring for why.
     """
-    bad = mask_warnings(cfg, info, seek=seek, duration=duration, root=root)
+    bad = [w for w in mask_warnings(cfg, info, seek=seek, duration=duration,
+                                    root=root) if w.get("blocking")]
     if not bad:
         return []
     lines = [f"  layer {w['layer']} component {w['component']}: {w['message']}"
@@ -3921,6 +4186,14 @@ def cmd_render(a):
     o = dict(cfg["output"], codec=codec)
     args = ffmpeg_inputs(a.input, rcfg, rinfo, a.start, a.duration,
                          strict_mattes=not a.allow_partial)
+    # Non blocking mask notices. An `unfinished` matte covers every frame this
+    # render asks for while its own track is still short of the end: that is
+    # allowed now (the refusal used to key on the declared state and stop it),
+    # so say it out loud instead of refusing silently.
+    for w in mask_warnings(cfg, info, seek=a.start, duration=a.duration):
+        if not w.get("blocking"):
+            print(f"note: layer {w['layer']} component {w['component']}: "
+                  f"{w['message']}", file=sys.stderr)
     if a.duration:
         args += ["-t", str(a.duration)]
     args += ["-filter_complex", graph, "-map", "[vout]"]
@@ -4081,6 +4354,10 @@ def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict):
             "grade.mattes is not on this branch yet (owned by lane M2, "
             "contract C6); --matte cannot resolve a matte id until it "
             "lands") from exc
+    # Checkpoint gap 5: with STUDIO_URL set and no STUDIO_DATA_DIR exported,
+    # ask the server where its own store is instead of failing to find a
+    # matte that was tracked into a --data-dir this CLI never heard of.
+    ensure_matte_root_from_server()
     try:
         minfo = MT.resolve(MT.matte_root(), matte_id)
         full, _served, warn = MT.load_time(
@@ -4150,7 +4427,8 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
                                 .astype("uint8")).resize((w, h), Image.BILINEAR),
                 dtype=np.float32) / 255.0
     row = {"time": t, "key": f"{Path(src).name}@{t:g}s",
-          "size": [w, h], "stats": frame_stats(rgb, weight=weight)}
+          "size": [w, h], "measured_width": int(w),
+          "stats": frame_stats(rgb, weight=weight)}
     if warns:
         row["warnings"] = warns
     return row
@@ -4161,7 +4439,12 @@ def _print_stats_block(label: str, row: dict) -> None:
     w, h = row["size"]
     lu, sa, ch, fam = s["luma"], s["saturation"], s["channels"], s["families"]
     cl, bd = s["clipped"], s["bands"]
-    print(f"{label}  {w}x{h}")
+    # "measured at N wide" spelled out, not left to be inferred from the
+    # size (checkpoint gap 11): this CLI measures the source's own
+    # resolution while POST /api/stats measures a 640 wide preview unless
+    # told otherwise, and mixing the two paths for one anchor silently
+    # compares two different samples.
+    print(f"{label}  {w}x{h}  measured at {w} wide")
     print(f"  luma     p5 {lu['p5']:.4f}  p25 {lu['p25']:.4f}  p50 {lu['p50']:.4f}  "
           f"p75 {lu['p75']:.4f}  p95 {lu['p95']:.4f}  mean {lu['mean']:.4f} "
           f"({lu['mean8']:.1f}/255)")
@@ -4264,6 +4547,7 @@ def cmd_stats(a):
             rgb = decode_image(a.image, region=region)
             row = {"key": Path(a.image).name,
                   "size": [int(rgb.shape[1]), int(rgb.shape[0])],
+                  "measured_width": int(rgb.shape[1]),
                   "stats": frame_stats(rgb)}
         _print_stats(a, row)
         return
@@ -5498,11 +5782,21 @@ def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
                 dest = outdir / f"{out.get('pick_id', 'pick')}-{iid}-{field}{ext}"
                 dest.write_bytes(data)
                 inst[f"{field}_file"] = str(dest)
+    instances = out.get("instances") or []
     if a.json:
         print(json.dumps(out, indent=2))
+    if not instances:
+        # Checkpoint gap 3: an empty list and an unparseable phrase used to
+        # read the same, and the command exited 0 either way, so a scripted
+        # retry loop could not tell "found nothing" from "worked". The
+        # server's own sentence is raised here, which exits 1.
+        raise GradeError(out.get("message") or (
+            f"no match for these prompts on {a.clip} at {a.time:g}s: "
+            f"0 candidates from the model"))
+    if a.json:
         return
     print(f"pick {out.get('pick_id')}  "
-         f"{len(out.get('instances') or [])} instance(s)")
+         f"{len(instances)} instance(s)")
     for inst in out.get("instances") or []:
         box = inst.get("box")
         box_s = " ".join(f"{v:.3f}" for v in box) if box else "?"
@@ -5536,18 +5830,34 @@ def _cmd_mask_track(a, base: str, hdr: dict) -> None:
         payload["end"] = a.end
     if a.steady is not None:
         payload["steady"] = a.steady
+    if getattr(a, "force", False):
+        payload["force"] = True
     out = _studio_call(base, "mask/track", "POST", payload, headers=hdr)
     job_id = out.get("job_id")
+    queued = dict(out)                 # the queue answer, before --wait polls
     if a.wait:
         if not job_id:
-            raise GradeError(
-                f"mask track did not return a job_id to wait on: {out}")
-        out = _mask_wait(base, hdr, job_id)
+            if queued.get("cached"):
+                # Checkpoint gap 12: a cache hit has no job to wait on, and
+                # that is not an error. Say which matte answered instead of
+                # dying on a missing job_id.
+                mattes = ", ".join(str(m.get("matte_id"))
+                                   for m in (queued.get("mattes") or []))
+                print(f"cached: {mattes or '(none)'} already covers this "
+                     f"request, nothing to wait on", file=sys.stderr)
+            else:
+                raise GradeError(
+                    f"mask track did not return a job_id to wait on: {out}")
+        else:
+            out = _mask_wait(base, hdr, job_id)
     if a.json:
         print(json.dumps(out, indent=2))
         return
-    print(f"job {job_id}  state={out.get('state', '?')}")
-    for m in out.get("mattes") or []:
+    if queued.get("message"):
+        print(f"  {queued['message']}", file=sys.stderr)
+    state = out.get("state") or ("cached" if queued.get("cached") else "?")
+    print(f"job {job_id}  state={state}")
+    for m in queued.get("mattes") or out.get("mattes") or []:
         print(f"  matte {m.get('matte_id')}  state={m.get('state')}")
 
 
@@ -5599,9 +5909,20 @@ def _cmd_mask_jobs(a, base: str, hdr: dict) -> None:
 
 
 def _cmd_mask_list(a, base: str, hdr: dict) -> None:
+    """`GET /api/matte?clip=`, the summary by default (checkpoint gap 6).
+
+    The route used to answer with every matte's full per frame `areas` and
+    `scores`, padded to the clip's whole length whether or not any of it was
+    written: four mattes over 384 frames was thousands of mostly-null
+    numbers just to read four states, which is why M8 polled `mask jobs` for
+    progress instead of this command. `--full` (`?full=1` on the route) is
+    the old payload, for a caller that really does want the arrays.
+    """
     import urllib.parse                                       # noqa: PLC0415
-    out = _studio_call(base, f"matte?clip={urllib.parse.quote(a.clip)}",
-                       headers=hdr)
+    query = f"matte?clip={urllib.parse.quote(a.clip)}"
+    if getattr(a, "full", False):
+        query += "&full=1"
+    out = _studio_call(base, query, headers=hdr)
     if a.json:
         print(json.dumps(out, indent=2))
         return
@@ -5611,9 +5932,42 @@ def _cmd_mask_list(a, base: str, hdr: dict) -> None:
         print(f"no mattes for {a.clip}")
         return
     for m in mattes:
-        print(f"{m.get('matte_id', '?'):<22} state={m.get('state', '?'):<10} "
-             f"{m.get('done_frames', '?')}/{m.get('frames', '?')} frames "
-             f"model={m.get('model', '?')} backend={m.get('backend', '?')}")
+        span = m.get("span") or {}
+        recipe = m.get("recipe") or {}
+        prompts = (recipe.get("prompts") or {}) if isinstance(recipe, dict) else {}
+        text = ",".join(prompts.get("text") or []) or (m.get("label") or "-")
+        q = m.get("quality") or {}
+        line = (f"{m.get('matte_id', '?'):<22} state={m.get('state', '?'):<9} "
+                f"{m.get('done_frames', '?')}/{m.get('frames', '?')} frames  "
+                f"span {span.get('start_s', '?')}s-{span.get('end_s', '?')}s "
+                f"coverage={m.get('coverage', '?')}  "
+                f"score={m.get('mean_score')}  recipe={text}")
+        if q.get("suspect_count"):
+            line += (f"  SUSPECT {q['suspect_count']} frames from "
+                     f"{q.get('first_suspect_time')}s")
+        print(line)
+    print("every matte is frozen outside its span: past the last written "
+         "frame the mask holds still, it does not track. Use `mask show ID "
+         "--strip -o OUT.jpg` before grading on one.")
+
+
+def _quality_line(q: dict) -> str:
+    """One line of the matte's own per frame flags (checkpoint gap 18)."""
+    if not q:
+        return "quality  (not reported by this server)"
+    n = int(q.get("suspect_count") or 0)
+    th = q.get("thresholds") or {}
+    src = q.get("iou_source") or "none"
+    if not n:
+        return (f"quality   no suspect frames of {q.get('checked')} checked "
+                f"(area jump > {th.get('area_jump')}, iou < {th.get('min_iou')}"
+                f", iou from {src})")
+    reasons = ", ".join(f"{k} {v}" for k, v in (q.get("reasons") or {}).items()
+                        if v)
+    return (f"quality   {n} SUSPECT frames of {q.get('checked')} checked "
+            f"({reasons}); first at {q.get('first_suspect_time')}s "
+            f"(frame {q.get('first_suspect_index')}). Thresholds: area jump > "
+            f"{th.get('area_jump')}, iou < {th.get('min_iou')} (iou from {src})")
 
 
 def _print_matte_index(idx: dict) -> None:
@@ -5622,6 +5976,20 @@ def _print_matte_index(idx: dict) -> None:
     print(f"state     {idx.get('state')}")
     print(f"frames    {idx.get('done_frames')}/{idx.get('frames')}  "
          f"fps={idx.get('fps')}  {idx.get('width')}x{idx.get('height')}")
+    # Checkpoint gaps 8 and 10: a matte answers for its own span and holds
+    # its nearest written frame outside it, done or not. That is the design,
+    # so it is stated here rather than left for a caller to discover by
+    # measuring a frozen mask at 20 seconds and believing the number.
+    span = idx.get("span") or {}
+    if span:
+        print(f"span      {span.get('start_s')}s to {span.get('end_s')}s "
+             f"(frames {span.get('start_frame')}..{span.get('end_frame')}, "
+             f"{span.get('written')} written"
+             + ("" if span.get("contiguous", True) else ", with holes")
+             + f", coverage {idx.get('coverage')})")
+        print("          frozen outside span: the matte holds its nearest "
+             "written frame there, it does not track")
+    print(_quality_line(idx.get("quality") or {}))
     print(f"model     {idx.get('model')} ({idx.get('backend')})")
     recipe = idx.get("recipe")
     if recipe is not None:
@@ -5646,53 +6014,126 @@ def _composite_matte_panel(pic_bytes: bytes, matte_bytes: bytes):
 
 
 def _draw_area_curve(width: int, height: int, areas: list, seconds: list,
-                     fps: float):
+                     fps: float, suspect: list | None = None):
     """The tracked area fraction, one point per matte frame, under the
     strip's per second panels: `mask show --strip`'s way of showing drift
     or a lost subject as a shape, not only as a picture at each sampled
-    second. A vertical tick marks each panel's own frame index."""
+    second. A vertical tick marks each panel's own frame index, and a red
+    tick marks every frame the matte's own quality flags called suspect
+    (checkpoint gap 18).
+
+    `areas` comes straight off `GET /api/matte/<id>`, which pads the array
+    to the matte's FULL declared length: a partial matte's tail is `None`,
+    not a number. Those entries are skipped rather than plotted, which is
+    what checkpoint gap 13 was about: `max()`/`min()` over a list holding
+    `None` raised a bare `TypeError` and no partial matte could be looked at
+    at all. The curve now draws the written part and says how much of the
+    matte it is showing.
+    """
     from PIL import Image, ImageDraw                           # noqa: PLC0415
 
     img = Image.new("RGB", (max(1, int(width)), max(1, int(height))),
                     (18, 18, 18))
     d = ImageDraw.Draw(img)
-    if not areas:
+    n = len(areas or [])
+    written = [(i, float(v)) for i, v in enumerate(areas or []) if v is not None]
+    if not written:
         d.text((6, height // 2 - 6), "no per frame area data in this matte",
                fill=(200, 200, 200))
         return img
-    n = len(areas)
-    mx = max(areas) if areas else 0.0
+    mx = max(v for _i, v in written)
     pad = 4
-    pts = []
-    for i, v in enumerate(areas):
-        x = pad + (width - 2 * pad) * (i / max(1, n - 1))
+
+    def x_of(index: int) -> float:
+        return pad + (width - 2 * pad) * (index / max(1, n - 1))
+
+    # One polyline per contiguous run of written frames, so a hole in a
+    # partial matte reads as a break rather than as a line drawn straight
+    # across frames nobody tracked.
+    run = []
+    prev_i = None
+    for i, v in written:
+        if prev_i is not None and i != prev_i + 1 and run:
+            if len(run) > 1:
+                d.line(run, fill=(120, 200, 255), width=2)
+            run = []
         frac = (v / mx) if mx > 0 else 0.0
-        y = height - pad - (height - 2 * pad) * frac
-        pts.append((x, y))
-    if len(pts) > 1:
-        d.line(pts, fill=(120, 200, 255), width=2)
+        run.append((x_of(i), height - pad - (height - 2 * pad) * frac))
+        prev_i = i
+    if len(run) > 1:
+        d.line(run, fill=(120, 200, 255), width=2)
+
     for t in seconds:
         idx = min(n - 1, max(0, round(t * fps)))
-        x = pad + (width - 2 * pad) * (idx / max(1, n - 1))
-        d.line([(x, 0), (x, height)], fill=(70, 70, 70))
-    d.text((4, 2), f"tracked area, 0..{mx:.4f} shown, {n} frames",
-          fill=(200, 200, 200))
+        d.line([(x_of(idx), 0), (x_of(idx), height)], fill=(70, 70, 70))
+    for s in (suspect or []):
+        idx = s.get("index") if isinstance(s, dict) else s
+        if idx is None:
+            continue
+        x = x_of(min(n - 1, max(0, int(idx))))
+        d.line([(x, height - 10), (x, height)], fill=(235, 60, 60), width=2)
+    label = f"tracked area, 0..{mx:.4f} shown, {len(written)} of {n} frames"
+    if suspect:
+        label += f", {len(suspect)} suspect (red)"
+    d.text((4, 2), label, fill=(200, 200, 200))
     return img
+
+
+def _matte_written_span(index: dict) -> tuple[int, int]:
+    """The `[first, last + 1)` frame range a matte has actually written,
+    from `GET /api/matte/<id>`'s own answer.
+
+    Prefers the route's `span` (the server scans the directory for it); a
+    server that predates it, or a hand written index, falls back to the
+    non-null entries of `areas`, which is the same set for every matte the
+    SAM service wrote. Both beat the declared `frames` count, which is what
+    the track ASKED for rather than what it produced.
+    """
+    span = index.get("span") or {}
+    if span.get("end_frame"):
+        return int(span.get("start_frame") or 0), int(span["end_frame"])
+    written = [i for i, v in enumerate(index.get("areas") or [])
+               if v is not None]
+    if written:
+        return written[0], written[-1] + 1
+    # `done_frames` is what got written; `frames` is what the track asked
+    # for. Falling back to `frames` here is what let a queued matte with
+    # nothing on disk claim its whole requested length and get stripped
+    # (checkpoint gap 13), so it is deliberately not in this chain.
+    return 0, int(index.get("done_frames") or 0)
 
 
 def _build_matte_strip(base: str, hdr: dict, matte_id: str, index: dict,
                        out_path: str, panel_width: int) -> None:
+    """One panel per second across the frames the matte has really written.
+
+    Checkpoint gap 13: this used to walk `frames / fps` seconds, which is
+    the track's REQUESTED length, and hand the whole padded `areas` array to
+    the curve. On a matte that was still running (259 of 384 frames) that
+    meant panels for seconds nobody had tracked and a `TypeError` out of
+    `max(areas)` on the `None` tail, so exactly the mattes most in need of
+    the "verify over time" check were the ones that could not be checked.
+    Now the span comes from the written frames, every panel says which frame
+    it really got (a held frame is labelled `held`), and a matte with a hole
+    inside its span says so under the picture instead of drawing a straight
+    line over it.
+    """
     from PIL import Image, ImageDraw, ImageFont                # noqa: PLC0415
 
     fps = float(index.get("fps") or 0.0)
-    frames = int(index.get("frames") or 0)
-    if fps <= 0 or frames <= 0:
+    first, end = _matte_written_span(index)
+    written = end - first
+    if fps <= 0 or written <= 0:
         raise GradeError(
-            f"matte {matte_id} has no frames yet to strip "
-            f"(state={index.get('state')}); wait for it to run first")
-    duration = frames / fps
+            f"matte {matte_id} has no frames written yet to strip "
+            f"(state={index.get('state')}, {index.get('done_frames')} of "
+            f"{index.get('frames')} frames); wait for the track to write "
+            f"something first")
     panel_w = max(64, int(panel_width or 220))
-    seconds = list(range(0, max(1, int(duration)) + 1))
+    start_s = first / fps
+    end_s = end / fps
+    seconds = list(range(int(start_s), max(int(start_s), int(end_s - 1e-9)) + 1))
+    seconds = [t for t in seconds if t * fps >= first - 0.5] or [int(start_s)]
     clip = index.get("clip")
     rotation = index.get("rotation") or "auto"
 
@@ -5706,7 +6147,12 @@ def _build_matte_strip(base: str, hdr: dict, matte_id: str, index: dict,
             payload={"clip": clip, "time": t, "width": panel_w,
                     "mode": "flat", "config": {}, "rotation": rotation})
         panel = _composite_matte_panel(pic_bytes, m_bytes)
-        panels.append((panel, t, m_hdrs.get("X-Matte-State", "?")))
+        state = m_hdrs.get("X-Matte-State", "?")
+        served = m_hdrs.get("X-Matte-Frame")
+        wanted = round(t * fps)
+        if served is not None and str(served).isdigit() and int(served) != wanted:
+            state += f" held {served}"
+        panels.append((panel, t, state))
 
     label_h = 16
     font = ImageFont.load_default()
@@ -5720,10 +6166,22 @@ def _build_matte_strip(base: str, hdr: dict, matte_id: str, index: dict,
         d.text((x + 3, 2), f"t={t}s {state}", fill=(230, 230, 230), font=font)
         x += panel.width
 
-    curve = _draw_area_curve(row_w, 90, index.get("areas") or [], seconds, fps)
-    out_img = Image.new("RGB", (row_w, row_h + curve.height), (18, 18, 18))
+    quality = index.get("quality") or {}
+    curve = _draw_area_curve(row_w, 90, index.get("areas") or [], seconds, fps,
+                             suspect=quality.get("suspect_frames"))
+    note_h = 18
+    out_img = Image.new("RGB", (row_w, row_h + curve.height + note_h),
+                        (18, 18, 18))
     out_img.paste(strip, (0, 0))
     out_img.paste(curve, (0, row_h))
+    note = (f"matte {matte_id}  state={index.get('state')}  "
+            f"span {start_s:g}s to {end_s:g}s "
+            f"({written} of {index.get('frames')} frames), frozen outside span")
+    if quality.get("suspect_count"):
+        note += (f"  |  {quality['suspect_count']} suspect frames, first at "
+                 f"{quality.get('first_suspect_time')}s")
+    ImageDraw.Draw(out_img).text((4, row_h + curve.height + 4), note,
+                                 fill=(210, 210, 210), font=font)
     out_img.save(out_path)
 
 
@@ -6035,6 +6493,15 @@ def main():
                        "omit with --image, which measures a still instead "
                        "of a clip")
         p.add_argument("--preset", "-p")
+        p.add_argument("--preset-from", dest="preset_from",
+                       choices=list(PRESET_SOURCES), default="auto",
+                       help="which namespace a bare --preset NAME reads: "
+                            "auto tries an existing file, then the studio's "
+                            "own saved presets when STUDIO_URL is set, then "
+                            "the built-in catalog under grade/presets, and "
+                            "prints which one answered; file, studio and "
+                            "catalog force exactly one and refuse instead of "
+                            "falling through")
         p.add_argument("--look", "-l")
         p.add_argument("--exposure", "-e", type=float)
         p.add_argument("--tonemap", choices=["aces", "filmic", "none"])
@@ -6487,6 +6954,15 @@ def main():
                      help="block until the job finishes, printing "
                           "progress lines to stderr the way render does, "
                           "and exit non zero if the job fails")
+    mtr.add_argument("--force", action="store_true",
+                     help="throw the cached matte away and track this "
+                          "recipe from scratch. Without it an identical "
+                          "repeat request is free while the cached matte "
+                          "still covers the window asked for, RESUMES "
+                          "(re-queues only the missing frames, keeping the "
+                          "ones already written) when it does not, and "
+                          "RESTARTS the whole window when the earlier "
+                          "attempt ended failed, cancelled or stale")
     mtr.add_argument("--json", action="store_true")
     add_server_flags(mtr)
     mtr.set_defaults(fn=cmd_mask)
@@ -6502,6 +6978,12 @@ def main():
     mls = mask_sub.add_parser(
         "list", help="GET /api/matte?clip=: every matte saved for a clip")
     mls.add_argument("clip")
+    mls.add_argument("--full", action="store_true",
+                     help="also fetch the per frame areas/scores/ious "
+                          "arrays (?full=1). Off by default: they are padded "
+                          "to the clip's whole length, so a clip with four "
+                          "mattes answered with thousands of mostly null "
+                          "numbers just to report four states")
     mls.add_argument("--json", action="store_true")
     add_server_flags(mls)
     mls.set_defaults(fn=cmd_mask)
@@ -6563,7 +7045,10 @@ def main():
                     help="list every heading and exit")
     dc.set_defaults(fn=cmd_docs)
 
+    global RUNNING_AS_CLI
+    RUNNING_AS_CLI = True
     a = ap.parse_args(_fix_negative_values_flag(sys.argv[1:]))
+    set_preset_source(getattr(a, "preset_from", "auto"))
     # colour-science prints a notice about the missing scipy and matplotlib
     # extras the first time something imports it (grade/slice.py does, via
     # colorlib, on nearly every command). Neither extra is used here; keep
@@ -6574,6 +7059,12 @@ def main():
     else:
         warnings.filterwarnings("ignore", module="colour")
     try:
+        # Checkpoint gap 4, once for every subcommand that takes a clip
+        # positional: a bare name that is not a file here resolves through
+        # the studio's own footage root before this CLI's default, and a name
+        # neither has is a sentence rather than an ffprobe traceback.
+        if getattr(a, "input", None):
+            a.input = resolve_clip_input(a.input)
         a.fn(a)
     except GradeError as exc:
         sys.exit(str(exc))

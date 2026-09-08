@@ -55,6 +55,7 @@ What it pins:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -77,6 +78,13 @@ GRADE = CONTENT / "grade"
 PYTHON = str(CONTENT / ".venv" / "bin" / "python")
 SERVER = str(STUDIO / "server.py")
 PASSWORD = "a-long-enough-test-password-2"
+# The working width every mask route hands the service, and the floor the
+# server clamps to (studio/server.py: set_mask_width, and _preview_dims for
+# every other sampled frame). Nothing narrower is a real width anywhere in
+# the studio, so a test asking for 64 would be measuring 160 and calling it
+# 64.
+MASK_WIDTH = 160
+MIN_SAMPLE_WIDTH = 160
 
 sys.path.insert(0, str(GRADE))
 import mattes as MT                                           # noqa: E402
@@ -163,6 +171,10 @@ class _FakeSamState:
         self.track_calls = 0
         self.segment_calls = 0
         self.pick_track_calls = 0
+        # The `matte_ids` override the last /track carried, so a test can
+        # prove studio asked for a RESUME rather than a fresh matte
+        # (checkpoint gap 12).
+        self.last_matte_ids: dict = {}
 
 
 class _FakeSamHandler(BaseHTTPRequestHandler):
@@ -222,6 +234,14 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                 self.state.segment_calls += 1
             prompts = body.get("prompts") or {}
             texts = prompts.get("text") or []
+            if any(str(t).startswith("__none__") for t in texts):
+                # A phrase the model cannot find anything for. The service
+                # answers 200 with an empty list; saying so in words is
+                # studio's job (checkpoint gap 3).
+                self._send(200, {"pick_id": f"p_none{self.state.segment_calls}",
+                                 "instances": [], "elapsed_s": 0.01,
+                                 "warnings": ["the model matched nothing"]})
+                return
             n = 2 if "two" in texts else 1
             instances = []
             pick_instances = {}
@@ -288,16 +308,41 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             else:
                 prompts = prompts or {}
                 texts = prompts.get("text") or []
+                # The real service derives a matte id from a digest of the
+                # WHOLE recipe (sam/server.py), so two different prompt sets
+                # can never land in one directory. Deriving it from a single
+                # text and its position, which this fake used to do, made
+                # ["slow"] and ["slow", "resume tail"] both mint
+                # `m_text_0_slow`: one test then read the matte another test
+                # had already filled, and the render refusal that is right
+                # about a barely started matte looked wrong. The digest keeps
+                # an identical recipe on an identical id (the cache tests
+                # need that) and separates recipes that only share a word.
+                tag = _recipe_tag(prompts, select, body.get("steady"))
                 if isinstance(select, list) and select:
-                    mattes = [{"matte_id": f"m_{_slug(s)}", "object_id": str(s),
+                    mattes = [{"matte_id": f"m_{_slug(s)}_{tag}",
+                              "object_id": str(s),
                               "label": None, "kind": "box"} for s in select]
                 elif texts:
-                    mattes = [{"matte_id": f"m_text_{i}_{_slug(t)}",
+                    mattes = [{"matte_id": f"m_text_{i}_{_slug(t)}_{tag}",
                               "object_id": str(i), "label": t, "kind": "text"}
                              for i, t in enumerate(texts)]
                 else:
-                    mattes = [{"matte_id": "m_auto0", "object_id": "0",
+                    mattes = [{"matte_id": f"m_auto0_{tag}", "object_id": "0",
                               "label": None, "kind": "box"}]
+            # Checkpoint gap 12: `matte_ids` ({object_id: matte_id}) names
+            # mattes that already exist, so a resumed tail is written back
+            # into the SAME directory instead of a freshly derived one. The
+            # real service overrides its own recipe digest with this; the
+            # fake derives ids from the prompt text, so it overrides that.
+            resume_ids = {str(k): str(v)
+                         for k, v in (body.get("matte_ids") or {}).items()}
+            with self.state.lock:
+                self.state.last_matte_ids = dict(resume_ids)
+            for m in mattes:
+                override = resume_ids.get(str(m.get("object_id")))
+                if override:
+                    m["matte_id"] = override
             matte_ids = [m["matte_id"] for m in mattes]
             fail_texts = {t for t in texts if t.startswith("__fail__")}
             slow = "slow" in texts
@@ -397,6 +442,19 @@ def _slug(text) -> str:
     return s[:40] or "x"
 
 
+def _recipe_tag(prompts, select=None, steady=None) -> str:
+    """A short digest of the whole recipe, the way the real service ids a
+    matte (a digest, not one prompt word).
+
+    Deliberately NOT keyed on the frame range: a resume re-queues a tail with
+    a different start_frame and has to land on the same id, which is the
+    whole point of the `matte_ids` override below.
+    """
+    raw = json.dumps({"prompts": prompts or {}, "select": select,
+                      "steady": steady}, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode()).hexdigest()[:8]
+
+
 def _fake_index_write(dir_path: Path, **fields) -> None:
     """A minimal stand-in for the real SAM service's own index.json writer
     (C2): merge-write under a lock, atomic rename, so a matte directory this
@@ -485,8 +543,16 @@ class MaskRoutesTest(unittest.TestCase):
         port = _free_port()
         cls.base = f"http://127.0.0.1:{port}/api"
         cls.proc = subprocess.Popen(
+            # 160 is the narrowest working width the server accepts
+            # (set_mask_width floors it there, the same floor _preview_dims
+            # puts on every other sampled frame), so it is the cheapest
+            # proxy these tests can ask for and the number the status route
+            # must then report. Asking for less is not an error, it is
+            # silently the floor, which is why MASK_WIDTH is asserted below
+            # rather than assumed.
             [PYTHON, SERVER, "--port", str(port), "--data-dir", cls.data_dir,
-            "--sam-url", f"http://127.0.0.1:{sam_port}", "--mask-width", "64"],
+            "--sam-url", f"http://127.0.0.1:{sam_port}",
+            "--mask-width", str(MASK_WIDTH)],
             cwd=str(CONTENT), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         _wait_ready(cls.base, cls.proc)
 
@@ -707,6 +773,282 @@ class MaskRoutesTest(unittest.TestCase):
             "clip": self.clip, "config": cfg, "duration": 0.2,
             "allow_partial": True, "name": f"masktest_allow_{matte_id}"})
         self.assertIn("job", out)
+
+    # -- the checkpoint gaps M8 logged --------------------------------------
+
+    def test_segment_with_no_match_says_so_in_words(self):
+        """Checkpoint gap 3. An empty list used to be the whole answer, so a
+        prompt the model could not find and a prompt that worked read the
+        same to a script."""
+        out = self._segment(prompts={"text": ["__none__ghost"]})
+        self.assertEqual(out["instances"], [])
+        self.assertEqual(out["candidates"], 0)
+        self.assertIn("no match for", out["message"])
+        self.assertIn("__none__ghost", out["message"])
+        # the service's own warning is passed through, not swallowed
+        self.assertTrue(any("matched nothing" in w
+                            for w in out.get("warnings") or []))
+
+    def test_matte_list_is_a_summary_and_full_asks_for_the_arrays(self):
+        """Checkpoint gap 6. The list route used to answer with every
+        matte's whole per frame arrays, thousands of mostly-null numbers to
+        read four states."""
+        result = self._track(prompts={"text": ["summary subject"]}, start=0, end=0.5)
+        matte_id = result["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+
+        listing = _get(self.base + f"/matte?clip={self.clip}")
+        self.assertFalse(listing["full"])
+        row = next(m for m in listing["mattes"] if m["matte_id"] == matte_id)
+        self.assertNotIn("areas", row)
+        self.assertNotIn("scores", row)
+        for key in ("span", "coverage", "mean_score", "quality",
+                    "done_frames", "total_frames", "state", "recipe"):
+            self.assertIn(key, row, f"the summary must still carry {key}")
+
+        full = _get(self.base + f"/matte?clip={self.clip}&full=1")
+        self.assertTrue(full["full"])
+        full_row = next(m for m in full["mattes"] if m["matte_id"] == matte_id)
+        self.assertIn("areas", full_row)
+        self.assertIn("scores", full_row)
+
+        # One matte by id always carries them: `mask show --strip` plots its
+        # area curve from exactly this response.
+        one = _get(self.base + f"/matte/{matte_id}")
+        self.assertIn("areas", one)
+
+    def test_a_matte_says_which_seconds_it_answers_for(self):
+        """Checkpoint gaps 8 and 10. Holding the last written frame past the
+        span is the design; a caller measuring a frozen mask at 20 seconds
+        having no way to know was the problem."""
+        result = self._track(prompts={"text": ["span subject"]}, start=0, end=0.5)
+        matte_id = result["mattes"][0]["matte_id"]
+        info = self._wait_matte_state(matte_id, ("done",))
+        span = info["span"]
+        self.assertTrue(info["frozen_outside_span"])
+        self.assertTrue(span["frozen_outside_span"])
+        self.assertEqual(span["start_frame"], 0)
+        self.assertGreater(span["end_frame"], 0)
+        self.assertEqual(span["written"], info["written_count"])
+        self.assertLessEqual(span["end_frame"], span["declared_frames"])
+        self.assertAlmostEqual(span["end_s"], span["end_frame"] / info["fps"],
+                               places=3)
+        self.assertGreater(info["coverage"], 0.0)
+
+    def test_a_matte_reports_its_own_suspect_frames(self):
+        """Checkpoint gap 18. The grader's `face` matte lost the face, then
+        latched onto a tree, and nothing said so."""
+        result = self._track(prompts={"text": ["quality subject"]}, start=0, end=0.5)
+        matte_id = result["mattes"][0]["matte_id"]
+        info = self._wait_matte_state(matte_id, ("done",))
+        q = info["quality"]
+        # The thresholds always travel with the counts, so a number can
+        # never be read without knowing what judged it.
+        self.assertIn("area_jump", q["thresholds"])
+        self.assertIn("min_iou", q["thresholds"])
+        self.assertIn(q["iou_source"], ("index", "frames", "none"))
+        self.assertEqual(q["checked"], info["written_count"])
+        self.assertEqual(set(q["reasons"]),
+                         {"zero_area", "area_jump", "low_iou"})
+        self.assertEqual(q["suspect_count"],
+                         q["reasons"]["zero_area"] + q["reasons"]["area_jump"]
+                         + q["reasons"]["low_iou"]
+                         - self._overlapping_reasons(q))
+        # and the thresholds in force are readable without computing them
+        status = _get(self.base + "/mask/status")
+        self.assertIn("area_jump", status["quality_thresholds"])
+
+    @staticmethod
+    def _overlapping_reasons(q: dict) -> int:
+        """A frame can trip more than one rule, so the per reason counts sum
+        to more than the frame count by exactly that overlap."""
+        return sum(len(f["reasons"]) - 1 for f in q["suspect_frames"])
+
+    def test_a_dead_matte_is_retried_instead_of_handed_back(self):
+        """Checkpoint gap 12. The recipe cache used to answer an identical
+        retry with the same failed matte and job_id None, so the only way to
+        get another attempt was to change the words."""
+        text = "__fail__retry me"
+        first = self._track(prompts={"text": [text]})
+        matte_id = first["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("failed",))
+        calls_before = self.sam_state.track_calls
+
+        second = self._track(prompts={"text": [text]})
+        self.assertFalse(second["cached"])
+        self.assertTrue(second["restarted"])
+        self.assertFalse(second["resumed"])
+        self.assertEqual(second["resumed_from"], 0)
+        self.assertIn("restarting", second["message"])
+        self.assertEqual(second["mattes"][0]["matte_id"], matte_id,
+                         "a restart writes back into the same matte")
+        self.assertEqual(self.sam_state.track_calls, calls_before + 1)
+        self.assertEqual(self.sam_state.last_matte_ids.get("0"), matte_id,
+                         "the retry must name the existing matte so the "
+                         "frames are not orphaned in a new directory")
+
+    def test_a_cancelled_matte_resumes_from_its_first_missing_frame(self):
+        """Checkpoint gap 12, the resume half: frames already written stay
+        written and only the missing tail is re-queued.
+
+        The prompt list carries the exact word "slow" (which is how the fake
+        service picks its timed writer) plus a phrase of its own, so this
+        test's recipe hashes differently from every other "slow" track here.
+        The recipe cache is keyed on the prompts and deliberately not on the
+        frame range, so two tests sharing a prompt would share a matte.
+
+        The window is half a second on purpose. The fake writes one frame
+        every 0.5 s, so the whole point of the test (the tail is re-queued
+        and actually runs to the end) has to fit in a timeout: four seconds
+        of a 24 fps clip is 96 frames, which is 48 seconds of fake tracking
+        and can never finish inside any sane wait. Twelve frames proves the
+        same thing: a cancel lands after the first one or two, and the
+        resume writes the rest into the same matte.
+        """
+        prompts = {"text": ["slow", "resume tail"]}
+        first = self._track(prompts=prompts, start=0, end=0.5)
+        job_id = first["job_id"]
+        matte_id = first["mattes"][0]["matte_id"]
+        # Let at least one frame land, then stop it.
+        deadline = time.time() + 20.0
+        written = 0
+        while time.time() < deadline:
+            written = _get(self.base + f"/matte/{matte_id}")["written_count"]
+            if written >= 1:
+                break
+            time.sleep(0.2)
+        self.assertGreaterEqual(written, 1, "the slow track wrote nothing")
+        _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+        before = self._wait_matte_state(
+            matte_id, ("partial", "failed", "done"), timeout=25.0)
+        if before["state"] == "done":
+            self.skipTest("the fake finished this track before the cancel "
+                          "landed; there is no missing tail to resume")
+        stopped_at = before["span"]["end_frame"]
+
+        second = self._track(prompts=prompts, start=0, end=0.5)
+        self.assertFalse(second["cached"],
+                         "a matte with a hole in the window asked for is not "
+                         "a cache hit")
+        self.assertTrue(second["resumed"] or second["restarted"])
+        self.assertEqual(second["mattes"][0]["matte_id"], matte_id,
+                         "a resume writes back into the same matte")
+        self.assertLessEqual(second["start_frame"], stopped_at)
+        self.assertEqual(self.sam_state.last_matte_ids.get("0"), matte_id,
+                         "the resume must name the existing matte, or the "
+                         "frames already written are orphaned in an old "
+                         "directory under a freshly derived id")
+        after = self._wait_matte_state(matte_id, ("done", "partial"),
+                                       timeout=30.0)
+        self.assertGreaterEqual(after["written_count"], stopped_at,
+                                "a resume keeps the frames already on disk")
+
+    def test_force_redoes_a_finished_matte(self):
+        """Checkpoint gap 12, the escape hatch: a matte that IS complete is a
+        cache hit, and `force` is how you say you want it again anyway."""
+        text = "forced subject"
+        first = self._track(prompts={"text": [text]})
+        matte_id = first["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+        calls = self.sam_state.track_calls
+
+        cached = self._track(prompts={"text": [text]})
+        self.assertTrue(cached["cached"])
+        self.assertEqual(self.sam_state.track_calls, calls)
+
+        forced = self._track(prompts={"text": [text]}, force=True)
+        self.assertFalse(forced["cached"])
+        self.assertTrue(forced["restarted"])
+        self.assertIn("force", forced["message"])
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+        self._wait_matte_state(matte_id, ("done",))
+
+    def test_render_takes_a_partial_matte_that_covers_the_window(self):
+        """The successor lane's --allow-partial finding: the refusal keyed on
+        the matte's DECLARED state, so a render whose every frame was on disk
+        was refused for the frames it never asked for."""
+        # "slow" exactly (the fake's timed writer) plus a phrase of its own,
+        # so this recipe is not shared with another test's matte.
+        first = self._track(prompts={"text": ["slow", "render window"]},
+                            start=0, end=8)
+        job_id = first["job_id"]
+        matte_id = first["mattes"][0]["matte_id"]
+        deadline = time.time() + 25.0
+        info = None
+        while time.time() < deadline:
+            info = _get(self.base + f"/matte/{matte_id}")
+            if info["written_count"] >= 4:
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(info)
+        self.assertGreaterEqual(info["written_count"], 4)
+        try:
+            self.assertTrue(info["is_partial"],
+                            "this test needs a matte that is not finished")
+            fps = float(info["fps"])
+            cfg = _matte_layer_config(matte_id)
+            # Three frames of a matte that has at least four: covered.
+            out = _post(self.base + "/render", {
+                "clip": self.clip, "config": cfg, "duration": 3.0 / fps,
+                "name": f"masktest_covered_{matte_id}"})
+            self.assertIn("job", out)
+            # And a window it genuinely is short of is still refused.
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/render", {
+                    "clip": self.clip, "config": cfg, "duration": 60.0,
+                    "name": f"masktest_short_{matte_id}"})
+            self.assertEqual(caught.exception.code, 400)
+            body = json.loads(caught.exception.read())
+            self.assertIn("allow_partial", body.get("error", ""))
+        finally:
+            _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+
+    def test_stats_says_the_width_it_measured_at(self):
+        """Checkpoint gap 11. Two measurements taken at different sizes used
+        to be indistinguishable once written down."""
+        # No width: the route measures at the source's own width, unchanged
+        # by this addition, and now says so.
+        default = _post(self.base + "/stats",
+                        {"clip": self.clip, "time": 0.1, "config": {}})
+        self.assertEqual(default["measured_width"], default["size"][0])
+        narrow = _post(self.base + "/stats",
+                       {"clip": self.clip, "time": 0.1, "config": {},
+                        "width": 320})
+        self.assertEqual(narrow["measured_width"], 320)
+        self.assertEqual(narrow["size"][0], 320)
+        self.assertNotEqual(narrow["measured_width"], default["measured_width"],
+                            "a 320 wide measurement and a default width one "
+                            "must not read the same once written down")
+        # The whole point of the field: it reports the sample really taken,
+        # not the number that was asked for. The studio floors every sampled
+        # frame at 160 wide (_preview_dims, shared with source_frame and
+        # render_raw so the two agree on WxH), so a request under the floor
+        # is measured at 160 and says 160.
+        floored = _post(self.base + "/stats",
+                        {"clip": self.clip, "time": 0.1, "config": {},
+                         "width": 96})
+        self.assertEqual(floored["measured_width"], MIN_SAMPLE_WIDTH)
+        self.assertEqual(floored["size"][0], MIN_SAMPLE_WIDTH)
+
+    def test_health_and_status_say_where_everything_lives(self):
+        """Checkpoint gaps 4 and 5. The CLI could not find a clip or a matte
+        that the server it was talking to knew about, because neither route
+        said where either lived."""
+        health = _get(self.base + "/health")
+        for key in ("data_dir", "footage_dir", "matte_root"):
+            self.assertIn(key, health)
+        self.assertTrue(health["matte_root"].startswith(health["data_dir"]))
+        status = _get(self.base + "/mask/status")
+        for key in ("data_dir", "footage_dir", "matte_root", "mask_width",
+                    "quality_thresholds"):
+            self.assertIn(key, status)
+        self.assertEqual(status["data_dir"], health["data_dir"])
+        # --mask-width above, and not the 1280 default: the flag reaches the
+        # route a mask caller reads, so an agent can tell what size the
+        # model is really being shown without guessing.
+        self.assertEqual(status["mask_width"], MASK_WIDTH)
+        self.assertEqual(status["footage_dir"], health["footage_dir"])
+        self.assertEqual(status["matte_root"], health["matte_root"])
 
     # -- stats by matte -------------------------------------------------
 

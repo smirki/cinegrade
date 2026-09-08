@@ -1260,6 +1260,20 @@
     badge.setAttribute("data-mask-badge", "");
     badge.dataset.state = st.state;
     if (st.state !== "none") ctrls.appendChild(badge);
+    /* A second badge, never a replacement for the state one: a matte can be
+     * cleanly `done` and still have jumped onto the wrong thing halfway
+     * through (checkpoint gap 18). Count only; the reasons and the first
+     * suspect time are in the matte block below. */
+    var sq = (st.info || {}).quality || null;
+    if (sq && num(sq.suspect_count, 0) > 0) {
+      var flag = el("span", "mask-badge", sq.suspect_count + " suspect");
+      flag.setAttribute("data-mask-suspect-badge", "");
+      flag.dataset.state = "suspect";
+      flag.title = "Frames where the tracked area jumped, the overlap with "
+        + "the frame before dropped, or the area went to zero inside the "
+        + "span. First at " + sq.first_suspect_time + "s.";
+      ctrls.appendChild(flag);
+    }
     row.appendChild(ctrls);
 
     /* Feather is per component (C1 puts it there, not in finesse), so it lives
@@ -1353,6 +1367,39 @@
         + " frames, held past there");
       held.setAttribute("data-mask-held", "");
       box.appendChild(held);
+    }
+
+    /* The span the matte really answers for, and the plain statement that it
+     * is frozen outside it (checkpoint gaps 8 and 10). A DONE matte freezes
+     * past its own window exactly like a running one, which is easy to read
+     * as "this matte is valid for the whole clip" when nothing says
+     * otherwise. */
+    var span = info ? info.span : null;
+    if (span && span.end_frame) {
+      var sp = el("div", "mask-line mono muted",
+        "span " + span.start_s + "s to " + span.end_s + "s, frozen outside it");
+      sp.setAttribute("data-mask-span", "");
+      sp.title = "Outside this window the matte holds its nearest written "
+        + "frame: the correction still applies, it just stops moving.";
+      box.appendChild(sp);
+    }
+
+    /* Per frame quality flags (checkpoint gap 18): the "face" matte that lost
+     * the face, grabbed a tree and then tracked the whole person read as a
+     * clean `done` everywhere in this panel before this line existed. */
+    var q = info ? info.quality : null;
+    if (q && num(q.suspect_count, 0) > 0) {
+      var sus = el("div", "mask-line mask-reason",
+        q.suspect_count + " suspect frames, first at " + q.first_suspect_time
+        + "s: check `mask show " + String(info.matte_id || "") + " --strip` "
+        + "before grading on this");
+      sus.setAttribute("data-mask-suspect", "");
+      sus.title = "A frame is suspect when its tracked area jumps by more "
+        + "than " + ((q.thresholds || {}).area_jump) + " of the frame before "
+        + "it, its overlap with that frame falls under "
+        + ((q.thresholds || {}).min_iou) + ", or its area is zero inside the "
+        + "span.";
+      box.appendChild(sus);
     }
 
     var job = st.job;

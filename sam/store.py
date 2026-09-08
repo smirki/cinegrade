@@ -11,10 +11,14 @@ Two decisions worth stating because everything downstream depends on them:
   index = round(time * fps). A track over frames 48 to 120 writes
   `000048.png` first. So a reader turns a time into a file name without
   knowing anything about which range was tracked.
-* **`areas` and `scores` are indexed by absolute frame index too**, length
-  `frames`, with `null` wherever no frame has been written: outside the
-  tracked range, or not computed yet. That makes the area curve directly
+* **`areas`, `scores` and `ious` are indexed by absolute frame index too**,
+  length `frames`, with `null` wherever no frame has been written: outside
+  the tracked range, or not computed yet. That makes the area curve directly
   plottable against the clip's timeline and makes a partial matte obvious.
+  `ious` is each written frame's overlap with the previous written frame,
+  computed here because this is the only place both masks are in memory;
+  `grade/mattes.py::quality` reads it to flag a frame where the track
+  jumped onto something else (checkpoint gap 18).
 
 `index.json` is rewritten atomically (temp file then `os.replace`) at most
 once a second while a job runs, and always when the state changes, so a
@@ -120,7 +124,16 @@ class _Steady:
 
 
 class MatteWriter:
-    """One matte: its frames, its index.json, its state."""
+    """One matte: its frames, its index.json, its state.
+
+    Opening a matte id that already has a directory is a RESUME (checkpoint
+    gap 12): the frames already on disk stay, the per frame arrays are
+    carried forward instead of blanked, `start_frame` keeps the earliest of
+    the two ranges, and `done_frames` counts what is really there rather
+    than only what this run writes. Without that, re-queueing the missing
+    tail of a cancelled track would report 125 of 384 while 384 files sat in
+    the folder, and the area curve would lose every point before the tail.
+    """
 
     def __init__(self, root: Path, matte_id: str, header: dict, steady: int = 1):
         self.dir = Path(root) / matte_id
@@ -128,6 +141,10 @@ class MatteWriter:
         self.matte_id = matte_id
         self.steady = _Steady(steady)
         frames = int(header.get("frames") or 0)
+        try:
+            previous = read_index(self.dir)
+        except (OSError, ValueError):
+            previous = {}
         self.index = dict(header)
         self.index.update({
             "matte_id": matte_id,
@@ -136,13 +153,59 @@ class MatteWriter:
             "steady": self.steady.n,
             "areas": [None] * frames,
             "scores": [None] * frames,
+            # Overlap with the PREVIOUS WRITTEN frame, same indexing as
+            # areas/scores (checkpoint gap 18). Written here because this is
+            # the one place both masks are already in memory: computing it
+            # later means re-reading every PNG off disk. First written frame
+            # has nothing to compare against and stays None.
+            "ious": [None] * frames,
             "created": header.get("created") or utc_now(),
             "updated": utc_now(),
             "error": None,
         })
-        self.done = 0
+        self._carry_forward(previous, frames)
         self._last_write = 0.0
+        # The previous written frame as a boolean array, for the per frame
+        # IoU above. Kept at the mask's own resolution: it is one array, and
+        # the comparison is two numpy reductions, so this costs a frame of
+        # memory rather than a second pass over the whole matte.
+        self._prev_mask = None
         self.save(force=True)
+
+    def _carry_forward(self, previous: dict, frames: int) -> None:
+        """A resume keeps what the earlier attempt already produced.
+
+        Only when the earlier index agrees about how long the matte is
+        (`frames`): a different length means a different track, and merging
+        two of those by index would put one attempt's numbers at another's
+        timestamps. `done_frames` is recounted off the directory, because
+        that is the only number that survives a process dying.
+        """
+        self.done = 0
+        # Frames this matte has on disk, so `done_frames` counts what is
+        # really there and a resumed range that overwrites a frame does not
+        # count it twice.
+        self._written: set[int] = set()
+        if not previous or int(previous.get("frames") or 0) != int(frames):
+            return
+        for key in ("areas", "scores", "ious"):
+            old = previous.get(key)
+            if isinstance(old, list) and len(old) == frames:
+                merged = list(self.index.get(key) or [None] * frames)
+                for i, value in enumerate(old):
+                    if value is not None and merged[i] is None:
+                        merged[i] = value
+                self.index[key] = merged
+        old_start = previous.get("start_frame")
+        new_start = self.index.get("start_frame")
+        if old_start is not None and new_start is not None:
+            self.index["start_frame"] = min(int(old_start), int(new_start))
+        try:
+            self._written = {int(p.stem) for p in self.dir.glob(FRAME_GLOB)
+                             if p.stem.isdigit()}
+        except OSError:
+            self._written = set()
+        self.done = len(self._written)
 
     # -- state -------------------------------------------------------------
 
@@ -184,10 +247,19 @@ class MatteWriter:
         clipped = np.clip(mask, 0.0, 1.0)
         Image.fromarray((clipped * 255.0 + 0.5).astype(np.uint8), mode="L") \
             .save(self.dir / frame_name(index))
+        cur = clipped >= 0.5
         if 0 <= index < len(self.index["areas"]):
             self.index["areas"][index] = round(float(clipped.mean()), 6)
             self.index["scores"][index] = round(float(score), 4)
-        self.done += 1
+            ious = self.index.setdefault("ious", [None] * len(self.index["areas"]))
+            if self._prev_mask is not None and self._prev_mask.shape == cur.shape:
+                union = float(np.logical_or(self._prev_mask, cur).sum())
+                inter = float(np.logical_and(self._prev_mask, cur).sum())
+                if 0 <= index < len(ious):
+                    ious[index] = round(inter / union, 4) if union > 0 else 1.0
+        self._prev_mask = cur
+        self._written.add(int(index))
+        self.done = len(self._written)
         self.save()
 
     # -- finish ------------------------------------------------------------

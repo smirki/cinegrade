@@ -2877,15 +2877,46 @@ def list_clip_mattes(clip_key: str) -> list:
     return out
 
 
-def _matte_summary(info) -> dict:
-    return {
+def _mean_of(values) -> float | None:
+    good = [float(v) for v in (values or []) if v is not None]
+    return round(sum(good) / len(good), 6) if good else None
+
+
+def _matte_summary(info, full: bool = True, quality_limit: int | None = 64
+                   ) -> dict:
+    """One matte's record for `GET /api/matte/<id>` and the list route.
+
+    `full` decides whether the per frame arrays come with it (checkpoint gap
+    6): `GET /api/matte/<id>` is one matte and always sends them, since
+    `mask show --strip` plots the area curve from exactly this response.
+    `GET /api/matte?clip=` defaults to the summary and only sends the arrays
+    for `?full=1`, because a clip with four mattes over 384 frames was
+    answering with more than 3000 mostly-null numbers just to report four
+    states, which is why M8 polled `mask jobs` instead of this route.
+
+    `span`, `coverage` and `frozen_outside_span` (checkpoint gaps 8 and 10)
+    say which seconds the matte really answers for and state, rather than
+    imply, that it holds its nearest written frame outside them. `quality`
+    (gap 18) is the per frame flag summary; `suspect_frames` inside it is
+    capped by `quality_limit` so a list route cannot answer with a hundred
+    rows per matte, with `truncated` saying when that happened.
+    """
+    sp = MT.span(info)
+    span_len = max(0, sp["end_frame"] - sp["start_frame"])
+    out = {
         "matte_id": info.matte_id, "clip": info.clip, "clip_key": info.clip_key,
         "rotation": info.rotation, "fps": info.fps, "frames": info.frames,
         "width": info.width, "height": info.height, "state": info.state,
         "done_frames": info.done_frames, "written_count": info.written_count,
         "total_frames": info.total_frames, "is_partial": info.is_partial,
-        "recipe": info.recipe, "areas": info.areas, "scores": info.scores,
+        "recipe": info.recipe,
         "created": info.created, "model": info.model, "backend": info.backend,
+        "span": sp,
+        "frozen_outside_span": True,
+        "coverage": (round(sp["written"] / span_len, 4) if span_len else 0.0),
+        "mean_score": _mean_of(info.scores),
+        "mean_area": _mean_of(info.areas),
+        "quality": MT.quality(info, limit=quality_limit),
         # Not one of MatteInfo's own dataclass fields; index.json carries it
         # straight from the service on a failed matte ("no instance for text
         # 'shirt'"), and a caller (the jobs panel, a UI badge) needs it to
@@ -2893,6 +2924,11 @@ def _matte_summary(info) -> dict:
         "object_id": info.raw.get("object_id"), "label": info.raw.get("label"),
         "kind": info.raw.get("kind"), "error": info.raw.get("error"),
     }
+    if full:
+        out["areas"] = info.areas
+        out["scores"] = info.scores
+        out["ious"] = info.raw.get("ious")
+    return out
 
 
 def matte_frame_png(matte_id: str, time_s: float, width: int | None
@@ -2988,6 +3024,49 @@ def _recipe_cache_get(clip_key: str, rhash: str) -> list[str] | None:
         except MT.MatteMissing:
             continue           # a matte this cache remembers was deleted since
     return good or None
+
+
+def _matte_request_window(info, start, end) -> tuple[int, int]:
+    """The frame range a `start`/`end` (seconds) request asks of THIS matte,
+    clamped to the range the matte itself says it covers.
+
+    Clamping to the matte's own declared `[start_frame, end_frame)` is what
+    keeps a request for more than the clip has (`--end 20` on a 16 second
+    clip) from looking like a permanently missing tail and re-queueing on
+    every repeat call. Widening a matte's window is a separate thing and
+    still mints a separate matte, since the service's own id includes the
+    range (checkpoint gap 2, out of scope here).
+    """
+    fps = float(info.fps or 0.0)
+    raw = info.raw or {}
+    m_start = int(raw.get("start_frame") or 0)
+    m_end = int(raw.get("end_frame") or info.total_frames or 0)
+    w_start, w_end = m_start, m_end
+    if fps > 0 and start is not None:
+        w_start = max(m_start, int(round(float(start) * fps)))
+    if fps > 0 and end is not None:
+        w_end = min(m_end, int(round(float(end) * fps)))
+    return w_start, max(w_start, w_end)
+
+
+def _matte_first_missing(info, start, end) -> int | None:
+    """The first frame of that window this matte has not written, or None
+    when the window is fully covered."""
+    w_start, w_end = _matte_request_window(info, start, end)
+    written = set(info.written_indices(refresh=True))
+    for i in range(w_start, w_end):
+        if i not in written:
+            return i
+    return None
+
+
+# States that mean "this matte will never finish on its own". `cancelled` is
+# not one of C2's own states: a cancelled job settles as `partial` when it
+# wrote something and `failed` (error "cancelled") when it did not, which is
+# why both spellings are here and why `partial` alone is not enough to judge
+# on (a partial matte that covers the window asked for is fine, checkpoint
+# gap 12 and the render refusal).
+_MATTE_DEAD_STATES = ("failed", "stale", "cancelled")
 
 
 def _recipe_cache_put(clip_key: str, rhash: str, matte_ids: list) -> None:
@@ -3095,8 +3174,27 @@ def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
             oldest = sorted(PICKS.items(), key=lambda kv: kv[1]["created"])
             for pid, _entry in oldest[:-PICKS_MAX]:
                 PICKS.pop(pid, None)
-    return {"pick_id": pick_id, "instances": instances_out,
-            "elapsed_s": resp.get("elapsed_s")}
+    out = {"pick_id": pick_id, "instances": instances_out,
+           "candidates": len(instances_out),
+           "elapsed_s": resp.get("elapsed_s")}
+    # Checkpoint gap 3: an empty list said nothing about WHY it was empty,
+    # so "the model looked and found nothing" and "this phrase meant
+    # nothing to the model" read identically. The service's own warnings
+    # come through unchanged; `message` is the one sentence a caller can
+    # print, and the CLI exits non zero on it.
+    if resp.get("warnings"):
+        out["warnings"] = list(resp["warnings"])
+    if not instances_out:
+        asked = ", ".join(f'"{t}"' for t in (norm_prompts.get("text") or []))
+        if not asked:
+            kinds = [k for k in ("points", "boxes", "exemplars")
+                     if norm_prompts.get(k)]
+            asked = " + ".join(kinds) or "these prompts"
+        out["message"] = (
+            f"no match for {asked} at {float(time_s):g}s: 0 candidates from "
+            f"the model. Try another word for the same thing, a different "
+            f"--time, or a --point/--box prompt on the pixels themselves.")
+    return out
 
 
 _POLL_INTERVAL = 1.0
@@ -3181,7 +3279,8 @@ def _poll_sam_job(job: Job, clip_key: str, sam_job_id) -> None:
 
 
 def queue_mask_track(clip: str, rotation, prompts=None, select=None,
-                     steady=None, pick_id=None, start=None, end=None) -> dict:
+                     steady=None, pick_id=None, start=None, end=None,
+                     force: bool = False) -> dict:
     """POST /api/mask/track's implementation (C3/C4).
 
     Two request shapes fold into one recipe: a bare prompts dict (the
@@ -3211,9 +3310,16 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     all, when a fallback bootstrap write here is the only thing keeping
     GET /api/matte/<id> from 404ing on something the track call did accept.
 
-    Returns {"job_id": str|None, "mattes": [...]}. job_id is None only on a
-    pure cache hit: design rule 5 means that call cost nothing, there is no
-    fresh job, and the caller reads the existing matte's own state instead.
+    Returns {"job_id": str|None, "mattes": [...]}, plus `cached: true` on a
+    pure cache hit (design rule 5: that call cost nothing, there is no fresh
+    job, and the caller reads the existing matte's own state instead) or
+    `resumed`/`restarted` with a `message` when this call picked a stalled
+    matte back up. job_id is None only on a cache hit.
+
+    `force` is the full redo (checkpoint gap 12): the previously written
+    frames for this recipe are deleted and the whole window tracked again,
+    for the case where the matte on disk is not wanted at all rather than
+    merely unfinished.
     """
     rot = CG.normalise_rotation(rotation)
     clip_key = mask_clip_key(clip)
@@ -3233,16 +3339,87 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     rhash = _recipe_hash(clip_key, rot, recipe)
 
     cached_ids = _recipe_cache_get(clip_key, rhash)
-    if cached_ids:
-        infos = []
-        for mid in cached_ids:
-            try:
-                infos.append(MT.resolve(MT.matte_root(), mid))
-            except MT.MatteMissing:
-                continue
-        return {"job_id": _matte_jobs.get(rhash),
-                "mattes": [{"matte_id": i.matte_id, "recipe": i.recipe,
-                            "state": i.state} for i in infos]}
+    cached_infos = []
+    for mid in (cached_ids or []):
+        try:
+            cached_infos.append(MT.resolve(MT.matte_root(), mid))
+        except MT.MatteMissing:
+            continue
+
+    # Checkpoint gap 12. The cache used to hand back whatever it remembered
+    # with no look at that matte's own state, so a cancelled or failed track
+    # answered an identical retry with the same dead matte and job_id None,
+    # and the only way to get a fresh attempt was to change the prompt text.
+    # Now the cache is a hit only while the answer is still usable:
+    #
+    #   a live job for this recipe        hit (asking twice is free, and the
+    #                                     work is already happening)
+    #   every frame of the window written hit, whatever the state says
+    #   failed / stale / cancelled        RESTART: re-queue the whole window
+    #   a gap in the window               RESUME: re-queue from the first
+    #                                     missing frame, keeping every frame
+    #                                     already on disk
+    #   force                             RESTART, frames deleted first
+    #
+    # The dead states are read BEFORE the gap, not after: a failed matte has
+    # a gap by definition (that is what failing means), so testing the gap
+    # first would resume every dead matte from its first missing frame and
+    # the RESTART row could never be reached. A matte that is merely partial
+    # or stalled, which is how a cancelled job that wrote something settles,
+    # is not a dead state and does resume.
+    #
+    # A resume and a restart both go through the same track call below with
+    # `matte_ids` naming the existing mattes, so the frames land back in the
+    # same matte and the state moves to queued/running again instead of
+    # staying dead.
+    resume_from = None
+    resume_kind = ""                 # "resume", "restart" or "force"
+    restart_reason = ""
+    resume_ids: dict[str, str] = {}
+    if cached_infos and not force:
+        live = JOBS.get(_matte_jobs.get(rhash) or "")
+        live_now = live is not None and live.status in ("queued", "running")
+        gaps = [g for g in (_matte_first_missing(i, start, end)
+                            for i in cached_infos) if g is not None]
+        dead = [i for i in cached_infos if i.state in _MATTE_DEAD_STATES]
+        # "Covered" is frames really on disk, not merely an absence of gaps:
+        # a matte whose declared window is empty (a bootstrap index written
+        # before the service said how long the track is) has no missing
+        # frame to find, and must not read as a hit on that technicality.
+        covered = not gaps and all(i.written_count for i in cached_infos)
+        if live_now or covered:
+            return {"job_id": _matte_jobs.get(rhash), "cached": True,
+                    "mattes": [{"matte_id": i.matte_id, "recipe": i.recipe,
+                                "state": i.state} for i in cached_infos]}
+        if dead or not gaps:
+            resume_from = min(_matte_request_window(i, start, end)[0]
+                              for i in cached_infos)
+            resume_kind = "restart"
+            restart_reason = (
+                f"restarting from frame {resume_from}: "
+                f"{', '.join(sorted({i.state for i in (dead or cached_infos)}))}")
+        else:
+            resume_from = min(gaps)
+            resume_kind = "resume"
+            restart_reason = (f"resuming from frame {resume_from}: "
+                              f"{', '.join(sorted({i.state for i in cached_infos}))}")
+    elif cached_infos and force:
+        # A full redo. The service derives the same matte id for the same
+        # recipe and window, so without clearing the frames first a shorter
+        # re-track would leave the old attempt's tail sitting on disk and
+        # reading as tracked. The index goes with them; the track call below
+        # writes a fresh one.
+        for i in cached_infos:
+            shutil.rmtree(i.path, ignore_errors=True)
+        MT.forget_cache()
+        resume_kind = "force"
+        restart_reason = "force: previous frames cleared, tracking again"
+
+    if cached_infos:
+        for i in cached_infos:
+            oid = str(i.raw.get("object_id") or "").strip()
+            if oid:
+                resume_ids[oid] = i.matte_id
 
     path, params = ensure_mask_proxy_ready(clip, rot)
     out_dir = MT.matte_root() / clip_key
@@ -3256,6 +3433,14 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     end_frame = total_frames
     if end is not None:
         end_frame = min(total_frames, max(start_frame, int(round(float(end) * params["fps"]))))
+    if resume_from is not None:
+        # Re-queue the missing part only, and keep the matte's own declared
+        # end so its `frames` (and therefore its area/score arrays, and
+        # every index a caller already holds) do not move under it.
+        declared_end = max([int((i.raw or {}).get("end_frame") or i.total_frames)
+                            for i in cached_infos] + [end_frame])
+        start_frame = max(0, min(int(resume_from), total_frames))
+        end_frame = min(total_frames, max(start_frame, declared_end))
     try:
         resp = SAMC.client().track(
             str(path), str(out_dir), fps=params["fps"],
@@ -3279,7 +3464,12 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
             # in INTEGRATION-A while cross checking `stats --matte` against
             # a real tracked matte end to end.
             rotation_probe_path=str(clip_path(clip)),
-            width=params["width"], recipe=recipe)
+            width=params["width"], recipe=recipe,
+            # Empty on a first track; on a resume or a restart it names the
+            # mattes to write back into, so the frames that survived stay
+            # where they are instead of being orphaned in an old directory
+            # (checkpoint gap 12).
+            matte_ids=resume_ids or None)
     except SAMC.SamUnavailable as exc:
         raise HttpError(503, str(exc)) from exc
     except SAMC.SamError as exc:
@@ -3321,7 +3511,14 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
 
     threading.Thread(target=_poll_sam_job, args=(job, clip_key, sam_job_id),
                      daemon=True).start()
-    return {"job_id": job.id, "mattes": mattes_out}
+    out = {"job_id": job.id, "mattes": mattes_out, "cached": False,
+           "start_frame": start_frame, "end_frame": end_frame}
+    if resume_kind:
+        out["resumed"] = resume_kind == "resume"
+        out["restarted"] = resume_kind in ("restart", "force")
+        out["resumed_from"] = resume_from
+        out["message"] = restart_reason
+    return out
 
 
 def _mask_job_view(job: Job) -> dict:
@@ -5033,6 +5230,16 @@ class Handler(BaseHTTPRequestHandler):
                 "ffmpeg_slots_free": int(getattr(FFMPEG_SLOTS, "_value", 0)),
                 "cache_dir": str(CACHE),
                 "data_dir": str(DB.DATA),
+                # Checkpoint gaps 4 and 5: the standalone CLI has its own
+                # idea of both of these (content/footage and
+                # studio/data/mattes) and a server started with --footage or
+                # --data-dir does not. Answering them here is what lets a
+                # CLI with STUDIO_URL set resolve a bare clip name and a
+                # matte id the same way the server would, instead of the
+                # caller exporting STUDIO_DATA_DIR by hand and getting an
+                # ffprobe traceback when they forget.
+                "footage_dir": str(FOOTAGE),
+                "matte_root": str(MT.matte_root()),
                 "logins": AUTH.enabled(),
             })
             return
@@ -5719,6 +5926,13 @@ class Handler(BaseHTTPRequestHandler):
                         raise StudioError(str(exc)) from exc
                     row["size"] = [meta.get("width", rgb.shape[1]),
                                    meta.get("height", rgb.shape[0])]
+                    # Checkpoint gap 11: this route measures a 640 wide
+                    # preview unless `width` says otherwise, while the
+                    # standalone CLI measures the source's own resolution.
+                    # Both now state the width they measured at, so two
+                    # numbers from the two paths cannot be compared without
+                    # noticing they came from different samples.
+                    row["measured_width"] = int(row["size"][0])
                     if "region" in meta:
                         row["region"] = meta["region"]
                         row["region_pixels"] = meta["region_pixels"]
@@ -5740,6 +5954,7 @@ class Handler(BaseHTTPRequestHandler):
             out = {"key": meta["key"], "stats": stats_out,
                    "size": [meta.get("width", rgb.shape[1]),
                             meta.get("height", rgb.shape[0])]}
+            out["measured_width"] = int(out["size"][0])       # gap 11, above
             if "region" in meta:
                 out["region"] = meta["region"]
                 out["region_pixels"] = meta["region_pixels"]
@@ -6043,7 +6258,17 @@ class Handler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 jobs = [j.as_dict() for j in JOBS.values()
                        if j.kind in ("mask_track", "mask_proxy")]
-            self._json({"ok": ok, "service": health, "jobs": jobs})
+            self._json({"ok": ok, "service": health, "jobs": jobs,
+                        # The same three paths GET /api/health carries, so a
+                        # mask-only caller (the CLI's `mask` group, an agent
+                        # already polling this route) does not need a second
+                        # request to find the store or the footage root
+                        # (checkpoint gaps 4 and 5).
+                        "data_dir": str(DB.DATA),
+                        "matte_root": str(MT.matte_root()),
+                        "footage_dir": str(FOOTAGE),
+                        "mask_width": MASK_WORKING_WIDTH,
+                        "quality_thresholds": MT.quality_thresholds()})
             return
 
         if route == "mask/segment" and method == "POST":
@@ -6062,7 +6287,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(queue_mask_track(
                 payload["clip"], rotation, payload.get("prompts"),
                 payload.get("select"), payload.get("steady"),
-                payload.get("pick_id"), payload.get("start"), payload.get("end")))
+                payload.get("pick_id"), payload.get("start"), payload.get("end"),
+                force=bool(payload.get("force"))))
             return
 
         if route.startswith("mask/pick/") and method == "GET":
@@ -6135,7 +6361,16 @@ class Handler(BaseHTTPRequestHandler):
                 infos = list_clip_mattes(mask_clip_key(clip))
             else:
                 infos = list_all_mattes()
-            self._json({"mattes": [_matte_summary(i) for i in infos]})
+            # Checkpoint gap 6: the summary is the default here and the per
+            # frame arrays are opt in (`?full=1`). `GET /api/matte/<id>`
+            # below is unchanged and still carries them, so the one caller
+            # that plots the curve (`mask show --strip`) reads the same
+            # bytes it always did.
+            full = str(q.get("full", "")).strip().lower() in ("1", "true", "yes")
+            self._json({"mattes": [_matte_summary(i, full=full,
+                                                  quality_limit=8)
+                                   for i in infos],
+                        "full": full})
             return
 
         if route.startswith("matte/") and route.endswith("/frame") and method == "GET":

@@ -141,8 +141,13 @@ def test_unknown_preset_fails_cleanly(ctx):
     ctx.note(f"exit {r.returncode}, stderr: {r.stderr.strip()[:220]}")
     ctx.expect_true("unknown preset exits non-zero", r.returncode != 0,
                     f"exit {r.returncode}")
+    # Gap 17 (checkpoints/FIX-GAPS.md) rewrote this message to name every
+    # place it looked (a file path, the built-in catalog, and a studio's
+    # saved presets when STUDIO_URL is set) and to list the catalog by name
+    # rather than use the literal word "available"; this assertion follows
+    # that documented change.
     ctx.expect_true("the error names the problem and lists what is available",
-                    "preset not found" in r.stderr and "available" in r.stderr,
+                    "Looked in" in r.stderr and "catalog:" in r.stderr,
                     r.stderr.strip()[:160])
     ctx.expect_true("no raw traceback reaches the user",
                     "Traceback" not in r.stderr, "clean")

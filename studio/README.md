@@ -513,7 +513,9 @@ out.png`. Render, then measure; a raw `path` read never grades.
 `grade/cinegrade.py` is the primary agent surface; the server mirrors it, not
 the other way round. Every subcommand below takes `input` (the clip or still
 to grade, positional) plus a shared set of grading flags unless noted:
-`--preset/-p NAME_OR_PATH`, `--look/-l NAME`, `--exposure/-e STOPS`,
+`--preset/-p NAME_OR_PATH`, `--preset-from {auto,file,studio,catalog}`
+(which namespace a bare `--preset` name may come from, see below),
+`--look/-l NAME`, `--exposure/-e STOPS`,
 `--tonemap {aces,filmic,none}`, `--working-space {dwg,direct,rec709}`,
 `--contrast`, `--saturation`, `--temperature`, `--tint`, `--rotate
 {auto,0,90,180,270}` (beats the config's own `rotation`, see "Rotation"
@@ -523,14 +525,27 @@ apple_log,hlg,pq,rec709,slog3,logc3,vlog,clog3,dlog}` (overrides
 transforms" above; on `render`, `still`, `compare`, `scopes`, `stats`,
 `orient` and `sweep`), `--verbose/-v` (also un-silences colour-science's own
 scipy/matplotlib startup notice, silent by default on every command).
-`NAME_OR_PATH` on `--preset` checks the literal path first (`load_preset` in
-`grade/cinegrade.py`) and only falls back to `grade/presets/NAME.json` when
-that path does not exist, so a file `grade save`/`preset save` wrote, a
-`PUT /api/grade`/`POST /api/preset` body saved to disk, or any hand written
-JSON, goes straight to `--preset` with no need to copy it into
-`grade/presets/` first, including for a field with no dedicated flag (see
-the measured rows added to "Which way is which" below for a worked
-example).
+`NAME_OR_PATH` on `--preset` resolves through three namespaces, in this
+order (`load_preset` in `grade/cinegrade.py`):
+
+1. **a literal path**, always first, so a file `grade save`/`preset save`
+   wrote, a `PUT /api/grade`/`POST /api/preset` body saved to disk, or any
+   hand written JSON goes straight to `--preset` with no need to copy it into
+   `grade/presets/` first, including for a field with no dedicated flag (see
+   the measured rows added to "Which way is which" below for a worked
+   example);
+2. **a preset saved on the studio** named by `STUDIO_URL`
+   (`GET /api/preset?name=&expand=true`);
+3. **the built-in look catalog**, `grade/presets/NAME.json`.
+
+Whichever answered is printed to stderr (never stdout, which carries
+`--json`), so a checkpoint that records the command also records which preset
+it got; the catalog line only prints when `STUDIO_URL` is set, because that is
+the only time a bare name could have meant two things. `--preset-from
+{auto,file,studio,catalog}` forces one namespace and refuses instead of
+falling through, which is how you say "the built-in `cinekit`, not the one
+somebody saved on this server". A name in neither namespace is refused with
+both places named and the catalog listed.
 
 `--agent`/`--attach`/`--if-rev`, and `--port`/`--url` (env `STUDIO_PORT`/
 `STUDIO_URL`), are documented under "Per caller identity" in Agent API
@@ -545,12 +560,12 @@ which is a human's own live studio.
 
 | Command | Flags beyond the shared set | What it does |
 | --- | --- | --- |
-| `render IN -o OUT` | `--start`, `--duration/-t` (seconds); `--no-audio`; `--codec NAME` (this render only, never the preset file; extension must agree, `prores_ks` to `.mov`, else `.mp4`, or the command refuses before ffmpeg runs); `--width N` / `--scale F` (mutually exclusive; scales the pixel denominated FX params the same way the studio preview does); audio maps only the first stream (`0:a:0?`), so a second, undecodable stream (an iPhone spatial audio `apac` track) no longer kills the render | writes a finished file to `grade/out/` (or wherever `-o` points), streaming `render Xs of Ys` progress to STDERR once per second of rendered output while it runs (stdout carries nothing until the end), then prints the one final `rendered (input INPUT, rotation ROTATION) -> PATH` line on stdout, naming the resolved input transform (`Input transforms` above) and the rotation mode actually used, not only `rendered -> PATH` |
+| `render IN -o OUT` | `--start`, `--duration/-t` (seconds); `--allow-partial` (render anyway when a matte layer does not cover the window asked for); `--no-audio`; `--codec NAME` (this render only, never the preset file; extension must agree, `prores_ks` to `.mov`, else `.mp4`, or the command refuses before ffmpeg runs); `--width N` / `--scale F` (mutually exclusive; scales the pixel denominated FX params the same way the studio preview does); audio maps only the first stream (`0:a:0?`), so a second, undecodable stream (an iPhone spatial audio `apac` track) no longer kills the render | writes a finished file to `grade/out/` (or wherever `-o` points), streaming `render Xs of Ys` progress to STDERR once per second of rendered output while it runs (stdout carries nothing until the end), then prints the one final `rendered (input INPUT, rotation ROTATION) -> PATH` line on stdout, naming the resolved input transform (`Input transforms` above) and the rotation mode actually used, not only `rendered -> PATH` |
 | `still IN -o OUT` | `--time` (default 0); `--width`; `--region X0 Y0 X1 Y1`, `--zoom F` (see "What the numbers mean" above) | one graded frame as a PNG |
 | `compare IN -o OUT` | `--time`; `--width` (default 560); `--region`, `--zoom`; `--looks a,b,c`; `--presets a,b,c`; `--open` (Preview.app) | a grid of the same frame under several looks or presets |
 | `scopes IN -o OUT` | `--time`; `--width` (default 700); `--open` | histogram, waveform, parade and vectorscope as one image |
 | `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect, rotation_tag_note, ...}` instead of rendering the default sheet; see "Rotation" above); `--sheet OUT.jpg` (a labelled 2x2 of the four fixed candidates, 0/90/180/270; independent of `--json`, both together write both and the JSON dict gains a `"sheet"` key naming the path) | the default hand drawn row sheet, a labelled 2x2, the JSON facts, or (with both flags) all of the JSON plus the 2x2; `rotation_tag_suspect` is a prompt to go look, not a verdict, and `rotation_tag_note` says why in one sentence, see "Rotation" |
-| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`); `--matte ID` (weights every percentile, band and hue family by that matte's value, resolved straight off disk under `grade/mattes.py`, no running server needed; `region` crops first, then `matte` weights what is left; refused together with `--image`, a matte measures a clip over time, a still is one frame; a time past what the matte has tracked so far falls back to its nearest written frame and the response gains a `warnings` field saying so; a matte that covers nothing at the requested region and time is refused rather than silently averaged to nothing) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "stats"}` envelope, the numbers live one level down under `stats`; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
+| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`); `--matte ID` (weights every percentile, band and hue family by that matte's value, resolved straight off disk under `grade/mattes.py`, no running server needed; `region` crops first, then `matte` weights what is left; refused together with `--image`, a matte measures a clip over time, a still is one frame; a time past what the matte has tracked so far falls back to its nearest written frame and the response gains a `warnings` field saying so; a matte that covers nothing at the requested region and time is refused rather than silently averaged to nothing) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "measured_width", "stats"}` envelope, the numbers live one level down under `stats`; `measured_width` is the width the measurement was actually taken at (the printed block says `1920x1080  measured at 1920 wide`), so two numbers taken at different sizes cannot be compared by accident; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
 | `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order; a leading negative parses unquoted, `--values -0.1,0,0.1`, as well as with an `=`); `--width` (default 640, scaled down from the source, matching `POST /api/stats`'s own default; this used to always measure at the source's full resolution); `--json` (stdout stays pure JSON even with `--sheet`, which then prints its path to stderr instead); `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
 | `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input); `--region X0 Y0 X1 Y1` (crops each panel to fractions of ITS OWN size, after loading, before the shared height is solved; no `--zoom`, a cropped panel is already rescaled to the shared height afterwards) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
 | `docs [SECTION]` | `SECTION` (a heading's text, matched case insensitively at any level, skipping headings inside fenced code blocks; omit to list); `--list` (list every heading and exit; a `SECTION` that matches nothing also lists them, rather than failing) | prints one section of this file, or the whole table of contents |
@@ -560,11 +575,11 @@ which is a human's own live studio.
 | `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--rotate {auto,0,90,180,270}` (sent as this call's own `rotation` field; falls back to `--preset`'s own config `rotation`, then `auto`, same order every other subcommand's `--rotate` falls back through; `match` previously had no rotation handling at all); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
 | `preset {save,load} NAME` | `save NAME -p grade.json --comment TEXT`; `load NAME [--expand] [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `POST`/`GET /api/preset`: the shared, named grade store, read and written by every account and agent alike |
 | `grade {save,load} CLIP` | `save CLIP -p grade.json --message TEXT`; `load CLIP [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `PUT`/`GET /api/grade` (contract C3): one clip's own per clip grade, distinct from the shared `preset` above and from `session patch` (the live config a browser tab is watching; `grade save` never wakes it) |
-| `mask segment CLIP` | `--time` (default 0); `--text "PROMPT"` (repeatable); `--point X,Y[,neg]` (repeatable, fraction of the frame, trailing `,neg` for a negative point); `--box X0,Y0,X1,Y1` (repeatable); `--rotate`; `-o DIR` (downloads every instance's `overlay`/`mask` preview image); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/segment` (contract C4): SAM's synchronous pick on one frame, `{"pick_id", "instances": [{"id", "score", "box", "area", "overlay", "mask"}, ...]}`, nothing tracked or saved yet, look at the previews before choosing an id to track |
-| `mask track CLIP` | `--text "PROMPT"` (repeatable) or `--pick PICK --select IDS` (comma separated ids, or `all`), not both; `--start`, `--end` (seconds); `--steady N` (temporal smoothing frames); `--rotate`; `--wait` (blocks, prints progress to stderr the way `render` does, exits non zero on a `failed` job); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/track`: starts a background SAM track, returns `{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...]}` immediately unless `--wait`; cached by clip identity, rotation and recipe, a repeat request is free |
+| `mask segment CLIP` | `--time` (default 0); `--text "PROMPT"` (repeatable); `--point X,Y[,neg]` (repeatable, fraction of the frame, trailing `,neg` for a negative point); `--box X0,Y0,X1,Y1` (repeatable); `--rotate`; `-o DIR` (downloads every instance's `overlay`/`mask` preview image); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/segment` (contract C4): SAM's synchronous pick on one frame, `{"pick_id", "instances": [{"id", "score", "box", "area", "overlay", "mask"}, ...], "candidates": N}`, nothing tracked or saved yet, look at the previews before choosing an id to track. A prompt the model matches nothing for is NOT a silent empty list: the response carries `"candidates": 0` and a `message` (`no match for "shirt" at 3s: 0 candidates from the model. Try another word ...`), and the CLI raises that sentence, so `mask segment` exits 1. With `--json` the payload still prints first, then the command exits 1, so a JSON caller loses nothing and a shell caller gets a real failure |
+| `mask track CLIP` | `--text "PROMPT"` (repeatable) or `--pick PICK --select IDS` (comma separated ids, or `all`), not both; `--start`, `--end` (seconds); `--steady N` (temporal smoothing frames); `--rotate`; `--wait` (blocks, prints progress to stderr the way `render` does, exits non zero on a `failed` job; a cache hit has no job to wait on and says so on stderr rather than failing); `--force` (redo a matte this recipe already has, frames deleted first); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/track`: starts a background SAM track, returns `{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...], "cached": false, "start_frame", "end_frame"}` immediately unless `--wait`. Cached by clip identity, rotation and recipe, and the cache is a hit only while its answer is still usable: a live job for this recipe, or every frame of the window already written, is free (`{"job_id", "cached": true, "mattes": [...]}`); a HOLE in the window resumes from the first missing frame; a `failed`/`stale`/`cancelled` matte restarts the window; `force` restarts it after deleting the frames. A resume or a restart answers with `resumed`, `restarted`, `resumed_from` and a `message`, writes back into the SAME matte id, and moves the state to `queued`/`running` again. Before this, an identical retry of a dead track handed back the same dead matte and `job_id: null`, and the only way to get another attempt was to change the words |
 | `mask jobs` | `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/mask/jobs`: every queued or running track job, visible to every caller |
-| `mask list CLIP` | `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte?clip=`: that clip's mattes with state and progress; mattes belong to the clip, shared by every caller |
-| `mask show ID` | `--strip` (one frame per second, matte tinted over the picture, with the tracked area curve underneath, needs `-o` and Pillow); `-o/--output OUT.jpg` (required with `--strip`); `--width N` (default 220, panel width for `--strip`); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte/<id>`: one matte's index (state, frame count, recipe); with `--strip`, the verification pass to run before grading on a matte, see the Masks section of `.claude/skills/studio-grading/SKILL.md` |
+| `mask list CLIP` | `--full` (the per frame arrays as well as the summary); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte?clip=`: that clip's mattes, a SUMMARY per matte by default (`matte_id`, `state`, `done_frames`/`frames`, `span`, `coverage` of that span, `mean_score`, `mean_area`, `quality`, `recipe`), not the per frame arrays: four mattes over 384 frames used to be thousands of mostly-null numbers just to read four states. `--full` (`?full=1` on the route) adds `areas`, `scores` and `ious` back; `GET /api/matte/<id>` always carries them. The printed line also flags suspect frames (`SUSPECT 3 frames from 4.25s`) and closes with the reminder that every matte is frozen outside its span. Mattes belong to the clip, shared by every caller |
+| `mask show ID` | `--strip` (one panel per second of the frames the matte really wrote, matte tinted over the picture, with the tracked area curve underneath, needs `-o` and Pillow); `-o/--output OUT.jpg` (required with `--strip`); `--width N` (default 220, panel width for `--strip`); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte/<id>`: one matte's index (state, frame count, recipe), plus its `span`, `coverage` and `quality`. Works on a matte that is still running or only partly written: the printed block names the span in seconds, says "frozen outside span" out loud, and lists the suspect frames; the strip walks only the written span, labels a panel `held <frame>` when the server served a frozen one, marks suspect frames in red on the curve, and refuses with a sentence (naming the state and the count) when nothing has been written yet. A matte with nothing written used to be drawn as if the whole requested length existed, and the `None` tail raised a `TypeError`, so the mattes most in need of a look over time were the ones that could not be looked at. With `--strip`, the verification pass to run before grading on a matte, see the Masks section of `.claude/skills/studio-grading/SKILL.md` |
 
 ## How a preview frame is made
 
@@ -2562,7 +2577,12 @@ curl -s -H 'Content-Type: application/json' \
 **`GET /api/mask/status`**: the SAM service's own health plus its queue
 (`{ok, backend, model, loaded, busy, queue}`), the first thing to check
 before assuming a stuck job is a problem with this clip rather than the
-service being down or out of capacity.
+service being down or out of capacity. It also reports where this server
+keeps things and what it judges mattes by: `data_dir`, `matte_root`,
+`footage_dir`, `mask_width` (the working width tracks are run at) and
+`quality_thresholds`. `GET /api/health` carries the same three paths, which
+is how the CLI resolves a bare clip name and a matte id through whichever
+server it was told about (see below).
 
 **`GET /api/mask/jobs`**, **`GET /api/mask/jobs/<id>`** (`{"state",
 "done_frames", "total_frames", "fps", "elapsed_s", "matte_ids", "error"}`,
@@ -2573,12 +2593,49 @@ way footage does).
 
 **`GET /api/matte?clip=`** (list), **`GET /api/matte/<id>`** (one index:
 `matte_id`, `clip`, `clip_key`, `rotation`, `fps`, `frames`, `width`,
-`height`, `recipe`, `state`, `done_frames`, `areas`, `scores`, `created`,
-`model`, `backend`), **`DELETE /api/matte/<id>`** (admin only, with logins
-on): a matte's own record, `state` one of `queued`, `running`, `done`,
-`failed`, `stale` (its recipe no longer matches anything live) alongside
+`height`, `recipe`, `state`, `done_frames`, `written_count`, `total_frames`,
+`is_partial`, `areas`, `scores`, `ious`, `created`, `model`, `backend`, plus
+`span`, `frozen_outside_span`, `coverage`, `mean_score`, `mean_area` and
+`quality`), **`DELETE /api/matte/<id>`** (admin only, with logins on): a
+matte's own record, `state` one of `queued`, `running`, `done`, `failed`,
+`stale` (its recipe no longer matches anything live) alongside
 `queued`/`running`'s own `partial` reading (servable by its nearest already
 written frame, never empty).
+
+The LIST route answers a summary per matte and leaves the per frame arrays
+out (`{"mattes": [...], "full": false}`); `?full=1` puts `areas`, `scores`
+and `ious` back. One matte by id always carries them, because `cinegrade mask
+show ID --strip` plots its area curve from exactly that response.
+
+`span` is the window the matte really answers for, computed from the frames on
+disk rather than the declared `frames` count: `{"start_frame", "end_frame"
+(exclusive), "written", "declared_frames", "contiguous", "start_s", "end_s",
+"frozen_outside_span": true}`. Outside it the engines hold the matte's nearest
+written frame, which is what keeps a correction working while a track is still
+running, and is also why it is stated in every response instead of left to be
+discovered by measuring a frozen mask at 20 seconds and believing the number.
+`coverage` is `span.written` over the span's own length, so a matte with a
+hole in the middle reads below 1.0.
+
+`quality` is the per frame flag block: `{"thresholds": {"area_jump",
+"min_iou"}, "checked", "iou_source", "suspect_count", "suspect_frames":
+[{"index", "time", "reasons", "area", "prev_area", "jump", "iou"}, ...],
+"truncated", "first_suspect_index", "first_suspect_time", "reasons":
+{"zero_area", "area_jump", "low_iou"}}`. A written frame is **suspect** when
+its area is zero inside the span, when its area moved by more than
+`area_jump` of the previous written frame's area, or when its IoU with the
+previous written frame is below `min_iou`. Defaults are `0.5` and `0.3`,
+measured on the arc's own bakeoff mattes (a matte that lost its subject and
+latched onto a tree flags 45 of 144 frames; a clean sky matte flags none),
+and are overridable per call and by `CINEGRADE_MATTE_AREA_JUMP` /
+`CINEGRADE_MATTE_MIN_IOU`. The thresholds always travel with the counts, so a
+number can never be read without knowing what judged it. `iou_source` says
+which IoU actually ran: `index` (the `ious` the SAM service wrote as it
+tracked), `frames` (read off disk on demand, `mask show` only), or `none`, so
+an absent rule is stated rather than silently passed. The list route caps
+`suspect_frames` and sets `truncated`; the counts are always the true ones.
+This exists because a track that lost its subject reported nothing at all,
+and a grade was measured against the wrong subject without anybody knowing.
 
 **`GET /api/matte/<id>/frame?time=&width=`**: one grey PNG matte frame,
 nearest written frame served when `time` is past what a still-running track
@@ -2587,6 +2644,24 @@ has reached, with `X-Matte-State` (the matte's state) and `X-Matte-Frame`
 fallback happened without re-parsing anything. `cinegrade mask show ID
 --strip` builds a whole clip's worth of these, one per second, tinted over
 the picture, as a single verification image.
+
+**Rendering on a matte that is not finished.** `POST /api/render` (and
+`cinegrade render`) refuses on COVERAGE OF THE WINDOW ASKED FOR, not on the
+matte's declared state. Every warning `mask_warnings` produces carries a
+`kind` and a `blocking` flag: `missing` (an id that names nothing, or no id
+yet), `pending` (no frames at all) and `partial` (the window has missing
+frames) are blocking; `unfinished` (the window is covered, the track is still
+going) is not. So a matte with 259 of 384 frames written renders a 0 to 10.79
+second window with no flag at all, and prints a `note:` line on stderr saying
+the track is unfinished and holds its last written frame past the window.
+`allow_partial` (`--allow-partial`) still exists for the genuinely uncovered
+case. Before this the refusal keyed on the state, so a render whose every
+frame was on disk was refused for the frames it never asked for, and
+`--allow-partial` was needed to ship a fully covered window.
+
+**`POST /api/stats`** accepts an optional `"width"` (default unchanged: the
+source's own width, or the still's) and every answer, single or `times`
+row, carries `measured_width`, the width the numbers were really taken at.
 
 **`POST /api/stats`** also accepts `"matte": ID` alongside `region`
 (contract C4): weights every percentile, band and hue family by that
@@ -2602,6 +2677,25 @@ studio-grading/SKILL.md`'s Masks section covers the method: verifying a
 matte over time before grading on it, starting tracks early, a hold by
 matte following the subject, a matte intersect key for skin, measuring by
 matte, and what to do when the service is down or a job fails.
+
+**Where the CLI looks for a clip and for a matte.** A server started with
+`--footage` or `--data-dir` keeps its clips and its mattes somewhere the CLI's
+own defaults know nothing about, so with `STUDIO_URL` set the CLI asks it (one
+cached `GET /api/health` per process) instead of failing to find a matte it
+just tracked.
+
+A bare clip name (`cinegrade stats bare.mp4`) resolves: an existing path as
+given, then the server's `footage_dir`, then `content/footage`. A multi-part
+path that does not exist is refused as `no such file` rather than having its
+basename hunted for elsewhere, and a name nothing has is refused with every
+place it looked.
+
+A matte store (`stats --matte`, and a render whose layer holds a matte)
+resolves: `CINEGRADE_MATTE_ROOT`, then `STUDIO_DATA_DIR`, then the server's
+own `data_dir` (set into `STUDIO_DATA_DIR` for that process only), then
+`content/studio/data/mattes`. An explicit variable always wins outright, and
+nothing is created or written on the way. Only the CLI ever asks: the server
+imports the same module and must never end up calling itself.
 
 ### The first party client module
 
@@ -2639,9 +2733,11 @@ by=None)`, `project`, `frame`, `stats(..., matte=None)`, `stats_at(clip,
 times, ..., matte=None)`, `ref_stats`, `match`, `segment(clip, time=0.0,
 prompts=None, text=None, points=None, boxes=None, exemplars=None,
 rotation=None)`, `track(clip, text=None, pick_id=None, select=None,
-start=None, end=None, steady=None, rotation=None, prompts=None)`,
-`wait(job_id, poll=1.0, timeout=None, on_progress=None)`, `matte_frame(id,
-time=0.0, width=None, out=None)`, `preset_save`/`preset_load`,
+start=None, end=None, steady=None, rotation=None, prompts=None,
+force=False)`, `wait(job_id, poll=1.0, timeout=None, on_progress=None)`,
+`mattes(clip, full=False)` (the summary list, `full=True` for the per frame
+arrays), `matte(matte_id)` (one matte, arrays always included),
+`matte_frame(id, time=0.0, width=None, out=None)`, `preset_save`/`preset_load`,
 `grade_save`/`grade_load`, `session_get`/`session_patch`, `sweep`, and the
 escape hatch `request(method, path, ...)` for anything not wrapped yet.
 `segment`/`track` return the routes' own shapes unchanged (`{"pick_id",

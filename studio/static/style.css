@@ -2730,6 +2730,10 @@ html[data-mobile="on"] .activityrow { padding: 8px 10px; }
 .mask-badge[data-state="failed"] { color: var(--danger); border-color: var(--danger); }
 .mask-badge[data-state="stale"],
 .mask-badge[data-state="needs_pick"] { color: var(--warn); border-color: var(--warn); }
+/* The per frame quality flag badge (checkpoint gap 18): a matte can be
+   cleanly "tracked" and still have jumped onto the wrong subject, so this
+   sits beside the state badge rather than replacing it. */
+.mask-badge[data-state="suspect"] { color: var(--danger); border-color: var(--danger); }
 
 .mask-matte, .mask-shape { padding: 4px 0 0; }
 .mask-line {

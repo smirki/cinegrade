@@ -41,7 +41,8 @@ from typing import Any, Iterator
 import numpy as np
 
 from .base import (Backend, BackendError, BackendUnavailable, Instance,
-                   TrackedMask, mask_box, normalize_prompts, plan_objects)
+                   TrackedMask, mask_box, normalize_prompts, plan_objects,
+                   window_meter)
 
 CHUNK_FRAMES = 48
 
@@ -56,6 +57,7 @@ class TorchAdapter(Backend):
         self._outer_lock_held = outer_lock_held
         self._log = log
         self._inner = None
+        self.meter = window_meter(log=log)
         self.name = "torch-mps" if device == "mps" else "torch-cpu"
         self.model = repo_id or "jetjodh/sam3"
 
@@ -93,6 +95,47 @@ class TorchAdapter(Backend):
         if self._inner is not None:
             self._inner.close()
             self._inner = None
+        gc.collect()
+        self._empty_cache()
+
+    # -- memory ------------------------------------------------------------
+
+    def _empty_cache(self) -> None:
+        """Hand the Mac GPU's allocator cache back, the torch equivalent of
+        MLX's `clear_cache`.
+
+        torch's MPS allocator caches freed blocks exactly the way MLX's does,
+        so a windowed track that never empties it grows for the same reason
+        the MLX one did: the live set is one window, the process is every
+        window. On CPU there is nothing to empty and this is a no op.
+        """
+        if self._device != "mps":
+            return
+        try:
+            import torch
+
+            torch.mps.empty_cache()
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def memory(self) -> dict:
+        """What torch says it is holding on the Mac GPU, in MB."""
+        if self._device != "mps":
+            return {"device": "cpu"}
+        try:
+            import torch
+
+            return {
+                "device": "mps",
+                "active_mb": round(torch.mps.current_allocated_memory() / 1048576, 1),
+                "driver_mb": round(torch.mps.driver_allocated_memory() / 1048576, 1),
+            }
+        except Exception:                                       # noqa: BLE001
+            return {"device": "mps"}
+
+    def release(self) -> None:
+        gc.collect()
+        self._empty_cache()
 
     # -- one frame ---------------------------------------------------------
 
@@ -168,8 +211,11 @@ class TorchAdapter(Backend):
         last_mask: dict[str, np.ndarray] = {}
 
         for window_index, (start, window) in enumerate(self._windows(frames)):
-            self.window = {"start": start, "end": start + len(window),
-                           "frames": len(window), "size": self.chunk_frames}
+            window_size = len(window)
+            self.window = {"start": start, "end": start + window_size,
+                           "frames": window_size, "size": self.chunk_frames}
+            self.meter.start(start=start, end=start + window_size,
+                             frames=window_size)
             if window_index == 0:
                 seeded, order = inner_prompts, None
             else:
@@ -215,10 +261,17 @@ class TorchAdapter(Backend):
                     if mask.any():
                         last_mask[mapping[key]] = mask
                 on_frame(start + index, renamed)
+                self.meter.sample()
 
-            self._inner.track(iter(window), fps, seeded, "all", relabel)
-            window = None
-            gc.collect()
+            try:
+                self._inner.track(iter(window), fps, seeded, "all", relabel)
+            finally:
+                # The inner backend materialises whatever iterator it is given
+                # (`list(frames)`), so this list is a second copy of the same
+                # window until it goes. Emptying it in place drops the copy the
+                # generator is still holding too.
+                window.clear()
+                self.meter.finish(freed=self.release)
         self.window = None
 
     def _windows(self, frames: Iterator[np.ndarray]):
@@ -230,8 +283,10 @@ class TorchAdapter(Backend):
         for frame in frames:
             buffer.append(frame)
             if len(buffer) >= self.chunk_frames:
-                yield start, buffer
-                start += len(buffer) - 1
-                buffer = [buffer[-1]]
+                tail, size = buffer[-1], len(buffer)
+                yield start, buffer          # the caller may empty this list
+                start += size - 1
+                buffer = [tail]
+                tail = None
         if len(buffer) > 1 or start == 0:
             yield start, buffer

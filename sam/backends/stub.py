@@ -30,7 +30,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from .base import (Backend, Instance, ObjectSlot, TrackedMask, mask_area,
-                   mask_box, normalize_prompts, plan_objects)
+                   mask_box, normalize_prompts, plan_objects, window_meter)
 
 # How far the ellipse wanders, as a fraction of the frame, and how fast.
 DRIFT_X = 0.18
@@ -116,9 +116,16 @@ class StubBackend(Backend):
     name = "stub"
     model = "stub-ellipse"
 
-    def __init__(self, delay_ms: float = 0.0, chunk_frames: int = 48) -> None:
+    def __init__(self, delay_ms: float = 0.0, chunk_frames: int = 48,
+                 log=print) -> None:
         self._loaded = False
         self.delay_ms = float(delay_ms or 0.0)
+        self._log = log
+        # The stub has no MLX allocator to bound, but it does report the same
+        # per window memory record the real backends report, so the /health
+        # fields, the CLI and the browser can be built and tested against it
+        # without weights and without the machine wide model lock.
+        self.meter = window_meter(log=log)
         # The stub has no memory problem, so it does not need windows. It
         # reports them anyway, because a real backend must track in bounded
         # windows on this machine and the studio shows which one is loaded:
@@ -131,6 +138,17 @@ class StubBackend(Backend):
 
     def close(self) -> None:
         self._loaded = False
+
+    def memory(self) -> dict:
+        """No model, so no model memory: the shape is here, the numbers are
+        honest zeros. `limits` is empty rather than absent, because a caller
+        that reads /health should not have to branch on the backend."""
+        return {"active_mb": 0.0, "cache_mb": 0.0, "peak_mb": 0.0, "limits": {}}
+
+    def release(self) -> None:
+        import gc
+
+        gc.collect()
 
     # -- one frame ---------------------------------------------------------
 
@@ -181,9 +199,13 @@ class StubBackend(Backend):
 
         for index, frame in enumerate(frames):
             if index % self.chunk_frames == 0:
+                if self.window is not None:
+                    self.meter.finish()
                 self.window = {"start": index, "end": index + self.chunk_frames,
                                "frames": self.chunk_frames,
                                "size": self.chunk_frames}
+                self.meter.start(start=index, end=index + self.chunk_frames,
+                                 frames=self.chunk_frames)
             if FAIL_PHRASE in prompts["text"] and index >= 2:
                 raise RuntimeError("the stub was asked to fail on purpose")
             if self.delay_ms:
@@ -194,4 +216,7 @@ class StubBackend(Backend):
                                           round(ell.score(time_s), 4))
                      for slot_id, ell in ellipses.items()}
             on_frame(index, masks)
+            self.meter.sample()
+        if self.window is not None:
+            self.meter.finish()
         self.window = None

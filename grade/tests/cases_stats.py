@@ -293,8 +293,12 @@ def test_cmd_stats_clip_and_image_envelopes_agree(ctx):
     clip_out = json.loads(r_clip.stdout)
     ctx.expect_eq("image and clip stats envelopes carry the same keys",
                   set(img_out), set(clip_out))
-    ctx.expect_eq("the envelope is exactly key/size/stats",
-                  set(clip_out), {"key", "size", "stats"})
+    # measured_width joined the envelope with checkpoint gap 11: the server
+    # route measures a 640 wide preview by default and this CLI measures the
+    # source's own resolution, so both now state the width they read rather
+    # than leaving it to be inferred from `size`.
+    ctx.expect_eq("the envelope is exactly key/size/measured_width/stats",
+                  set(clip_out), {"key", "size", "measured_width", "stats"})
     ctx.expect_true("no stray time key on a singular clip measurement",
                     "time" not in clip_out, str(set(clip_out)))
 

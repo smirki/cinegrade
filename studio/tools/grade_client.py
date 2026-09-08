@@ -443,7 +443,7 @@ class Studio:
     def track(self, clip: str, text=None, pick_id: str | None = None,
              select=None, start: float | None = None, end: float | None = None,
              steady: bool | None = None, rotation: str | None = None,
-             prompts: dict | None = None) -> dict:
+             prompts: dict | None = None, force: bool = False) -> dict:
         """POST /api/mask/track: start a background SAM track over a clip.
 
         Returns immediately with `{"job_id", "mattes": [{"matte_id",
@@ -459,6 +459,17 @@ class Studio:
         list of ids, or `"all"`) chooses what gets tracked; give one, not
         both. `prompts` is the same escape hatch `segment` takes, for a
         point/box prompt instead of text.
+
+        An identical repeat request is free while the cached matte still
+        covers the window asked for (`"cached": true` comes back and
+        `job_id` is None). When it does not, the call RESUMES it: the frames
+        already written stay where they are and only the missing range is
+        queued. When the earlier attempt ended `failed`, `cancelled` or
+        `stale` it RESTARTS instead, re-queueing the whole window, since a
+        dead attempt's first missing frame is not a place to pick up from.
+        `"resumed"`/`"restarted"` and a `"message"` say which happened
+        (checkpoint gap 12). `force=True` throws the cached frames away and
+        tracks the whole window again.
         """
         using_pick = pick_id is not None
         p = dict(prompts) if prompts is not None else {}
@@ -479,7 +490,28 @@ class Studio:
                 body[key] = value
         if rotation is not None:
             body["rotation"] = rotation
+        if force:
+            body["force"] = True
         return self.request("POST", "/api/mask/track", body=body)
+
+    def mattes(self, clip: str, full: bool = False) -> dict:
+        """GET /api/matte?clip=: that clip's mattes, `{"mattes": [...]}`.
+
+        The summary by default: id, recipe, state, span, done/total frames,
+        coverage of the span, mean score, and the per frame quality flag
+        summary (`quality.suspect_count`, `quality.first_suspect_time`).
+        `full=True` (`?full=1`) adds the per frame `areas`/`scores`/`ious`
+        arrays, which are padded to the clip's whole length and are why this
+        route used to answer with thousands of nulls for four states
+        (checkpoint gap 6).
+        """
+        return self.request("GET", "/api/matte",
+                            params={"clip": clip,
+                                   **({"full": "1"} if full else {})})
+
+    def matte(self, matte_id: str) -> dict:
+        """GET /api/matte/<id>: one matte's whole index, arrays included."""
+        return self.request("GET", f"/api/matte/{matte_id}")
 
     def wait(self, job_id: str, poll: float = 1.0, timeout: float | None = None,
              on_progress=None) -> dict:

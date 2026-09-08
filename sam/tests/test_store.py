@@ -33,6 +33,18 @@ def ramp(value: float) -> np.ndarray:
     return np.full((4, 8), value, dtype=np.float32)
 
 
+def half(left: bool) -> np.ndarray:
+    """Half the frame covered, on one side or the other. Two of these in a
+    row overlap in nothing, which is the shape change the per frame IoU
+    (checkpoint gap 18) exists to notice."""
+    a = np.zeros((4, 8), dtype=np.float32)
+    if left:
+        a[:, :4] = 1.0
+    else:
+        a[:, 4:] = 1.0
+    return a
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="sam-store-"))
 
@@ -118,6 +130,98 @@ def main() -> int:
     check("steady 5 emits every frame once", [e[0] for e in emitted] == list(range(12)))
     check("an interior frame is the mean of its five neighbours",
           abs(float(emitted[6][1].mean()) - 6.0) < 1e-4, str(float(emitted[6][1].mean())))
+
+    print("\nper frame IoU with the previous written frame (gap 18)")
+    iou_writer = MatteWriter(root, "m_iou", header(4), steady=1)
+    iou_writer.push(0, half(True), 0.9)      # left half
+    iou_writer.push(1, half(True), 0.9)      # the same half: no change
+    iou_writer.push(2, half(False), 0.9)     # the other half: nothing shared
+    iou_writer.push(3, half(True), 0.9)      # back again
+    iou_writer.finish("done")
+    index = read_index(iou_writer.dir)
+    check("ious is one slot per frame, indexed like areas and scores",
+          len(index["ious"]) == 4, str(index["ious"]))
+    check("the first written frame has nothing to compare against",
+          index["ious"][0] is None, str(index["ious"][0]))
+    check("an unchanged mask reads as an IoU of 1",
+          abs(index["ious"][1] - 1.0) < 1e-6, str(index["ious"][1]))
+    check("a mask that jumps to a disjoint region reads as an IoU of 0",
+          abs(index["ious"][2] - 0.0) < 1e-6, str(index["ious"][2]))
+    check("and jumping back is just as suspect",
+          abs(index["ious"][3] - 0.0) < 1e-6, str(index["ious"][3]))
+    check("the store writes ious itself, so nothing has to re-read the pngs "
+          "to judge a matte",
+          "ious" in index)
+
+    print("\nre-opening a matte id is a resume, not a restart (gap 12)")
+    first = MatteWriter(root, "m_resume", header(10), steady=1)
+    first.set_state("running")
+    for i in range(4):
+        first.push(i, ramp(0.5), 0.9)
+    first.finish("partial", "cancelled")
+    stopped = read_index(first.dir)
+    check("the cancelled attempt wrote four frames",
+          stopped["done_frames"] == 4 and stopped["areas"][3] is not None
+          and stopped["areas"][4] is None, str(stopped["done_frames"]))
+
+    second = MatteWriter(root, "m_resume", header(10), steady=1)
+    check("re-opening it does not blank the frames already written",
+          second.done == 4, str(second.done))
+    resumed_open = read_index(second.dir)
+    check("and does not blank the arrays either",
+          resumed_open["areas"][0] is not None
+          and resumed_open["areas"][3] is not None,
+          str(resumed_open["areas"][:5]))
+    second.set_state("running")
+    for i in range(4, 10):
+        second.push(i, ramp(0.75), 0.8)
+    second.finish("done")
+    index = read_index(second.dir)
+    files = sorted(p.name for p in second.dir.glob("*.png"))
+    check("the tail lands in the same directory as the head",
+          len(files) == 10 and files[0] == "000000.png"
+          and files[-1] == "000009.png", str(len(files)))
+    check("done_frames counts what is on disk, head and tail together",
+          index["done_frames"] == 10, str(index["done_frames"]))
+    check("the earlier attempt's own areas survive the resume",
+          abs(index["areas"][0] - 0.5) < 0.01, str(index["areas"][0]))
+    check("and the tail's areas are the new run's",
+          abs(index["areas"][9] - 0.75) < 0.01, str(index["areas"][9]))
+    check("the resumed matte reads done, not partial",
+          index["state"] == "done" and index["error"] is None)
+
+    print("\na resumed range that overlaps is not counted twice")
+    third = MatteWriter(root, "m_resume", header(10), steady=1)
+    for i in range(2, 10):                     # re-writes 2..9 over the top
+        third.push(i, ramp(0.6), 0.7)
+    third.finish("done")
+    index = read_index(third.dir)
+    check("done_frames is the number of frames on disk, not the number of "
+          "writes",
+          index["done_frames"] == 10, str(index["done_frames"]))
+    check("an overwritten frame takes the new run's value",
+          abs(index["areas"][2] - 0.6) < 0.01, str(index["areas"][2]))
+
+    print("\na different length is a different track, not a resume")
+    other = MatteWriter(root, "m_resume", header(20), steady=1)
+    check("re-opening the same id with another frame count starts clean",
+          other.done == 0, str(other.done))
+    fresh = read_index(other.dir)
+    check("and its arrays are the new length, all empty",
+          len(fresh["areas"]) == 20 and all(a is None for a in fresh["areas"]))
+
+    print("\na matte that starts part way through keeps the earlier start")
+    late = MatteWriter(root, "m_startkeep",
+                       dict(header(120), start_frame=48, end_frame=52), steady=1)
+    late.push(48, ramp(1.0), 1.0)
+    late.finish("partial", "cancelled")
+    resumed_late = MatteWriter(root, "m_startkeep",
+                               dict(header(120), start_frame=49, end_frame=52),
+                               steady=1)
+    check("start_frame keeps the earliest of the two ranges, so the span a "
+          "caller already read does not move",
+          resumed_late.index["start_frame"] == 48,
+          str(resumed_late.index["start_frame"]))
 
     print("\nindex.json is never seen half written")
     writer = MatteWriter(root, "m_atomic", header(4), steady=1)

@@ -244,16 +244,28 @@ class Identity(unittest.TestCase):
         out = call("/api/health")
         self.assertEqual(out["status"], 200)
         self.assertTrue(out["ok"])
+        # footage_dir and matte_root joined this route with checkpoint gap 4:
+        # a CLI pointed at a server with STUDIO_URL had its own idea of where
+        # footage and mattes live, so a bare clip name that worked in the
+        # panel raised an ffprobe traceback in the shell. One cheap call now
+        # says where both are.
         self.assertEqual(set(out) - {"status", "_set_cookie"},
                          {"ok", "version", "clips", "uptime_s",
                           "ffmpeg_slots_free", "cache_dir", "data_dir",
-                          "logins"})
+                          "footage_dir", "matte_root", "logins"})
         self.assertFalse(out["logins"])
         self.assertEqual(out["clips"], len(STATE["clips"]))
         self.assertIsInstance(out["version"], str)
         self.assertGreater(out["uptime_s"], 0)
         self.assertGreaterEqual(out["ffmpeg_slots_free"], 0)
         self.assertEqual(Path(out["data_dir"]), Path(STATE["tmp"]).resolve())
+        # Both new paths are this server's own, not the CLI's defaults:
+        # answering with content/footage here would send a caller looking in
+        # the founder's real folders for a clip only this temp server has.
+        self.assertEqual(Path(out["footage_dir"]).resolve(),
+                         Path(STATE["footage"]).resolve())
+        self.assertEqual(Path(out["matte_root"]).parent,
+                         Path(STATE["tmp"]).resolve())
 
     def test_02_the_cache_lands_under_the_data_dir(self):
         # The whole reason this exists: a temp server must not evict the

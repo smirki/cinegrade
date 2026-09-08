@@ -41,6 +41,16 @@ class FakeState:
         self.mattes: dict[str, dict] = {}
         self.picks: dict[str, dict] = {}
         self.next_id = 0
+        # What GET /api/health answers for footage_dir / data_dir /
+        # matte_root, so a test can point the CLI's own resolution at its
+        # temp folders (checkpoint gaps 4 and 5).
+        self.paths: dict[str, str] = {}
+        # Saved presets, the namespace `--preset NAME` reads before the
+        # built-in catalog when STUDIO_URL is set (checkpoint gap 17).
+        self.presets: dict[str, dict] = {}
+        # recipe key -> matte ids, so a repeat track is a cache hit and a
+        # dead matte resumes (checkpoint gap 12).
+        self.recipes: dict[str, list] = {}
 
     def new_id(self, prefix: str) -> str:
         self.next_id += 1
@@ -74,6 +84,91 @@ def _picture_jpeg(t: float, width: int) -> bytes:
     return buf.getvalue()
 
 
+def _areas_for(done: int, total: int, suspect: bool = False) -> list:
+    """`areas` the way the real store writes it: indexed by ABSOLUTE frame
+    index, padded to `total` with None wherever nothing is written yet
+    (contract C2). The `None` tail is exactly what made `mask show --strip`
+    raise a TypeError on a partial matte (checkpoint gap 13), so the fake
+    has to have it or the fix cannot be tested here.
+
+    `suspect` writes a track that went wrong the way the grader's "face"
+    matte did (checkpoint gap 18): it holds a small area, loses the subject
+    entirely at frame 2, then latches onto something several times bigger.
+    Frame 2 trips the zero-area rule and frame 4 trips the area-jump rule.
+    """
+    def area(i: int) -> float:
+        if not suspect:
+            return 0.02 + 0.01 * i
+        if i == 2:
+            return 0.0
+        return 0.05 if i < 4 else 0.30 + 0.01 * i
+
+    return [area(i) if i < done else None for i in range(total)]
+
+
+def _matte_summary(mid: str, m: dict, full: bool = True) -> dict:
+    """The C4 matte record, summary by default (checkpoint gap 6).
+
+    A small, independent copy of what studio/server.py's own
+    `_matte_summary` answers: span and coverage of it, the mean score, and
+    the per frame quality flag block (gap 18). Independent on purpose, the
+    same way this whole file is: it pins the WIRE shape the CLI parses, not
+    the server's implementation of it.
+    """
+    areas = list(m.get("areas") or [])
+    written = [i for i, v in enumerate(areas) if v is not None]
+    fps = float(m.get("fps") or 24.0)
+    total = int(m.get("frames") or 0)
+    first = written[0] if written else 0
+    end = (written[-1] + 1) if written else 0
+    span_len = max(0, end - first)
+    thresholds = {"area_jump": 0.5, "min_iou": 0.3}
+    flagged = []
+    prev = None
+    for i in written:
+        reasons = []
+        v = float(areas[i])
+        if v <= 0.0:
+            reasons.append("zero_area")
+        if prev is not None and prev > 0 and abs(v - prev) / prev > thresholds["area_jump"]:
+            reasons.append("area_jump")
+        if reasons:
+            flagged.append({"index": i, "time": round(i / fps, 4),
+                            "reasons": reasons, "area": v, "prev_area": prev,
+                            "jump": None, "iou": None})
+        prev = v
+    out = dict(m, matte_id=mid)
+    out["span"] = {"start_frame": first, "end_frame": end,
+                   "written": len(written), "declared_frames": total,
+                   "contiguous": span_len == len(written),
+                   "start_s": round(first / fps, 4),
+                   "end_s": round(end / fps, 4) if written else 0.0,
+                   "frozen_outside_span": True}
+    out["frozen_outside_span"] = True
+    out["coverage"] = round(len(written) / span_len, 4) if span_len else 0.0
+    scores = [v for v in (m.get("scores") or []) if v is not None]
+    out["mean_score"] = round(sum(scores) / len(scores), 6) if scores else None
+    out["total_frames"] = total
+    out["written_count"] = len(written)
+    out["is_partial"] = len(written) < total or m.get("state") != "done"
+    out["quality"] = {
+        "thresholds": thresholds, "checked": len(written), "iou_source": "none",
+        "suspect_count": len(flagged), "suspect_frames": flagged[:8],
+        "truncated": len(flagged) > 8,
+        "first_suspect_index": flagged[0]["index"] if flagged else None,
+        "first_suspect_time": flagged[0]["time"] if flagged else None,
+        "reasons": {"zero_area": sum(1 for f in flagged
+                                     if "zero_area" in f["reasons"]),
+                    "area_jump": sum(1 for f in flagged
+                                     if "area_jump" in f["reasons"]),
+                    "low_iou": 0},
+    }
+    if not full:
+        for key in ("areas", "scores", "ious"):
+            out.pop(key, None)
+    return out
+
+
 def _advance_job(job: dict) -> None:
     if job["state"] == "queued":
         job["state"] = "running"
@@ -84,7 +179,8 @@ def _advance_job(job: dict) -> None:
         for mid in job["matte_ids"]:
             m = STATE.mattes[mid]
             m["done_frames"] = job["done_frames"]
-            m["areas"] = [0.02 + 0.01 * i for i in range(job["done_frames"])]
+            m["areas"] = _areas_for(job["done_frames"], int(m["frames"]),
+                                    suspect=job["clip"] == "SUSPECT_CLIP")
             m["state"] = "running"
         if job["done_frames"] >= job["total_frames"]:
             job["state"] = "done"
@@ -131,7 +227,24 @@ class Handler(BaseHTTPRequestHandler):
         q = self._query()
         with STATE_LOCK:
             if path == "/api/health":
-                self._json({"ok": True, "backend": "stub"})
+                # footage_dir / data_dir / matte_root are what let the CLI
+                # resolve a bare clip name and a matte id through the server
+                # instead of its own defaults (checkpoint gaps 4 and 5). A
+                # test sets STATE.paths to point them at its own temp dirs.
+                self._json({"ok": True, "backend": "stub", **STATE.paths})
+                return
+            if path == "/api/preset":
+                # Checkpoint gap 17: `--preset NAME` reads the studio's own
+                # saved presets before the built-in catalog when STUDIO_URL
+                # is set. STATE.presets is what `preset save` would have
+                # written; an unknown name is a 404, so `auto` falls through.
+                name = q.get("name") or ""
+                cfg = STATE.presets.get(name)
+                if cfg is None:
+                    self._json({"error": f"no preset {name}"}, 404)
+                    return
+                self._json({"name": name, "comment": "", "config": cfg,
+                            "expanded": True})
                 return
             if path == "/api/mask/jobs":
                 jobs = [dict(j, job_id=jid) for jid, j in STATE.jobs.items()]
@@ -153,9 +266,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/matte":
                 clip = q.get("clip")
-                out = [dict(m, matte_id=mid) for mid, m in STATE.mattes.items()
+                full = str(q.get("full", "")).lower() in ("1", "true", "yes")
+                out = [_matte_summary(mid, m, full=full)
+                      for mid, m in STATE.mattes.items()
                       if clip is None or m["clip"] == clip]
-                self._json({"mattes": out})
+                self._json({"mattes": out, "full": full})
                 return
             if path.startswith("/api/matte/") and path.endswith("/frame"):
                 mid = path.split("/")[3]
@@ -176,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 if m is None:
                     self._json({"error": f"no matte {mid}"}, 404)
                     return
-                self._json(dict(m, matte_id=mid))
+                self._json(_matte_summary(mid, m, full=True))
                 return
             if path.startswith("/previews/"):
                 # segment's overlay/mask preview images: server-relative,
@@ -192,6 +307,21 @@ class Handler(BaseHTTPRequestHandler):
         with STATE_LOCK:
             if path == "/api/mask/segment":
                 pick_id = STATE.new_id("pick")
+                texts = ((body.get("prompts") or {}).get("text") or [])
+                if any("nothing" in str(t) for t in texts):
+                    # Checkpoint gap 3: zero matches carries a sentence and a
+                    # candidates count, not just an empty list.
+                    asked = ", ".join(f'"{t}"' for t in texts)
+                    self._json({
+                        "pick_id": pick_id, "instances": [], "candidates": 0,
+                        "warnings": ["the model found nothing for these prompts"],
+                        "message": (f"no match for {asked} at "
+                                    f"{float(body.get('time', 0)):g}s: 0 "
+                                    f"candidates from the model. Try another "
+                                    f"word for the same thing, a different "
+                                    f"--time, or a --point/--box prompt on the "
+                                    f"pixels themselves.")})
+                    return
                 instances = [
                     {"id": "1", "score": 0.94, "box": [0.1, 0.1, 0.6, 0.9],
                     "area": 0.32,
@@ -204,30 +334,73 @@ class Handler(BaseHTTPRequestHandler):
                 ]
                 STATE.picks[pick_id] = {"clip": body.get("clip"),
                                         "instances": instances}
-                self._json({"pick_id": pick_id, "instances": instances})
+                self._json({"pick_id": pick_id, "instances": instances,
+                            "candidates": len(instances)})
                 return
             if path == "/api/mask/track":
                 clip = body.get("clip")
-                job_id = STATE.new_id("job")
                 fail = clip == "FAIL_CLIP"
                 total = 9
-                matte_id = STATE.new_id("m_")
-                STATE.mattes[matte_id] = {
-                    "clip": clip, "clip_key": clip, "rotation": "auto",
-                    "fps": 24.0, "frames": total, "width": 240, "height": 135,
-                    "recipe": body, "state": "failed" if fail else "queued",
-                    "done_frames": 0, "areas": [], "scores": [],
-                    "created": time.time(), "model": "stub", "backend": "stub",
-                }
+                force = bool(body.get("force"))
+                # The recipe cache, keyed the way the real server keys it
+                # (clip, rotation, prompts/pick), so a repeat request can be
+                # a hit, a resume, or a forced redo (checkpoint gap 12).
+                key = json.dumps([clip, body.get("rotation"),
+                                  body.get("prompts"), body.get("pick_id"),
+                                  body.get("select")], sort_keys=True)
+                known = [mid for mid in STATE.recipes.get(key, [])
+                        if mid in STATE.mattes]
+                if known and not force:
+                    dead = [mid for mid in known
+                           if STATE.mattes[mid]["state"] in
+                           ("failed", "stale", "cancelled")]
+                    short = [mid for mid in known
+                            if STATE.mattes[mid]["done_frames"] <
+                            int(STATE.mattes[mid]["frames"])]
+                    if not dead and not short:
+                        self._json({"job_id": None, "cached": True, "mattes": [
+                            {"matte_id": mid, "recipe": STATE.mattes[mid]["recipe"],
+                            "state": STATE.mattes[mid]["state"]}
+                            for mid in known]})
+                        return
+                job_id = STATE.new_id("job")
+                resumed = bool(known) and not force
+                if known:
+                    matte_ids = known
+                    for mid in matte_ids:
+                        STATE.mattes[mid]["state"] = "queued"
+                        if force:
+                            STATE.mattes[mid]["done_frames"] = 0
+                            STATE.mattes[mid]["areas"] = _areas_for(0, total)
+                else:
+                    matte_ids = [STATE.new_id("m_")]
+                    STATE.mattes[matte_ids[0]] = {
+                        "clip": clip, "clip_key": clip, "rotation": "auto",
+                        "fps": 24.0, "frames": total, "width": 240, "height": 135,
+                        "recipe": body, "state": "failed" if fail else "queued",
+                        "done_frames": 0, "areas": _areas_for(0, total),
+                        "scores": [], "created": time.time(),
+                        "model": "stub", "backend": "stub",
+                    }
+                STATE.recipes[key] = matte_ids
+                first = STATE.mattes[matte_ids[0]]
                 STATE.jobs[job_id] = {
                     "clip": clip, "state": "failed" if fail else "queued",
-                    "done_frames": 0, "total_frames": total, "fps": 3.5,
-                    "matte_ids": [matte_id], "started": time.time(),
+                    "done_frames": first["done_frames"], "total_frames": total,
+                    "fps": 3.5, "matte_ids": matte_ids, "started": time.time(),
                     "error": "synthetic failure for FAIL_CLIP" if fail else None,
                 }
-                self._json({"job_id": job_id, "mattes": [
-                    {"matte_id": matte_id, "recipe": body,
-                    "state": STATE.mattes[matte_id]["state"]}]})
+                out = {"job_id": job_id, "cached": False, "mattes": [
+                    {"matte_id": mid, "recipe": STATE.mattes[mid]["recipe"],
+                    "state": STATE.mattes[mid]["state"]} for mid in matte_ids]}
+                if known:
+                    out["resumed"] = resumed
+                    out["restarted"] = bool(force)
+                    out["resumed_from"] = first["done_frames"]
+                    out["message"] = ("force: previous frames cleared, "
+                                      "tracking again" if force else
+                                      f"resuming from frame {first['done_frames']}")
+                self._json(out)
                 return
             if path == "/api/frame":
                 t = float(body.get("time", 0.0))
