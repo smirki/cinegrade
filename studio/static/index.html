@@ -586,48 +586,90 @@
          cards together instead of leaving any one of them stranded at a
          leftover width. gs-no-resize plus the .autosize wrapper: same
          content-follows-size treatment as scopes above, same reason (see
-         that card's own comment, and initAutosizeCards in app.js) -- #marks
-         in particular can grow to more than one row as marks pile up, and
-         that should grow this card, not scroll inside it. -->
+         that card's own comment, and initAutosizeCards in app.js): the
+         transport row wraps to a second line at a narrow width, and that
+         should grow this card rather than be clipped by it. (Marks used to
+         be the growing part, as a wrapping row of chips under the bar. They
+         are flags on the ruler now, so they cost the card nothing however
+         many there are.) -->
     <div class="grid-stack-item" gs-id="timeline" gs-x="0" gs-y="11" gs-w="1" gs-h="3" gs-no-resize="true">
       <div class="grid-stack-item-content">
         <div class="widgethead">Timeline</div>
         <div class="autosize">
+        <!-- One transport row and one ruler (static/timeline.js). It used to
+             be two rows of form controls plus a scrolling filmstrip and a
+             wrapping row of mark chips; everything that was a number in a
+             text box is now a thing on the ruler you can see and drag. The
+             element ids below are load bearing beyond this file: app.js
+             binds every button by id, and #playDur / #loopStart / #loopEnd
+             are still the values the two playback engines read (see the
+             comment on .tlghost in style.css for why they are still inputs
+             rather than plain state). -->
         <div id="timeline">
           <div class="tlbar">
-            <button class="btn" id="playHead">|&lt;</button>
-            <button class="btn" id="stepBack" title="one frame back (,)">&lt;</button>
-            <button class="btn" id="stepFwd" title="one frame forward (.)">&gt;</button>
+            <button class="btn tlicon" id="playHead" title="First frame (home)">&#9198;</button>
+            <!-- "-1" and "+1" rather than two more triangles: a triangle next
+                 to a button that says Play reads as a second play button, and
+                 the one thing these two do is move the playhead by exactly one
+                 frame (ten with shift). -->
+            <button class="btn tlicon tlstep" id="stepBack" title="One frame back (,), ten with shift">-1</button>
+            <button class="btn tlicon tlplay toggle" id="playBtn" title="Play or pause from the playhead, with the current grade, looping the range (space or P)">Play</button>
+            <button class="btn tlicon tlstep" id="stepFwd" title="One frame forward (.), ten with shift">+1</button>
+            <button class="btn tlicon" id="tlEnd" title="Last frame (end)">&#9197;</button>
+            <!-- The one place the time is written out. #timeLabel stays
+                 exactly "N.NNs" and nothing else: three specs parseFloat it.
+                 The frame number and the duration are their own spans beside
+                 it, and the whole readout is a drag source carrying the
+                 playhead's time (contract E4, drop it on a frame slot). -->
+            <span class="tlclock" id="tlClock" title="Playhead. Drag onto a frame slot to show that time there">
+              <b class="mono" id="timeLabel">0.00s</b>
+              <span class="mono tlframe" id="tlFrame">f0</span>
+              <span class="tlslash">/</span>
+              <span class="mono tlframe" id="tlDur">0.00s</span>
+            </span>
             <span class="sep"></span>
-            <button class="btn toggle" id="playBtn" title="Play from the current playhead with the current grade, looping until stopped or scrubbed (P)">Play</button>
-            <label class="tb" title="Length of clip played per loop; empty plays the whole clip">secs <input type="text" id="playDur" class="mono num" size="3" placeholder="all"></label>
-            <span class="mono muted" id="playStatus"></span>
-            <span class="sep"></span>
-            <input type="range" id="scrub" min="0" max="1000" value="0">
-            <span class="mono" id="timeLabel">0.00s</span>
             <button class="btn" id="markBtn" title="Mark this frame (M)">Mark</button>
-            <button class="btn" id="clearMarksBtn">Clear marks</button>
+            <button class="btn tlonlymarks" id="clearMarksBtn" title="Remove every mark">Clear</button>
+            <span class="sep"></span>
+            <button class="btn" id="loopMarkBtn" title="Set the loop range from the playhead to the next mark, or clear it">Range</button>
+            <button class="btn toggle" id="loopBtn" title="Loop the range on the GPU, re-grading every frame as it plays (shift L)">Loop</button>
             <span class="spacer"></span>
-            <button class="btn accent" id="renderDialogBtn" title="Open the render dialog (R)">Render</button>
+            <span class="mono muted small tlstatus" id="playStatus"></span>
+            <span class="mono muted small tlstatus" id="loopStatus"></span>
+            <span class="mono muted small tlstatus" id="loopBudget"></span>
+            <button class="btn accent" id="renderDialogBtn" title="Open the render dialog (shift R)">Render</button>
           </div>
-          <!-- Live loop (job: live GPU viewer, mode 2). Its own row, its own
-               button, deliberately not sharing playBtn above: Play streams a
-               server-encoded segment once through; Loop decodes a range once
-               and then re-grades every frame on the GPU as it repeats, and
-               every knob stays live while it does. The two are mutually
-               exclusive (app.js stops one before starting the other) but are
-               not the same feature wearing two names. -->
-          <div class="tlbar" id="loopBar">
-            <button class="btn toggle" id="loopBtn" title="Loop this range on the GPU, grading every frame as it plays">Loop</button>
-            <label class="tb" title="Loop range start, in seconds">from <input type="text" id="loopStart" class="mono num" size="4" value="0"></label>
-            <label class="tb" title="Loop range end, in seconds">to <input type="text" id="loopEnd" class="mono num" size="4" value="2"></label>
-            <button class="btn" id="loopMarkBtn" title="Set the loop range from the playhead and the next mark">Use marks</button>
-            <span class="mono muted" id="loopStatus"></span>
-            <span class="spacer"></span>
-            <span class="mono muted small" id="loopBudget"></span>
+          <!-- The ruler. One scrub surface: a pointer down anywhere in it
+               moves the playhead there and a drag follows the pointer, on
+               mouse, trackpad and touch alike (timeline.js). Its children are
+               painted layers, not controls: only the mark flags and the loop
+               range's own out handle take a pointer of their own. #scrub
+               keeps its id because app.js, three specs and the touch-action
+               rule in style.css all name it. -->
+          <div id="scrub" class="tltrack" tabindex="0" role="slider"
+               aria-label="Playhead" aria-valuemin="0" aria-valuenow="0" aria-valuetext="0.00s">
+            <div class="tlruler" id="tlRuler"></div>
+            <div id="thumbs" class="tlstrip"></div>
+            <div class="tlrange" id="tlRange">
+              <div class="tlband" id="tlBand">
+                <span class="tlbandlabel" id="tlBandLabel"></span>
+              </div>
+              <div class="tlout" id="tlOut" title="Drag to set how much of the clip Play loops"></div>
+            </div>
+            <div id="marks" class="tlmarks"></div>
+            <div class="tlhead" id="tlHead"></div>
+            <div class="tlhover" id="tlHover"><span class="tlbubble" id="tlBubble"></span></div>
           </div>
-          <div id="thumbs"></div>
-          <div id="marks"></div>
+          <!-- Still inputs, still the values both playback engines read
+               (playDurationValue and loopDuration in app.js), still written
+               and restored exactly as before (extras.play_secs). The ruler
+               above is now the only thing that writes them, and the spec that
+               checks the round trip still sets and reads them directly. -->
+          <div class="tlghost">
+            <input type="text" id="playDur" value="">
+            <input type="text" id="loopStart" value="0">
+            <input type="text" id="loopEnd" value="2">
+          </div>
         </div>
         </div>
       </div>
@@ -896,6 +938,13 @@
      event files.js dispatches after a write, and asks the server itself. -->
 <script src="/files.js"></script>
 <script src="/activity.js"></script>
+<!-- The timeline: the ruler, the scrub gesture, the filmstrip, the mark flags
+     and the loop range. Before app.js for the same reason frames.js is: app.js
+     hands it a small api object of its own functions (setTime, the clip, the
+     marks) during boot(), so window.StudioTimeline has to exist by then. It
+     owns no state of its own beyond the pixels: the playhead is still S.time
+     in app.js and the loop length is still #playDur. -->
+<script src="/timeline.js"></script>
 <script src="/app.js"></script>
 <script src="/window-editor.js"></script>
 <!-- Mobile mode (contract C8): the page bar, the floating preview mirror and

@@ -938,9 +938,7 @@
     // Slot 1 of the multi frame viewer IS the playhead (contract E4), so it
     // is told here rather than keeping a copy that could disagree.
     if (window.Frames) window.Frames.playheadMoved(S.time);
-    $("timeLabel").textContent = S.time.toFixed(2) + "s";
-    $("scrub").value = String(Math.round(S.duration ? (S.time / S.duration) * 1000 : 0));
-    highlightThumb();
+    paintTime();
     // The proxy answers a scrub in the time of a seek instead of a decode,
     // which is what makes dragging the timeline feel like a player rather
     // than a series of stills. It is a PREVIEW: scheduleRender below still
@@ -950,21 +948,26 @@
     if (!opts || opts.publish !== false) pushProjectTime();
   }
 
-  function highlightThumb() {
-    var imgs = $("thumbs").querySelectorAll("img");
-    var best = -1, bd = 1e9;
-    imgs.forEach(function (im, i) {
-      var d = Math.abs(parseFloat(im.dataset.t) - S.time);
-      if (d < bd) { bd = d; best = i; }
-    });
-    imgs.forEach(function (im, i) { im.classList.toggle("active", i === best); });
+  /* The one place a moved playhead is drawn. Four call sites used to write
+     #timeLabel and #scrub.value and re-highlight the filmstrip by hand
+     (setTime, and each of the three playback engines' per frame callbacks);
+     the ruler owns all of that now (static/timeline.js), so they all come
+     here instead and there is one definition of "the timeline shows this
+     time". Cheap enough to call at frame rate on purpose: the label is a
+     text write and the playhead itself is coalesced into one animation
+     frame inside timeline.js. */
+  function paintTime() {
+    if (window.StudioTimeline) window.StudioTimeline.timeChanged();
   }
 
-  /* One drag source definition for both places a timecode can be picked up:
-     a filmstrip thumbnail and a mark chip. The contact sheet's own cells
-     cannot be a third: it replaces the whole viewer while it is on (see
-     #viewport.sheet in style.css), so there is no slot on screen to drop
-     one onto. Its marks are these chips. */
+  /* One drag source definition for every place a timecode can be picked up:
+     the timeline's own timecode readout, a mark flag on the ruler, and the
+     filmstrip tiles (which frames.js and the harness still read a time off,
+     even though the strip itself is no longer a pointer target: the ruler is
+     one scrub surface now, see .tlstrip in style.css). The contact sheet's
+     own cells cannot be one: it replaces the whole viewer while it is on
+     (see #viewport.sheet in style.css), so there is no slot on screen to
+     drop one onto. Its marks are the flags. */
   function makeTimeDraggable(el, t) {
     el.draggable = true;
     el.addEventListener("dragstart", function (ev) {
@@ -975,61 +978,33 @@
     });
   }
 
-  function buildThumbs() {
-    var host = $("thumbs");
-    host.innerHTML = "";
-    if (!S.clip || !S.duration) return;
-    var n = 16;
-    for (var i = 0; i < n; i++) {
-      var t = (S.duration * i) / n;
-      var im = document.createElement("img");
-      im.dataset.t = String(t);
-      im.title = t.toFixed(2) + "s";
-      im.src = "/api/thumb?clip=" + encodeURIComponent(S.clip)
-        + "&t=" + t.toFixed(3) + "&w=94&rotation=" + encodeURIComponent(S.rotation);
-      im.addEventListener("click", function (ev) {
-        setTime(parseFloat(ev.target.dataset.t));
-      });
-      // "I should be able to drag and drop from the preview timeline into
-      // the preview preview" (contract E4). The time travels in a MIME type
-      // of our own so a file dragged in from the desktop can never be read
-      // as a timecode; text/plain carries the same number for anything that
-      // can only read that. frames.js is the drop half.
-      makeTimeDraggable(im, t);
-      host.appendChild(im);
-    }
-    highlightThumb();
+  /* Everything on the ruler that is drawn from the clip rather than from the
+     playhead: the tick scale for this duration, the sixteen filmstrip tiles,
+     the mark flags, the loop range. Called at exactly the two moments the
+     open clip (and with it the duration, the fps and the rotation) changes.
+     It used to be buildThumbs, which built the filmstrip and nothing else. */
+  function rebuildTimeline() {
+    if (window.StudioTimeline) window.StudioTimeline.clipChanged();
   }
 
+  /* S.marks is still the only copy of the marked frames and the contact
+     sheet still reads it unchanged (sheetTimes above). What changed is where
+     they are drawn: they were a wrapping row of chips under the timeline bar
+     and they are flags on the ruler now, at the time they mark, which is
+     what timeline.js draws from here. */
   function drawMarks() {
-    var host = $("marks");
-    host.innerHTML = "";
-    S.marks.forEach(function (t, i) {
-      var chip = document.createElement("span");
-      chip.className = "markchip" + (Math.abs(t - S.time) < 0.01 ? " active" : "");
-      chip.textContent = t.toFixed(2) + "s";
-      var kill = document.createElement("span");
-      kill.className = "kill"; kill.textContent = "x";
-      kill.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        S.marks.splice(i, 1);
-        drawMarks();
-        if (S.sheet) renderSheet();
-      });
-      chip.appendChild(kill);
-      chip.addEventListener("click", function () { setTime(t); });
-      // Draggable onto a frame slot for the same reason a thumbnail is
-      // (contract E4): a mark is a time somebody already decided mattered.
-      makeTimeDraggable(chip, t);
-      host.appendChild(chip);
-    });
-    if (!S.marks.length) {
-      var hint = document.createElement("span");
-      hint.className = "muted small";
-      hint.textContent = "no marks. Mark (M) stores a frame; the contact sheet "
-        + "checks one grade against up to four of them at once.";
-      host.appendChild(hint);
-    }
+    if (window.StudioTimeline) window.StudioTimeline.marksChanged();
+  }
+
+  /* Removing one mark, by its index in S.marks. It used to live inside the
+     chip's own x handler; the flag on the ruler is built by timeline.js, so
+     the splice has to be reachable from there, and the contact sheet has to
+     be told either way because it may be showing the frame just removed. */
+  function removeMark(i) {
+    if (i < 0 || i >= S.marks.length) return;
+    S.marks.splice(i, 1);
+    drawMarks();
+    if (S.sheet) renderSheet();
   }
 
   /* ---- viewer ---------------------------------------------------------- */
@@ -1714,6 +1689,12 @@
         var secs = extras.play_secs;
         $("playDur").value = (typeof secs === "number" && isFinite(secs) && secs > 0)
           ? String(secs) : "";
+        // That field is hidden now and the loop range on the ruler is what
+        // shows its value, so the ruler has to be told a restored one landed.
+        // rangeChanged, not clipChanged: the strip and the ruler were built
+        // when the clip changed, and rebuilding them here would put another
+        // 16 thumbnail requests in front of whatever the page is loading.
+        if (window.StudioTimeline) window.StudioTimeline.rangeChanged();
         if (window.Frames) window.Frames.clipChanged(clip, extras);
       });
   }
@@ -2200,7 +2181,7 @@
     S.proxyDesc = null;
     var entry = S.state && S.state.clips.filter(function (c) { return c.name === S.clip; })[0];
     if (entry) drawClipInfo(entry);
-    buildThumbs();
+    rebuildTimeline();
     warmProxy();
     scheduleRender(0);
   }
@@ -2326,7 +2307,7 @@
     // folder the clip lives in; this moves that row's highlight, the same
     // thing renderFolderClips just did for the anywhere browser's list.
     if (window.StudioFiles) window.StudioFiles.clipChanged(name);
-    buildThumbs();
+    rebuildTimeline();
     // The previous clip's proxy is a decoder plus tens of MB of video held
     // for a clip nobody is looking at any more; let it go before asking for
     // the next one. warmProxy then starts this clip's encode in the
@@ -2849,7 +2830,7 @@
 
   var HELP_HTML = [
     "<h4>Viewer</h4><ul>",
-    "<li><kbd>space</kbd> hold to see the ungraded frame, release to go back</li>",
+    "<li><kbd>v</kbd> hold to see the ungraded frame, release to go back</li>",
     "<li><kbd>\\</kbd> toggle between after only and before only</li>",
     "<li><kbd>b</kbd> bypass: the technical conversion with none of the grade. ",
     "The stats and the scopes measure the bypassed picture while it is on screen</li>",
@@ -2862,21 +2843,37 @@
     "<li><kbd>shift 1</kbd> <kbd>shift 2</kbd> copy the live grade into that slot</li>",
     "<li><kbd>f</kbd> fit &nbsp; <kbd>0</kbd> 100 percent</li>",
     "<li><kbd>r</kbd> show or hide the reference image beside the frame</li>",
-    "<li><kbd>k</kbd> show the selected layer's mask</li>",
+    "<li><kbd>shift K</kbd> show the selected layer's mask</li>",
     "<li><kbd>c</kbd> contact sheet: this grade on four marked frames at once</li>",
     "<li><kbd>g</kbd> show or hide the scopes and statistics dock</li>",
     "</ul>",
     "<h4>Time</h4><ul>",
-    "<li><kbd>,</kbd> <kbd>.</kbd> one frame back or forward</li>",
-    "<li><kbd>shift ,</kbd> <kbd>shift .</kbd> one second back or forward</li>",
+    "<li><kbd>space</kbd> or <kbd>p</kbd> play or pause from the playhead, with the ",
+    "current grade, looping the range</li>",
+    "<li><kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd> shuttle back, stop, shuttle forward. ",
+    "Press <kbd>j</kbd> or <kbd>l</kbd> again for 2x, 4x, 8x</li>",
+    "<li><kbd>,</kbd> <kbd>.</kbd> one frame back or forward &nbsp; ",
+    "<kbd>shift ,</kbd> <kbd>shift .</kbd> ten frames</li>",
+    "<li><kbd>home</kbd> <kbd>end</kbd> first or last frame</li>",
     "<li><kbd>m</kbd> mark this frame &nbsp; <kbd>[</kbd> <kbd>]</kbd> previous or next mark</li>",
-    "<li><kbd>p</kbd> play or pause from the current playhead, with the current grade</li>",
-    "<li><kbd>l</kbd> loop the range set below the timeline, GPU-graded live</li>",
+    "<li><kbd>shift L</kbd> loop the range on the ruler, GPU-graded live</li>",
+    "</ul>",
+    "<h4>The timeline</h4><ul>",
+    "<li>Press anywhere on the ruler to put the playhead there; drag to scrub. ",
+    "The proxy frame follows the pointer, the full frame lands when you stop</li>",
+    "<li>Arrow keys step a frame once the ruler has focus, <kbd>shift</kbd> ten; ",
+    "a wheel or a trackpad swipe over it steps too</li>",
+    "<li>Drag in the strip along the bottom to set the loop range Play repeats, ",
+    "or drag its right hand handle to lengthen it. Drag it away to loop the ",
+    "whole clip. Range does it from the playhead to the next mark</li>",
+    "<li>Marks are flags on the ruler: click one to jump to it, or the small ",
+    "circle above it to remove it. Drag a flag, or the timecode itself, onto a ",
+    "frame slot to show that time there</li>",
     "</ul>",
     "<h4>Grade</h4><ul>",
     "<li><kbd>cmd Z</kbd> undo &nbsp; <kbd>shift cmd Z</kbd> redo</li>",
     "<li><kbd>cmd S</kbd> overwrite the loaded preset &nbsp; <kbd>shift cmd S</kbd> save as</li>",
-    "<li><kbd>j</kbd> raw JSON view &nbsp; <kbd>?</kbd> this panel &nbsp; <kbd>esc</kbd> close</li>",
+    "<li><kbd>shift J</kbd> raw JSON view &nbsp; <kbd>?</kbd> this panel &nbsp; <kbd>esc</kbd> close</li>",
     "</ul>",
     "<h4>Controls</h4><ul>",
     "<li>Drag any number left or right to scrub it. <kbd>shift</kbd> is fine, ",
@@ -3119,14 +3116,23 @@
       $("scopesAuto").classList.toggle("active", S.scopesAuto);
     });
 
-    // timeline
-    $("scrub").addEventListener("input", function (e) {
-      setTime((parseInt(e.target.value, 10) / 1000) * S.duration);
+    // timeline. The ruler itself (#scrub, its ticks, filmstrip, mark flags,
+    // loop range and the pointer gesture over all of them) is
+    // static/timeline.js, wired in boot() the same way frames.js is; these
+    // are the buttons around it, which stay app.js's because each one is a
+    // one line call into a function that already exists here.
+    // Shift is ten frames, the step every editor's shifted arrow takes.
+    $("stepBack").addEventListener("click", function (ev) {
+      stopShuttle();
+      setTime(S.time - (ev.shiftKey ? 10 : 1) / S.fps);
     });
-    $("stepBack").addEventListener("click", function () { setTime(S.time - 1 / S.fps); });
-    $("stepFwd").addEventListener("click", function () { setTime(S.time + 1 / S.fps); });
-    $("playHead").addEventListener("click", function () { setTime(0); });
+    $("stepFwd").addEventListener("click", function (ev) {
+      stopShuttle();
+      setTime(S.time + (ev.shiftKey ? 10 : 1) / S.fps);
+    });
+    $("playHead").addEventListener("click", function () { stopShuttle(); setTime(0); });
     $("playBtn").addEventListener("click", function () {
+      stopShuttle();
       if (playbackActive()) stopAnyPlayback(); else startPlayback();
     });
     // Persist per project (contract E3): "change" rather than "input", so
@@ -3138,16 +3144,14 @@
     $("loopBtn").addEventListener("click", function () {
       if (S.looping || S.loopPreparing) stopLoop(); else startLoop();
     });
-    // A quick way to point the loop at "here": the playhead to two seconds
-    // past it, clamped to the clip, or the playhead to the next mark after
-    // it if one exists. Typing exact numbers into the fields directly
-    // always works too; this just saves doing that for the common case.
+    // A quick way to point the loop at "here": the playhead to the next mark
+    // after it, or two seconds if there is none, and pressing it again
+    // clears the range back to the whole clip. The range itself is a band on
+    // the ruler that can be dragged directly (timeline.js owns both the band
+    // and this button's behaviour); this is the keyboard-free shortcut for
+    // the common case, and what the old "Use marks" button did.
     $("loopMarkBtn").addEventListener("click", function () {
-      var start = S.time;
-      var after = S.marks.filter(function (m) { return m > start + 0.01; }).sort(function (a, b) { return a - b; });
-      var end = after.length ? after[0] : Math.min(S.duration || start + 2, start + 2);
-      $("loopStart").value = start.toFixed(2);
-      $("loopEnd").value = end.toFixed(2);
+      if (window.StudioTimeline) window.StudioTimeline.toggleRange();
     });
     $("markBtn").addEventListener("click", addMark);
     $("clearMarksBtn").addEventListener("click", function () {
@@ -3286,7 +3290,10 @@
 
     document.addEventListener("keydown", onKey);
     document.addEventListener("keyup", function (ev) {
-      if (ev.code === "Space" && S.beforeHold) {
+      // V, not space: space is play and pause now (see onKey). Both cases of
+      // the letter, because shift can be picked up or let go mid hold and
+      // the peek must still end when the key does.
+      if ((ev.key === "v" || ev.key === "V") && S.beforeHold) {
         var wasHeld = effectiveMode();
         S.beforeHold = false;
         applyViewerState();
@@ -3309,6 +3316,14 @@
   function syncSlotButtons() {
     $("slotA").classList.toggle("active", S.active === "A");
     $("slotB").classList.toggle("active", S.active === "B");
+  }
+
+  /* Any explicit jump ends a shuttle: someone who just pressed "one frame
+     back" is not shuttling any more. Kept here rather than inside
+     timeline.js's own setTime path because the shuttle IS a stream of
+     setTime calls, and a stopper inside that path would stop it every frame. */
+  function stopShuttle() {
+    if (window.StudioTimeline) window.StudioTimeline.shuttleStop();
   }
 
   function addMark() {
@@ -3511,9 +3526,7 @@
           if (myToken !== playToken || !S.playing) return;
           var t = S.playSegStart + video.currentTime;
           S.time = t;
-          $("timeLabel").textContent = t.toFixed(2) + "s";
-          $("scrub").value = String(Math.round(S.duration ? (t / S.duration) * 1000 : 0));
-          highlightThumb();
+          paintTime();
         }
         function onEnded() {
           if (myToken !== playToken) return;
@@ -3732,10 +3745,7 @@
             onFrame: function (f) {
               if (token !== proxyToken) return;
               S.time = f.time;
-              $("timeLabel").textContent = f.time.toFixed(2) + "s";
-              $("scrub").value = String(Math.round(
-                S.duration ? (f.time / S.duration) * 1000 : 0));
-              highlightThumb();
+              paintTime();
               if (f.measuredFps !== lastFps) {
                 lastFps = f.measuredFps;
                 $("playStatus").textContent = "playing " + f.measuredFps
@@ -3886,9 +3896,7 @@
         resolvedInput: clipResolvedInput(),
         onFrame: function (f) {
           S.time = f.time;
-          $("timeLabel").textContent = f.time.toFixed(2) + "s";
-          $("scrub").value = String(Math.round(S.duration ? (f.time / S.duration) * 1000 : 0));
-          highlightThumb();
+          paintTime();
           setRendererBadge("GPU loop", !!cfg().grain.enabled);
           if (f.measuredFps !== lastFps) {
             lastFps = f.measuredFps;
@@ -4026,11 +4034,20 @@
     if (meta) return;
 
     switch (ev.key) {
+      // Space is play and pause, which is the first key anyone tries on a
+      // transport. It used to be "hold to peek at the ungraded frame"; that
+      // moved to V, below, when the timeline was rebuilt.
       case " ":
         ev.preventDefault();
-        // Space already means "hold to peek at the ungraded frame"; while a
-        // video is on screen that would mean showing beforeLayer behind a
-        // still-playing video, so space stops playback instead of holding.
+        stopShuttle();
+        $("playBtn").click();
+        break;
+      // The peek, moved off space. Held rather than toggled: the keyup
+      // handler below is what puts the graded frame back.
+      case "v":
+        // While a video is on screen this would mean showing beforeLayer
+        // behind a still-playing video, so it stops playback instead of
+        // holding, exactly as space used to.
         if (playbackActive()) { stopAnyPlayback(); break; }
         if (!S.beforeHold) {
           var wasHeld = effectiveMode();
@@ -4043,8 +4060,22 @@
           refreshForViewChange(wasHeld);
         }
         break;
-      case "p": $("playBtn").click(); break;
-      case "l": $("loopBtn").click(); break;
+      case "p": stopShuttle(); $("playBtn").click(); break;
+      /* J K L, the shuttle every editor has. Forward at 1x is the real
+         playback engine; every other rate is one proxy seek per animation
+         frame (timeline.js), because a <video> cannot play backwards and the
+         proxy answers a seek far faster than a decode. Pressing J or L again
+         doubles the rate to 8x.
+
+         The three letters were already taken (j raw JSON, k mask, l loop),
+         so those three moved to their own shifted key and nothing was lost:
+         shift J, shift K, shift L still do exactly what j, k and l did, and
+         all three also have a button on screen. */
+      case "j": if (window.StudioTimeline) StudioTimeline.shuttle(-1); break;
+      case "k": if (window.StudioTimeline) StudioTimeline.shuttle(0); break;
+      case "l": if (window.StudioTimeline) StudioTimeline.shuttle(1); break;
+      case "K": $("maskBtn").click(); break;
+      case "L": $("loopBtn").click(); break;
       case "\\": toggleBeforeAfter(); break;
       case "b": $("bypassBtn").click(); break;
       case "w": $("wipeBtn").click(); break;
@@ -4064,7 +4095,6 @@
         if (window.ViewerZoom) window.ViewerZoom.step(-1); break;
       case "r": $("refShow").checked = !$("refShow").checked;
         S.refShow = $("refShow").checked; applyViewerState(); break;
-      case "k": $("maskBtn").click(); break;
       case "c": $("sheetBtn").click(); break;
       case "g": {
         var d = $("dock");
@@ -4073,19 +4103,36 @@
         break;
       }
       case "m": addMark(); break;
-      case ",": setTime(S.time - (ev.shiftKey ? 1 : 1 / S.fps)); break;
-      case ".": setTime(S.time + (ev.shiftKey ? 1 : 1 / S.fps)); break;
+      // One frame, or ten with shift: the step a shifted arrow takes in an
+      // editor. It used to be a whole second, which is 24 frames on this
+      // footage and lands nowhere in particular.
+      // "<" and ">" are what a US keyboard actually sends for shift plus these
+      // two keys, so the shifted step used to be unreachable: ev.key was
+      // never "," or "." with shift held, and the ten frame (previously one
+      // second) branch could not fire. Both spellings of each, the same way
+      // the zoom keys already list "+" and "=".
+      case ",": case "<":
+        stopShuttle(); setTime(S.time - (ev.shiftKey ? 10 : 1) / S.fps); break;
+      case ".": case ">":
+        stopShuttle(); setTime(S.time + (ev.shiftKey ? 10 : 1) / S.fps); break;
+      case "Home": ev.preventDefault(); stopShuttle(); setTime(0); break;
+      case "End":
+        ev.preventDefault(); stopShuttle();
+        setTime(Math.max(0, S.duration - 1 / S.fps));
+        break;
       case "[": {
+        stopShuttle();
         var prev = S.marks.filter(function (t) { return t < S.time - 0.01; });
         if (prev.length) setTime(prev[prev.length - 1]);
         break;
       }
       case "]": {
+        stopShuttle();
         var next = S.marks.filter(function (t) { return t > S.time + 0.01; });
         if (next.length) setTime(next[0]);
         break;
       }
-      case "j": openJSON(); break;
+      case "J": openJSON(); break;
       case "R": openRenderDialog(); break;
       case "?": $("helpBtn").click(); break;
       case "Escape":
@@ -4770,6 +4817,27 @@
           selectClipByName: selectUploadedClip,
           getClipName: function () { return S.clip; },
           toast: toast
+        });
+      }
+      /* The timeline (static/timeline.js): the ruler, the scrub gesture, the
+         filmstrip, the mark flags and the loop range. Same shape as the
+         Frames block below and for the same reason: it holds no state of its
+         own, it is handed the handful of app.js functions it needs, so the
+         playhead cannot end up with two owners. */
+      if (window.StudioTimeline) {
+        window.StudioTimeline.init({
+          getClip: function () { return S.clip; },
+          getTime: function () { return S.time; },
+          getDuration: function () { return S.duration; },
+          getFps: function () { return S.fps; },
+          getRotation: function () { return S.rotation; },
+          getMarks: function () { return S.marks; },
+          removeMark: removeMark,
+          setTime: function (t) { setTime(t); },
+          makeTimeDraggable: makeTimeDraggable,
+          playToggle: function () { $("playBtn").click(); },
+          stopPlayback: function () { stopAnyPlayback(); },
+          isPlaying: function () { return playbackActive() || S.looping; }
         });
       }
       if (window.Frames) {

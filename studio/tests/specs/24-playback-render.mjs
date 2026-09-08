@@ -89,12 +89,22 @@ export default async function run(ctx) {
     return page.evaluate(() => parseFloat(document.getElementById("timeLabel").textContent) || 0);
   }
 
+  /* A real press on the ruler at that time. #scrub used to be a native
+     <input type="range"> and this used to assign its .value and fire
+     "input"; the rebuilt timeline (static/timeline.js) is a track you press,
+     so this presses it, which is a truer user input than the assignment was.
+     The y offset lands in the filmstrip lane, above the range lane at the
+     bottom of the track, so this scrubs rather than dragging a loop range. */
   async function scrubTo(t) {
-    await page.evaluate((frac) => {
-      const scrub = document.getElementById("scrub");
-      scrub.value = String(Math.round(frac * 1000));
-      scrub.dispatchEvent(new Event("input", { bubbles: true }));
-    }, Math.max(0, Math.min(1, t / duration)));
+    const frac = Math.max(0, Math.min(1, t / duration));
+    const box = await page.evaluate(() => {
+      const card = document.querySelector('[gs-id="timeline"]');
+      if (card) card.scrollIntoView({ block: "end" });
+      const r = document.getElementById("scrub").getBoundingClientRect();
+      return { x: r.left, y: r.top + 30, w: r.width };
+    });
+    await page.mouse.click(box.x + box.w * frac, box.y);
+    await sleep(150);
   }
 
   async function setSecs(value) {

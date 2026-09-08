@@ -580,15 +580,31 @@ export default async function run(ctx) {
       await waitForBoot(p, 40000);
       await sleep(600);
       await openFilesTab(p);
+      /* Generous, and wall clock: this second server is answering two freshly
+         booted pages (each one warming a proxy, asking for a strip of
+         thumbnails and rendering a frame) on a machine that is also running
+         the first server for the rest of this run. The listing arrives when
+         it reaches the front of that queue, so a short ceiling here reads
+         load as a broken files pane. */
       await p.waitForFunction(() => document.querySelectorAll("#filesRoots .filesroot").length > 0,
-        { timeout: 15000 });
+        { timeout: 30000 });
       // New folder and Upload are disabled until a listing says this account may
       // write here, so the first listing is the real "ready" signal, not the chips.
-      await p.waitForFunction(() => {
-        const list = document.getElementById("filesList");
-        const btn = document.getElementById("filesNewFolder");
-        return !!(list && list.children.length && btn && !btn.disabled);
-      }, { timeout: 20000 });
+      try {
+        await p.waitForFunction(() => {
+          const list = document.getElementById("filesList");
+          const btn = document.getElementById("filesNewFolder");
+          return !!(list && list.children.length && btn && !btn.disabled);
+        }, { timeout: 45000 });
+      } catch (e) {
+        const seen = await p.evaluate(() => ({
+          rows: (document.getElementById("filesList") || { children: [] }).children.length,
+          text: ((document.getElementById("filesList") || {}).textContent || "").slice(0, 160),
+          disabled: (document.getElementById("filesNewFolder") || {}).disabled,
+        })).catch((x) => String(x));
+        throw new Error(who + "'s first listing never arrived: " + JSON.stringify(seen)
+          + " | errors " + JSON.stringify(errorsB.slice(0, 4)));
+      }
     }
 
     await signIn(pageA, "alice");
@@ -888,7 +904,9 @@ export default async function run(ctx) {
       partB = "skipped";
     } else {
       partB = "failed";
-      notes.push("Part B threw: " + (err && err.stack ? err.stack.split("\n")[0] : String(err)));
+      const where = (err && err.stack ? err.stack.split("\n") : [])
+        .filter((l) => l.indexOf("23-files.mjs") >= 0).slice(0, 2).join(" << ");
+      notes.push("Part B threw: " + (err && err.message ? err.message : String(err)) + " at " + where);
     }
   } finally {
     for (const c of [ctxA, ctxB]) {

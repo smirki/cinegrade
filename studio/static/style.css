@@ -92,7 +92,7 @@
      is 12px, so the base is scaled down to keep the same RELATIONSHIP
      between a card's roundness and its own row height, rather than copying
      an absolute number tuned for a much bigger UI onto a much smaller one). */
-  --radius-sm:   8px;  /* small interactive rows: lutrow, jobrow, markchip */
+  --radius-sm:   8px;  /* small interactive rows: lutrow, jobrow, filerow */
   --radius-lg:   12px; /* accordion items (.stage) */
   --radius-3xl:  24px;
   --radius-4xl:  28px; /* widget cards, overlay dialogs -- Unsloth's Card/Dialog radius */
@@ -1409,10 +1409,6 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
    #viewerMsg already uses for exactly this kind of "trust this less" note. */
 #rendererBadge.warn { color: var(--warn); }
 
-/* Loop range fields: same width as the render start/secs fields right above
-   them in the same widget, so the two rows of the timeline line up. */
-#loopStart, #loopEnd { width: 44px; }
-
 /* Default state, and .mode-after explicitly: after alone drives #stage's
    size exactly the way the single <img> used to, so the default mode never
    changes the stage's box model from what it was before this feature. */
@@ -1732,39 +1728,213 @@ html[data-paramtab="history"] .parampane[data-paramtab="history"] { display: fle
 .statrow.hot span { color: var(--warn); }
 .statrow.bad span { color: var(--danger); }
 
-/* ---- timeline ---------------------------------------------------------- */
+/* ---- timeline ----------------------------------------------------------
 
-/* Same content-follows-size treatment #dock gets above, for the same
-   reason: this used to be the last child squeezed by everything above it
-   in one tall column, with nowhere left to shrink to and its own
-   overflow-y as the only fallback. It is now its own GridStack widget,
-   gs-no-resize and wrapped in .autosize in the HTML (see the comment there,
-   just above .widgethead), so reflowAutosizeCards in app.js keeps the
-   card's real height matched to this element's natural content --
-   including #marks growing past one row as marks pile up, which that
-   function's own ResizeObserver on #timeline is what catches, not one of
-   GridStack's sparser trigger points (init, window resize, column change,
-   drag-resize-stop). No min-height here on purpose, same
-   reasoning as #dock above: this rule used to carry a fixed 34px floor,
-   and a specific length would replace rather than add to the default
-   min-height: auto a flex item gets for free, which is what actually keeps
-   this from ever shrinking below its own real content. There is no
-   internal scroll left to fall back to on purpose. */
+   One transport row and one ruler (static/timeline.js). What was here
+   before: a native <input type="range"> with 1000 steps, a second row of
+   from/to text boxes, a horizontally scrolling filmstrip and a wrapping row
+   of mark chips. Everything that was a number in a box is a thing on the
+   ruler now, so the rules below are mostly geometry: three lanes stacked in
+   flow (ticks, filmstrip, loop range) with the mark flags, the playhead and
+   the hover line as absolutely positioned overlays on top of all three.
+
+   The card's own height still follows this element's content, the same
+   content-follows-size treatment #dock gets (see .autosize above, and the
+   long comment on it): no min-height and no internal scroll here on
+   purpose. The ruler is a fixed 80px of lanes and the bar above it wraps,
+   so the card grows by a row when the window is narrow and shrinks back. */
 #timeline {
   background: var(--panel);
 }
-#scrub { flex: 1 1 220px; accent-color: var(--accent); height: 20px; }
-#thumbs { display: flex; gap: 1px; padding: 2px; overflow-x: auto; }
-#thumbs img { height: 52px; display: block; border: 1px solid transparent; cursor: pointer; flex: none; }
-#thumbs img.active { border-color: var(--accent); }
-#marks { display: flex; gap: 4px; padding: 0 8px 4px; flex-wrap: wrap; min-height: 4px; }
-.markchip {
-  border: 1px solid var(--line2); background: var(--raised); padding: 1px 6px;
-  border-radius: var(--radius-full);
-  font: 10px var(--mono); cursor: pointer;
+
+/* Hidden, but still real inputs and still in the DOM: #playDur is the play
+   length both engines read (playDurationValue in app.js) and the value
+   saved as extras.play_secs, and #loopStart/#loopEnd are what the GPU loop
+   reads (loopDuration). timeline.js writes them and fires the same "change"
+   event leaving the old text box fired, so nothing downstream of them
+   changed. display: none rather than deleting them keeps app.js's own
+   bindings, the persistence round trip and the spec that checks it intact
+   while taking three text boxes off the screen. */
+.tlghost { display: none; }
+
+/* The transport. Icon buttons are square so the five of them read as one
+   cluster rather than five differently sized pills; everything else in the
+   row is the ordinary .btn from further up this file. */
+.tlicon { min-width: 28px; padding: 0 7px; font-size: 12px; line-height: 1; }
+.tlstep { font-family: var(--mono); font-size: 11px; }
+.tlplay { min-width: 52px; }
+/* The clock: the playhead's own timecode, big enough to read across the
+   room, with the frame number and the clip length beside it at label size.
+   It is also a drag source for a frame slot (contract E4), hence the grab
+   cursor and the "do not select the text while dragging it" guard. */
+.tlclock {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 0 8px; cursor: grab; user-select: none;
 }
-.markchip.active { border-color: var(--accent); color: var(--accent); }
-.markchip .kill { color: var(--text-dim); margin-left: 5px; }
+.tlclock:active { cursor: grabbing; }
+.tlclock #timeLabel { font-size: 13px; color: var(--text-hi); font-weight: 500; }
+.tlclock .tlframe { font-size: 10px; color: var(--text-dim); }
+.tlclock .tlslash { font-size: 10px; color: var(--line2); }
+.tlstatus:empty { display: none; }
+.tlhidden { display: none !important; }
+
+/* ---- the ruler ---------------------------------------------------------
+   One pointer surface. touch-action: none is set further up this file (the
+   shared rule that lists #scrub with .track and the other own-gesture
+   elements) so a touch drag scrubs instead of scrolling the page away
+   underneath it. */
+.tltrack {
+  position: relative;
+  height: 80px;
+  margin: 0;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  overflow: hidden;
+  user-select: none;
+  outline: none;
+}
+.tltrack.dragging { cursor: grabbing; }
+.tltrack:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+.tltrack.empty .tlstrip, .tltrack.empty .tlrange, .tltrack.empty .tlhead { opacity: 0; }
+
+/* Lane 1: the ticks. Labels along the top, tick marks hanging off the
+   bottom edge of the lane so they touch the filmstrip below and read as one
+   scale rather than two rows. */
+.tlruler {
+  position: relative; height: 20px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+}
+.tltick {
+  position: absolute; bottom: 0; width: 1px; height: 4px;
+  background: var(--line2);
+}
+.tltick.major { height: 8px; background: var(--text-dim); }
+.tllabel {
+  position: absolute; top: 2px; transform: translateX(3px);
+  font: 9px var(--mono); color: var(--text-dim);
+  text-decoration: none; letter-spacing: 0.02em; white-space: nowrap;
+}
+
+/* Lane 2: the filmstrip, on the same time axis as the ticks. Tile i covers
+   exactly the i-th sixteenth of the clip, so a picture is always directly
+   under the moment it belongs to; flex: 1 1 0 plus object-fit: cover is
+   what makes sixteen tiles fill the width at any width without the
+   horizontal scrollbar this row used to have.
+
+   pointer-events: none is deliberate and load bearing: the whole ruler is
+   one scrub surface, and a filmstrip that took the press would put a dead
+   stripe across the middle of it. The tiles are still drag sources for a
+   frame slot in the DOM sense (app.js's makeTimeDraggable is still attached
+   to each one), and the visible drag sources a person actually uses are the
+   timecode in the bar and the mark flags. */
+.tlstrip {
+  display: flex; height: 46px; background: #0e0e0e;
+  pointer-events: none;
+  border-bottom: 1px solid var(--line);
+}
+.tlstrip img {
+  flex: 1 1 0; min-width: 0; height: 100%;
+  object-fit: cover; display: block;
+  opacity: 0.66; transition: opacity 120ms linear;
+}
+.tlstrip img.active { opacity: 1; }
+
+/* Lane 3: the loop range. Its own strip so the gesture that edits the range
+   can never be confused with the gesture that scrubs: a drag in here draws
+   a range from where it was pressed, a drag on the out handle resizes it,
+   and the main surface above stays pure scrub. */
+.tlrange {
+  position: relative; height: 13px;
+  background: var(--panel2);
+  cursor: ew-resize;
+}
+.tlband {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--accent-wash);
+  border-left: 2px solid var(--accent);
+  pointer-events: none;
+}
+.tlrange.all .tlband {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border-left-color: transparent;
+}
+.tlbandlabel {
+  position: absolute; left: 5px; top: 0; line-height: 13px;
+  font: 9px var(--mono); color: var(--text-dim); white-space: nowrap;
+  pointer-events: none;
+}
+.tlrange:not(.all) .tlbandlabel { color: var(--accent); }
+/* The out handle. 3px of paint, 13px of grab: the ::before is the hit area,
+   which is what stops "drag the end of the loop" from being a pixel hunt. */
+.tlout {
+  position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -2px;
+  background: var(--accent); border-radius: var(--radius-full);
+  cursor: ew-resize;
+}
+.tlrange.all .tlout { background: var(--line2); }
+.tlout::before {
+  content: ""; position: absolute; top: -2px; bottom: -2px; left: -6px; right: -6px;
+}
+.tlrange.dragging .tlout, .tlout:hover { box-shadow: 0 0 0 2px var(--accent-wash); }
+
+/* Marks: flags on the ruler, one per S.marks entry. The flag jumps to that
+   frame; the small circle above it (revealed on hover, sitting over the
+   tick labels where there is already empty space) removes it. Both are real
+   buttons rather than a chip with an x, because a chip row under the bar is
+   exactly what this replaced. */
+.tlmarks { position: absolute; left: 0; right: 0; top: 0; height: 20px; pointer-events: none; }
+.tlmark { position: absolute; top: 0; width: 0; height: 20px; }
+.tlmarkflag {
+  position: absolute; bottom: 0; left: -5px; width: 10px; height: 9px;
+  background: var(--warn);
+  clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
+  pointer-events: auto; cursor: grab;
+}
+.tlmark.at .tlmarkflag { background: var(--accent); }
+.tlmarkflag:hover { filter: brightness(1.25); }
+.tlmarkkill {
+  position: absolute; top: 0; left: -7px; width: 14px; height: 12px;
+  padding: 0; border: none; border-radius: var(--radius-full);
+  background: var(--raised); color: var(--text-dim);
+  font: 9px var(--mono); line-height: 12px; text-align: center;
+  cursor: pointer; opacity: 0; pointer-events: none;
+  transition: opacity 120ms linear;
+}
+.tlmark:hover .tlmarkkill { opacity: 1; pointer-events: auto; }
+.tlmarkkill:hover { color: var(--danger); background: var(--panel); }
+
+/* The playhead. The only thing here that moves every frame, and it moves
+   with a transform on a cached width (timeline.js) rather than a left, so
+   playback never triggers layout from this card. */
+.tlhead {
+  position: absolute; top: 0; bottom: 0; left: 0; width: 1px;
+  background: var(--accent); pointer-events: none;
+  will-change: transform;
+}
+.tlhead::before {
+  content: ""; position: absolute; top: 0; left: -4px; width: 9px; height: 5px;
+  background: var(--accent);
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+
+/* The hover readout: a hairline under the pointer and the time it is over.
+   Hidden until the pointer is actually on the ruler, so it never competes
+   with the playhead when nobody is pointing at anything. */
+.tlhover {
+  position: absolute; top: 0; bottom: 13px; left: 0; width: 1px;
+  background: color-mix(in srgb, var(--text) 30%, transparent);
+  pointer-events: none; opacity: 0;
+}
+.tltrack.hovering .tlhover { opacity: 1; }
+.tltrack.dragging .tlhover { opacity: 0; }
+.tlbubble {
+  position: absolute; top: 22px; left: 0;
+  padding: 1px 5px; border-radius: var(--radius-full);
+  background: var(--panel2); border: 1px solid var(--line);
+  font: 10px var(--mono); color: var(--text-hi); white-space: nowrap;
+}
 
 /* ---- parameter panels: the accordion --------------------------------
 
@@ -2454,6 +2624,27 @@ html[data-mobile="on"] .track .fill { top: 12px; }
 html[data-mobile="on"] .track .knob { top: 7px; width: 18px; height: 18px; margin-left: -9px; }
 html[data-mobile="on"] .track .detent { top: 9px; height: 10px; }
 
+/* The timeline on a phone (contract C8). Same three lanes, every one of them
+   taller, because a 3px handle and a 10px flag are a mouse target, not a
+   thumb target: the loop range lane doubles in height and its out handle
+   grows a 22px grab zone, and a mark's delete circle is always visible
+   because there is no hover on a touchscreen for it to appear on. The
+   filmstrip keeps its height so a phone still gets a picture of where it is
+   in the clip; the ruler labels shrink one step so they do not collide at a
+   390px width. */
+html[data-mobile="on"] .tltrack { height: 104px; }
+html[data-mobile="on"] .tlruler { height: 22px; }
+html[data-mobile="on"] .tlmarks { height: 22px; }
+html[data-mobile="on"] .tlstrip { height: 52px; }
+html[data-mobile="on"] .tlrange { height: 28px; }
+html[data-mobile="on"] .tlhover { bottom: 28px; }
+html[data-mobile="on"] .tlbandlabel { line-height: 28px; }
+html[data-mobile="on"] .tlout { width: 5px; margin-left: -3px; }
+html[data-mobile="on"] .tlout::before { left: -11px; right: -11px; }
+html[data-mobile="on"] .tlmarkflag { width: 14px; left: -7px; height: 11px; }
+html[data-mobile="on"] .tlmarkkill { opacity: 1; pointer-events: auto; width: 18px; left: -9px; height: 14px; line-height: 14px; }
+html[data-mobile="on"] .tlclock #timeLabel { font-size: 15px; }
+
 /* ---- viewer zoom, pan, and the two/four frame grid (contract E4) ---------
    static/viewer-zoom.js and static/frames.js.
 
@@ -2518,9 +2709,11 @@ html[data-mobile="on"] .track .detent { top: 9px; height: 10px; }
 .fslot.drop { outline: 2px solid var(--accent); outline-offset: -2px; }
 .fslot.failed { outline: 1px solid var(--bad, #c96); outline-offset: -1px; }
 
-/* The drag sources for a slot: a filmstrip thumbnail and a mark chip
-   (frames.js reads application/x-studio-time off either). */
-#thumbs img[draggable="true"], .markchip[draggable="true"] { cursor: grab; }
+/* The drag sources for a slot: the timeline's own timecode readout and a
+   mark flag on the ruler (frames.js reads application/x-studio-time off
+   either). Both carry their own cursor in the timeline block above; this
+   rule is what stops a slot from looking droppable when nothing is being
+   dragged, and .fslot.drop above is the highlight while something is. */
 
 /* Phones: the slot's own button has no hover to appear on, so it is always
    visible there, and it is a real touch target rather than a 14px strip. */

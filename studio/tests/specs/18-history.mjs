@@ -137,6 +137,75 @@ export default async function run(ctx) {
     return page.evaluate(() => (document.getElementById("histHead") || {}).textContent || "");
   }
 
+  /* That header is repainted by a whole History refresh: GET /api/project,
+     then GET /api/project/log?limit=2000, then the graph relayout, behind
+     whatever else the page has queued at Chrome's six connections per host.
+     By this point in a full run the log carries every commit the specs
+     before this one made, so the refresh takes seconds rather than a
+     fraction of one, and a fixed sleep reads a slow refresh as a broken
+     button. Waiting for the value the claim is about keeps the claim
+     identical; 19-reload-state spells out the same reasoning for its own
+     ceiling on this same header. */
+  async function headBecomes(test, ceilingMs) {
+    const deadline = Date.now() + (ceilingMs || 15000);
+    let seen = await head();
+    while (!test(seen) && Date.now() < deadline) {
+      await sleep(100);
+      seen = await head();
+    }
+    return seen;
+  }
+
+  /* #historyRows is rebuilt wholesale by every refresh, so a row handle taken
+     a moment before one lands is a detached node by the time it is hovered
+     ("Node is either not clickable or not an Element"). This re-reads the row
+     it wants and tries again, bounded, rather than turning that race into a
+     failed claim. Index -1 means the last row (the oldest commit). */
+  /* Hover a row and press one of its action buttons inside ONE retry: those
+     buttons only exist in layout while the row is hovered, and any refresh
+     between the hover and the press detaches the row under the handle. The
+     label is read and checked before the press, so a wrong button is still a
+     failed claim rather than a wrong click. */
+  async function pressRowAction(index, buttonIndex, wantLabel, ceilingMs) {
+    const deadline = Date.now() + (ceilingMs || 10000);
+    for (;;) {
+      try {
+        const handles = await page.$$("#historyRows .historyrow");
+        const row = index < 0 ? handles[handles.length + index] : handles[index];
+        if (!row) throw new Error("no history row at index " + index);
+        await row.hover();
+        const buttons = await row.$$("button");
+        if (buttons.length < 2) return { count: buttons.length, label: null, clicked: false };
+        const label = await page.evaluate((el) => el.textContent, buttons[buttonIndex]);
+        if (!wantLabel.test(label)) return { count: buttons.length, label: label, clicked: false };
+        await buttons[buttonIndex].click();
+        return { count: buttons.length, label: label, clicked: true };
+      } catch (e) {
+        if (Date.now() >= deadline) throw e;
+        await sleep(150);
+      }
+    }
+  }
+
+  async function rowHandleAt(index, ceilingMs) {
+    const deadline = Date.now() + (ceilingMs || 8000);
+    for (;;) {
+      const handles = await page.$$("#historyRows .historyrow");
+      const want = index < 0 ? handles[handles.length + index] : handles[index];
+      if (want) {
+        try {
+          await want.hover();
+          return want;
+        } catch (e) {
+          if (Date.now() >= deadline) throw e;
+        }
+      } else if (Date.now() >= deadline) {
+        throw new Error("no history row at index " + index + " after " + (ceilingMs || 8000) + "ms");
+      }
+      await sleep(150);
+    }
+  }
+
   async function dragSlider(dx) {
     const handle = await page.$(EXPOSURE_SLIDER);
     if (!handle) throw new Error("no " + EXPOSURE_SLIDER + " found in #params");
@@ -270,8 +339,7 @@ export default async function run(ctx) {
   const undoDisabled = await page.$eval("#histUndoBtn", (el) => el.disabled);
   if (undoDisabled) return fail("#histUndoBtn is disabled right after a real edit, expected enabled");
   await page.click("#histUndoBtn");
-  await sleep(500);
-  const headAfterUndo = await head();
+  const headAfterUndo = await headBecomes((h) => !!h && h !== headAfterEdit);
   if (headAfterUndo === headAfterEdit || !headAfterUndo) {
     return fail("Undo left HEAD at " + JSON.stringify(headAfterUndo) + ", expected it to move back from " + headAfterEdit);
   }
@@ -287,8 +355,7 @@ export default async function run(ctx) {
   const redoDisabled = await page.$eval("#histRedoBtn", (el) => el.disabled);
   if (redoDisabled) return fail("#histRedoBtn is disabled right after an Undo, expected enabled");
   await page.click("#histRedoBtn");
-  await sleep(500);
-  const headAfterRedo = await head();
+  const headAfterRedo = await headBecomes((h) => h === headAfterEdit);
   if (headAfterRedo !== headAfterEdit) {
     return fail("Redo left HEAD at " + headAfterRedo + ", expected it back to " + headAfterEdit + " (the edit commit)");
   }
@@ -297,16 +364,10 @@ export default async function run(ctx) {
   // --- 5. Go here on the root row -------------------------------------------
   rows = await historyRows();
   const rootId = rows[rows.length - 1].id;
-  const rowHandles = await page.$$("#historyRows .historyrow");
-  const rootHandle = rowHandles[rowHandles.length - 1];
-  await rootHandle.hover();
-  const rootButtons = await rootHandle.$$("button");
-  if (rootButtons.length < 2) return fail("the root row has only " + rootButtons.length + " action button(s), expected Go here and Fork from here");
-  const rootGotoLabel = await page.evaluate((el) => el.textContent, rootButtons[0]);
-  if (!/go here/i.test(rootGotoLabel)) return fail('the root row\'s first action button reads "' + rootGotoLabel + '", expected "Go here"');
-  await rootButtons[0].click();
-  await sleep(500);
-  const headAtRoot = await head();
+  const rootAction = await pressRowAction(-1, 0, /go here/i);
+  if (rootAction.count < 2) return fail("the root row has only " + rootAction.count + " action button(s), expected Go here and Fork from here");
+  if (!rootAction.clicked) return fail('the root row\'s first action button reads "' + rootAction.label + '", expected "Go here"');
+  const headAtRoot = await headBecomes((h) => h === rootId);
   if (headAtRoot !== rootId) {
     return fail('"Go here" on the root row left HEAD at "' + headAtRoot + '", expected the root id "' + rootId + '"');
   }
@@ -317,7 +378,14 @@ export default async function run(ctx) {
   await switchTab("grade");
   await dragSlider(-60);
   await switchTab("history");
-  const branchesAfterFork = await branchOptions();
+  // Same wait, for the same reason: the auto fork lands when the refresh
+  // that follows the edit does, not when the tab is clicked.
+  let branchesAfterFork = await branchOptions();
+  const forkDeadline = Date.now() + 15000;
+  while (branchesAfterFork.length <= branchesBeforeFork.length && Date.now() < forkDeadline) {
+    await sleep(150);
+    branchesAfterFork = await branchOptions();
+  }
   if (branchesAfterFork.length <= branchesBeforeFork.length) {
     return fail("editing from a non tip commit did not grow the branch select: before=" + JSON.stringify(branchesBeforeFork) + " after=" + JSON.stringify(branchesAfterFork));
   }
@@ -365,8 +433,7 @@ export default async function run(ctx) {
   notes.push("graph has " + distinctStrokes.size + " distinct lane stroke colour(s) across a straight and a fork edge, the fork edge is a <path> curve, HEAD renders as a ring plus a filled centre");
 
   // --- 6c. hovering a row highlights its ancestry, dims the rest -------------
-  const hoverRowHandle = (await page.$$("#historyRows .historyrow"))[0];
-  await hoverRowHandle.hover();
+  await rowHandleAt(0);
   await sleep(150);
   const hoverInfo = await page.evaluate(() => {
     var svg = document.getElementById("historyGraph");
@@ -433,8 +500,7 @@ export default async function run(ctx) {
   }
   // Now hover the top row: its action buttons only exist in layout on
   // hover/focus, so "reachable" has to be checked there, not at rest.
-  const rowHandlesForHover = await page.$$("#historyRows .historyrow");
-  await rowHandlesForHover[0].hover();
+  await rowHandleAt(0);
   await sleep(150);
   const hoverContainment = await page.evaluate(() => {
     var panel = document.querySelector('.parampane[data-paramtab="history"]');
@@ -462,18 +528,11 @@ export default async function run(ctx) {
   const forkHeadId = await head();
 
   // --- 7. explicit Fork from here, answering the prompt() -------------------
-  rowHandles.length = 0;
-  const rowHandles2 = await page.$$("#historyRows .historyrow");
-  const headHandle = rowHandles2[0];
-  await headHandle.hover();
-  const headButtons = await headHandle.$$("button");
-  if (headButtons.length < 2) return fail("the HEAD row has only " + headButtons.length + " action button(s), expected Go here and Fork from here");
-  const forkLabel = await page.evaluate((el) => el.textContent, headButtons[1]);
-  if (!/fork from here/i.test(forkLabel)) return fail('the HEAD row\'s second action button reads "' + forkLabel + '", expected "Fork from here"');
-
   const branchName = "spec18-fork";
   const armed = armDialog(branchName);
-  await headButtons[1].click();
+  const headAction = await pressRowAction(0, 1, /fork from here/i);
+  if (headAction.count < 2) { armed.off(); return fail("the HEAD row has only " + headAction.count + " action button(s), expected Go here and Fork from here"); }
+  if (!headAction.clicked) { armed.off(); return fail('the HEAD row\'s second action button reads "' + headAction.label + '", expected "Fork from here"'); }
   await sleep(600);
   armed.off();
   if (!armed.seen.length) return fail('clicking "Fork from here" opened no prompt() dialog');

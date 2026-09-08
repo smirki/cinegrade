@@ -25,3 +25,8 @@ captions/omni-test/*.mp4
 # grading bakeoff: sources, reference stills, agent runs and the throwaway server data
 bakeoff/*
 !bakeoff/*.md
+
+# worktrees symlink these to the main tree; the slash rules above only match directories
+.venv
+footage
+refs

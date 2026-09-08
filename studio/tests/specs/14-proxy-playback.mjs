@@ -73,11 +73,16 @@ export default async function run(ctx) {
 
   // Start from a known place so "the time advanced" is not measured from the
   // end of the clip.
-  await page.evaluate(() => {
-    const scrub = document.getElementById("scrub");
-    scrub.value = "0";
-    scrub.dispatchEvent(new Event("input", { bubbles: true }));
+  // A real press on the left end of the ruler. #scrub used to be a native
+  // <input type="range"> and this used to assign its .value; the rebuilt
+  // timeline (static/timeline.js) is a track you press.
+  const scrubBox = await page.evaluate(() => {
+    const card = document.querySelector('[gs-id="timeline"]');
+    if (card) card.scrollIntoView({ block: "end" });
+    const r = document.getElementById("scrub").getBoundingClientRect();
+    return { x: r.left, y: r.top + 30 };
   });
+  await page.mouse.click(scrubBox.x + 1, scrubBox.y);
   await new Promise((r) => setTimeout(r, 900));
 
   const before = await sampleCanvas();

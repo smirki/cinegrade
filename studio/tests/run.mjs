@@ -52,6 +52,7 @@ const SPEC_FILES = [
   "23-files.mjs",
   "24-playback-render.mjs",
   "25-viewer-zoom-frames.mjs",
+  "26-timeline.mjs",
 ];
 
 /* Chasing one failing spec through a whole run costs minutes of GPU work, so
