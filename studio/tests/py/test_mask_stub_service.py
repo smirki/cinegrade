@@ -392,6 +392,36 @@ class MaskStubE2ETest(unittest.TestCase):
         self.assertTrue(seen - {"done"}, f"job finished before it could be "
                         f"observed running; states seen: {seen}")
 
+    def test_dedicated_cancel_route_matches_the_readmes_documented_path(self):
+        # INTEGRATION-A found studio/README.md documents a dedicated
+        # POST /api/mask/jobs/<id>/cancel that studio/server.py did not
+        # implement (the generic POST /api/job/cancel already covered the
+        # same behaviour functionally). Part B added the thin route per
+        # PLAN.md C4's own list; this proves it end to end against the real
+        # stub rather than just reading the code.
+        result = self._track(start=0.0, end=0.6,
+                             prompts={"text": ["m7 cancel route subject"]})
+        job_id = result["job_id"]
+        self.assertIsNotNone(job_id)
+        out = _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+        self.assertEqual(out["id"], job_id)
+        self.assertIn(out["state"], ("cancelled", "failed", "done"))
+        # Whatever terminal state the stub settles on, the job must leave
+        # "queued"/"running" behind: this is the same field and vocabulary
+        # GET /api/mask/jobs/<id> uses, so a caller reads one shape either
+        # way (M1's checkpoint contract, mirrored by _mask_job_view).
+        deadline = time.time() + 15.0
+        final = out
+        while final["state"] not in ("cancelled", "failed", "done") and time.time() < deadline:
+            time.sleep(0.2)
+            final = _get(self.base + f"/mask/jobs/{job_id}")
+        self.assertIn(final["state"], ("cancelled", "failed", "done"))
+
+    def test_cancel_route_404s_for_an_unknown_job_id(self):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            _post(self.base + "/mask/jobs/no-such-job/cancel", {})
+        self.assertEqual(caught.exception.code, 404)
+
     def test_track_needs_a_prompt_or_a_pick(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             self._track(prompts={})

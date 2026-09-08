@@ -66,8 +66,21 @@ for (const name of fs.readdirSync(FOOTAGE_SRC)) {
  * saved presets. The preset sweep reads GET /api/state's preset list, so
  * without this the row count is whoever-ran-it's own saved presets plus the
  * shipped library, and two runs on two machines are not comparable. With it
- * the sweep is exactly the checked in grade/presets/ library. */
-const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-parity-data-"));
+ * the sweep is exactly the checked in grade/presets/ library.
+ *
+ * PARITY_DATA_DIR overrides this with a caller supplied, PERSISTENT
+ * directory instead of a fresh temp one, and that directory is never
+ * deleted by this script's own cleanup() below (same treatment as
+ * cacheDir). This is the only way a PARITY_MATTE_ID row can ever measure
+ * anything: the matte store is a plain directory the SAM service writes to
+ * (C2), so a real (non stub) matte has to already be sitting under
+ * `<data-dir>/mattes/` before this server starts, which an ephemeral
+ * mkdtemp can never provide. Without this override the 3 PARITY_MATTE_ID
+ * rows can only ever be exercised by hand, never through this gate. */
+const dataDirIsOwn = !process.env.PARITY_DATA_DIR;
+const dataDir = process.env.PARITY_DATA_DIR
+  || fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-parity-data-"));
+if (!dataDirIsOwn) fs.mkdirSync(dataDir, { recursive: true });
 
 // The cache is deliberately NOT temporary: --data-dir makes the server's
 // default cache <data dir>/cache, so every run would re-decode frames it
@@ -96,7 +109,9 @@ function cleanup() {
   cleaned = true;
   try { srv.kill(); } catch { /* already gone */ }
   try { fs.rmSync(footageDir, { recursive: true, force: true }); } catch { /* best effort */ }
-  try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  if (dataDirIsOwn) {
+    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }
 process.on("exit", cleanup);
 process.on("SIGINT", () => { cleanup(); process.exit(130); });

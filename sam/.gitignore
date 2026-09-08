@@ -3,3 +3,4 @@ spike/out/
 spike/torch-out/
 tests/out/
 __pycache__/
+spike/integration-b-out/

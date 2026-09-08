@@ -6110,6 +6110,24 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_mask_job_view(job))
             return
 
+        if (route.startswith("mask/jobs/") and route.endswith("/cancel")
+                and method == "POST"):
+            # README's own documented route (C4). Functionally this was
+            # already reachable through the generic POST /api/job/cancel
+            # (body {"id": job_id}), which _poll_sam_job's loop already
+            # watches job.status == "cancelled" for; this is the same one
+            # line, scoped to a mask track job id in the path and answering
+            # in the mask jobs panel's own shape rather than the generic
+            # job dict, so a caller reads one response shape whichever
+            # cancel route it used.
+            job_id = route[len("mask/jobs/"):-len("/cancel")]
+            job = JOBS.get(job_id)
+            if not job or job.kind != "mask_track":
+                raise HttpError(404, f"no mask track job: {job_id}")
+            job.status = "cancelled"
+            self._json(_mask_job_view(job))
+            return
+
         if route == "matte" and method == "GET":
             clip = q.get("clip")
             if clip:
