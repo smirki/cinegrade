@@ -60,11 +60,17 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import numpy as np
+
+try:                                    # as a package (sam.backends.…)
+    from .. import modellock
+except ImportError:                     # with sam/ itself on sys.path
+    import modellock                                            # type: ignore
 
 logger = logging.getLogger("sam.backends.torch_backend")
 
@@ -77,31 +83,43 @@ DEFAULT_REPO_ID = "jetjodh/sam3"
 
 _MODEL_LOCK_DIR = Path("/tmp/fixxr-sam-model.lock")
 
+# One entry per lock this process is holding, newest last. A stack rather than
+# a single slot because two threads can each hold and release around their own
+# model load (the pytest suite does exactly that), and popping the wrong one
+# would release a lock its owner still needs.
+_HELD: list = []
+_HELD_MUTEX = threading.Lock()
 
-def acquire_model_lock(poll_s: float = 20.0, log: bool = True) -> None:
-    """Block until `/tmp/fixxr-sam-model.lock` can be created by us. Retries
-    forever (this is a build-machine safety net, not a request path with a
-    timeout budget)."""
-    waited = False
-    while True:
-        try:
-            os.mkdir(_MODEL_LOCK_DIR)
-            return
-        except FileExistsError:
-            if log and not waited:
-                logger.info("sam model lock held by another process, waiting (retry every %ss)", poll_s)
-                waited = True
-            time.sleep(poll_s)
+
+def acquire_model_lock(poll_s: float = 20.0, log: bool = True):
+    """Block until `/tmp/fixxr-sam-model.lock` is ours. Retries forever (this
+    is a build-machine safety net, not a request path with a timeout budget).
+
+    This goes through `sam/modellock.ModelLock` rather than a bare `os.mkdir`,
+    so the lock carries an `owner.json` naming this pid. A bare mkdir was the
+    one case that could never be reclaimed: a killed torch run left a
+    directory that named nobody, and every later run on this machine then
+    waited on it until a human removed it by hand (round 1 finding 11).
+    """
+    lock = modellock.ModelLock(
+        backend="torch", retry_s=poll_s, lock_dir=_MODEL_LOCK_DIR,
+        log=(lambda message: logger.info("%s", message)) if log
+        else (lambda _message: None))
+    lock.acquire()
+    with _HELD_MUTEX:
+        _HELD.append(lock)
+    return lock
 
 
 def release_model_lock() -> None:
-    try:
-        os.rmdir(_MODEL_LOCK_DIR)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        # not empty / not ours -- do not take another process's lock away
-        pass
+    with _HELD_MUTEX:
+        lock = _HELD.pop() if _HELD else None
+    if lock is not None:
+        lock.release()
+        return
+    # Nothing this process took: leave whatever is there alone. Removing it
+    # would be removing another process's lock.
+    return
 
 
 def _resolve_device(requested: str) -> str:
@@ -143,7 +161,8 @@ class TorchBackend:
     "torch-cpu", "stub").
     """
 
-    def __init__(self, device: str = "auto", repo_id: str | None = None):
+    def __init__(self, device: str = "auto", repo_id: str | None = None,
+                 use_model_lock: bool = True):
         self._requested_device = device
         self.repo_id = repo_id or os.environ.get("SAM_TORCH_REPO_ID", DEFAULT_REPO_ID)
         self.name = "torch-cpu"  # corrected in load()
@@ -151,19 +170,28 @@ class TorchBackend:
         self._kind: str | None = None  # "text" or "point" -- which model is resident
         self._model = None
         self._processor = None
+        # False when the caller already holds the machine wide lock (the
+        # service does, for as long as the model is resident). This is a
+        # constructor argument rather than the caller replacing this module's
+        # two lock functions with no-ops: that replacement was never undone, so
+        # every later TorchBackend in the process ran unlocked (round 1
+        # finding 47).
+        self._use_model_lock = bool(use_model_lock)
         self._lock_held = False
         self._next_auto_id = 1
 
     # -- lifecycle ---------------------------------------------------------
 
     def load(self) -> None:
-        acquire_model_lock()
-        self._lock_held = True
+        if self._use_model_lock:
+            acquire_model_lock()
+            self._lock_held = True
         try:
             self.device = _resolve_device(self._requested_device)
         except Exception:
-            release_model_lock()
-            self._lock_held = False
+            if self._lock_held:
+                release_model_lock()
+                self._lock_held = False
             raise
         self.name = "torch-mps" if self.device == "mps" else "torch-cpu"
         logger.info("TorchBackend loaded: device=%s repo=%s", self.device, self.repo_id)

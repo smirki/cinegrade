@@ -540,6 +540,17 @@
     });
     frameOrder = frameOrder.filter(function (k) { return k.indexOf(id + ":") !== 0; });
     delete lastFrame[id];
+    /* The GRADED picture holds its own copy of the same frames, and it has to
+     * be told too. This panel's overlay cache and gpu.js's matte cache are two
+     * caches of one store: a re-track writes different pixels under the same
+     * id and frame numbers, and a matte finishing turns a partial index into a
+     * full one, so a renderer that was never told would keep serving the old
+     * pixels (and the old, short frame count) for the rest of the session. It
+     * used to be told nothing at all, which is why a re-tracked matte looked
+     * right in the overlay and stayed wrong in the picture. */
+    if (global.StudioLive && global.StudioLive.invalidateMatte) {
+      global.StudioLive.invalidateMatte(id);
+    }
     wantMatte(id, true);
   }
 
@@ -554,6 +565,26 @@
     return body;
   }
 
+  /* Where a component is NOW, by its own id.
+   *
+   * A track is a network round trip, and while it is in flight the rows can be
+   * reordered, added to or deleted from. An array index is a POSITION, not a
+   * component, so stamping a finished track back at the position it started
+   * from attaches one subject's matte to whatever row happens to sit there
+   * now. Components carry an id (makeComponent writes one), so that is what is
+   * followed here. A component with no id at all (a preset written before ids
+   * existed) falls back to its position, which is the old behaviour and the
+   * best that can be done for it. Returns -1 when the component is gone. */
+  function componentIndexById(arr, cid, fallback) {
+    if (cid) {
+      for (var i = 0; i < arr.length; i++) {
+        if (arr[i] && arr[i].id === cid) return i;
+      }
+      return -1;
+    }
+    return arr[fallback] ? fallback : -1;
+  }
+
   /* Starts (or re-starts) the track for one component and stamps whatever came
    * back onto that component. `job_id` is remembered on the component's matte
    * ref so a reload of the panel still knows which job to watch; the engines
@@ -563,6 +594,7 @@
     var layer = layerAt(idx);
     var comp = componentsOf(layer)[j];
     if (!comp || comp.type !== "matte") return Promise.resolve();
+    var cid = comp.id || "";
     var ref = comp.matte || {};
     var recipe = ref.recipe || {};
     var body = trackBody({ steady: (opts && opts.steady) || ref.steady || null });
@@ -581,23 +613,32 @@
       var mattes = r.mattes || [];
       if (!mattes.length) throw new Error("the track started but named no matte");
       var arr = cloneComponents(layerAt(idx));
-      if (!arr[j]) return;
-      arr[j].matte = {
+      var at = componentIndexById(arr, cid, j);
+      if (at < 0 || !arr[at] || arr[at].type !== "matte") {
+        /* The component was deleted (or stopped being a matte) while the track
+         * ran. The matte itself is on disk and the job is real, so this is not
+         * an error to shout about, but there is nothing left to stamp it onto,
+         * and stamping it on the row that took that position would be the bug
+         * this whole helper exists to stop. */
+        setRowBusy(idx, j, false);
+        return;
+      }
+      arr[at].matte = {
         id: mattes[0].matte_id,
         recipe: mattes[0].recipe || recipe,
         job_id: r.job_id || null
       };
-      if (opts && opts.name) arr[j].name = opts.name;
+      if (opts && opts.name) arr[at].name = opts.name;
       /* "choose one or all": every instance past the first becomes its own
        * component, added below this one with op add, so a person can then
        * subtract or feather each one separately. */
       for (var k = 1; k < mattes.length; k++) {
-        var extra = JSON.parse(JSON.stringify(arr[j]));
+        var extra = JSON.parse(JSON.stringify(arr[at]));
         extra.id = freshId();
-        extra.name = (mattes[k].label || arr[j].name || "matte") + " " + (k + 1);
+        extra.name = (mattes[k].label || arr[at].name || "matte") + " " + (k + 1);
         extra.matte = { id: mattes[k].matte_id, recipe: mattes[k].recipe || recipe,
                         job_id: r.job_id || null };
-        arr.splice(j + k, 0, extra);
+        arr.splice(at + k, 0, extra);
       }
       writeComponents(idx, arr, true);
       if (r.job_id) { watching[r.job_id] = true; jobs[r.job_id] = { id: r.job_id, state: "queued" }; }
@@ -640,7 +681,11 @@
   /* ---- picking on the picture -------------------------------------------- */
 
   function startPick(idx, j) {
-    pick = { layer: idx, comp: j, points: [], boxes: [], busy: false,
+    // compId is the component this pick belongs to, followed by id rather than
+    // by row position for the whole life of the session (see choosePick).
+    pick = { layer: idx, comp: j,
+             compId: ((componentsOf(layerAt(idx))[j] || {}).id) || "",
+             points: [], boxes: [], busy: false,
              candidates: null, pickId: null, error: "" };
     if (global.WindowEditor && global.WindowEditor.setMaskPick) {
       /* window-editor.js owns the drawing and appends to the two arrays it
@@ -671,37 +716,66 @@
       toast("click the subject on the picture first", true);
       return;
     }
-    pick.busy = true;
-    pick.error = "";
+    /* THIS session, captured before the request goes out.
+     *
+     * `pick` is one module level slot that startPick reassigns wholesale, so
+     * `if (!pick)` tests that SOME pick is live, not that it is the one this
+     * response belongs to. Pick on component A, press Find, press Done, pick on
+     * component B, and A's late answer used to pass that guard and overwrite
+     * B's pickId and candidates: choosePick then tracked B with A's pick and
+     * attached a matte of the wrong subject with no error anywhere. Identity,
+     * not nullness. */
+    var session = pick;
+    session.busy = true;
+    session.error = "";
     refreshAll();
     post("/api/mask/segment", {
       clip: api.getClip(), time: api.getTime(), rotation: api.getRotation(),
-      prompts: { text: [], points: pick.points, boxes: pick.boxes },
+      prompts: { text: [], points: session.points, boxes: session.boxes },
       max_instances: 8
     }).then(function (r) {
-      if (!pick) return;
-      pick.busy = false;
-      pick.pickId = r.pick_id;
-      pick.candidates = r.instances || [];
-      if (!pick.candidates.length) pick.error = "SAM found nothing there. Try another point.";
+      if (pick !== session) return;
+      session.busy = false;
+      session.pickId = r.pick_id;
+      session.candidates = r.instances || [];
+      if (!session.candidates.length) {
+        session.error = "SAM found nothing there. Try another point.";
+      }
       refreshAll();
     }).catch(function (e) {
-      if (!pick) return;
-      pick.busy = false;
+      /* The service being down is a fact about the machine, not about this
+       * session, so it is recorded whichever pick is live now; the session's
+       * own error line is not, for the reason above. */
       if (e.status === 503) {
         service.state = "down";
         service.error = e.message;
         service.startCmd = startCommandFrom(e.message);
       }
-      pick.error = e.message || String(e);
+      if (pick !== session) { refreshAll(); return; }
+      session.busy = false;
+      session.error = e.message || String(e);
       refreshAll();
     });
   }
 
   function choosePick(select, label) {
     if (!pick || !pick.pickId) return;
-    var idx = pick.layer, j = pick.comp;
-    trackComponent(idx, j, { pick_id: pick.pickId, select: select, name: label });
+    /* Read the target off the session that owns this pick id, before stopPick
+     * clears it, and find the component by ITS OWN ID rather than by the
+     * position it had when the pick started. A pick session lasts as long as
+     * the user takes to click, press Find and press Done, and the rows can be
+     * reordered or deleted in that time (see componentIndexById). */
+    var session = pick;
+    var arr = componentsOf(layerAt(session.layer));
+    var at = componentIndexById(arr, session.compId, session.comp);
+    if (at < 0 || !arr[at] || arr[at].type !== "matte") {
+      toast("the component this pick belongs to is gone, so there is nothing "
+            + "to track: add it again and pick once more", true);
+      stopPick();
+      return;
+    }
+    trackComponent(session.layer, at,
+                   { pick_id: session.pickId, select: select, name: label });
     stopPick();
   }
 

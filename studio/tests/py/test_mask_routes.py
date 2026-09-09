@@ -45,6 +45,18 @@ What it pins:
   stats by matte   POST /api/stats with `matte` weights the measurement and
                    differs from the unweighted call on a frame with a real
                    (non uniform) matte.
+  stats by mask    POST /api/stats with `mask` (a whole component stack, gap
+                   19) folds it with the engine's own mask_matte: a one
+                   component stack measures exactly what `matte` measures,
+                   an intersect narrows it, coverage and mask_mattes come
+                   back on the row, a stack that covers nothing is a
+                   no_coverage row rather than a 400, and mask alongside
+                   matte or region, a mask that is not an object, a no-op
+                   mask and an unknown matte id inside a stack are all
+                   refused.
+  generated caches the LUTs this server bakes (layers, masks, slice) land
+                   under its own --data-dir cache and not in grade/luts
+                   (gap 22), so two runs on one clip cannot collide.
   preset load      GET /api/preset with `clip` resolves a saved text recipe
                    to a fresh matte id and queues it (mask_queued in the
                    response); a point recipe is left needs_pick instead.
@@ -59,7 +71,6 @@ import hashlib
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -86,17 +97,15 @@ PASSWORD = "a-long-enough-test-password-2"
 MASK_WIDTH = 160
 MIN_SAMPLE_WIDTH = 160
 
+sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(GRADE))
+import numpy as np                                            # noqa: E402
 import mattes as MT                                           # noqa: E402
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = int(s.getsockname()[1])
-    if port in (7431, 7614, 7615):                      # pragma: no cover
-        return _free_port()
-    return port
+# Round 1 finding 20: this file's own list avoided 7431, 7614 and 7615 and not
+# 7560 or 7632, the stub service suite's list avoided a different four, and
+# neither covered the port a live agent seat's studio was actually on. There
+# is one list now (studio/tests/forbidden-ports.json) and one picker.
+from ports import FORBIDDEN_PORTS, free_port as _free_port    # noqa: E402,F401
 
 
 def _get(url: str, timeout: float = 30.0, headers=None):
@@ -175,6 +184,29 @@ class _FakeSamState:
         # prove studio asked for a RESUME rather than a fresh matte
         # (checkpoint gap 12).
         self.last_matte_ids: dict = {}
+        # Per matte directory, per frame: area, score, IoU and the mask that
+        # produced them, so index.json can carry the real arrays the service
+        # writes (contract C2) instead of nothing at all.
+        self.frame_stats: dict[str, dict] = {}
+        # job_id to an Event a timed track waits on before writing past
+        # `HOLD_AFTER` frames. Round 1 finding 34: without this the cancel
+        # test raced the writer, so it accepted "resumed OR restarted" and
+        # skipped itself whenever the track happened to finish first, which
+        # meant the resume path it exists to prove was never asserted.
+        self.gates: dict[str, threading.Event] = {}
+        # The working width and rotation the last /track carried. Design rule
+        # 5 keys a track by clip, rotation, working width and recipe; round 1
+        # finding 40 found nothing that proved the last two were on the wire
+        # at all, let alone in the key.
+        self.last_track_width = None
+        self.last_track_rotation = None
+
+    def release_gates(self) -> None:
+        """Let every held track run to the end (called from the test)."""
+        with self.lock:
+            gates = list(self.gates.values())
+        for g in gates:
+            g.set()
 
 
 class _FakeSamHandler(BaseHTTPRequestHandler):
@@ -248,7 +280,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             for i in range(n):
                 d = Path(tempfile.mkdtemp(prefix="fake-sam-seg-"))
                 mask_path = d / "mask.png"
-                arr = _checker_mask(24, 18, i)
+                arr = _fake_mask(24, 18, i)
                 MT.write_gray_png(mask_path, arr)
                 label = texts[0] if texts else "object"
                 instances.append({
@@ -318,7 +350,9 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                 # about a barely started matte looked wrong. The digest keeps
                 # an identical recipe on an identical id (the cache tests
                 # need that) and separates recipes that only share a word.
-                tag = _recipe_tag(prompts, select, body.get("steady"))
+                tag = _recipe_tag(prompts, select, body.get("steady"),
+                                  body.get("clip_key"), body.get("rotation"),
+                                  body.get("width"))
                 if isinstance(select, list) and select:
                     mattes = [{"matte_id": f"m_{_slug(s)}_{tag}",
                               "object_id": str(s),
@@ -339,6 +373,8 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                          for k, v in (body.get("matte_ids") or {}).items()}
             with self.state.lock:
                 self.state.last_matte_ids = dict(resume_ids)
+                self.state.last_track_width = body.get("width")
+                self.state.last_track_rotation = body.get("rotation")
             for m in mattes:
                 override = resume_ids.get(str(m.get("object_id")))
                 if override:
@@ -346,6 +382,18 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             matte_ids = [m["matte_id"] for m in mattes]
             fail_texts = {t for t in texts if t.startswith("__fail__")}
             slow = "slow" in texts
+            # Marker words that choose the mask content this track writes
+            # (see _fake_mask): a track whose frames really drift, one that
+            # covers everything, one that covers half. Markers rather than
+            # separate routes because the content has to arrive through the
+            # ordinary /track path the studio uses (round 1 findings 15 and
+            # 17).
+            kind = "normal"
+            for mark in ("drift", "full", "half"):
+                if any(str(t).startswith(f"__{mark}__") for t in texts):
+                    kind = mark
+                    break
+            hold = "hold" in texts
             job_id = f"job{len(self.state.jobs) + 1}"
             for m in mattes:
                 m["path"] = str(out_dir / m["matte_id"])
@@ -364,9 +412,14 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                                   label=m.get("label"), kind=m.get("kind"),
                                   **common)
             if slow:
+                gate = None
+                if hold:
+                    gate = threading.Event()
+                    with self.state.lock:
+                        self.state.gates[job_id] = gate
                 threading.Thread(target=_run_slow_track, args=(
-                    self.state, job_id, out_dir, mattes, total, common, start),
-                                 daemon=True).start()
+                    self.state, job_id, out_dir, mattes, total, common, start,
+                    kind, gate), daemon=True).start()
             else:
                 for m in mattes:
                     mid = m["matte_id"]
@@ -380,12 +433,20 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                                           error=err, **common)
                         continue
                     for i in range(start, end):
-                        MT.write_gray_png(d / MT.frame_name(i),
-                                          _checker_mask(20, 15, i))
+                        _write_frame(self.state, d, i,
+                                     _fake_mask(20, 15, i, kind=kind))
                     with self.state.lock:
                         self.state.jobs[job_id]["matte_state"][mid] = "done"
+                    # Counted off the directory, not `total`, because the real
+                    # store recounts too (sam/store.py `_carry_forward`): a
+                    # resume or a widen writes a tail of 12 frames into a
+                    # matte that now holds 18, and reporting 12 would make a
+                    # correct widen look like a matte that lost its head.
+                    on_disk = len([q for q in d.glob("*.png") if q.stem.isdigit()])
                     _fake_index_write(d, matte_id=mid, state="done",
-                                      done_frames=total, **common)
+                                      done_frames=on_disk, **common,
+                                      **_frame_arrays(self.state, d,
+                                                      common.get("frames")))
                 with self.state.lock:
                     j = self.state.jobs[job_id]
                     j["state"] = "done"
@@ -404,6 +465,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             job_id = self.path[len("/jobs/"):-len("/cancel")]
             with self.state.lock:
                 job = self.state.jobs.get(job_id)
+                gate = self.state.gates.get(job_id)
                 if job:
                     job["state"] = "cancelled"
                     for m in job["mattes"]:
@@ -420,16 +482,134 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                             job["matte_error"][mid] = "cancelled"
                             _fake_index_write(Path(m["path"]), matte_id=mid,
                                               state="failed", error="cancelled")
+            # A held writer is waiting on its gate; wake it so it notices the
+            # cancel now rather than at the end of its bounded wait.
+            if gate is not None:
+                gate.set()
             self._send(200, {"job_id": job_id, "state": "cancelled" if job else None})
             return
         self._send(404, {"error": f"no such route: {self.path}"})
 
 
-def _checker_mask(w: int, h: int, seed: int):
-    import numpy as np
+# Where the injected drift lands in a `__drift__` track, as offsets from
+# frame 0. Named here because the test that reads them names them too, and a
+# number that has to agree in two places should be one number.
+DRIFT_LOST = 2                 # the subject is gone: nothing tracked at all
+DRIFT_ELSEWHERE = 4            # the same size, somewhere else entirely
+DRIFT_LATCH = 6                # the whole frame: latched onto the background
+
+
+def _fake_mask(w: int, h: int, index: int, kind: str = "normal"):
+    """The mask this fake writes for one frame of a track.
+
+    Alternate rows of the whole width (a matte that is not uniform, which is
+    what the stats tests weight by) plus one odd row that moves with the frame
+    number, so consecutive frames overlap the way a tracked subject does:
+    the area holds steady at 9 rows of 15, and the intersection over union
+    with the frame before it is 8/10.
+
+    This used to be `a[index::2] = 1`, which had two properties nobody had
+    reason to notice while the fake wrote no per frame arrays: every even
+    frame was DISJOINT from the odd frame beside it (an IoU of 0.0, which the
+    drift rule calls a lost track), and every frame past the frame height was
+    entirely EMPTY (an area of 0.0, which the drift rule calls a lost
+    subject). Round 1 finding 15 asked for those arrays to be real, and
+    against the old content every frame of every matte in this suite would
+    have come back flagged.
+
+    `kind` is how a test asks for content it can check by hand, chosen by a
+    marker word in the track's own prompts so it travels the ordinary /track
+    path rather than a back door:
+
+      "drift"  the three failures the quality rules exist to catch, at the
+               fixed offsets above:
+                 frame 2  nothing at all    the subject is lost
+                 frame 4  the other rows    the same size, one row of overlap
+                 frame 6  the whole frame   six tenths of the frame to all
+      "full"   every pixel, every frame. Weighting a measurement by this
+               matte has to reproduce the unweighted measurement EXACTLY,
+               which is the one comparison that cannot pass by accident.
+      "half"   the top half of the frame, every frame, so a weighted
+               measurement has something real to differ from.
+    """
     a = np.zeros((h, w), dtype=np.float32)
-    a[seed::2, :] = 1.0
+    odd = list(range(1, h, 2))
+    if kind == "full":
+        a[:, :] = 1.0
+        return a
+    if kind == "half":
+        a[:max(1, h // 2), :] = 1.0
+        return a
+    if kind == "drift" and index == DRIFT_LOST:
+        return a
+    if kind == "drift" and index == DRIFT_ELSEWHERE:
+        a[1::2, :] = 1.0
+        return a
+    if kind == "drift" and index == DRIFT_LATCH:
+        a[:, :] = 1.0
+        return a
+    a[0::2, :] = 1.0
+    if odd:
+        a[odd[index % len(odd)], :] = 1.0
     return a
+
+
+def _write_frame(state: "_FakeSamState", dir_path: Path, index: int, arr,
+                 score: float = 0.9) -> None:
+    """Write one matte frame AND the per frame numbers that go with it.
+
+    A mirror of sam/store.py's `MatteWriter._write`: the area is the mean of
+    the clipped mask, the score is the model's own confidence, and the IoU is
+    the overlap with the frame written before it, all rounded the way the real
+    store rounds them. Round 1 finding 15: this fake wrote none of the three,
+    so `quality()` through the real route was always judging an empty `areas`
+    list and could only ever answer "nothing suspect" no matter what the
+    frames held. Every quality assertion in this file was written against
+    that.
+
+    One deliberate difference from the store: the store keeps the previous
+    mask on the writer object, so the first frame of a resumed tail has no
+    predecessor and gets no IoU. This keeps the numbers per matte DIRECTORY
+    and compares against the previous frame index, so a resumed tail's first
+    frame is compared with the frame before it on disk. That is the same
+    answer on a track that runs straight through, and a better one on a
+    resume, and it means a widen cannot silently drop a matte's IoU curve.
+    """
+    MT.write_gray_png(dir_path / MT.frame_name(index), arr)
+    cur = np.asarray(arr) >= 0.5
+    with state.lock:
+        rec = state.frame_stats.setdefault(str(dir_path), {})
+        earlier = [i for i in rec if i < index]
+        iou = None
+        if earlier:
+            prev = rec[max(earlier)]["mask"]
+            if prev.shape == cur.shape:
+                union = float(np.logical_or(prev, cur).sum())
+                inter = float(np.logical_and(prev, cur).sum())
+                iou = round(inter / union, 4) if union > 0 else 1.0
+        rec[index] = {"area": round(float(np.clip(arr, 0.0, 1.0).mean()), 6),
+                      "score": round(float(score), 4), "iou": iou,
+                      "mask": cur}
+
+
+def _frame_arrays(state: "_FakeSamState", dir_path: Path, frames) -> dict:
+    """`areas`, `scores` and `ious` for index.json (contract C2).
+
+    Indexed by ABSOLUTE frame index and padded with None to the declared
+    frame count, which is what makes a partial matte obvious in the response
+    and what `quality()` reads.
+    """
+    with state.lock:
+        rec = {i: dict(v) for i, v in
+               state.frame_stats.get(str(dir_path), {}).items()}
+    n = max(int(frames or 0), (max(rec) + 1) if rec else 0)
+    out = {"areas": [None] * n, "scores": [None] * n, "ious": [None] * n}
+    for i, entry in rec.items():
+        if 0 <= i < n:
+            out["areas"][i] = entry["area"]
+            out["scores"][i] = entry["score"]
+            out["ious"][i] = entry["iou"]
+    return out
 
 
 def _slug(text) -> str:
@@ -442,16 +622,30 @@ def _slug(text) -> str:
     return s[:40] or "x"
 
 
-def _recipe_tag(prompts, select=None, steady=None) -> str:
+def _recipe_tag(prompts, select=None, steady=None, clip_key=None,
+                rotation=None, width=None) -> str:
     """A short digest of the whole recipe, the way the real service ids a
     matte (a digest, not one prompt word).
 
-    Deliberately NOT keyed on the frame range: a resume re-queues a tail with
-    a different start_frame and has to land on the same id, which is the
-    whole point of the `matte_ids` override below.
+    The real derivation is `recipe_digest(clip_key, rotation, source.width,
+    recipe, slot.id, steady, start, end)` in sam/server.py, so the clip, the
+    ROTATION and the WORKING WIDTH are part of the id: the same words at two
+    rotations are two different pictures and must not share a directory.
+    Round 1 finding 40 is that nothing anywhere proved either of those two
+    were part of any key; this fake left them out too, so a test that tracked
+    one prompt at two rotations would have had the second track write into the
+    first one's matte and the test would have proved the opposite of what it
+    read.
+
+    Deliberately NOT keyed on the frame range, which is the one place this
+    departs from the real digest: a resume re-queues a tail with a different
+    start_frame and has to land on the same id. The real service handles that
+    with the `matte_ids` override below, which this fake honours too.
     """
     raw = json.dumps({"prompts": prompts or {}, "select": select,
-                      "steady": steady}, sort_keys=True, default=str)
+                      "steady": steady, "clip_key": clip_key,
+                      "rotation": rotation, "width": width},
+                     sort_keys=True, default=str)
     return hashlib.sha1(raw.encode()).hexdigest()[:8]
 
 
@@ -477,9 +671,22 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
     tmp.replace(p)
 
 
+HOLD_AFTER = 2                 # frames a held track writes before it waits
+HOLD_TIMEOUT = 30.0            # and how long it waits before giving up
+
+
 def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
                     mattes: list, total: int, common: dict,
-                    start: int = 0) -> None:
+                    start: int = 0, kind: str = "normal",
+                    gate: threading.Event | None = None) -> None:
+    """The timed writer: one frame every half second, cancellable.
+
+    `gate` (a track whose prompts carry the word "hold") stops after
+    `HOLD_AFTER` frames and waits, so a test can cancel a track at a KNOWN
+    number of written frames instead of racing it. The wait is bounded and a
+    gate that is never released ends the thread rather than leaving it writing
+    into a matte a later test reads.
+    """
     for m in mattes:
         _fake_index_write(Path(m["path"]), matte_id=m["matte_id"], state="running")
     for i in range(total):
@@ -489,13 +696,21 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
                 return
         for m in mattes:
             d = Path(m["path"])
-            MT.write_gray_png(d / MT.frame_name(start + i), _checker_mask(20, 15, i))
-            _fake_index_write(d, matte_id=m["matte_id"], done_frames=i + 1, **common)
+            _write_frame(state, d, start + i,
+                         _fake_mask(20, 15, start + i, kind=kind))
+            _fake_index_write(d, matte_id=m["matte_id"], done_frames=i + 1,
+                              **common,
+                              **_frame_arrays(state, d, common.get("frames")))
         with state.lock:
             job = state.jobs.get(job_id)
             if job is None:
                 return
             job["done_frames"] = i + 1
+        if gate is not None and (i + 1) >= HOLD_AFTER:
+            if not gate.wait(timeout=HOLD_TIMEOUT):
+                return                      # nobody released it: write no more
+            gate = None                     # released: normal pace from here
+            continue
         time.sleep(0.5)
     with state.lock:
         job = state.jobs.get(job_id)
@@ -509,8 +724,13 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
             job = state.jobs.get(job_id)
             still_cancelled = job is not None and job["state"] == "cancelled"
         if not still_cancelled:
+            # Counted off the directory, not `total`: a resumed tail of 10
+            # frames landing in a matte that now holds 12 has to report 12,
+            # the way sam/store.py's `_carry_forward` recounts.
+            on_disk = len([q for q in d.glob("*.png") if q.stem.isdigit()])
             _fake_index_write(d, matte_id=m["matte_id"], state="done",
-                              done_frames=total, **common)
+                              done_frames=on_disk, **common,
+                              **_frame_arrays(state, d, common.get("frames")))
 
 
 def _start_fake_sam() -> tuple[ThreadingHTTPServer, threading.Thread, _FakeSamState]:
@@ -601,6 +821,28 @@ class MaskRoutesTest(unittest.TestCase):
             time.sleep(0.2)
         raise AssertionError(f"matte {matte_id} never reached {states}, stuck "
                              f"at {last}")
+
+    def _wait_written(self, matte_id: str, at_least: int,
+                      timeout: float = 20.0):
+        """Poll until the matte has at least `at_least` frames on disk.
+
+        A separate waiter from `_wait_matte_state` because a re-track (a
+        resume or a widen) starts from a matte that is ALREADY in the state
+        it will end in: waiting for "done" on one of those returns
+        immediately, before a single new frame is written, and the assertion
+        that follows reads the old matte and passes for the wrong reason.
+        """
+        deadline = time.time() + timeout
+        last = -1
+        info = None
+        while time.time() < deadline:
+            info = _get(self.base + f"/matte/{matte_id}")
+            last = info["written_count"]
+            if last >= at_least:
+                return info
+            time.sleep(0.2)
+        raise AssertionError(f"matte {matte_id} has {last} frames on disk, "
+                             f"waited for {at_least}")
 
     # -- status ---------------------------------------------------------
 
@@ -747,17 +989,34 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertIn("X-Matte-Frame", headers)
 
     def test_partial_matte_frame_falls_back_and_render_refuses_it(self):
-        result = self._track(prompts={"text": ["slow"]},
-                             start=0, end=1)
+        """Round 1 finding 39: this promised "the nearest-written-frame
+        fallback and its warning header" and then asserted that the state
+        header was one of the three states it could possibly be in. The
+        warning header was asserted nowhere in the arc.
+
+        The track is held at a known frame count now (the fake waits on a
+        gate for a prompt carrying "hold"), so the frame the fallback serves
+        is a number this test can name rather than whatever the clock left on
+        disk.
+        """
+        result = self._track(prompts={"text": ["slow", "hold"]},
+                             start=0, end=0.25)
         matte_id = result["mattes"][0]["matte_id"]
-        # Frame 0 lands quickly (the slow fake writes one frame per 0.5s);
-        # ask for a time past what has been written yet and confirm the
-        # nearest-written-frame fallback and its warning header.
-        self._wait_matte_state(matte_id, ("running", "done"))
+        window_end = result["end_frame"]
+        self.assertGreater(window_end, HOLD_AFTER)
+        held = self._wait_written(matte_id, HOLD_AFTER)
+        self.assertEqual(held["written_count"], HOLD_AFTER)
         png, headers = _post_none_get_raw(
             self.base + f"/matte/{matte_id}/frame?time=5&width=32")
         self.assertGreater(len(png), 0)
-        self.assertIn(headers.get("X-Matte-State"), ("running", "done", "queued"))
+        self.assertIn(headers.get("X-Matte-State"), ("running", "queued"))
+        self.assertEqual(headers.get("X-Matte-Frame"), str(HOLD_AFTER - 1),
+                         "the last frame written so far answers for every "
+                         "moment past it")
+        self.assertIn("is not tracked yet",
+                      headers.get("X-Matte-Warning") or "",
+                      "a frame served by the fallback has to say so, or a "
+                      "caller measures a frozen mask and never knows")
 
         cfg = _matte_layer_config(matte_id)
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -768,11 +1027,22 @@ class MaskRoutesTest(unittest.TestCase):
         body = json.loads(caught.exception.read())
         self.assertIn(matte_id, body.get("error", ""))
 
-        self._wait_matte_state(matte_id, ("done",), timeout=20.0)
         out = _post(self.base + "/render", {
             "clip": self.clip, "config": cfg, "duration": 0.2,
             "allow_partial": True, "name": f"masktest_allow_{matte_id}"})
         self.assertIn("job", out)
+
+        # And once the held track is let go it finishes the window, so the
+        # refusal above was about this matte being unfinished and not about
+        # anything permanent.
+        self.sam_state.release_gates()
+        done = self._wait_written(matte_id, window_end, timeout=30.0)
+        self.assertEqual(done["written_count"], window_end)
+        self._wait_matte_state(matte_id, ("done",), timeout=20.0)
+        finished = _post(self.base + "/render", {
+            "clip": self.clip, "config": cfg, "duration": 0.2,
+            "name": f"masktest_finished_{matte_id}"})
+        self.assertIn("job", finished)
 
     # -- the checkpoint gaps M8 logged --------------------------------------
 
@@ -833,7 +1103,17 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertLessEqual(span["end_frame"], span["declared_frames"])
         self.assertAlmostEqual(span["end_s"], span["end_frame"] / info["fps"],
                                places=3)
-        self.assertGreater(info["coverage"], 0.0)
+        # Round 1 finding 39: `coverage > 0` passes for any matte with a
+        # single frame in it. Coverage is written frames over the LENGTH OF
+        # THE SPAN, so on a matte with no holes it is exactly 1.0, and it says
+        # nothing at all about whether the track finished (this one declares
+        # 12 frames and answers for 12; the freeze test below has a matte
+        # whose coverage is also 1.0 while it holds 2 of 12).
+        span_len = span["end_frame"] - span["start_frame"]
+        self.assertEqual(info["coverage"],
+                         round(span["written"] / span_len, 4))
+        self.assertEqual(info["coverage"], 1.0)
+        self.assertTrue(span["contiguous"])
 
     def test_a_matte_reports_its_own_suspect_frames(self):
         """Checkpoint gap 18. The grader's `face` matte lost the face, then
@@ -846,8 +1126,22 @@ class MaskRoutesTest(unittest.TestCase):
         # never be read without knowing what judged it.
         self.assertIn("area_jump", q["thresholds"])
         self.assertIn("min_iou", q["thresholds"])
-        self.assertIn(q["iou_source"], ("index", "frames", "none"))
+        # Round 1 finding 15: this line used to be the whole assertion about
+        # the IoU rule, and "one of the three values that exist" is true of
+        # every possible answer. The service writes `ious` into index.json as
+        # it tracks (C2, and the fake mirrors it now), so the only correct
+        # source here is "index"; reading "none" would mean the rule did not
+        # run and a low_iou count of 0 meant nothing.
+        self.assertEqual(q["iou_source"], "index")
         self.assertEqual(q["checked"], info["written_count"])
+        # This subject does not drift (the fake writes a steady matte for an
+        # ordinary prompt), so the honest answer is zero on every rule. That
+        # is the assertion the arithmetic identity below cannot make: 0 == 0
+        # + 0 + 0 - 0 was what it checked before the arrays were real.
+        self.assertEqual(q["suspect_count"], 0, q["suspect_frames"])
+        self.assertEqual(q["reasons"], {"zero_area": 0, "area_jump": 0,
+                                        "low_iou": 0})
+        self.assertIsNone(q["first_suspect_index"])
         self.assertEqual(set(q["reasons"]),
                          {"zero_area", "area_jump", "low_iou"})
         self.assertEqual(q["suspect_count"],
@@ -857,6 +1151,153 @@ class MaskRoutesTest(unittest.TestCase):
         # and the thresholds in force are readable without computing them
         status = _get(self.base + "/mask/status")
         self.assertIn("area_jump", status["quality_thresholds"])
+
+    def test_a_drifting_matte_names_the_frames_that_went_wrong(self):
+        """Round 1 finding 15, through the route: the drift rules FIRING.
+
+        Everything else in this file asked a healthy matte whether it had
+        anything to report, so every count was 0 and every assertion held
+        whatever the rules did (the fake wrote no `areas` at all, which forces
+        0 by itself). This tracks a matte that really goes wrong and names the
+        frame and the reason for each failure.
+
+        The fake writes 9 rows of 15 for a steady frame, an area of 0.6, and
+        moves one row per frame so consecutive frames overlap at 0.8. Three
+        frames are deliberately wrong, and the whole expected table is
+        arithmetic on row counts:
+
+          frame 2  nothing written    area 0 (zero_area), the whole of the
+                                      previous area lost (area_jump 1.0) and
+                                      no overlap at all (low_iou 0.0)
+          frame 3  steady again       flagged for the shape only: it overlaps
+                                      an empty frame, so low_iou, and the jump
+                                      rule cannot divide by an area of 0
+          frame 4  the other rows     7 rows of 15, so no jump worth flagging
+                                      (0.22), one row of overlap out of 15
+                                      (low_iou 0.0667)
+          frame 5  steady again       the same one row of overlap, low_iou
+          frame 6  the whole frame    0.6 to 1.0 is a jump of 0.67, and it
+                                      still overlaps what came before, so
+                                      area_jump alone
+
+        Losing a subject trips three rules at once and coming back from it
+        trips one: that is the real behaviour of the shipped rules, not a
+        rounding of it, and writing it down means a change to any one rule
+        fails here instead of quietly changing what the studio reports.
+        """
+        result = self._track(prompts={"text": ["__drift__ face"]},
+                             start=0, end=0.5)
+        matte_id = result["mattes"][0]["matte_id"]
+        info = self._wait_matte_state(matte_id, ("done",))
+        q = info["quality"]
+        self.assertEqual(q["iou_source"], "index",
+                         "the fake writes ious the way sam/store.py does, so "
+                         "the rule has to run off the index")
+        self.assertEqual(q["thresholds"], {"area_jump": 0.5, "min_iou": 0.3})
+        by_index = {f["index"]: f["reasons"] for f in q["suspect_frames"]}
+        self.assertEqual(by_index, {
+            DRIFT_LOST: ["zero_area", "area_jump", "low_iou"],
+            DRIFT_LOST + 1: ["low_iou"],
+            DRIFT_ELSEWHERE: ["low_iou"],
+            DRIFT_ELSEWHERE + 1: ["low_iou"],
+            DRIFT_LATCH: ["area_jump"],
+        })
+        self.assertEqual(q["suspect_count"], 5)
+        self.assertEqual(q["reasons"], {"zero_area": 1, "area_jump": 2,
+                                        "low_iou": 4})
+        self.assertEqual(q["first_suspect_index"], DRIFT_LOST)
+        self.assertAlmostEqual(q["first_suspect_time"],
+                              DRIFT_LOST / info["fps"], places=3)
+        lost = next(f for f in q["suspect_frames"] if f["index"] == DRIFT_LOST)
+        self.assertEqual(lost["area"], 0.0)
+        self.assertAlmostEqual(lost["prev_area"], 0.6, places=3)
+        self.assertAlmostEqual(lost["jump"], 1.0, places=3)
+        self.assertEqual(lost["iou"], 0.0)
+        latch = next(f for f in q["suspect_frames"] if f["index"] == DRIFT_LATCH)
+        self.assertEqual(latch["area"], 1.0)
+        self.assertAlmostEqual(latch["jump"], 2.0 / 3.0, places=2)
+
+        # The arrays the rules read are on the wire too, so a caller plotting
+        # the curve (`mask show --strip`) sees the same numbers the flags came
+        # from, and an absent `ious` would be visible rather than silent.
+        one = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(one["areas"][DRIFT_LOST], 0.0)
+        self.assertEqual(one["areas"][DRIFT_LATCH], 1.0)
+        self.assertEqual(one["ious"][DRIFT_LOST], 0.0)
+        self.assertIsNone(one["ious"][0],
+                          "the first frame has nothing before it to overlap")
+        # And the list route carries the summary of the same judgement, capped
+        # but with the true count.
+        listing = _get(self.base + f"/matte?clip={self.clip}")
+        row = next(m for m in listing["mattes"] if m["matte_id"] == matte_id)
+        self.assertEqual(row["quality"]["suspect_count"], 5)
+        self.assertEqual(row["quality"]["first_suspect_index"], DRIFT_LOST)
+
+    def test_a_partial_matte_freezes_past_its_span_and_says_which_frame(self):
+        """Round 1 finding 39: `assertTrue(info["frozen_outside_span"])` is a
+        literal `True` in the response, so it passed whatever the studio
+        actually did with a moment past the tracked window.
+
+        This asks for one. The matte is stopped at two frames of a declared
+        twelve, and the frame route is asked for frame 10:
+
+          the bytes come back 200, not a 404 (the freeze is the design: a
+          correction keeps working while a track is still running),
+          X-Matte-Frame says 1, the last frame really tracked, not 10, and
+          X-Matte-Warning names the frame asked for, the frame served and how
+          much of the matte exists.
+
+        Inside the span there is no warning at all, which is what makes the
+        warning readable as "you are outside the tracked window".
+        """
+        prompts = {"text": ["slow", "hold", "freeze past the span"]}
+        queued = self._track(prompts=prompts, start=0, end=0.5)
+        matte_id = queued["mattes"][0]["matte_id"]
+        held = self._wait_written(matte_id, HOLD_AFTER)
+        self.assertEqual(held["written_count"], HOLD_AFTER,
+                         "the gate holds the fake at a known frame count, so "
+                         "this test never races the writer")
+        _post(self.base + f"/mask/jobs/{queued['job_id']}/cancel", {})
+        info = self._wait_matte_state(matte_id, ("partial",), timeout=25.0)
+        span = info["span"]
+        self.assertEqual(span["end_frame"], HOLD_AFTER)
+        self.assertGreater(info["total_frames"], span["end_frame"],
+                          "this test needs a matte that declares more frames "
+                          "than it answers for")
+        self.assertTrue(info["frozen_outside_span"])
+        # Coverage is 1.0 on a matte holding 2 of 12 frames, because coverage
+        # is about HOLES inside the span, not about being finished. Asserted
+        # here so the two numbers are never read as the same claim.
+        self.assertEqual(info["coverage"], 1.0)
+        self.assertTrue(info["is_partial"])
+
+        fps = float(info["fps"])
+        outside = 10
+        self.assertGreater(outside, span["end_frame"] - 1)
+        png, headers = _post_none_get_raw(
+            self.base + f"/matte/{matte_id}/frame?time={outside / fps}&width=32")
+        self.assertGreater(len(png), 0)
+        self.assertEqual(headers.get("X-Matte-Frame"),
+                         str(span["end_frame"] - 1),
+                         "past the span the LAST TRACKED frame is served, "
+                         "which is what frozen_outside_span means")
+        warning = headers.get("X-Matte-Warning") or ""
+        self.assertIn(matte_id, warning)
+        self.assertIn(f"frame {outside} is not tracked yet", warning)
+        self.assertIn(f"showing frame {span['end_frame'] - 1}", warning)
+        self.assertIn(f"{info['written_count']} of {info['total_frames']}",
+                      warning)
+
+        inside, inside_headers = _post_none_get_raw(
+            self.base + f"/matte/{matte_id}/frame?time=0&width=32")
+        self.assertEqual(inside_headers.get("X-Matte-Frame"), "0")
+        self.assertIsNone(inside_headers.get("X-Matte-Warning"),
+                          "a frame inside the span is not a fallback, so a "
+                          "warning there would train callers to ignore it")
+        self.assertNotEqual(inside, png,
+                            "the frozen frame and frame 0 are different "
+                            "pictures, so the fallback really moved")
+        self.sam_state.release_gates()
 
     @staticmethod
     def _overlapping_reasons(q: dict) -> int:
@@ -887,61 +1328,324 @@ class MaskRoutesTest(unittest.TestCase):
                          "the retry must name the existing matte so the "
                          "frames are not orphaned in a new directory")
 
+    def test_asking_for_a_wider_window_widens_the_matte(self):
+        """Round 1 finding 5. `mask track --end 2` then `--end 6` answered
+        `cached: true` with the words "already covers this request" and the
+        matte still stopped at two seconds.
+
+        The cause was one clamp: the requested window was clipped to the
+        MATTE's own declared length before being compared with it, so every
+        wider ask compared equal. The fix clamps to the CLIP's frame count
+        instead (which is what the clamp was really for: `--end 20` on a 16
+        second clip must not re-queue forever) and re-queues the frames
+        outside the matte, keeping the ones inside it.
+
+        Six frames then eighteen, both written by the fake service inside the
+        POST, so this test is arithmetic and not a race.
+        """
+        prompts = {"text": ["widen me"]}
+        first = self._track(prompts=prompts, start=0, end=0.25)
+        matte_id = first["mattes"][0]["matte_id"]
+        narrow_end = first["end_frame"]
+        self.assertEqual(first["start_frame"], 0)
+        self.assertGreaterEqual(narrow_end, 2,
+                                "this test needs a window of at least two "
+                                "frames to have an outside")
+        self._wait_matte_state(matte_id, ("done",))
+        self._wait_written(matte_id, narrow_end)
+        calls = self.sam_state.track_calls
+
+        # The control: the SAME window again really is a cache hit, and the
+        # answer now says which frames it decided were covered, so a reader
+        # (and the CLI, which prints them) can check the claim.
+        again = self._track(prompts=prompts, start=0, end=0.25)
+        self.assertTrue(again["cached"])
+        self.assertEqual(again["start_frame"], 0)
+        self.assertEqual(again["end_frame"], narrow_end)
+        self.assertEqual(self.sam_state.track_calls, calls,
+                         "an identical window must not call the service again")
+
+        wider = self._track(prompts=prompts, start=0, end=0.75)
+        self.assertFalse(
+            wider["cached"],
+            "a window wider than the matte is not a cache hit: this is the "
+            "finding, and on the old code this assertion is what fails")
+        self.assertTrue(wider["widened"])
+        self.assertFalse(wider["resumed"])
+        self.assertFalse(wider["restarted"])
+        self.assertEqual(wider["resumed_from"], narrow_end,
+                         "a widen starts at the first frame the matte does "
+                         "not have, so the frames it does have are kept")
+        self.assertEqual(wider["start_frame"], narrow_end)
+        self.assertGreater(wider["end_frame"], narrow_end)
+        self.assertIn("widening", wider["message"])
+        self.assertIn(str(wider["end_frame"]), wider["message"],
+                      "the message has to name the window asked for, or the "
+                      "reader cannot tell a widen from a redo")
+        self.assertEqual(wider["mattes"][0]["matte_id"], matte_id,
+                         "a widen writes back into the same matte")
+        self.assertEqual(self.sam_state.track_calls, calls + 1,
+                         "a widen has to reach the SAM service; that call is "
+                         "the whole point of the finding")
+        self.assertEqual(self.sam_state.last_matte_ids.get("0"), matte_id,
+                         "the widen must name the existing matte so the "
+                         "frames already tracked are not orphaned")
+        after = self._wait_written(matte_id, wider["end_frame"])
+        self.assertEqual(after["written_count"], wider["end_frame"],
+                         "every frame from 0 to the new end is on disk: the "
+                         "kept ones and the newly tracked ones")
+        self.assertEqual(after["span"]["end_frame"], wider["end_frame"])
+
+        # And once it is wide, the wide window is itself a cache hit.
+        third = self._track(prompts=prompts, start=0, end=0.75)
+        self.assertTrue(third["cached"])
+        self.assertEqual(third["end_frame"], wider["end_frame"])
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+
+    def test_a_narrower_window_inside_a_wide_matte_is_still_a_cache_hit(self):
+        """The other side of finding 5: widening must not turn every repeat
+        call into a re-track. A window INSIDE what the matte already holds is
+        answered from the cache, with the frames it checked."""
+        prompts = {"text": ["already wide"]}
+        first = self._track(prompts=prompts, start=0, end=0.75)
+        matte_id = first["mattes"][0]["matte_id"]
+        wide_end = first["end_frame"]
+        self._wait_matte_state(matte_id, ("done",))
+        self._wait_written(matte_id, wide_end)
+        calls = self.sam_state.track_calls
+
+        inner = self._track(prompts=prompts, start=0, end=0.25)
+        self.assertTrue(inner["cached"])
+        self.assertLess(inner["end_frame"], wide_end)
+        self.assertEqual(self.sam_state.track_calls, calls)
+
+    def test_a_stale_matte_is_re_tracked_even_when_it_covers_the_window(self):
+        """Round 1 finding 21: the cache asked "is every frame here" BEFORE
+        "is this matte still valid", so a stale matte (one the store marked
+        as made for a different clip, rotation or working width) with a full
+        set of frames was served as a cache hit and graded the wrong pixels.
+
+        `stale` is now read first, and it restarts with its own message
+        rather than the generic dead one, so the reason reaches the caller.
+        """
+        prompts = {"text": ["stale subject"]}
+        first = self._track(prompts=prompts, start=0, end=0.25)
+        matte_id = first["mattes"][0]["matte_id"]
+        end = first["end_frame"]
+        self._wait_matte_state(matte_id, ("done",))
+        info = self._wait_written(matte_id, end)
+
+        # Mark it stale in place, the way the store does when the identity it
+        # recomputes no longer matches what the index says (C2). Every frame
+        # stays on disk: that is exactly the case the old order got wrong.
+        matches = sorted(self._matte_root().rglob(f"{matte_id}/{MT.INDEX_NAME}"))
+        self.assertEqual(len(matches), 1, f"expected one {matte_id} on disk")
+        index_path = matches[0]
+        raw = json.loads(index_path.read_text())
+        raw["state"] = "stale"
+        index_path.write_text(json.dumps(raw))
+        self.assertEqual(_get(self.base + f"/matte/{matte_id}")["state"],
+                         "stale")
+        self.assertEqual(
+            _get(self.base + f"/matte/{matte_id}")["written_count"], end,
+            "the point of this test is a stale matte that IS fully written")
+        calls = self.sam_state.track_calls
+
+        again = self._track(prompts=prompts, start=0, end=0.25)
+        self.assertFalse(
+            again["cached"],
+            "a stale matte is wrong however many frames it holds; on the old "
+            "order coverage was read first and this came back cached")
+        self.assertTrue(again["restarted"])
+        self.assertFalse(again["resumed"])
+        self.assertFalse(again["widened"])
+        self.assertEqual(again["resumed_from"], 0,
+                         "a stale matte is re-tracked from the start of the "
+                         "window, not resumed from a hole it does not have")
+        self.assertIn("stale", again["message"],
+                      "the caller has to be told the recipe identity changed, "
+                      "not just handed a generic restart")
+        self.assertEqual(again["mattes"][0]["matte_id"], matte_id)
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+
     def test_a_cancelled_matte_resumes_from_its_first_missing_frame(self):
         """Checkpoint gap 12, the resume half: frames already written stay
         written and only the missing tail is re-queued.
 
-        The prompt list carries the exact word "slow" (which is how the fake
-        service picks its timed writer) plus a phrase of its own, so this
-        test's recipe hashes differently from every other "slow" track here.
-        The recipe cache is keyed on the prompts and deliberately not on the
-        frame range, so two tests sharing a prompt would share a matte.
+        Round 1 finding 34: this test used to accept a RESTART. It cancelled a
+        timed track after "at least one frame", which is a race against a
+        writer running on a clock, so it could not know how many frames were
+        on disk, could not name the frame the resume had to start from, and
+        skipped itself outright whenever the fake finished first. It asserted
+        `resumed or restarted`, and a restart is the opposite outcome: every
+        frame tracked so far thrown away. The resume path it exists to prove
+        was therefore never asserted by it at all.
 
-        The window is half a second on purpose. The fake writes one frame
-        every 0.5 s, so the whole point of the test (the tail is re-queued
-        and actually runs to the end) has to fit in a timeout: four seconds
-        of a 24 fps clip is 96 frames, which is 48 seconds of fake tracking
-        and can never finish inside any sane wait. Twelve frames proves the
-        same thing: a cancel lands after the first one or two, and the
-        resume writes the rest into the same matte.
+        The fake now holds a track whose prompts carry the word "hold" after
+        exactly `HOLD_AFTER` frames and waits to be released, so the cancel
+        lands at a KNOWN frame count and every number below is arithmetic:
+        two frames written, the tail re-queued from frame 2, and the frames
+        already on disk kept.
+
+        The prompt list carries the exact word "slow" (the fake's timed
+        writer) plus a phrase of its own, so this test's recipe hashes
+        differently from every other slow track here: the recipe cache is
+        keyed on the prompts and deliberately not on the frame range, so two
+        tests sharing a prompt would share a matte.
         """
-        prompts = {"text": ["slow", "resume tail"]}
+        prompts = {"text": ["slow", "hold", "resume tail"]}
         first = self._track(prompts=prompts, start=0, end=0.5)
         job_id = first["job_id"]
         matte_id = first["mattes"][0]["matte_id"]
-        # Let at least one frame land, then stop it.
-        deadline = time.time() + 20.0
-        written = 0
-        while time.time() < deadline:
-            written = _get(self.base + f"/matte/{matte_id}")["written_count"]
-            if written >= 1:
-                break
-            time.sleep(0.2)
-        self.assertGreaterEqual(written, 1, "the slow track wrote nothing")
+        declared_end = first["end_frame"]
+        self.assertGreater(declared_end, HOLD_AFTER + 1,
+                          "the window has to be longer than the hold, or "
+                          "there is no tail to resume")
+        held = self._wait_written(matte_id, HOLD_AFTER)
+        self.assertEqual(held["written_count"], HOLD_AFTER,
+                         "the gate holds the writer here, so the cancel below "
+                         "is not a race")
         _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
-        before = self._wait_matte_state(
-            matte_id, ("partial", "failed", "done"), timeout=25.0)
-        if before["state"] == "done":
-            self.skipTest("the fake finished this track before the cancel "
-                          "landed; there is no missing tail to resume")
-        stopped_at = before["span"]["end_frame"]
+        before = self._wait_matte_state(matte_id, ("partial",), timeout=25.0)
+        self.assertEqual(before["state"], "partial",
+                         "a cancel with frames on disk is partial, never done: "
+                         "the old version of this test skipped itself here")
+        self.assertEqual(before["span"]["end_frame"], HOLD_AFTER)
+        calls = self.sam_state.track_calls
 
         second = self._track(prompts=prompts, start=0, end=0.5)
         self.assertFalse(second["cached"],
                          "a matte with a hole in the window asked for is not "
                          "a cache hit")
-        self.assertTrue(second["resumed"] or second["restarted"])
+        self.assertTrue(second["resumed"],
+                        "the tail is re-queued and the head is kept: that is "
+                        "a resume, and this is the assertion finding 34 was "
+                        "about")
+        self.assertFalse(second["restarted"],
+                         "a restart would throw away the frames already "
+                         "tracked, which is the outcome this test used to "
+                         "accept as equivalent")
+        self.assertFalse(second["widened"])
+        self.assertEqual(second["resumed_from"], HOLD_AFTER,
+                         "a resume starts at the FIRST MISSING frame")
+        self.assertEqual(second["start_frame"], HOLD_AFTER)
+        self.assertEqual(second["end_frame"], declared_end,
+                         "and still ends where the request asked")
+        self.assertIn("resuming from frame", second["message"])
         self.assertEqual(second["mattes"][0]["matte_id"], matte_id,
                          "a resume writes back into the same matte")
-        self.assertLessEqual(second["start_frame"], stopped_at)
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
         self.assertEqual(self.sam_state.last_matte_ids.get("0"), matte_id,
                          "the resume must name the existing matte, or the "
                          "frames already written are orphaned in an old "
                          "directory under a freshly derived id")
-        after = self._wait_matte_state(matte_id, ("done", "partial"),
-                                       timeout=30.0)
-        self.assertGreaterEqual(after["written_count"], stopped_at,
-                                "a resume keeps the frames already on disk")
+
+        # Let the resumed tail run to the end and check what landed: every
+        # frame of the window, and the head's own per frame numbers still in
+        # place (contract C2's carry forward, which is what stops a resume
+        # from blanking the area curve before the tail).
+        self.sam_state.release_gates()
+        after = self._wait_written(matte_id, declared_end, timeout=40.0)
+        self.assertEqual(after["written_count"], declared_end)
+        self.assertEqual(after["span"], dict(after["span"], start_frame=0,
+                                            end_frame=declared_end,
+                                            contiguous=True))
+        full = _get(self.base + f"/matte/{matte_id}")
+        self.assertIsNotNone(full["areas"][0],
+                             "the frames tracked before the cancel keep their "
+                             "areas: a resume that blanks them loses the "
+                             "curve for the head of the clip")
+        self.assertIsNotNone(full["areas"][declared_end - 1])
+        self.assertEqual(full["quality"]["iou_source"], "index")
+
+    def test_the_track_cache_key_includes_rotation_and_the_working_width(self):
+        """Round 1 finding 40. Design rule 5 keys a track by clip identity,
+        rotation, working width and recipe hash, and `_recipe_hash` does
+        include all four. Nothing proved the middle two.
+
+        Every track in this arc ran at one rotation and one working width
+        (`--mask-width 160`, in both suites), so deleting `"rotation"` or
+        `"width": MASK_WORKING_WIDTH` from that payload left every test green
+        while the studio served a matte tracked at one rotation, or measured
+        at one width, for a request that asked for another. Both are wrong
+        pixels reported as a cache hit.
+
+        Three tracks of ONE prompt: the same request twice (free, the
+        control), the same request rotated (a different picture, so a
+        different matte and a real service call), and the same request again
+        on a second server whose working width is 320 and whose data
+        directory is the same one (a different measurement, so a different
+        matte again). The second server is the only way to vary the width: it
+        is a server flag, not a request field.
+        """
+        prompts = {"text": ["rotation and width subject"]}
+        calls = self.sam_state.track_calls
+        at0 = self._track(prompts=prompts, rotation=0, start=0, end=0.25)
+        id0 = at0["mattes"][0]["matte_id"]
+        self.assertFalse(at0["cached"])
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+        self.assertEqual(self.sam_state.last_track_width, MASK_WIDTH,
+                         "the server's working width has to be on the wire "
+                         "before it can be part of any key")
+        self._wait_matte_state(id0, ("done",))
+
+        # The control: the identical request is free, so the differences
+        # below are the rotation and the width and nothing else.
+        again = self._track(prompts=prompts, rotation=0, start=0, end=0.25)
+        self.assertTrue(again["cached"])
+        self.assertEqual(again["mattes"][0]["matte_id"], id0)
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+
+        at90 = self._track(prompts=prompts, rotation=90, start=0, end=0.25)
+        self.assertFalse(at90["cached"],
+                         "the same words on a rotated clip are a different "
+                         "picture: answering it from the cache hands back a "
+                         "matte made for the other orientation")
+        id90 = at90["mattes"][0]["matte_id"]
+        self.assertNotEqual(id90, id0)
+        self.assertEqual(self.sam_state.track_calls, calls + 2,
+                         "and it has to reach the service")
+        self.assertEqual(str(self.sam_state.last_track_rotation), "90")
+        self._wait_matte_state(id90, ("done",))
+        # Both mattes exist side by side, each remembering its own rotation.
+        self.assertEqual(_get(self.base + f"/matte/{id0}")["rotation"], "0")
+        self.assertEqual(_get(self.base + f"/matte/{id90}")["rotation"], "90")
+
+        # A second studio on the SAME data directory (so the same matte store
+        # and the same recipe cache file), working at 320 instead of 160.
+        wide_width = 320
+        port = _free_port()
+        wide_base = f"http://127.0.0.1:{port}/api"
+        sam_port = self.sam_srv.server_address[1]
+        proc = subprocess.Popen(
+            [PYTHON, SERVER, "--port", str(port), "--data-dir", self.data_dir,
+            "--sam-url", f"http://127.0.0.1:{sam_port}",
+            "--mask-width", str(wide_width)],
+            cwd=str(CONTENT), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _wait_ready(wide_base, proc)
+            self.assertEqual(_get(wide_base + "/mask/status")["mask_width"],
+                             wide_width)
+            before = self.sam_state.track_calls
+            wide = _post(wide_base + "/mask/track",
+                        {"clip": self.clip, "prompts": prompts,
+                         "rotation": 0, "start": 0, "end": 0.25})
+            self.assertFalse(wide["cached"],
+                             "a matte tracked at a 160 wide working size is "
+                             "not an answer to a request measured at 320")
+            self.assertNotEqual(wide["mattes"][0]["matte_id"], id0)
+            self.assertEqual(self.sam_state.track_calls, before + 1)
+            self.assertEqual(self.sam_state.last_track_width, wide_width)
+            # And the same request on the wide server twice is still free, so
+            # what changed is the width and not simply "a second server".
+            twice = _post(wide_base + "/mask/track",
+                         {"clip": self.clip, "prompts": prompts,
+                          "rotation": 0, "start": 0, "end": 0.25})
+            self.assertTrue(twice["cached"])
+            self.assertEqual(twice["mattes"][0]["matte_id"],
+                             wide["mattes"][0]["matte_id"])
+        finally:
+            _stop(proc)
 
     def test_force_redoes_a_finished_matte(self):
         """Checkpoint gap 12, the escape hatch: a matte that IS complete is a
@@ -1053,20 +1757,57 @@ class MaskRoutesTest(unittest.TestCase):
     # -- stats by matte -------------------------------------------------
 
     def test_stats_weighted_by_matte_differs_from_unweighted(self):
-        result = self._track(prompts={"text": ["stats subject"]})
-        matte_id = result["mattes"][0]["matte_id"]
-        self._wait_matte_state(matte_id, ("done",))
-        plain = _post(self.base + "/stats",
-                      {"clip": self.clip, "time": 0.1, "width": 64, "config": {}})
-        weighted = _post(self.base + "/stats",
-                         {"clip": self.clip, "time": 0.1, "width": 64,
-                          "config": {}, "matte": matte_id})
-        self.assertEqual(weighted["matte"], matte_id)
-        self.assertIn("stats", weighted)
-        # A checkerboard matte is not uniform, so weighting by it should not
-        # generally reproduce the flat frame mean exactly.
-        self.assertIn("luma", weighted["stats"])
-        self.assertIn("luma", plain["stats"])
+        """Round 1 finding 17: a test named "differs" that asserted no
+        difference.
+
+        What it checked was that the key "luma" was present in both answers,
+        which is true of every stats response the route can produce, weighted
+        or not. A route that ignored `matte` entirely passed it.
+
+        There are two comparisons here instead, and the first is the one that
+        cannot pass by accident: a matte that covers EVERY pixel has to
+        reproduce the unweighted measurement exactly, block for block. That is
+        the identity case of a weighted mean, so it pins the weighting as
+        correct and not merely present. Then a matte covering the top half of
+        the frame has to move the numbers, and by more than float noise.
+        """
+        width = self.STACK_WIDTH
+        body = {"clip": self.clip, "time": 0.1, "width": width, "config": {}}
+        plain = _post(self.base + "/stats", dict(body))
+
+        full = self._track(prompts={"text": ["__full__ every pixel"]},
+                           start=0, end=0.25)
+        full_id = full["mattes"][0]["matte_id"]
+        self._wait_matte_state(full_id, ("done",))
+        by_full = _post(self.base + "/stats", dict(body, matte=full_id))
+        self.assertEqual(by_full["matte"], full_id)
+        self.assertEqual(by_full["coverage"], 1.0,
+                         "a matte over the whole frame covers all of it")
+        for block in ("luma", "saturation", "channels", "families", "clipped",
+                      "bands"):
+            self.assertEqual(by_full["stats"][block], plain["stats"][block],
+                             f"weighting by a matte that covers everything has "
+                             f"to reproduce the unweighted {block} exactly")
+
+        half = self._track(prompts={"text": ["__half__ top of frame"]},
+                           start=0, end=0.25)
+        half_id = half["mattes"][0]["matte_id"]
+        self._wait_matte_state(half_id, ("done",))
+        by_half = _post(self.base + "/stats", dict(body, matte=half_id))
+        # The fake writes 15 rows and covers the top 7 of them, so the
+        # coverage this route reports is a number that can be checked by hand.
+        self.assertAlmostEqual(by_half["coverage"], 7 / 15, delta=0.01)
+        moved = abs(by_half["stats"]["luma"]["mean"]
+                    - plain["stats"]["luma"]["mean"])
+        # Measured at 0.038 on the clip in footage/ before this floor was
+        # written down. The floor is deliberately well under that and well
+        # over rounding (the means are reported to 4 decimals), so it fails on
+        # a route that stops weighting and does not depend on the clip.
+        self.assertGreater(moved, 0.005,
+                           f"the top half of the frame reads the same as the "
+                           f"whole frame to within {moved:.4f}: nothing is "
+                           f"being weighted")
+        self.assertNotEqual(by_half["stats"]["luma"], plain["stats"]["luma"])
 
     def test_stats_with_an_unknown_matte_is_a_clean_404(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -1074,6 +1815,347 @@ class MaskRoutesTest(unittest.TestCase):
                                          "width": 64, "config": {},
                                          "matte": "not-a-real-matte"})
         self.assertEqual(caught.exception.code, 404)
+
+    # -- stats by a whole mask stack (checkpoint gap 19) -------------------
+
+    # Everything below asks for the same recipe on purpose: track is free the
+    # second time (design rule 5), so these share one matte instead of
+    # queueing a fresh track per test.
+    STACK_PROMPT = "mask stack subject"
+    STACK_WIDTH = 240                  # over the 160 floor, small enough to be cheap
+
+    def _stack_matte(self) -> str:
+        result = self._track(prompts={"text": [self.STACK_PROMPT]})
+        matte_id = result["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+        return matte_id
+
+    def _stats(self, **extra):
+        body = {"clip": self.clip, "time": 0.1, "width": self.STACK_WIDTH,
+                "config": {}}
+        body.update(extra)
+        return _post(self.base + "/stats", body)
+
+    def _stats_error(self, **extra):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self._stats(**extra)
+        return caught.exception.code, json.loads(caught.exception.read()).get("error", "")
+
+    def test_stats_by_a_one_component_mask_stack_matches_the_matte_shortcut(self):
+        """Checkpoint gap 19. `matte: ID` could only ever say one stored
+        matte, so "the person matte intersected with a skin key" (the round 4
+        skin anchor's own measurement) had to be hand built against the
+        engine's internal modules and then separately proved against a real
+        render. `mask` takes the same component stack a graded layer carries,
+        folded by the engine's OWN mask_matte, which is why the one component
+        stack that names a single matte has to land on exactly the numbers the
+        shortcut lands on: it is not a second implementation of the fold.
+        """
+        matte_id = self._stack_matte()
+        shortcut = self._stats(matte=matte_id)
+        stack = self._stats(mask={"components": [
+            {"type": "matte", "op": "add", "matte": {"id": matte_id}}]})
+        self.assertEqual(stack["stats"], shortcut["stats"])
+        self.assertEqual(stack["mask_mattes"], [matte_id])
+        self.assertEqual(stack["measured_width"], stack["size"][0])
+        self.assertIsNotNone(stack.get("coverage"))
+        self.assertFalse(stack["no_coverage"])
+        # And both weighted rows say how much they covered, which an
+        # unweighted row does not claim at all.
+        self.assertEqual(stack["coverage"], shortcut["coverage"])
+        self.assertNotIn("coverage", self._stats())
+
+    def test_an_intersect_in_the_stack_narrows_what_was_measured(self):
+        """The op in the stack has to change the answer in the direction it
+        says, otherwise `mask` is decoration. The fake matte covers alternate
+        rows of the WHOLE width, so intersecting it with a window over the
+        middle half can only take pixels away.
+        """
+        matte_id = self._stack_matte()
+        whole = self._stats(mask={"components": [
+            {"type": "matte", "op": "add", "matte": {"id": matte_id}}]})
+        narrowed = self._stats(mask={"components": [
+            {"type": "matte", "op": "add", "matte": {"id": matte_id}},
+            {"type": "window", "op": "intersect",
+             "window": {"shape": "rect", "w": 0.5, "h": 1.0, "softness": 0.0}}]})
+        self.assertLess(narrowed["coverage"], whole["coverage"])
+        self.assertNotEqual(narrowed["stats"]["luma"]["mean"],
+                            whole["stats"]["luma"]["mean"],
+                            "a narrower mask that reads the same mean is not "
+                            "weighting anything")
+
+    def test_a_mask_stack_that_covers_nothing_is_a_row_not_an_error(self):
+        """Checkpoint gap 23, through the route. Subtracting a window that
+        covers the frame leaves a weight of exactly zero, which used to be a
+        StatsError (a 400) and stopped a script walking timestamps dead. It is
+        an ordinary 200 now, flagged, with the measurement blocks null rather
+        than zero so nobody averages a frame that was never measured.
+        """
+        matte_id = self._stack_matte()
+        out = self._stats(mask={"components": [
+            {"type": "matte", "op": "add", "matte": {"id": matte_id}},
+            {"type": "window", "op": "subtract",
+             "window": {"shape": "rect", "w": 1.5, "h": 1.5,
+                        "softness": 0.0}}]})
+        self.assertTrue(out["no_coverage"])
+        self.assertEqual(out["coverage"], 0.0)
+        self.assertTrue(out["stats"]["no_coverage"])
+        for block in ("luma", "saturation", "channels", "families", "clipped",
+                      "bands"):
+            self.assertIsNone(out["stats"][block],
+                              f"{block} must be null on a frame the mask "
+                              f"covers nothing of, not zero")
+        # measured_width still says what was looked at, so the empty row is
+        # comparable with the rows around it.
+        self.assertEqual(out["measured_width"], out["size"][0])
+
+    def test_stats_times_with_a_mask_answers_one_row_per_time(self):
+        matte_id = self._stack_matte()
+        out = self._stats(times=[0.1, 0.2],
+                          mask={"components": [
+                              {"type": "matte", "op": "add",
+                               "matte": {"id": matte_id}}]})
+        self.assertEqual(len(out["results"]), 2)
+        for row in out["results"]:
+            self.assertEqual(row["mask_mattes"], [matte_id])
+            self.assertIsNotNone(row.get("coverage"))
+            self.assertIn("no_coverage", row)
+            self.assertEqual(row["measured_width"], row["size"][0])
+
+    def test_an_unknown_matte_inside_a_mask_stack_is_a_clean_404(self):
+        """mask_matte on its own treats a matte it cannot resolve as a black
+        matte, so a typo would come back as an honest looking "no coverage"
+        row. Every id in the stack is resolved before the first render for
+        exactly that reason.
+        """
+        code, message = self._stats_error(mask={"components": [
+            {"type": "matte", "op": "add",
+             "matte": {"id": "not-a-real-matte"}}]})
+        self.assertEqual(code, 404)
+        self.assertIn("not-a-real-matte", message)
+
+    def test_stats_refuses_a_mask_it_cannot_honestly_measure(self):
+        """Five ways to ask for a measurement that would come back wrong
+        rather than refused. The empty dict is the sharp one: a truthiness
+        check drops it and measures the WHOLE frame while the caller believes
+        a mask was applied, so `mask` is tested for presence, never for truth.
+        """
+        matte_id = self._stack_matte()
+        one = {"components": [{"type": "matte", "op": "add",
+                               "matte": {"id": matte_id}}]}
+        code, message = self._stats_error(mask=one, matte=matte_id)
+        self.assertEqual(code, 400)
+        self.assertIn("send one", message)
+        code, message = self._stats_error(mask=one, region=[0, 0, 0.5, 1.0])
+        self.assertEqual(code, 400)
+        self.assertIn("do not compose", message)
+        code, message = self._stats_error(mask="person intersect skin")
+        self.assertEqual(code, 400)
+        self.assertIn("has to be an object", message)
+        code, message = self._stats_error(mask={})
+        self.assertEqual(code, 400)
+        self.assertIn("nothing to measure through", message)
+        code, message = self._stats_error(mask={"components": [
+            {"type": "luma", "op": "intersect"}]})
+        self.assertEqual(code, 400)
+        self.assertIn("no component reaches the matte", message)
+
+    # -- generated caches are per run (checkpoint gap 22) ------------------
+
+    def test_the_luts_this_server_bakes_land_in_its_own_cache(self):
+        """Checkpoint gap 22. LUT_LAYERS, LUT_MASKS and the slice cache were
+        module level constants under grade/, so every studio run on one clip
+        baked into the same three folders no matter which data directory it
+        was started with: two runs could collide on one hash-named file, and a
+        run's own generated files were impossible to point at. They resolve
+        from the cache root the server already owns now, which for this test
+        is a temporary --data-dir, so nothing here can be satisfied by a stale
+        file in grade/luts.
+        """
+        health = _get(self.base + "/health")
+        cache = Path(health["cache_dir"])
+        self.assertTrue(str(cache).startswith(str(Path(self.data_dir).resolve())),
+                        f"{cache} is not inside this run's data dir")
+        shipped = GRADE / "luts"
+        before = {name: sorted(q.name for q in (shipped / name).glob("*"))
+                  for name in ("layers", "masks", "slice")}
+        # A layer with a correction bakes a layer cube, its window component
+        # bakes a mask, and the hue curves bake a slice cube: the three
+        # generated caches this gap is about, in one frame.
+        cfg = {"layers": [
+            {"enabled": True, "name": "L1", "placement": "before_look",
+             "mask": {"components": [
+                 {"id": "c1", "type": "window", "op": "add",
+                  "window": {"shape": "rect", "w": 0.6, "h": 0.6,
+                             "softness": 0.2}}]},
+             "correct": {"exposure": 0.4, "contrast": 1.1}}],
+            "hue_curves": {"enabled": True,
+                           "hue_sat": [[30.0, 1.25], [210.0, 0.85]]}}
+        body, _headers = _post(self.base + "/frame",
+                               {"clip": self.clip, "time": 0.1, "width": 320,
+                                "config": cfg}, raw=True, timeout=180.0)
+        self.assertGreater(len(body), 0)
+        for name in ("layers", "masks", "slice"):
+            baked = sorted((cache / "luts" / name).glob("*"))
+            self.assertTrue(baked, f"nothing baked into {cache / 'luts' / name}")
+            after = sorted(q.name for q in (shipped / name).glob("*"))
+            self.assertEqual(
+                after, before[name],
+                f"the render added files to {shipped / name}; generated LUTs "
+                f"belong to the run, not to the checkout")
+
+    # -- the matte routes as ROUTES: what an id may be, what DELETE may
+    #    remove, and whose clip a matte is (round 1 blocker 1, majors 6
+    #    and 12, minor 38)
+    # ----------------------------------------------------------------------
+
+    def _matte_root(self) -> Path:
+        return Path(self.data_dir) / "mattes"
+
+    def test_delete_of_a_path_shaped_id_is_refused_and_the_directory_lives(self):
+        """The review's own reproduction, as a test.
+
+        `mattes.resolve()` used to accept a matte id that was itself a
+        filesystem path, and `info_from_dir` builds a MatteInfo for ANY
+        directory (no index.json needed), so
+        `DELETE /api/matte//tmp/.../VICTIM` answered `{"deleted": ...}` and the
+        directory and its contents were gone. The route's two guards
+        (`_guard_read`, `_require_admin`) both return immediately with logins
+        off, which is the documented default and the way every agent runs this
+        server, so nothing else was in the way: pointed at footage, grade/out
+        or studio/data it deleted the founder's files.
+
+        On the old code this fails on the surviving-directory assertion.
+        """
+        victim = Path(self.data_dir) / "VICTIM"
+        victim.mkdir(parents=True, exist_ok=True)
+        keeper = victim / "founder-footage.mov"
+        keeper.write_text("not a matte, not yours to delete")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            _delete(self.base + f"/matte/{victim}")
+        self.assertEqual(caught.exception.code, 404)
+        self.assertTrue(victim.is_dir(),
+                        "DELETE /api/matte/<path> removed a directory that is "
+                        "not a matte")
+        self.assertTrue(keeper.is_file(), "the file inside it went too")
+
+    def test_the_matte_routes_refuse_an_id_that_is_not_an_id(self):
+        """One pattern, all three `matte/...` routes, checked before the id is
+        ever joined onto a path. `_dispatch` does not unquote the route, so a
+        plain absolute path in the URL reaches the handler intact and `%2F` is
+        not even needed."""
+        for bad in (str(Path(self.data_dir)), "/etc", "..", "../..",
+                    ".hidden", "m" * 90):
+            for suffix in ("", "/frame"):
+                with self.assertRaises(urllib.error.HTTPError,
+                                       msg=f"GET {bad}{suffix}") as caught:
+                    _get(self.base + f"/matte/{bad}{suffix}")
+                self.assertEqual(caught.exception.code, 404, f"GET {bad}")
+            with self.assertRaises(urllib.error.HTTPError,
+                                   msg=f"DELETE {bad}") as caught:
+                _delete(self.base + f"/matte/{bad}")
+            self.assertEqual(caught.exception.code, 404, f"DELETE {bad}")
+
+    def test_delete_refuses_a_directory_in_the_store_that_is_not_a_matte(self):
+        """The id is well formed and the directory is inside the store, and it
+        still is not a matte: no index.json and no frames. 400, and the files
+        are still there afterwards."""
+        junk = self._matte_root() / "notaclipkey" / "m_notamatte"
+        junk.mkdir(parents=True, exist_ok=True)
+        notes = junk / "notes.txt"
+        notes.write_text("somebody's working files")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            _delete(self.base + "/matte/m_notamatte")
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("not a matte",
+                      json.loads(caught.exception.read()).get("error", ""))
+        self.assertTrue(notes.is_file())
+        shutil.rmtree(junk.parent, ignore_errors=True)
+
+    def test_delete_removes_a_real_matte(self):
+        """The other half of the guard: it refuses what is not a matte and
+        still deletes what is one. Without this, deleting the rmtree
+        altogether would pass every refusal test above."""
+        result = self._track(prompts={"text": ["delete me please"]})
+        matte_id = result["mattes"][0]["matte_id"]
+        info = self._wait_matte_state(matte_id, ("done",))
+        path = self._matte_root() / info["clip_key"] / matte_id
+        self.assertTrue(path.is_dir(), f"no matte directory at {path}")
+        out = _delete(self.base + f"/matte/{matte_id}")
+        self.assertEqual(out["deleted"], matte_id)
+        self.assertFalse(path.exists(), "the matte directory is still there")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(caught.exception.code, 404)
+
+    def test_a_matte_tracked_on_another_clip_is_refused(self):
+        """Major 6. index.json records the clip and the clip_key the track ran
+        on and nothing outside the browser compared either with the clip in
+        front of it, so a landscape clip measured through a portrait matte from
+        a different clip answered with numbers, no warning and exit 0, and a
+        render stretched that matte over the wrong picture and wrote the file.
+        Both weight forms and the render path, with `allow_partial` on so this
+        cannot be the coverage refusal in disguise."""
+        other = _write_fixture_matte(self._matte_root(), "notthisclipskey",
+                                     "m_otherclip", "somebody-elses-clip.mov")
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/stats",
+                      {"clip": self.clip, "time": 0.1, "width": 64,
+                       "config": {}, "matte": "m_otherclip"})
+            self.assertEqual(caught.exception.code, 400)
+            message = json.loads(caught.exception.read()).get("error", "")
+            self.assertIn("somebody-elses-clip.mov", message)
+            self.assertIn(self.clip, message)
+
+            # The same matte as a component stack: the other way a
+            # measurement can be weighted, refused the same way.
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/stats",
+                      {"clip": self.clip, "time": 0.1, "width": 64,
+                       "config": {},
+                       "mask": {"components": [
+                           {"type": "matte", "op": "add",
+                            "matte": {"id": "m_otherclip"}}]}})
+            self.assertEqual(caught.exception.code, 400)
+            self.assertIn("somebody-elses-clip.mov",
+                          json.loads(caught.exception.read()).get("error", ""))
+
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/render",
+                      {"clip": self.clip,
+                       "config": _matte_layer_config("m_otherclip"),
+                       "duration": 0.2, "allow_partial": True,
+                       "name": "masktest_wrong_clip"})
+            self.assertEqual(caught.exception.code, 400)
+            message = json.loads(caught.exception.read()).get("error", "")
+            self.assertIn("layer 0 component 0", message)
+            self.assertIn("somebody-elses-clip.mov", message)
+            self.assertIn(self.clip, message)
+
+            # And a matte of THIS clip still measures, so the check refuses a
+            # mismatch rather than every matte.
+            good = self._track(prompts={"text": ["same clip subject"]})
+            good_id = good["mattes"][0]["matte_id"]
+            self._wait_matte_state(good_id, ("done",))
+            ok = _post(self.base + "/stats",
+                       {"clip": self.clip, "time": 0.1, "width": 64,
+                        "config": {}, "matte": good_id})
+            self.assertEqual(ok["matte"], good_id)
+        finally:
+            shutil.rmtree(other.parent, ignore_errors=True)
+
+    def test_the_matte_list_with_no_clip_still_answers_with_logins_off(self):
+        """Major 12's fix filters the no-clip list by the same read guard the
+        `?clip=` branch uses. With logins off that guard is a no-op, so this
+        server (and every agent's) sees exactly what it saw before: the
+        refusal half is proved on a server with logins on, in
+        test_identity.py."""
+        matte_id = self._track(prompts={"text": ["listed everywhere"]}
+                               )["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+        listing = _get(self.base + "/matte")
+        self.assertIn(matte_id, [m["matte_id"] for m in listing["mattes"]])
 
     # -- preset load resolution ------------------------------------------
 
@@ -1123,6 +2205,38 @@ class MaskRoutesTest(unittest.TestCase):
 def _post_none_get_raw(url):
     with urllib.request.urlopen(url, timeout=30) as r:
         return r.read(), dict(r.headers)
+
+
+def _write_fixture_matte(root: Path, clip_key: str, matte_id: str, clip: str,
+                        frames: int = 4, fps: float = 10.0,
+                        width: int = 16, height: int = 9) -> Path:
+    """A matte directory written by hand, for a case a track cannot make.
+
+    The fake service only ever tracks the one clip this suite opened, so "a
+    matte belonging to a DIFFERENT clip" has to be built on disk. Real
+    index.json fields (C2) and real frames, so the routes read it exactly as
+    they read a tracked one; everything lands under the test server's own
+    --data-dir and the caller removes it again.
+    """
+    import numpy as np                                        # noqa: PLC0415
+
+    d = Path(root) / clip_key / matte_id
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(frames):
+        arr = np.zeros((height, width), dtype=np.uint8)
+        arr[:, :width // 2] = 255
+        MT.write_gray_png(d / MT.frame_name(i), arr)
+    (d / MT.INDEX_NAME).write_text(json.dumps({
+        "matte_id": matte_id, "clip": clip, "clip_key": clip_key,
+        "rotation": 0, "fps": fps, "frames": frames,
+        "start_frame": 0, "end_frame": frames,
+        "width": width, "height": height,
+        "recipe": {"prompts": {"text": ["somebody else's subject"]}},
+        "state": "done", "done_frames": frames,
+        "areas": [0.5] * frames, "scores": [0.9] * frames,
+        "created": time.time(), "model": "fixture", "backend": "fixture",
+    }))
+    return d
 
 
 def _matte_layer_config(matte_id: str, recipe=None) -> dict:

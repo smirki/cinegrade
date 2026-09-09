@@ -12,9 +12,14 @@
  *                       NOT posted back to studio/tools/parity-results.json)
  *   PARITY_CLIP, PARITY_TIME, PARITY_WIDTHS
  *   PARITY_OUT          write the whole report as JSON here as well
+ *   PARITY_MASKS        "0" turns the mask fixture block off (it is ON by
+ *                       default, and a FAILED mask row fails the gate)
+ *   PARITY_MASK_OUT     write the mask block's own rows as JSON here
+ *   PARITY_MATTE_ID     also measure this REAL tracked matte, on top of the
+ *                       ones the block builds for itself
  */
 import puppeteer from "puppeteer-core";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -179,22 +184,28 @@ if (report && report.rows) {
  * layer rows do: a matte that is right under a correction that barely moves
  * the picture would measure exact while proving nothing.
  *
- * Measured 2026-09-08 against the branch: 3 EXACT, 0 CLOSE, 23 FAILED. The
- * three that pass are the three needing no new ffmpeg input (a key component,
- * a luma component, and an all-off inverted stack, which is a global
- * correction). Every one of the 23 fails on the same integration item, an
- * error from ffmpeg and not a difference in pixels:
+ * The block runs BY DEFAULT and a FAILED row fails the gate (see the exit at
+ * the bottom of this file). It also refuses to pass on the wrong number of
+ * rows, so deleting a fixture cannot quietly shrink the result.
  *
- *     Invalid file index 1 in filtergraph description
- *     [1:v]format=gray16le,setrange=full,setsar=1[cm0_0];...
+ * PARITY_MASKS=0 turns the block off, which is for bisecting the sweep above
+ * it and nothing else: a run without these rows is not a result.
  *
- * studio/server.py still builds its `-i` list with the old window_layers
- * loop, which cannot see a component stack's window and matte inputs, so the
- * graph references an input nobody passed. The fix is one line in each of the
- * two places that inline that loop (`args += CG.mask_extra_inputs(cfg, info,
- * seek=...)`, see M2's checkpoint) and it is not this lane's file. The rows
- * are written to run unchanged once it lands, which is the honest state: the
- * gate says "awaiting integration" rather than pretending.
+ * A note on this comment's history, because it is the kind of thing that
+ * wastes an afternoon: it used to say "Measured 2026-09-08: 3 EXACT, 0 CLOSE,
+ * 23 FAILED" and blame studio/server.py for building its `-i` list with the
+ * old window-only loop. server.py calls CG.mask_extra_inputs on both paths and
+ * has since the same commit that comment landed in, so the sentence was never
+ * true. Every row measures, and every row measures EXACT.
+ *
+ * The matte rows below build their own matte on disk (C2 is a directory of
+ * PNGs plus an index.json, which is a thing a test can write) rather than
+ * waiting for a PARITY_MATTE_ID from a hand run. Two of them are deliberately
+ * at a size the render is NOT, because that is the branch where the browser
+ * has to scale the store's frame with swscale's own bilinear filter the way
+ * the engine's `scale=W:H:flags=bilinear` does, and the frames differ from each
+ * other, so a preview that read frame 0 instead of round(time * fps) fails
+ * here as well as in the spec suite.
  */
 const LCORR = { hue_shift: -25, sat_gain: 1.45, lum_gain: 1.12,
                 offset: [0.05, -0.02, -0.04] };
@@ -373,31 +384,162 @@ const MASK_FIXTURES = [
         correct: { offset: [0.22, 0.0, -0.05] } }] } }
 ];
 
-/* A matte component needs a real matte in the registry, so it is only added
- * when one is named. `cinegrade mask track` prints the id; pass it in as
- * PARITY_MATTE_ID once the service and the routes are on the branch. */
-if (process.env.PARITY_MATTE_ID) {
-  const mid = process.env.PARITY_MATTE_ID;
+/* The matte fixture on disk.
+ *
+ * C2 says a matte is `<data-dir>/mattes/<clip-key>/<matte-id>/000000.png...`
+ * plus an index.json, so a test can write one, and both sides read the same
+ * bytes: the engine feeds the PNG sequence to ffmpeg as an extra input at
+ * frame round(seek * fps) (cinegrade.matte_input_args), the browser fetches
+ * the same frame over GET /api/matte/<id>/frame. Nothing is mocked here; this
+ * is the store's own on-disk format, written by the studio's own Python
+ * against grade/mattes.py's real write_gray_png.
+ *
+ * index.json deliberately records NO clip_key: a matte with none cannot be
+ * checked against the clip in front of it (server.py's _matte_clip_refusal
+ * says so in as many words), which is right for a fixture that was never
+ * tracked on anything.
+ *
+ * Each frame is a cone: a smooth radial ramp with a hard boundary, centred at
+ * an x that walks across the frame with the frame number. Smooth because a
+ * resampler difference only shows up on a gradient, hard-edged because an edge
+ * is where a filter's tap count shows up, and moving because a preview that
+ * ignores time then measures FAILED instead of passing quietly.
+ */
+const MATTE_FIXTURE_SCRIPT = `
+import sys, os, json
+sys.path.insert(0, "grade")
+import numpy as np
+import mattes as MT
+
+spec = json.load(sys.stdin)
+d = os.path.join(spec["dataDir"], "mattes", spec["clipKey"], spec["id"])
+os.makedirs(d, exist_ok=True)
+w, h, n = int(spec["width"]), int(spec["height"]), int(spec["frames"])
+ys, xs = np.mgrid[0:h, 0:w]
+r = 0.45 * w
+for k in range(n):
+    cx = (0.2 + 0.6 * (k / float(max(1, n - 1)))) * w
+    cy = h * 0.5
+    d2 = np.sqrt((xs - cx) ** 2 + ((ys - cy) * (w / float(h))) ** 2)
+    v = np.clip(1.0 - d2 / r, 0.0, 1.0)
+    MT.write_gray_png(os.path.join(d, MT.frame_name(k)),
+                      np.clip(np.round(v * 255.0), 0, 255).astype(np.uint8))
+index = {
+    "matte_id": spec["id"], "clip": spec["clip"], "rotation": "auto",
+    "fps": spec["fps"], "frames": n, "width": w, "height": h,
+    "state": "done", "done_frames": n,
+    "areas": [0.2] * n, "scores": [1.0] * n,
+    "created": "2026-09-09T00:00:00Z", "model": "parity-fixture",
+    "backend": "parity-fixture",
+}
+with open(os.path.join(d, MT.INDEX_NAME), "w") as f:
+    json.dump(index, f)
+print("ok " + spec["id"] + " " + str(n) + " frames at " + str(w) + "x" + str(h))
+`;
+
+function buildMatteFixture(spec) {
+  return execFileSync(PYTHON, ["-c", MATTE_FIXTURE_SCRIPT], {
+    cwd: ROOT, input: JSON.stringify(spec), encoding: "utf8",
+  }).trim();
+}
+
+const MASKS_ON = process.env.PARITY_MASKS !== "0";
+let maskBad = false;
+if (!MASKS_ON) {
+  console.log("mask fixtures: SKIPPED by PARITY_MASKS=0, so this run is not a result");
+}
+if (MASKS_ON) {
+  const widths = (process.env.PARITY_WIDTHS || "640,1280").split(",").map(Number);
+
+  /* What the sweep above actually measured, read out of the page rather than
+   * guessed, so the matte fixture is built for THIS clip at THIS time. */
+  const pstate = await page.evaluate(() => ({
+    clip: window.Parity.state.clip, time: window.Parity.state.time,
+  }));
+  /* The render's exact pixel size at the first width, from the server's own
+   * header, so one fixture can be built at exactly the size the render runs at
+   * (the texelFetch branch) and read at another width as well (the resample
+   * branch). Guessing this from the clip's aspect would only reproduce
+   * scale_for_preview's rounding by accident. */
+  const srcHead = await fetch(base + "/api/source", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clip: pstate.clip, time: pstate.time,
+                           width: widths[0], autorotate: true }),
+  });
+  const nativeSize = (srcHead.headers.get("X-Frame-Size") || "0x0").split("x").map(Number);
+  await srcHead.arrayBuffer();          // drain it, the bytes are not wanted
+  if (!(nativeSize[0] > 0 && nativeSize[1] > 0)) {
+    console.error("could not read the render size for the matte fixtures");
+    cleanup();
+    process.exit(2);
+  }
+
+  const stamp = Date.now().toString(36);
+  const clipKey = "parity-mask-" + stamp;
+  const MFPS = 24;
+  // Ten seconds of matte, so any PARITY_TIME inside a test clip has a frame.
+  const MFRAMES = 240;
+  const nativeId = "pmnative" + stamp;
+  const smallId = "pmsmall" + stamp;
+  console.log(buildMatteFixture({
+    dataDir, clipKey, id: nativeId, clip: pstate.clip, fps: MFPS,
+    frames: MFRAMES, width: nativeSize[0], height: nativeSize[1],
+  }));
+  console.log(buildMatteFixture({
+    dataDir, clipKey, id: smallId, clip: pstate.clip, fps: MFPS,
+    frames: MFRAMES, width: 320, height: 180,
+  }));
+  console.log("matte fixture frame at " + pstate.time + "s: "
+    + Math.round(pstate.time * MFPS));
+
+  /* PARITY_MATTE_ID still works and now means "measure this REAL tracked matte
+   * as well as the built ones", which is the useful thing to do with the id
+   * `cinegrade mask track` prints. */
+  const realId = process.env.PARITY_MATTE_ID || "";
   MASK_FIXTURES.push(
+    /* The matte at exactly the render's size at the first width: no scaling at
+     * all on either side there, which isolates the 8 bit lattice hop
+     * (gray16le lifts a matte code by 257) from the resampling. At the second
+     * width the same fixture is a 2x upscale on both sides. */
     { id: "maskv2_matte", stage: "mask",
       config: { layers: [{ mask: { components: [
-                  comp({ id: "c1", type: "matte", matte: { id: mid } })] },
+                  comp({ id: "c1", type: "matte", matte: { id: nativeId } })] },
                            correct: LCORR }] } },
     { id: "maskv2_matte_in_window", stage: "mask",
       config: { layers: [{ mask: { components: [
-                  comp({ id: "c1", type: "matte", matte: { id: mid } }),
+                  comp({ id: "c1", type: "matte", matte: { id: nativeId } }),
                   comp({ id: "c2", window: WIN_A, op: "intersect" })] },
                            correct: LCORR }] } },
     { id: "maskv2_matte_feather_clean", stage: "mask",
       config: { layers: [{ mask: { components: [
-                  comp({ id: "c1", type: "matte", matte: { id: mid },
+                  comp({ id: "c1", type: "matte", matte: { id: nativeId },
                          feather: 0.01 })],
                            finesse: { grow: 0.004, clean_black: 0.15 } },
+                           correct: LCORR }] } },
+    /* A matte the render's size is NOT, at both widths: the row that measures
+     * the resampler. The engine scales the store's frame with
+     * scale=W:H:flags=bilinear and the browser runs the ported swscale filter,
+     * so this row is EXACT; with the card's own LINEAR filter (a two tap tent,
+     * which swscale's bilinear is not on an upscale of this ratio) it is not. */
+    { id: "maskv2_matte_scaled", stage: "mask",
+      config: { layers: [{ mask: { components: [
+                  comp({ id: "c1", type: "matte", matte: { id: smallId } })] },
+                           correct: LCORR }] } },
+    /* The same scaled matte in MATTE VIEW, where the matte is the picture
+     * itself rather than the weight on a correction: a resampler difference
+     * lands on the output undiluted here, which makes this the sharpest row in
+     * the block. */
+    { id: "maskv2_matte_scaled_show", stage: "mask",
+      config: { layers: [{ mask: { show: true, components: [
+                  comp({ id: "c1", type: "matte", matte: { id: smallId } })] },
                            correct: LCORR }] } });
-}
-
-if (process.env.PARITY_MASKS === "1") {
-  const widths = (process.env.PARITY_WIDTHS || "640,1280").split(",").map(Number);
+  if (realId) {
+    MASK_FIXTURES.push(
+      { id: "maskv2_matte_tracked", stage: "mask",
+        config: { layers: [{ mask: { components: [
+                    comp({ id: "c1", type: "matte", matte: { id: realId } })] },
+                             correct: LCORR }] } });
+  }
   const maskRows = await page.evaluate(async (fixtures, ws) => {
     const P = window.Parity, S = P.state, TH = P.thresholds;
     const gpu = S.gpu, clip = S.clip, time = S.time;
@@ -495,8 +637,27 @@ if (process.env.PARITY_MASKS === "1") {
     fs.writeFileSync(process.env.PARITY_MASK_OUT,
                      JSON.stringify({ rows: maskRows, counts }, null, 2));
   }
+  /* The exit status, which is the whole point of a gate.
+   *
+   * These verdicts used to be printed and then thrown away: the only thing
+   * that reached process.exit was the sweep page's own `done` flag, so all 52
+   * mask rows could read FAILED and the gate still exited 0. Now a FAILED row
+   * is fatal, and so is the WRONG NUMBER of rows, because a fixture that
+   * quietly stops being measured (deleted, renamed, or lost to a thrown
+   * fixture builder) is the same hole in a different shape. */
+  const expected = MASK_FIXTURES.length * widths.length;
+  if (maskRows.length !== expected) {
+    console.error("mask fixtures: measured " + maskRows.length
+      + " rows, expected " + expected + " (" + MASK_FIXTURES.length
+      + " fixtures at " + widths.length + " widths)");
+    maskBad = true;
+  }
+  if (counts.FAILED) {
+    console.error("mask fixtures: " + counts.FAILED + " FAILED, which is fatal");
+    maskBad = true;
+  }
 }
 
 await browser.close();
 cleanup();
-process.exit(done === "1" ? 0 : 1);
+process.exit(done === "1" && !maskBad ? 0 : 1);

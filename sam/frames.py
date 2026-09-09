@@ -14,11 +14,23 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
 from PIL import Image
+
+
+def _tail(handle, limit: int = 400) -> str:
+    """The last of whatever ffmpeg said, for an error message. Never raises:
+    an unreadable stderr must not replace the real failure."""
+    try:
+        handle.seek(0)
+        text = handle.read().decode("utf-8", "replace").strip()
+    except Exception:                                          # noqa: BLE001
+        return ""
+    return text[-limit:]
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 PROBE_TIMEOUT_S = 30
@@ -170,14 +182,29 @@ class FrameSource:
 
         if not (self.width and self.height):
             raise VideoError(f"ffprobe could not read the frame size of {self.path}")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stderr goes to a temporary FILE, never a pipe. A pipe nobody drains
+        # holds 64 KB, and a chattier ffmpeg (a `-loglevel` change, a warning
+        # per frame) would fill it and block ffmpeg while this loop waits on
+        # stdout: a decode that hangs with no timeout, since `-t` bounds the
+        # output duration and not the wall clock (round 1 finding 45). A file
+        # cannot fill, and it means the message is there to read when a decode
+        # produces nothing.
+        errors = tempfile.TemporaryFile()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors)
         size = self.width * self.height * 3
         wanted = end - start
+        got = 0
         try:
             for _ in range(wanted):
                 buffer = proc.stdout.read(size)
                 if not buffer or len(buffer) < size:
+                    if got == 0:
+                        raise VideoError(
+                            f"ffmpeg decoded no frame at all from {self.path} "
+                            f"(frames {start}..{end}): "
+                            f"{_tail(errors) or 'it printed nothing'}")
                     break
+                got += 1
                 # copy(): frombuffer hands back a read only view over the
                 # pipe's buffer, and a backend may want to write into it.
                 yield np.frombuffer(buffer, dtype=np.uint8).reshape(
@@ -190,9 +217,10 @@ class FrameSource:
                 proc.wait(timeout=10)
             except Exception:                                  # noqa: BLE001
                 pass
-            for pipe in (proc.stdout, proc.stderr):
+            for handle in (proc.stdout, proc.stderr, errors):
                 try:
-                    pipe.close()
+                    if handle is not None:
+                        handle.close()
                 except Exception:                              # noqa: BLE001
                     pass
 

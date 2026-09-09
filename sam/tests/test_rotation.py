@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import check, report, sam_path                                # noqa: E402
+from common import check, report, sam_path, skip                                # noqa: E402
 
 sam_path()
 from frames import probe_rotation_tag                                     # noqa: E402
@@ -85,7 +85,15 @@ def main() -> int:
         check("a missing rotation field resolves the same way \"auto\" does",
               resolved_default == tag, f"got {resolved_default}")
     else:
-        print(f"  skip: {ROTATED_90} is not on this machine")
+        # Printed AND counted: three checks that quietly disappeared used to
+        # shrink this suite's own total, and the gate's total with it, so a
+        # missing clip looked exactly like a passing run (round 1 finding 41).
+        for label in ("probe_rotation_tag reads a real clip's own tag as 90",
+                      "resolve_rotation(\"auto\", clip) matches "
+                      "probe_rotation_tag(clip)",
+                      "a missing rotation field resolves the same way "
+                      "\"auto\" does"):
+            skip(label, f"{ROTATED_90} is not on this machine")
 
     if ROTATED_NEG90.is_file():
         tag = probe_rotation_tag(str(ROTATED_NEG90))
@@ -96,7 +104,8 @@ def main() -> int:
         check(f"a clip tagged -90 (a real phone rotation) resolves to 270, "
               f"not -90", tag == 270, f"got {tag}")
     else:
-        print(f"  skip: {ROTATED_NEG90} is not on this machine")
+        skip("a clip tagged -90 (a real phone rotation) resolves to 270",
+             f"{ROTATED_NEG90} is not on this machine")
 
     return report("sam: rotation \"auto\" resolution")
 

@@ -99,6 +99,21 @@ gitignored.
   against the fresh navigation, fenced independently of the initial load
   and of every other spec's console output in between.
 
+The list above stops where it was written; the numbered files in `specs/` are
+the current truth, and each one's own header says what it proves. Two of them
+are worth calling out because they are not shaped like the rest:
+
+- **30-gpu-matte-time**: acceptance A1's GPU half. It builds a matte on disk
+  (contract C2's own format, written by `grade/mattes.py`) whose white bar walks
+  across the frame, puts it on a layer in matte view, and then checks both the
+  frame NUMBER the renderer reports and where the brightness actually is on
+  `#gpuCanvas`, at three still times, through the app's own scrub, and during
+  real playback. It fails on any build where the playhead does not reach
+  `gpu.js`, which is the bug it was written for.
+- **31-mask-stack-ref**: runs `studio/tests/mask-stack-ref.mjs` (the mask model
+  v2 arithmetic on plain arrays, no browser and no GPU) and turns its count line
+  into a spec result. That file used to be run by nothing at all.
+
 ## Known limitation
 
 Specs run against one shared page and one shared browser session in a

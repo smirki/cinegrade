@@ -25,6 +25,27 @@ const CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrom
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
 const PORT_MIN = 20000;
 const PORT_MAX = 60000;
+// Round 1 finding 20: this harness picked freely from 20000-60000 with no
+// exclusions at all, and that range contains two ports a real server was
+// found on. The list of ports nothing here may ever bind now lives in ONE
+// file, studio/tests/forbidden-ports.json, read by this harness and by both
+// python suites (studio/tests/py/ports.py, grade/tests/ports.py), so adding
+// a port is one edit rather than four that drift apart.
+const FORBIDDEN_PORTS = new Set(
+  JSON.parse(fs.readFileSync(path.join(HERE, "forbidden-ports.json"), "utf8")).ports
+    .map((p) => Number(p)));
+
+/* A free port that is not on the shared list. findFreePort binds and releases,
+ * so it only ever offers something nothing holds right now; the list is what
+ * keeps it off a port whose owner is momentarily down. */
+async function pickPort() {
+  for (let i = 0; i < 40; i++) {
+    const port = await findFreePort(PORT_MIN, PORT_MAX, 40);
+    if (!FORBIDDEN_PORTS.has(port)) return port;
+  }
+  throw new Error("could not find a free port outside " +
+    [...FORBIDDEN_PORTS].sort((a, b) => a - b).join(", "));
+}
 
 // Lane M7's own addition: the real SAM masking service (contract C3), always
 // started in --stub mode (no weights, synthetic drifting ellipses, the
@@ -77,6 +98,15 @@ const SPEC_FILES = [
   "27-masks-panel.mjs",
   "28-masks-pick-and-track.mjs",
   "29-masks-fixture-states.mjs",
+  /* 30 is acceptance A1's GPU half (a tracked matte moving in the graded
+   * picture and in playback) and 31 wires in studio/tests/mask-stack-ref.mjs,
+   * the mask arithmetic reference, which until now no runner invoked at all.
+   *
+   * 30 runs AFTER 29 on purpose even though 29 stops the SAM stub: it needs no
+   * SAM service, only a matte on disk and the GPU, and 29's own note says
+   * nothing numbered after it needs the stub alive. */
+  "30-gpu-matte-time.mjs",
+  "31-mask-stack-ref.mjs",
 ];
 
 /* Chasing one failing spec through a whole run costs minutes of GPU work, so
@@ -202,7 +232,7 @@ async function putGradesBack(baseUrl, saved) {
 }
 
 async function main() {
-  const port = await findFreePort(PORT_MIN, PORT_MAX, 40);
+  const port = await pickPort();
   const baseUrl = "http://127.0.0.1:" + port;
   console.log("[run] port " + port);
 
@@ -212,11 +242,12 @@ async function main() {
   // existing. findFreePort is called again rather than reused: the two
   // servers must never be told to share one port, and a second independent
   // call (which binds and releases before returning) is how every other
-  // free port in this harness is chosen too. PORT_MIN/PORT_MAX (20000 to
-  // 60000) keeps this, like the studio port, nowhere near 7431 (the
-  // founder's live studio), 7560 (the SAM service's own default port), 7614
-  // or 7615: the four ports this whole arc treats as permanently off limits.
-  const samPort = await findFreePort(PORT_MIN, PORT_MAX, 40);
+  // free port in this harness is chosen too. pickPort also refuses every
+  // port on the shared forbidden list above (the founder's live studio, the
+  // SAM service's own default, the reserved pair, the agent seat's studio
+  // and the two ports a real server was found squatting inside this very
+  // 20000-60000 range), so neither server here can land on one.
+  const samPort = await pickPort();
   const samBase = "http://127.0.0.1:" + samPort;
   const samDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fixxr-sam-test-"));
   console.log("[run] SAM stub port " + samPort + ", data dir " + samDataDir);

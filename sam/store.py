@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -40,6 +41,50 @@ INDEX_NAME = "index.json"
 FRAME_GLOB = "*.png"
 WRITE_EVERY_S = 1.0
 MAX_STEADY = 31
+
+# A matte id is ONE path segment and nothing else. It is used as a directory
+# name, so anything that can mean "somewhere else" is refused: a separator, a
+# `..`, a leading dot, an absolute path. Without this an id of
+# `../../ESCAPED` walked up out of the store and an id of `/tmp/anything`
+# replaced the root entirely, because `Path("/a") / "/b"` is `/b`. Both were
+# proved against this file in round 1 finding 13.
+ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+_ID_RE = re.compile(f"^{ID_PATTERN}$")
+
+
+class StoreError(ValueError):
+    """A caller asked for something this store will not write."""
+
+
+def safe_id(value, what: str = "matte id") -> str:
+    """`value` as a plain path segment, or raise. Never returns a path."""
+    text = str(value or "")
+    if not _ID_RE.match(text) or text in (".", ".."):
+        raise StoreError(
+            f"{what} {text!r} is not usable as a directory name: it must be 1 "
+            f"to 64 characters of letters, digits, '_', '-' or '.', starting "
+            f"with a letter or digit, and it may not contain a path separator")
+    return text
+
+
+def under(root, *parts) -> Path:
+    """`root/parts...`, refused unless the result really is inside `root`.
+
+    The pattern check above stops traversal; this stops a symlink. Both, not
+    either: a `mattes/` directory whose entry is a link into somebody's
+    footage folder is not something this store should follow.
+    """
+    base = Path(root).expanduser()
+    joined = base.joinpath(*[safe_id(p) for p in parts])
+    try:
+        resolved = joined.resolve()
+        anchor = base.resolve()
+    except OSError as exc:                                     # noqa: BLE001
+        raise StoreError(f"{joined} cannot be resolved: {exc}") from exc
+    if resolved != anchor and not resolved.is_relative_to(anchor):
+        raise StoreError(f"{joined} resolves to {resolved}, which is outside "
+                         f"{anchor}")
+    return joined
 
 
 def frame_name(index: int) -> str:
@@ -136,9 +181,13 @@ class MatteWriter:
     """
 
     def __init__(self, root: Path, matte_id: str, header: dict, steady: int = 1):
-        self.dir = Path(root) / matte_id
+        # Checked here as well as in the service's own route, because this is
+        # the line that creates a directory and writes a file: a store that
+        # trusts its caller's id is one bad request away from writing an
+        # index.json anywhere on the machine (round 1 finding 13).
+        self.matte_id = safe_id(matte_id)
+        self.dir = under(root, self.matte_id)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.matte_id = matte_id
         self.steady = _Steady(steady)
         frames = int(header.get("frames") or 0)
         try:
@@ -147,7 +196,7 @@ class MatteWriter:
             previous = {}
         self.index = dict(header)
         self.index.update({
-            "matte_id": matte_id,
+            "matte_id": self.matte_id,
             "state": header.get("state", "queued"),
             "done_frames": 0,
             "steady": self.steady.n,

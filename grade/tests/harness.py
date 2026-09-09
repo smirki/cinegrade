@@ -124,13 +124,31 @@ def leaf_paths(node: dict, prefix: str = "") -> list[str]:
 _RENDER_CACHE: dict[str, np.ndarray] = {}
 _STATS = {"renders": 0, "cache_hits": 0, "ffmpeg_seconds": 0.0}
 
-# The engine caches baked secondary cubes and radial masks under grade/luts/,
-# named from a hash of their settings. The parameter sweep asks for dozens of
-# one-off combinations, so the run records exactly which of those files it
-# referenced and cleans up only those. Deleting by "appeared during the run"
-# instead would also delete anything the studio server baked at the same time.
-CACHE_DIRS = [GRADE / "luts" / "layers", GRADE / "luts" / "masks",
-              GRADE / "luts" / "slice"]
+# Round 1 finding 44. The engine caches baked secondary cubes, window and
+# radial mattes and Color Slice cubes under a "cache root", named from a hash
+# of their settings. That root used to be grade/ for every run on this tree,
+# and run_tests.py DELETES the files a run baked when it finishes, so two
+# suites running at once against this worktree deleted each other's cache
+# entries mid-run: the loser re-baked a file it was about to read, or read a
+# half written one. The merge note asking for one run at a time was the
+# workaround; this is the fix.
+#
+# Each run now gets its own root inside its own per-process scratch, for this
+# process (set_cache_root, which also rebinds cg.LUT_LAYERS / cg.LUT_MASKS,
+# the two names legacy_parity.py normalises out of a graph fingerprint) and
+# for every CLI subprocess it spawns (CINEGRADE_CACHE_DIR, which those
+# children inherit). Because it lives under WORK, the ordinary end of run
+# cleanup takes it away and --keep-work keeps it with the rest of the
+# evidence. Nothing under grade/luts/ is read or written by a suite run any
+# more, so nothing there can be deleted by one either.
+#
+# The gap 22 test in cases_cli.py deliberately clears this pin to prove the
+# unset default is still grade/luts, and re-pins it in its own finally.
+CACHE_ROOT = WORK / "cache"
+os.environ["CINEGRADE_CACHE_DIR"] = str(CACHE_ROOT)
+cg.set_cache_root(CACHE_ROOT)
+CACHE_DIRS = [CACHE_ROOT / "luts" / "layers", CACHE_ROOT / "luts" / "masks",
+              CACHE_ROOT / "luts" / "slice"]
 _TOUCHED_CACHE: set[str] = set()
 
 

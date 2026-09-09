@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -22,23 +20,15 @@ import urllib.request
 from pathlib import Path
 
 import harness as H
+# Round 1 finding 20: this file's own picker excluded NOTHING while drawing
+# from 20000-60000, a range that contains two ports a real server was found
+# squatting. One shared list now (studio/tests/forbidden-ports.json).
+from ports import free_port as _free_port
 
 PY = str(H.CONTENT / ".venv" / "bin" / "python")
 ENGINE = str(H.GRADE / "cinegrade.py")
 SERVER = str(H.CONTENT / "studio" / "server.py")
 CLIP = H.CLIP_A.name
-
-
-def _free_port() -> int:
-    for _ in range(60):
-        port = random.randint(20000, 60000)
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError("no free port")
 
 
 def _start_server(data_dir: Path):

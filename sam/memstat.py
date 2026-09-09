@@ -255,8 +255,20 @@ class WindowMeter:
         if freed is not None:
             try:
                 freed()
-            except Exception:                                  # noqa: BLE001
-                pass
+            except Exception as exc:                           # noqa: BLE001
+                # Said out loud, not swallowed. This callable is the one that
+                # drops a window's session state, and the failure mode it
+                # guards against (mlx-cv moving what SAM3VideoSessionState
+                # holds) produced no exception, no log line and slowly growing
+                # memory: the hardest kind of regression to find from a
+                # checkpoint that says to look here first (round 1 finding 28).
+                current["freed_error"] = f"{type(exc).__name__}: {exc}"
+                if self._log:
+                    self._log(f"[memory] freeing window "
+                              f"{current.get('start')}..{current.get('end')} "
+                              f"raised {type(exc).__name__}: {exc}. The window's "
+                              f"state is still held; sam/backends/mlx_backend.py "
+                              f"_drop_state is the first place to look.")
         after = snapshot(self.mx)
         current.update({
             "footprint_after_mb": after["footprint_mb"],

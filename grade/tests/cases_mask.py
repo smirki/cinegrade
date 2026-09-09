@@ -145,24 +145,37 @@ def _gating(ctx, layer, label, tol_in=0.0, tol_out=0.0):
 
 
 def make_matte(name, frames: dict, width=64, height=36, fps=24.0,
-               total=None, state="done", clip_key="clipA") -> str:
+               total=None, state="done", clip_key="clipA",
+               areas=None, ious=None) -> str:
     """Write a matte fixture into the run's store and return its id.
 
     `frames` maps a frame index to a (height, width) uint8 array. Anything
     not in it is simply not written, which is how a partial matte is built:
     the store's own answer to "what is missing" is the directory listing.
+
+    `areas` and `ious` are the per frame arrays the SAM service writes
+    alongside the frames (contract C2, checkpoint gap 18), aligned to the
+    absolute frame index and padded with None past what is written. They are
+    what `quality()` judges a track by, so a fixture that omits them can only
+    ever produce "nothing suspect" (round 1 finding 15: every assertion in
+    the arc was written against exactly that).
     """
     root = MATTE_ROOT / clip_key / name
     root.mkdir(parents=True, exist_ok=True)
     for idx, arr in frames.items():
         MT.write_gray_png(root / MT.frame_name(idx), arr)
-    (root / "index.json").write_text(json.dumps({
+    index = {
         "matte_id": name, "clip": CLIP.name, "clip_key": clip_key,
         "rotation": "auto", "fps": fps,
         "frames": total if total is not None else (max(frames) + 1),
         "width": width, "height": height, "recipe": {"text": ["person"]},
         "state": state, "done_frames": len(frames),
-        "created": 0.0, "model": "test", "backend": "stub"}))
+        "created": 0.0, "model": "test", "backend": "stub"}
+    if areas is not None:
+        index["areas"] = list(areas)
+    if ious is not None:
+        index["ious"] = list(ious)
+    (root / "index.json").write_text(json.dumps(index))
     MT.forget_cache()
     return name
 
@@ -895,16 +908,34 @@ def test_matte_intersect_key_is_the_skin_recipe(ctx):
     h, w, _ = got.shape
     moved = np.abs(got.astype(np.int16) - plain.astype(np.int16)).max(axis=2) > 2
     right = moved[:, int(w * 0.55):]
-    ctx.note(f"the intersection moves {moved.mean() * 100:.2f}% of the frame, "
-             f"{float(right.mean()) * 100:.3f}% of it outside the matte")
-    ctx.expect_gt("something is selected", float(moved.mean()), 0.0)
-    ctx.expect_close("nothing outside the matte is touched",
-                     float(right.mean()), 0.0, 0.0)
+    matte_only = _layer([{"type": "matte", "op": "add",
+                          "matte": {"id": matte}}])
+    matte_alone = np.abs(H.render(CLIP, _cfg(matte_only), T).astype(np.int16)
+                         - plain.astype(np.int16)).max(axis=2) > 2
     key_only = _layer([{"type": "key", "op": "add", "key": key}])
     only = np.abs(H.render(CLIP, _cfg(key_only), T).astype(np.int16)
                   - plain.astype(np.int16)).max(axis=2) > 2
+    ctx.note(f"the intersection moves {moved.mean() * 100:.2f}% of the frame, "
+             f"{float(right.mean()) * 100:.3f}% of it outside the matte; the "
+             f"matte alone moves {matte_alone.mean() * 100:.2f}% and the key "
+             f"alone {only.mean() * 100:.2f}%")
+    # Round 1 finding 42: this used to be `> 0.0`, which one non-zero pixel
+    # out of 181,760 satisfies. The floor is a real region of the picture
+    # (measured on this footage: 38.65% of the frame, of a matte that covers
+    # half of it), so a stack that selected almost nothing now fails instead
+    # of passing on a stray pixel.
+    ctx.expect_gt("something is really selected, not one stray pixel",
+                  float(moved.mean()), 0.10)
+    ctx.expect_close("nothing outside the matte is touched",
+                     float(right.mean()), 0.0, 0.0)
+    # Both halves of "intersect": smaller than each of the two components on
+    # its own. Without the second of these, a key that was silently ignored
+    # (the intersection collapsing to the matte) still passed.
     ctx.expect_lt("and the intersection is smaller than the key alone",
                   float(moved.mean()), float(only.mean()))
+    ctx.expect_lt("and smaller than the matte alone: the key really narrowed "
+                  "it, it did not just fold to the matte",
+                  float(moved.mean()), float(matte_alone.mean()))
 
 
 # --------------------------------------------------------------------------
@@ -1042,6 +1073,184 @@ def test_matte_reader_reads_the_store(ctx):
         ctx.check(True, f"a missing matte raises MatteMissing: {str(exc)[:50]}")
 
 
+def test_quality_flags_the_frames_that_went_wrong(ctx):
+    """Round 1 finding 15: `quality()`, the function REPORT.md section 8 opens
+    with, had no test anywhere that could fail.
+
+    Every assertion written against it in the arc ran on a fixture with no
+    `areas` and no `ious` at all, which forces `suspect_count: 0`, all three
+    reason counts 0 and `iou_source: "none"`; the assertions then checked that
+    a key was present, that a value was one of the three values that exist,
+    and that 0 == 0 + 0 + 0. A function returning those constants passed.
+
+    So: hand built arrays with answers worked out on paper. The story is the
+    grader's own face matte (checkpoint gap 18): a small steady area, the
+    subject lost at frame 2, then a latch onto something thirteen times
+    bigger at frame 4 that also barely overlaps what came before it.
+
+      frame  area   why
+      0      0.05   the subject
+      1      0.05   steady
+      2      0.00   lost:            zero_area, and area_jump too, because a
+                                     drop to nothing is a 100% change and 1.0
+                                     is over the 0.5 threshold
+      3      0.05   back:            not flagged, because the jump rule needs
+                                     a non zero frame BEFORE it to divide by
+      4      0.65   the tree:        area_jump (12.0 against 0.5) and
+                                     low_iou (0.05 against 0.3)
+      5      0.66   steady on it
+
+    Two suspect FRAMES (2 and 4) and four suspect REASONS across them: the
+    difference between those two numbers is the thing the route test's
+    `suspect_count == zero + jump + iou - overlap` arithmetic was standing in
+    for, and here both are stated outright.
+
+    Frames 2 and 3 are the pair worth reading twice. Losing the subject is
+    counted under two reasons at once, and coming back is counted under none,
+    because the rule divides by the previous area and 0 is not a base to
+    measure a change against. That asymmetry is the real behaviour of the
+    shipped function; it is written down here so that a future change to it
+    fails this test instead of quietly changing what the studio reports.
+    """
+    frames = {i: band(64, 36, 0, 8 + i) for i in range(6)}
+    areas = [0.05, 0.05, 0.0, 0.05, 0.65, 0.66]
+    ious = [None, 0.9, 0.85, 0.88, 0.05, 0.91]
+    name = make_matte("m_drift", frames, total=6, fps=24.0,
+                      areas=areas, ious=ious)
+    info = MT.resolve(MT.matte_root(), name)
+    q = MT.quality(info)
+    ctx.note(f"suspect frames {[f['index'] for f in q['suspect_frames']]}, "
+             f"reasons {q['reasons']}, iou_source {q['iou_source']}")
+    ctx.expect_eq("every written frame is judged", q["checked"], 6)
+    ctx.expect_eq("the ious came from the index the service wrote",
+                  q["iou_source"], "index")
+    ctx.expect_eq("two frames are suspect, not none and not all six",
+                  q["suspect_count"], 2)
+    ctx.expect_eq("and they are the two that went wrong",
+                  [f["index"] for f in q["suspect_frames"]], [2, 4])
+    ctx.expect_eq("the reason counts name what went wrong on each",
+                  q["reasons"], {"zero_area": 1, "area_jump": 2, "low_iou": 1})
+    lost, tree = q["suspect_frames"]
+    ctx.expect_eq("the lost frame is flagged for its area being zero, and for "
+                  "the drop that got it there", lost["reasons"],
+                  ["zero_area", "area_jump"])
+    ctx.expect_close("that drop being the whole of the previous area",
+                     float(lost["jump"]), 1.0, 1e-6)
+    ctx.expect_eq("and the frame the subject comes back on is not flagged, "
+                  "because there is no non zero area before it to compare "
+                  "against", [f["index"] for f in q["suspect_frames"]
+                              if f["index"] == 3], [])
+    ctx.expect_eq("the latch is flagged for BOTH the size change and the "
+                  "shape moving", tree["reasons"], ["area_jump", "low_iou"])
+    ctx.expect_close("and the jump is reported as a fraction of the frame "
+                     "before it", float(tree["jump"]), 12.0, 1e-6)
+    ctx.expect_close("with the overlap that went with it", float(tree["iou"]),
+                     0.05, 1e-6)
+    ctx.expect_eq("the first suspect frame is named for a caller that only "
+                  "wants the headline", q["first_suspect_index"], 2)
+    ctx.expect_close("with its time in seconds",
+                     float(q["first_suspect_time"]), 2 / 24.0, 1e-4)
+
+    # The thresholds really are the thresholds: each rule can be turned off
+    # by moving its own number past the data, and nothing else moves.
+    loose = MT.quality(info, area_jump=20.0, min_iou=0.001)
+    ctx.expect_eq("with both thresholds moved past the data, only the zero "
+                  "area frame is left", [f["index"] for f in
+                                         loose["suspect_frames"]], [2])
+    ctx.expect_eq("and it is left for the one reason a threshold cannot turn "
+                  "off: an empty matte is empty at any threshold",
+                  loose["reasons"], {"zero_area": 1, "area_jump": 0,
+                                     "low_iou": 0})
+    ctx.expect_eq("and the thresholds in force come back with the report",
+                  loose["thresholds"], {"area_jump": 20.0, "min_iou": 0.001})
+    tight = MT.quality(info, area_jump=0.005, min_iou=0.95)
+    ctx.expect_eq("and with both tightened past every frame, every frame "
+                  "after the first is suspect",
+                  tight["suspect_count"], 5)
+
+    # `limit` caps the list and nothing else: the counts stay true, and the
+    # report says it was capped. A route that lists a clip's mattes relies on
+    # this, and "truncated" is how a reader knows not to trust the list length.
+    capped = MT.quality(info, limit=1)
+    ctx.expect_eq("limit caps the list", len(capped["suspect_frames"]), 1)
+    ctx.expect_eq("but not the count", capped["suspect_count"], 2)
+    ctx.expect_true("and says it was capped", capped["truncated"], "truncated")
+
+    # A clean matte reports zero, so the flags mean something when they are
+    # absent as well as when they are present.
+    clean = make_matte("m_clean", frames, total=6, fps=24.0,
+                       areas=[0.05, 0.051, 0.052, 0.053, 0.054, 0.055],
+                       ious=[None, 0.95, 0.94, 0.96, 0.95, 0.93])
+    qc = MT.quality(MT.resolve(MT.matte_root(), clean))
+    ctx.expect_eq("a clean track reports nothing suspect", qc["suspect_count"], 0)
+    ctx.expect_eq("with every reason at zero", qc["reasons"],
+                  {"zero_area": 0, "area_jump": 0, "low_iou": 0})
+    ctx.expect_eq("and it still says where its ious came from",
+                  qc["iou_source"], "index")
+
+    # And the honest "this rule did not run" case: the same drift, no ious in
+    # the index. `low_iou` is 0 because the rule could not run, and
+    # `iou_source` is the only thing that says so. Reading the count without
+    # the source is finding 15 in one line.
+    no_iou = make_matte("m_drift_no_iou", frames, total=6, fps=24.0,
+                        areas=areas)
+    qn = MT.quality(MT.resolve(MT.matte_root(), no_iou))
+    ctx.expect_eq("with no ious written, the shape rule does not run",
+                  qn["reasons"]["low_iou"], 0)
+    ctx.expect_eq("so the tree frame is flagged on its size alone",
+                  qn["suspect_frames"][-1]["reasons"], ["area_jump"])
+    ctx.expect_eq("and the report says so rather than implying a clean shape",
+                  qn["iou_source"], "none")
+    ctx.expect_eq("the area rules still run", qn["suspect_count"], 2)
+
+
+def test_frame_ious_reads_the_shapes_off_disk(ctx):
+    """The fallback for a matte tracked before the service wrote `ious`.
+
+    Round 1 finding 15's second half: `frame_ious()` is reachable only through
+    `quality(..., compute_iou=True)`, which nothing in the product passes, so
+    it was dead code with a docstring naming a caller it did not have. It is
+    kept because it is the only way to judge drift on an older matte, and it
+    is tested here directly, on overlaps computed on paper:
+
+      frames 0 and 1  the same band            iou 1.0
+      frame 2         a disjoint band          iou 0.0
+      frame 3         half overlapping frame 2 iou 1/3
+
+    1/3 is deliberately just ABOVE the 0.3 threshold, so the boundary is
+    pinned in the direction that matters: a frame that moved a bit is not
+    called drift.
+    """
+    frames = {0: band(64, 36, 0, 32), 1: band(64, 36, 0, 32),
+              2: band(64, 36, 32, 64), 3: band(64, 36, 16, 48)}
+    name = make_matte("m_shapes", frames, total=4, fps=24.0,
+                      areas=[0.5, 0.5, 0.5, 0.5])
+    info = MT.resolve(MT.matte_root(), name)
+    got = MT.frame_ious(info)
+    ctx.note(f"ious off disk: {got}")
+    ctx.expect_true("the first written frame has nothing to compare against, "
+                    "so it is absent rather than 1.0", 0 not in got,
+                    sorted(got))
+    ctx.expect_close("an identical shape overlaps itself completely",
+                     float(got[1]), 1.0, 0.02)
+    ctx.expect_close("a shape that moved somewhere else overlaps nothing",
+                     float(got[2]), 0.0, 0.02)
+    ctx.expect_close("and a half overlap is a third: intersection over UNION, "
+                     "not over either one of them", float(got[3]), 1 / 3, 0.03)
+
+    # Through quality(), which is how a caller would ever see these.
+    q = MT.quality(info, compute_iou=True)
+    ctx.expect_eq("quality(compute_iou=True) says the numbers came from the "
+                  "frames, not the index", q["iou_source"], "frames")
+    ctx.expect_eq("the frame that moved away is flagged, and only it",
+                  [f["index"] for f in q["suspect_frames"]], [2])
+    ctx.expect_eq("for the shape, not for its size", q["reasons"],
+                  {"zero_area": 0, "area_jump": 0, "low_iou": 1})
+    ctx.expect_eq("and with the fallback switched off (the default), the rule "
+                  "does not run at all",
+                  MT.quality(info)["iou_source"], "none")
+
+
 def test_matte_reader_has_no_dependencies(ctx):
     """The zlib PNG reader and PIL agree, byte for byte.
 
@@ -1090,8 +1299,16 @@ def test_matte_resize_lands_where_the_scaler_lands(ctx):
     ff = np.frombuffer(raw[:320 * 180], np.uint8).reshape(180, 320) / 255.0
     d = float(np.abs(up - ff).max())
     mean = float(np.abs(up - ff).mean())
-    ctx.note(f"worst disagreement {d:.4f}, mean {mean:.5f} of 1.0")
+    ctx.note(f"worst disagreement {d:.3e}, mean {mean:.3e} of 1.0")
     ctx.expect_lt("the two scalers agree to well under a code value", mean, 0.004)
+    # Round 1 finding 42: the mean was the only assertion, and this fixture is
+    # one hard edge in a flat frame, so a disagreement confined to the edge
+    # (a half pixel offset, which is exactly how a resampler bug looks and is
+    # the one place the two engines are known to differ) averaged away to
+    # nothing. Measured here: worst 7.2e-08, i.e. float rounding, against a
+    # limit of one 8-bit code value.
+    ctx.expect_lt("and the WORST pixel agrees too, not just the average",
+                  d, 1.0 / 255.0)
 
 
 # --------------------------------------------------------------------------
@@ -1165,5 +1382,12 @@ def register(suite):
               doc="grade/mattes.py: resolve, index, nearest written, load (C6)")
     suite.add(g, "matte_reader_standalone", test_matte_reader_has_no_dependencies,
               doc="the zlib PNG reader agrees with PIL on both writers' files")
+    suite.add(g, "quality_flags_drift",
+              test_quality_flags_the_frames_that_went_wrong,
+              doc="quality() flags a lost subject, a 12x area jump and a "
+                  "shape that moved, on hand built arrays with known answers")
+    suite.add(g, "frame_ious_off_disk", test_frame_ious_reads_the_shapes_off_disk,
+              doc="frame_ious() computes intersection over union off the "
+                  "frames themselves, and quality(compute_iou=True) uses it")
     suite.add(g, "matte_resize", test_matte_resize_lands_where_the_scaler_lands,
               doc="the numpy resample and ffmpeg's bilinear scaler agree")

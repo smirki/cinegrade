@@ -32,17 +32,20 @@ if _SAM_DIR not in sys.path:
 
 from memstat import (StageMeter, WindowMeter, mlx_memory,   # noqa: E402
                      snapshot, stage_meter)
+from throttle import DEFAULT_DUTY_CYCLE, DutyCycle          # noqa: E402
 
 __all__ = [
     "Backend",
     "BackendError",
     "BackendUnavailable",
     "Cancelled",
+    "DutyCycle",
     "Instance",
     "ObjectSlot",
     "StageMeter",
     "TrackedMask",
     "WindowMeter",
+    "duty_cycle",
     "mask_area",
     "mask_box",
     "mlx_memory",
@@ -58,6 +61,12 @@ __all__ = [
 def window_meter(log=None, mx=None) -> WindowMeter:
     """One per backend: the per window memory record C3's /health reports."""
     return WindowMeter(mx=mx, log=log)
+
+
+def duty_cycle(fraction=DEFAULT_DUTY_CYCLE, log=None) -> DutyCycle:
+    """One per backend: quiet mode's busy fraction of wall time (see
+    `sam/throttle.py`). The default never sleeps."""
+    return DutyCycle(fraction=fraction, log=log)
 
 
 class BackendError(RuntimeError):
@@ -335,6 +344,22 @@ class Backend:
     name: str = "base"
     model: str = ""
 
+    # Can `track` be seeded with `prompts.masks` (a PNG per object) rather than
+    # only a box? The service asks this before it turns a reviewed pick into a
+    # seed: a box is a much weaker description of the shape somebody just
+    # approved, and where the answer is False the track response says so
+    # instead of leaving it to be discovered from the result (checkpoint gap
+    # 20).
+    supports_mask_prompts: bool = False
+
+    # What the per frame `scores` array in index.json MEANS on this backend.
+    # "tracker" is the tracker's own confidence for that frame; "presence" is
+    # derived from the mask (1.0 wherever the object is there at all), which is
+    # what a backend that reports no score gets from `split_mask_score`. The
+    # two are not comparable, and the matte's id has no backend in it, so this
+    # is recorded per matte (round 1 finding 29).
+    score_kind: str = "presence"
+
     def load(self) -> None:
         """Make the backend ready to answer. Raise `BackendUnavailable` when
         this machine cannot run it, so `--backend auto` can move on."""
@@ -373,6 +398,48 @@ class Backend:
 
     #: A `memstat.WindowMeter`, or None on a backend that does not window.
     meter = None
+
+    # -- quiet mode, added by the 2026-09-09 duty cycle lane ----------------
+    #
+    # Also additive: a backend that never touches `self.throttle` gets one
+    # anyway (a duty cycle of 1, which never sleeps and costs one attribute
+    # read), so the service can report it on /health and interrupt it on a
+    # cancel without knowing which backend it has.
+
+    _throttle: DutyCycle | None = None
+
+    @property
+    def throttle(self) -> DutyCycle:
+        if self._throttle is None:
+            self._throttle = DutyCycle()
+        return self._throttle
+
+    @throttle.setter
+    def throttle(self, value: DutyCycle) -> None:
+        self._throttle = value
+
+    def rest(self, token, unit: str = "window") -> None:
+        """Give the machine back after one unit of model work.
+
+        Raises `Cancelled` when the service woke the rest to stop the job,
+        which is the same exception a cancelled `on_frame` raises, so a
+        cancel arriving during a rest ends the job the same way a cancel
+        arriving during a frame does. With the default duty cycle of 1 this
+        is one clock reading and no sleep at all.
+        """
+        if self.throttle.rest(token, unit=unit):
+            raise Cancelled("cancelled while the duty cycle was resting")
+
+    def settle(self, unit: str | None = None) -> None:
+        """Take the rest a previous `throttle.owe()` remembered, if any.
+
+        Called at the top of a window loop, so the gap falls between two
+        windows: by then the previous window's memory has been given back, and
+        resting while still holding it would hand back the GPU and not the
+        machine. A no op when nothing is owed.
+        """
+        if self.throttle.settle(unit=unit):
+            raise Cancelled("cancelled while the duty cycle was resting")
 
     def memory(self) -> dict:
         """The backend's own view of its memory. Empty when it has none."""

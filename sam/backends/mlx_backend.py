@@ -50,8 +50,9 @@ from typing import Any, Iterator
 import numpy as np
 
 from .base import (Backend, BackendError, BackendUnavailable, Instance,
-                   TrackedMask, mask_area, mask_box, normalize_prompts,
-                   mlx_memory, plan_objects, stage_meter, window_meter)
+                   TrackedMask, duty_cycle, mask_area, mask_box,
+                   normalize_prompts, mlx_memory, plan_objects, stage_meter,
+                   window_meter)
 
 # `next(iterator, _DONE)` rather than a for loop, so the decode of one frame
 # can be timed and measured on its own without a stage context wrapping the
@@ -152,13 +153,20 @@ def _log(message: str) -> None:
 
 class MlxBackend(Backend):
     name = "mlx"
+    # mlx-cv's session takes a mask prompt directly (_add_prompt below), so a
+    # reviewed pick can seed a track with its own pixels (checkpoint gap 20).
+    supports_mask_prompts = True
+    # The tracker reports a per frame confidence and `track` passes it through
+    # in a TrackedMask, so `scores` is the tracker's own number here.
+    score_kind = "tracker"
 
     def __init__(self, repo_id: str = REPO_ID, chunk_frames: int = CHUNK_FRAMES,
                  score_threshold: float = SCORE_THRESHOLD,
                  cache_limit_mb: int = CACHE_LIMIT_MB,
                  memory_limit_mb: int = MEMORY_LIMIT_MB,
                  layer_eval: bool = LAYER_EVAL,
-                 attention_chunk: int = ATTENTION_CHUNK, log=_log):
+                 attention_chunk: int = ATTENTION_CHUNK,
+                 duty_cycle_fraction: float = 1.0, log=_log):
         self.model = repo_id
         self.repo_id = repo_id
         self.chunk_frames = max(2, int(chunk_frames))
@@ -173,6 +181,9 @@ class MlxBackend(Backend):
         self._processor = None
         self._mx = None
         self.meter = window_meter(log=log)
+        # Quiet mode: how much of the wall clock this backend is allowed to
+        # own. 1.0 (the default) never sleeps. See sam/throttle.py.
+        self.throttle = duty_cycle(duty_cycle_fraction, log=log)
         # Off by default: `stage()` then returns a shared do-nothing object,
         # so an unmeasured run pays one attribute read per stage and makes no
         # syscall. `spike/stage_memory.py` turns it on.
@@ -194,6 +205,18 @@ class MlxBackend(Backend):
                 "Install it with: uv sync --project sam --extra mlx"
             ) from exc
 
+        # The allocator is bounded HERE, before a single weight is read, which
+        # is what this method's docstring always claimed and what it did not do:
+        # the limits used to be applied after from_pretrained, so 1.75 GB of
+        # weights and the processor were built under MLX's own 15564.8 MB cache
+        # limit (round 1 finding 23).
+        self._mx = mx
+        self.meter.mx = mx
+        self.stages.mx = mx
+        self.limits = self._apply_limits(mx)
+        self.limits["layer_eval"] = self._apply_layer_eval(mx)
+        self.limits["attention_chunk"] = self._apply_attention_chunk(mx)
+
         started = time.perf_counter()
         try:
             snapshot = resolve_pretrained(self.repo_id)
@@ -208,6 +231,13 @@ class MlxBackend(Backend):
         except Exception as exc:                               # noqa: BLE001
             raise BackendUnavailable(
                 f"SAM 3.1 weights would not load through mlx-cv: {exc}") from exc
+        # Reachable by close() from this line on, not only once every later
+        # check has passed. A raise below used to leave 1.75 GB of weights
+        # bound to a local and to the exception's traceback frames, with
+        # close() clearing a self._session that was still None: in
+        # `--backend auto` that is the moment torch-mps starts loading on top
+        # of it (round 1 finding 26).
+        self._session = session
 
         bpe = snapshot / "bpe_simple_vocab_16e6.txt.gz" if snapshot.is_dir() else None
         if bpe is None or not bpe.is_file():
@@ -219,14 +249,7 @@ class MlxBackend(Backend):
         processor = SAM3Processor(session.model.detector, bpe_path=bpe,
                                   score_threshold=self.score_threshold)
 
-        self._mx = mx
-        self._session = session
         self._processor = processor
-        self.meter.mx = mx
-        self.stages.mx = mx
-        self.limits = self._apply_limits(mx)
-        self.limits["layer_eval"] = self._apply_layer_eval(mx)
-        self.limits["attention_chunk"] = self._apply_attention_chunk(mx)
         self._log(f"[mlx] loaded {self.repo_id} in {time.perf_counter() - started:.2f}s "
                   f"(device {mx.default_device()})")
 
@@ -313,28 +336,74 @@ class MlxBackend(Backend):
                 self._log("[mlx] mx.fast.scaled_dot_product_attention is not "
                           "there to chunk; the tracker's memory attention will "
                           "allocate its whole matrix")
+            elif self._remove_attention_chunk():
+                # A second load() in this process with --mlx-attention-chunk 0
+                # has to really take the wrapper off. It used to return here
+                # with the wrapper still installed, so /health said
+                # "enabled: false" while 512 query chunking was in force
+                # (round 1 finding 24), and the spike scripts, which are the
+                # only thing that loads twice in one process, are exactly where
+                # the before/after comparison is made.
+                self._log("[mlx] attention chunking taken back off: this "
+                          "process runs the whole matrix again")
             return out
-        if getattr(original, "_fixxr_chunked", False):
-            return out                      # already patched in this process
+        installed = getattr(original, "_fixxr_chunked", False)
+        if installed:
+            running = int(getattr(original, "_fixxr_chunk", 0) or 0)
+            if running == self.attention_chunk:
+                # Already exactly what was asked for. Report the wrapper's own
+                # chunk, not the request, so the two can never differ.
+                out["chunk"] = running
+                return out
+            # A different size was asked for: retune rather than silently keep
+            # the old one and report the new one (round 1 finding 24).
+            self._remove_attention_chunk()
+            original = getattr(fast, "scaled_dot_product_attention", None)
+            self._log(f"[mlx] attention chunking retuned from {running} to "
+                      f"{self.attention_chunk} queries a block")
         chunk = self.attention_chunk
         threshold = ATTENTION_CHUNK_MIN_MB * 1048576
         log = self._log
-        counter = {"chunked": 0, "whole": 0}
+        # `whole_over_threshold` is the number that matters: a big matrix left
+        # whole is the 5.2 GB transient coming back while every log line still
+        # says the fix is on. It reaches /health through memory()["limits"]
+        # (round 1 finding 25).
+        counter = {"chunked": 0, "whole": 0, "whole_over_threshold": 0,
+                   "whole_reason": None}
 
         def chunked(queries, keys, values, **kwargs):
             try:
                 heads = int(queries.shape[-3])
                 query_length = int(queries.shape[-2])
                 key_length = int(keys.shape[-2])
+                # Every axis in front of the head axis multiplies the matrix:
+                # a batched call was underestimated by the batch factor and
+                # could stay whole for that reason alone (round 1 finding 46).
+                batch = 1
+                for size in queries.shape[:-3]:
+                    batch *= int(size)
             except Exception:                                  # noqa: BLE001
                 return original(queries, keys, values, **kwargs)
-            matrix = heads * query_length * key_length * 4
+            matrix = batch * heads * query_length * key_length * 4
             if (query_length <= chunk or matrix < threshold
                     or kwargs.get("mask") is not None):
                 # A mask would have to be sliced along the query axis too, and
                 # nothing in this model passes one; refusing to chunk is the
                 # safe answer rather than a clever one.
                 counter["whole"] += 1
+                if matrix >= threshold and query_length > chunk:
+                    reason = ("a mask was passed, and slicing a mask along the "
+                              "query axis is not something this wrapper does"
+                              if kwargs.get("mask") is not None
+                              else "the shape was not chunkable")
+                    if not counter["whole_over_threshold"]:
+                        log(f"[mlx] attention left WHOLE at "
+                            f"{matrix / 1048576:.0f} MB ({batch}x{heads} heads "
+                            f"x {query_length} x {key_length}): {reason}. This "
+                            f"is the transient the chunking exists to remove; "
+                            f"/health counts every one of these.")
+                    counter["whole_over_threshold"] += 1
+                    counter["whole_reason"] = reason
                 return original(queries, keys, values, **kwargs)
             if not counter["chunked"]:
                 log(f"[mlx] attention in blocks of {chunk} queries: "
@@ -352,12 +421,41 @@ class MlxBackend(Backend):
             return mx.concatenate(pieces, axis=-2)
 
         chunked._fixxr_chunked = True                          # noqa: SLF001
+        chunked._fixxr_chunk = chunk                           # noqa: SLF001
         chunked._fixxr_original = original                     # noqa: SLF001
         chunked._fixxr_counter = counter                       # noqa: SLF001
         fast.scaled_dot_product_attention = chunked
         self._log(f"[mlx] scaled_dot_product_attention will run in blocks of "
                   f"{chunk} queries when the attention matrix would be over "
                   f"{ATTENTION_CHUNK_MIN_MB} MB")
+        return out
+
+    def attention_chunk_report(self) -> dict:
+        """What the attention wrapper is DOING, not what it was asked for.
+
+        The counter used to live only on the wrapper, read by one test and
+        nothing else, so a future mlx-cv that started passing a mask into that
+        attention would bring the whole matrix back while every log line said
+        the fix was on and /health agreed (round 1 finding 25). Now /health
+        carries the counts and the reason.
+        """
+        out = dict(self.limits.get("attention_chunk") or
+                   {"chunk": self.attention_chunk,
+                    "min_matrix_mb": ATTENTION_CHUNK_MIN_MB,
+                    "enabled": False})
+        mx = self._mx
+        current = getattr(getattr(mx, "fast", None),
+                          "scaled_dot_product_attention", None)
+        installed = bool(getattr(current, "_fixxr_chunked", False))
+        out["installed"] = installed
+        if installed:
+            out["chunk"] = int(getattr(current, "_fixxr_chunk", out.get("chunk") or 0))
+            out.update(getattr(current, "_fixxr_counter", None) or {})
+        elif out.get("enabled"):
+            # Asked for, not in force: somebody took the wrapper off.
+            out["enabled"] = False
+            out["note"] = ("the wrapper is not installed any more, so the "
+                           "tracker's memory attention runs whole")
         return out
 
     @staticmethod
@@ -442,7 +540,11 @@ class MlxBackend(Backend):
     def memory(self) -> dict:
         """MLX's own numbers plus the limits in force, for /health."""
         out = dict(mlx_memory(self._mx))
-        out["limits"] = self.limits
+        out["limits"] = dict(self.limits)
+        if self._mx is not None:
+            # Only once this backend has loaded: with no model there is nothing
+            # to inspect and an empty report is the honest one.
+            out["limits"]["attention_chunk"] = self.attention_chunk_report()
         return out
 
     def release(self) -> None:
@@ -610,15 +712,26 @@ class MlxBackend(Backend):
         seed_frame = np.ascontiguousarray(seed_frame)
         height, width = seed_frame.shape[:2]
 
+        token = self.throttle.begin()
         with self.stages.stage("seed detect"):
             live = self._seed_slots(processor, seed_frame, slots, width, height)
         if not live:
             raise BackendError(
                 "the detector found nothing for any of these prompts on the "
                 "seed frame, so there is nothing to track")
+        # The detector is one model pass and gets the same courtesy as a
+        # window: owed now, rested for at the top of the loop below.
+        self.throttle.owe(token, unit="seed detect")
 
         last_mask: dict[str, np.ndarray] = {}
         for chunk_start, chunk in self._chunks(iterator, seed_frame):
+            # Quiet mode's gap goes HERE, between two windows, rather than
+            # inside one: at this point the previous window's session, its
+            # preprocessed frames and MLX's own buffers have all been given
+            # back (the `finally` below), so the machine gets the GPU and the
+            # memory at the same time.
+            self.settle()
+            token = self.throttle.begin()
             # What the service reports on /health, so a person watching a slow
             # job can see which window of the clip is loaded right now.
             chunk_frames_here = len(chunk)
@@ -699,6 +812,11 @@ class MlxBackend(Backend):
                 self.meter.finish(freed=lambda held=state: self._free_window(session, held))
                 state = None
                 self._reset_peak()
+                # The window that just closed is owed a rest. The NEXT pass of
+                # this loop takes it (above); if there is no next pass, the
+                # service takes it once the job has been reported, so a track
+                # never reads as 100 percent complete and still running.
+                self.throttle.owe(token)
 
     def _free_window(self, session, state) -> None:
         with self.stages.stage("window free"):

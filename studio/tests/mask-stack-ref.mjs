@@ -12,10 +12,13 @@
  * So this file is not a mock of anything. It loads the real gpu.js, in node,
  * with no browser and no server, and asserts on the real functions the
  * shaders mirror. What it cannot prove is that the SHADERS mirror them: that
- * is the mask parity fixtures' job, and they need M2's engine and M5's routes
- * on the branch first.
+ * is the mask fixture block of studio/tests/parity-gate.mjs, which renders 52
+ * component stacks through both sides and measures them (it runs by default
+ * and a failed row fails the gate). The two together are the contract: this
+ * file says what the arithmetic IS, parity says the shaders do it.
  *
- * Run: node studio/tests/mask-stack-ref.mjs
+ * Run: node studio/tests/mask-stack-ref.mjs, or through the spec suite, which
+ * runs it as spec 31.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -230,42 +233,131 @@ eq("clean_white in a stack pushes a high matte to full swing",
   eq("the knee saturates at 1", p2.knee, 1);
 }
 
-/* Finesse runs clean, then grow, then blur: cleaning fixes the levels,
- * growing decides where the edge is, blurring softens what is left. The two
- * orders give different pixels, which is what this checks. */
+/* Finesse ORDER: clean, then grow, then blur.
+ *
+ * Tested as an order, not as "cleaning does something". The composed answer is
+ * rebuilt here out of the very primitives maskStackCPU is made of (softKnee,
+ * morph, gblur and the two roundings, all exported for exactly this), once in
+ * the documented order and once with one step moved, and then:
+ *
+ *   - the documented order has to match M.stack CODE FOR CODE, which pins the
+ *     order completely rather than bounding it, and
+ *   - each wrong order has to differ, in a stated direction.
+ *
+ * This block used to compare "clean plus blur" against "blur alone", which
+ * only proves that cleaning changes something: it would have passed just as
+ * happily with the order reversed, which is the one thing it claimed to check.
+ * The order matters because it decides whether the softness survives: clean
+ * last re-crushes the ramp the blur just made. */
 {
   const W = 32, H = 32;
   const win = { shape: "rect", cx: 0.5, cy: 0.5, w: 0.5, h: 0.5,
                 rotation: 0, softness: 0.4, invert: false };
   const comps = [{ id: "w", type: "window", op: "add", window: win }];
-  const cleaned = M.stack({ components: comps,
-                            finesse: { blur: 0.03, grow: 0, clean_black: 0.3, clean_white: 0.3 } },
-                          W, H, {});
-  const blurredOnly = M.stack({ components: comps,
-                                finesse: { blur: 0.03, grow: 0, clean_black: 0, clean_white: 0 } },
-                              W, H, {});
-  check("clean before blur is not the same picture as blur alone",
-        Array.from(cleaned).some((v, i) => v !== blurredOnly[i]));
-  check("the softness survives the clean, so the edge is still a ramp",
-        Array.from(cleaned).some(v => v > 0 && v < 65535));
+  const fin = { blur: 0.06, grow: 0.09, clean_black: 0.3, clean_white: 0.2 };
+  const got = M.stack({ components: comps, finesse: fin }, W, H, {});
+
+  /* The combined matte BEFORE finesse. One add component over an accumulator
+   * that starts at 0 folds to max(0, b), which is the component itself on the
+   * 16 bit lattice, so this is the same array the finesse steps below see. */
+  function base() {
+    const w = M.window(win, W, H);
+    const a = new Float64Array(W * H);
+    for (let i = 0; i < a.length; i++) a[i] = M.q16r(w[i]) / M.MAX;
+    return a;
+  }
+  // geq truncates its own output, which is why this is q16f and not q16r.
+  function clean(a) {
+    const o = Float64Array.from(a);
+    for (let i = 0; i < o.length; i++) {
+      o[i] = M.q16f(M.softKnee(o[i], fin.clean_black, fin.clean_white)) / M.MAX;
+    }
+    return o;
+  }
+  function grow(a) {
+    const steps = Math.min(M.GROW_MAX, M.pyRound(Math.abs(fin.grow) * W));
+    return M.morph(a, W, H, steps, fin.grow > 0);
+  }
+  function blur(a) { return M.gblur(a, W, H, fin.blur * W); }
+  function codes(a) {
+    const o = new Uint16Array(a.length);
+    for (let i = 0; i < a.length; i++) o[i] = M.q16r(a[i]);
+    return o;
+  }
+  const documented = codes(blur(grow(clean(base()))));
+  const cleanLast = codes(clean(blur(grow(base()))));
+  const growLast = codes(grow(blur(clean(base()))));
+
+  const soft = (u) => Array.from(u).filter(v => v > 0 && v < M.MAX).length;
+  const total = (u) => Array.from(u).reduce((s, v) => s + v, 0);
+
+  check("the stack's finesse IS clean, then grow, then blur, code for code",
+        Array.from(got).every((v, i) => v === documented[i]),
+        "the stack and a hand composed clean/grow/blur disagree");
+  check("cleaning LAST is a different picture (the order is not free)",
+        Array.from(got).some((v, i) => v !== cleanLast[i]));
+  check("and cleaning last crushes the ramp the blur made: fewer soft codes",
+        soft(cleanLast) < soft(documented),
+        "clean last " + soft(cleanLast) + " soft codes, documented order "
+        + soft(documented));
+  check("growing LAST is a different picture too",
+        Array.from(got).some((v, i) => v !== growLast[i]));
+  check("and growing after the blur selects less than growing before it",
+        total(growLast) < total(documented),
+        "grow last totals " + total(growLast) + ", documented order "
+        + total(documented));
+  check("the softness survives the documented order, so the edge is a ramp",
+        soft(documented) > 0);
 }
 
-// The grow cap: 32 passes, and the pass count is Python's round().
+/* The grow step in COMPOSITION: the pass count is Python's round() of
+ * grow * width, and it is capped at 32 passes.
+ *
+ * pyRound is unit tested above, but the number that reaches morph is the one
+ * that matters, and nothing tested THAT: the old block only checked the cap,
+ * so a stack using JavaScript's Math.round (which rounds a half away from
+ * zero, where Python rounds it to even) would have passed. A rect window with
+ * no softness makes the pass count directly measurable: a dilate of n passes
+ * widens the run of fully selected pixels by exactly n on each side. */
 {
   const W = 200, H = 8;
   const comps = [{ id: "w", type: "window", op: "add",
                    window: { shape: "rect", cx: 0.5, cy: 0.5, w: 0.2, h: 0.9,
                              rotation: 0, softness: 0, invert: false } }];
-  const big = M.stack({ components: comps,
-                        finesse: { blur: 0, grow: 0.5, clean_black: 0, clean_white: 0 } },
-                      W, H, {});
-  const capped = M.stack({ components: comps,
-                           finesse: { blur: 0, grow: 0.16, clean_black: 0, clean_white: 0 } },
-                         W, H, {});
+  function widthOf(u16) {
+    const y = Math.floor(H / 2);
+    let n = 0;
+    for (let x = 0; x < W; x++) if (u16[y * W + x] === M.MAX) n++;
+    return n;
+  }
+  function stackWith(grow) {
+    return M.stack({ components: comps,
+                     finesse: { blur: 0, grow: grow, clean_black: 0, clean_white: 0 } },
+                   W, H, {});
+  }
+  const flat = widthOf(stackWith(0));
+  check("the un-grown rect is a measurable run of selected pixels", flat > 8, "run " + flat);
+  // 0.02 * 200 = 4 exactly: four passes, four pixels each side.
+  eq("a grow of 4 passes widens the selection by 4 pixels each side",
+     widthOf(stackWith(0.02)), flat + 8);
+  /* 0.0125 * 200 = 2.5, which Python rounds DOWN to 2 (round half to even)
+   * and JavaScript rounds UP to 3. Two passes, so four pixels, not six: this
+   * is the assertion that fails if the pass count ever stops going through
+   * pyRound. */
+  eq("a grow of exactly two and a half passes rounds to two, Python's way",
+     widthOf(stackWith(0.0125)), flat + 4);
+  // 0.0175 * 200 = 3.5, which rounds to 4 both ways: the half-to-even rule
+  // only shows up on an odd half, and this pins the other side of it.
+  eq("a grow of three and a half passes rounds to four",
+     widthOf(stackWith(0.0175)), flat + 8);
+
+  const big = stackWith(0.5);
+  const capped = stackWith(0.16);
   // 0.5 * 200 = 100 passes, 0.16 * 200 = 32: both clamp to 32, so the two
   // mattes are the same picture and a grow past the cap does nothing more.
   check("grow is capped at 32 passes, so a bigger grow does not grow further",
         Array.from(big).every((v, i) => v === capped[i]));
+  eq("and the cap is 32", M.GROW_MAX, 32);
 }
 
 // ------------------------------------------------- the key and luma cubes
@@ -501,15 +593,57 @@ eq("frameIndex clamps at zero", M.frameIndex({ fps: 24, frames: 10 }, -5), 0);
 eq("frameIndex is null without an index", M.frameIndex(null, 1.0), null);
 eq("frameIndex is null with no fps", M.frameIndex({ fps: 0, frames: 10 }, 1.0), null);
 
+/* The cache key has no render width in it any more. A matte frame is fetched
+ * and cached at the matte's OWN size and scaled per pass with the ported
+ * swscale filter, so one decoded frame serves every render size: keying on the
+ * width would hold the same frame twice at 640 and at 1280, and the second
+ * copy would be a different picture from the engine's anyway, since the engine
+ * scales the store's frame itself. */
 eq("frameKey uses the frame number when there is an index",
-   M.frameKey("m1", 1280, { fps: 24, frames: 100 }, 1.0), "m1:1280:24");
+   M.frameKey("m1", { fps: 24, frames: 100 }, 1.0), "m1:24");
 eq("frameKey falls back to the time when there is not",
-   M.frameKey("m1", 1280, null, 1.0), "m1:1280:t1.000");
+   M.frameKey("m1", null, 1.0), "m1:t1.000");
 eq("two times in one frame share a cache entry",
-   M.frameKey("m1", 640, { fps: 24, frames: 100 }, 1.00),
-   M.frameKey("m1", 640, { fps: 24, frames: 100 }, 1.01));
-check("two widths do not share a cache entry",
-      M.frameKey("m1", 640, null, 1) !== M.frameKey("m1", 1280, null, 1));
+   M.frameKey("m1", { fps: 24, frames: 100 }, 1.00),
+   M.frameKey("m1", { fps: 24, frames: 100 }, 1.01));
+eq("the render width is NOT part of the key any more",
+   M.frameKey("m1", { fps: 24, frames: 100 }, 1.0), M.frameKeyAt("m1", 24));
+check("and the prefetch's own key formatter is the same one",
+      M.frameKeyAt("m1", 7) === "m1:7");
+
+/* A failed index fetch is retried with an exponential backoff rather than
+ * remembered as broken for the session (which used to switch the prefetch off
+ * permanently and degrade every key to the time form). */
+eq("the first retry waits two seconds", M.retryDelay(1), 2000);
+eq("the delay doubles", M.retryDelay(2), 4000);
+eq("and stops doubling at thirty seconds", M.retryDelay(20), 30000);
+check("a zero or negative try count is still a real delay", M.retryDelay(0) >= 2000);
+
+/* The cache cap grows with the number of mattes on the config and shrinks with
+ * the size of a frame. A flat 48 with a per matte read ahead of 8 is a cache
+ * that thrashes as soon as a grade has six mattes on it: each matte's prefetch
+ * evicts the frames another matte is about to need, and the state line sits on
+ * "matte lagging" for the rest of the session. */
+{
+  const floor = M.PREFETCH + 2;
+  eq("one matte gets the flat floor of 48", M.cacheCap(1, 0), M.CACHE_MAX);
+  eq("so do four, whose windows still fit inside 48",
+     M.cacheCap(4, 0), M.CACHE_MAX);
+  eq("six mattes get a read ahead window each instead",
+     M.cacheCap(6, 0), 6 * floor);
+  eq("a small frame does not lower the cap",
+     M.cacheCap(6, 64 * 36 * 4), 6 * floor);
+  // An HD matte frame is 8.3 MB on the card, so the byte ceiling bites first.
+  eq("an HD frame lowers the cap to what the byte ceiling allows",
+     M.cacheCap(6, 1920 * 1080 * 4),
+     Math.floor(M.CACHE_BYTES / (1920 * 1080 * 4)));
+  // A 4K frame is 33 MB: the ceiling would allow seven, which is less than one
+  // read ahead window, and a cache smaller than the read ahead cannot work at
+  // all, so the floor wins and the ceiling is deliberately overshot.
+  eq("but the cap never drops below one read ahead window plus two",
+     M.cacheCap(6, 3840 * 2160 * 4), floor);
+  eq("even for an absurd frame size", M.cacheCap(6, M.CACHE_BYTES), floor);
+}
 
 {
   const order = [];

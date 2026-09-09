@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (FORBIDDEN_PORTS, call, check, free_port, report,  # noqa: E402
-                    sam_path, start, stop, wait_for_job)
+                    sam_path, skip, start, stop, wait_for_job)
 
 sam_path()
 import memstat                                                        # noqa: E402
@@ -115,8 +115,20 @@ def test_stub_windows() -> None:
     check("the backend reports its own memory in the shape /health expects",
           set(backend.memory()) >= {"active_mb", "cache_mb", "peak_mb", "limits"},
           str(backend.memory()))
-    backend.release()
-    check("release is safe to call on a backend with nothing to release", True)
+    # The outcome, not the fact that the line was reached: this was a bare
+    # check("...", True), which passed whatever release() did (round 1
+    # finding 39). Called twice, because the service calls it in a `finally`
+    # after a window it may never have opened.
+    raised = ""
+    try:
+        backend.release()
+        backend.release()
+    except Exception as exc:                                   # noqa: BLE001
+        raised = f"{type(exc).__name__}: {exc}"
+    check("release is safe to call twice on a backend with nothing to "
+          "release, and the window record it already wrote survives it",
+          raised == "" and len(backend.meter.windows) == 3,
+          raised or f"{len(backend.meter.windows)} windows")
 
 
 def test_mlx_limits_without_mlx() -> None:
@@ -279,8 +291,20 @@ def test_stage_meter() -> None:
           any(r["name"] == "after" for r in meter.rows()))
     meter.reset()
     check("reset clears the stages", meter.rows() == [] and meter.order == [])
-    meter.stop()
-    check("stopping a meter twice is safe", True)
+    # Twice, with the outcome checked: another bare check("...", True) that
+    # passed whatever stop() did (round 1 finding 39). The service stops the
+    # meter from an exit path that can run after a normal stop.
+    raised = ""
+    try:
+        meter.stop()
+        meter.stop()
+    except Exception as exc:                                   # noqa: BLE001
+        raised = f"{type(exc).__name__}: {exc}"
+    check("stopping a meter twice is safe, and the second stop leaves the "
+          "sampler thread gone rather than restarting it",
+          raised == "" and meter.rows() == []
+          and (meter._thread is None or not meter._thread.is_alive()),
+          raised or str(meter.rows()))
 
 
 class _FakeMx:
@@ -314,12 +338,18 @@ def test_attention_chunk() -> None:
     except ImportError:
         mx = None
     if mx is None:
+        # SKIPPED, not passed. These four used to be recorded as passes when
+        # MLX was absent, including the bit-identical claim the REPORT rests on,
+        # so an environment with no MLX produced the same green line as one that
+        # had proved it (round 1 finding 18). They now print as skips and the
+        # gate's summary counts them (round 1 finding 41).
         for label in ("the patch replaces mx.fast.scaled_dot_product_attention",
                       "a big attention really is chunked and a small one is not",
                       "the chunked result is bit identical to the whole one",
                       "and the patch can be taken back off"):
-            check(f"{label} (mlx is not installed in this environment, so "
-                  f"there is nothing to patch)", True)
+            skip(label, "mlx is not installed in this environment: install it "
+                        "with `uv sync --project sam --extra mlx` and run this "
+                        "suite again before believing the chunking claim")
         return
 
     backend = MlxBackend(log=lambda _m: None)

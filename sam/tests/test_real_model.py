@@ -48,10 +48,19 @@ def main() -> int:
     args = parser.parse_args()
 
     if not FRAMES.is_dir() or not CLIP.is_file():
+        # A missing fixture is a SETUP ERROR, not a pass. This used to return 0
+        # with a "Skipping." line, so a run that tested nothing at all reported
+        # success; if this file is ever added to sam/tests/run.py that green
+        # line would have meant nothing (round 1 finding 41).
         print(f"the spike material is missing under {SPIKE}.\n"
               "This test uses what the spike left there; it does not download "
-              "or re-encode anything. Skipping.")
-        return 0
+              "or re-encode anything.\n"
+              "Run `uv run --project sam python sam/spike/track_memory.py "
+              "--windows 1` once to produce it, then run this again.")
+        print("\ntest_real_model: 0/0 checks passed")
+        print("test_real_model: 1 checks skipped")
+        print(f"  SKIPPED: the whole suite (no fixtures under {SPIKE})")
+        return 2
 
     still = sorted(FRAMES.glob("*.png"))[0]
     tmp = Path(tempfile.mkdtemp(prefix="sam-real-"))

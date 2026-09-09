@@ -306,32 +306,36 @@
      "affects the PREVIEW only; a render reads the same frames off disk with " +
      "no deadline, and refuses a partial matte outright unless it is told to " +
      "allow one."],
-    ["The component mask is not yet measured against the render.",
-     "ported, not yet proven",
+    ["The component mask is measured, with one arithmetic caveat left.",
+     "measured exact, one bounded difference",
      "The preview's whole claim to be trusted is the parity harness: every " +
      "stage says exact, close or unsupported, and the number behind that word " +
      "was measured against ffmpeg on this machine. The mask component stack " +
      "(add, intersect, subtract, per component feather and invert, the linear " +
-     "gradient, matte finesse) is ported and reports itself CLOSE rather than " +
-     "exact, because at the time of writing most of its parity fixtures " +
-     "cannot run: the engine builds the filter graph for a component stack " +
-     "but the studio server does not yet pass that graph the extra image " +
-     "inputs it names, so those renders fail before a pixel is compared. " +
-     "Three rows DO measure exact already, and they are the three that need " +
-     "no extra input: a colour key component, a luma component, and an " +
-     "inverted stack with nothing switched on. What else HAS been measured " +
-     "is the arithmetic: the three " +
-     "combine modes, the clean expression's rounding and the way the grow " +
-     "step treats the frame border were all probed against ffmpeg on this " +
-     "machine and this preview matches them, so those are no longer guesses. " +
-     "Two places are still expected to move by a code and cannot be checked " +
-     "until the fixtures run: the clean black and clean white knee is " +
-     "evaluated in double precision by ffmpeg and in single precision here, " +
-     "so a value sitting exactly on a whole code can round the other way, and " +
-     "a matte served at a size other than the render's is resampled by the " +
-     "graphics card here and by swscale there, which are different " +
-     "resamplers. Legacy masks (a power window and a colour key) are " +
-     "unaffected and still measure exactly as they did."],
+     "gradient, a tracked matte, matte finesse) HAS now been measured: the " +
+     "mask block of the parity gate renders 31 component stacks, at two " +
+     "preview widths each, through this preview and through ffmpeg and " +
+     "compares them pixel by pixel, and all 62 of those rows (five of them " +
+     "on a real tracked matte on disk, two of those at a size the render is " +
+     "not) come back EXACT, meaning no channel of any pixel differs by more than " +
+     "one 8 bit code. That block runs by default and a failed row fails the " +
+     "gate. An earlier version of this page said most of those fixtures could " +
+     "not run because the server did not pass the filter graph its extra " +
+     "image inputs; it does (studio/server.py calls mask_extra_inputs on both " +
+     "the still and the render path), and that sentence was already wrong when " +
+     "it was written. " +
+     "One difference is still expected and is reported as CLOSE on any layer " +
+     "that can hit it: the clean black and clean white knee is evaluated in " +
+     "double precision by ffmpeg and in single precision here, so a matte " +
+     "value sitting exactly on a whole code inside the knee can round the " +
+     "other way. It measures exact on the fixtures; the bound is one code. " +
+     "A matte component is also reported CLOSE, for a different reason: its " +
+     "pixels match (it is scaled to the render size by ffmpeg's own swscale " +
+     "bilinear filter, ported into the shader, not by the graphics card's " +
+     "filter, which is a different filter) but the frame has to arrive over " +
+     "HTTP first, and a frame that has not arrived is shown as the last one " +
+     "that did. See the lagging entry above. Legacy masks (a power window and " +
+     "a colour key) are unaffected and still measure exactly as they did."],
     ["An inverted matte component with nothing decoded selects everything.",
      "known trap",
      "A matte component whose frame has not arrived reads as 0, meaning " +

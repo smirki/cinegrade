@@ -33,6 +33,14 @@ def ramp(value: float) -> np.ndarray:
     return np.full((4, 8), value, dtype=np.float32)
 
 
+def box(y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+    """A rectangle of ones in a 4x8 frame, so an area and an IoU can be
+    worked out by hand and written into the check."""
+    a = np.zeros((4, 8), dtype=np.float32)
+    a[y0:y1, x0:x1] = 1.0
+    return a
+
+
 def half(left: bool) -> np.ndarray:
     """Half the frame covered, on one side or the other. Two of these in a
     row overlap in nothing, which is the shape change the per frame IoU
@@ -153,6 +161,50 @@ def main() -> int:
           "to judge a matte",
           "ious" in index)
 
+    print("\nwhat a drift check reads off a matte that lost its subject "
+          "(finding 15, producer side)")
+    # The three rules `grade/mattes.py::quality()` applies (a zero area frame, a
+    # big area jump, a low IoU) are only as real as the arrays this store
+    # writes. Round 1 finding 15 found every assertion about `quality()` running
+    # against a fake index.json with NO areas and NO ious, which forces
+    # suspect_count to 0 whatever the rules do. So this proves the producer:
+    # after a track that latches onto something else, the numbers on disk are
+    # the ones those rules need, with the values spelled out here so the engine
+    # side can be unit tested against exactly these.
+    drift = MatteWriter(root, "m_drift", header(6), steady=1)
+    drift.set_state("running")
+    drift.push(0, box(1, 3, 1, 3), 0.90)      # the subject: 4 of 32 pixels
+    drift.push(1, box(1, 3, 1, 3), 0.88)      # holding
+    drift.push(2, np.zeros((4, 8), dtype=np.float32), 0.10)   # lost outright
+    drift.push(3, box(0, 4, 0, 8), 0.55)      # latched onto the background
+    drift.push(4, box(0, 4, 0, 8), 0.57)      # holding the wrong thing
+    drift.push(5, box(1, 3, 1, 3), 0.86)      # back on the subject
+    drift.finish("done")
+    d = read_index(drift.dir)
+    areas, ious = d["areas"], d["ious"]
+    check("a frame where the object was lost is an area of exactly 0, which is "
+          "the zero_area rule's input",
+          areas[2] == 0.0, str(areas[2]))
+    check("the frame that latched onto the background is an 8x area jump off "
+          "the last non zero frame, which is the area_jump rule's input",
+          areas[1] > 0 and areas[3] / areas[1] == 8.0,
+          f"{areas[1]} -> {areas[3]}")
+    check("the jump reads as an IoU of 0 against the frame before it, because "
+          "the frame before it was the empty one",
+          abs(ious[3] - 0.0) < 1e-6, str(ious[3]))
+    check("and the recovery is the low_iou rule's own case, with no empty "
+          "frame in between: 4 pixels inside 32 is an IoU of 0.125 while the "
+          "score looks healthy again at 0.86",
+          abs(ious[5] - 0.125) < 1e-6 and areas[5] == areas[0]
+          and d["scores"][5] == 0.86,
+          f"area {areas[5]} iou {ious[5]} score {d['scores'][5]}")
+    check("every frame of the track has a number in all three arrays, so a "
+          "drift check reads no Nones inside the tracked span",
+          all(v is not None for v in areas)
+          and all(v is not None for v in d["scores"])
+          and all(v is not None for v in ious[1:]),
+          f"{areas} {ious}")
+
     print("\nre-opening a matte id is a resume, not a restart (gap 12)")
     first = MatteWriter(root, "m_resume", header(10), steady=1)
     first.set_state("running")
@@ -225,11 +277,34 @@ def main() -> int:
 
     print("\nindex.json is never seen half written")
     writer = MatteWriter(root, "m_atomic", header(4), steady=1)
+    # The outcome is checked, not merely reached: this used to be a bare
+    # check("...", True) after the loop, so a half written index.json would
+    # have crashed the suite with a traceback instead of failing one named
+    # check, and a loop that parsed nothing would have passed (round 1
+    # finding 39).
+    parsed = []
+    trouble = ""
     for i in range(4):
         writer.push(i, ramp(0.25), 0.5)
-        json.loads((writer.dir / "index.json").read_text())
+        try:
+            parsed.append(json.loads((writer.dir / "index.json").read_text()))
+        except (OSError, ValueError) as exc:
+            trouble = f"frame {i}: {type(exc).__name__}: {exc}"
+            break
     writer.finish("done")
-    check("index.json parses after every single frame", True)
+    final = read_index(writer.dir)
+    check("index.json parses as whole JSON after every single frame, with the "
+          "keys a reader needs still in it",
+          not trouble and len(parsed) == 4
+          and all({"state", "done_frames", "areas"} <= set(doc)
+                  for doc in parsed),
+          trouble or f"{len(parsed)} reads")
+    check("the rewrite is throttled to at most once a second while a job "
+          "runs, so those four reads cost one write, and finish() always "
+          "writes: done_frames is 4 only at the end",
+          [doc["done_frames"] for doc in parsed] == [0, 0, 0, 0]
+          and final["done_frames"] == 4,
+          f"{[doc['done_frames'] for doc in parsed]} then {final['done_frames']}")
     check("no temp files are left behind",
           not list(writer.dir.glob("*.tmp*")), str(list(writer.dir.glob("*.tmp*"))))
 

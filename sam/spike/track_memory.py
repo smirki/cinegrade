@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import socket
@@ -67,8 +68,16 @@ PYTHON = SAM / ".venv" / "bin" / "python"
 OUT = SAM / "spike" / "out"
 CLIP = Path("/Users/smirk/Programming/Fixxr-Agent-Workspace/content/"
             "bakeoff/r2/sources/A001_09061900_C015.mov")
-# Ports that belong to somebody else's running server and are never taken.
-FORBIDDEN_PORTS = {7431, 7560, 7614, 7615, 22929, 28958}
+# Ports that belong to somebody else's running server and are never taken. One
+# list, in sam/ports.py, read by every script and suite that picks a port: this
+# one used to keep its own copy and the four copies in the tree disagreed
+# (round 1 finding 20).
+from ports import FORBIDDEN_PORTS, PORT_RANGE                      # noqa: E402
+# `taskpolicy -b` runs a program under the macOS background QoS tier, which is
+# what the OS itself uses for Spotlight indexing and Time Machine: throttled
+# CPU, throttled disk, and a lower GPU priority. It is a launch wrapper, not a
+# code path, which is why it lives in this script and not in the service.
+TASKPOLICY = "/usr/sbin/taskpolicy"
 
 
 def say(message: str) -> None:
@@ -77,7 +86,7 @@ def say(message: str) -> None:
 
 def free_port() -> int:
     for _ in range(400):
-        port = random.randint(20000, 60000)
+        port = random.randint(*PORT_RANGE)
         if port in FORBIDDEN_PORTS:
             continue
         with socket.socket() as probe:
@@ -145,10 +154,22 @@ def top_sample(pid: int) -> dict:
     return out
 
 
+def load_average() -> list[float]:
+    """The 1, 5 and 15 minute load averages, the same three numbers `uptime`
+    prints. This is the "is the machine usable" reading, and it is the point of
+    quiet mode: the service's own footprint can be perfect while the machine is
+    unusable, and only this number and the founder's own scroll say so."""
+    try:
+        return [round(value, 2) for value in os.getloadavg()]
+    except OSError:                                                # noqa: BLE001
+        return []
+
+
 def sample(pid: int, base: str | None) -> dict:
     """One reading of everything: top, the kernel's own footprint for that
-    pid, and what the service says about itself."""
-    shot = {"at": round(time.time(), 3), "top": top_sample(pid)}
+    pid, the machine's load average, and what the service says about itself."""
+    shot = {"at": round(time.time(), 3), "top": top_sample(pid),
+            "load": load_average()}
     footprint = memstat.pid_footprint(pid)
     shot["footprint_mb"] = round(footprint / 1048576, 1) if footprint else None
     if base:
@@ -156,6 +177,7 @@ def sample(pid: int, base: str | None) -> dict:
             health = get(base, "/health")
             shot["health_memory"] = health.get("memory")
             shot["window"] = health.get("window")
+            shot["throttle"] = health.get("throttle")
         except Exception as exc:                                   # noqa: BLE001
             shot["health_error"] = f"{type(exc).__name__}: {exc}"
     return shot
@@ -236,6 +258,20 @@ def start_service(args, port: int, data_dir: Path, log_path: Path):
         command += ["--mlx-attention-chunk", str(args.attention_chunk)]
     if args.layer_eval:
         command += ["--mlx-layer-eval"]
+    if args.quiet:
+        command += ["--quiet"]
+    if args.duty_cycle is not None:
+        command += ["--duty-cycle", str(args.duty_cycle)]
+    if args.nice is not None:
+        command += ["--nice", str(args.nice)]
+    if args.taskpolicy:
+        # In front of the interpreter, so the whole service (and therefore its
+        # Metal work) inherits the background tier. `taskpolicy` execs in place,
+        # so proc.pid is still the python process and stop_service still stops
+        # the thing it started rather than a wrapper.
+        if not Path(TASKPOLICY).exists():
+            raise SystemExit(f"{TASKPOLICY} is missing; --taskpolicy needs it")
+        command = [TASKPOLICY, "-b"] + command
     say("starting: " + " ".join(command))
     handle = log_path.open("w")
     proc = subprocess.Popen(command, cwd=str(ROOT), stdout=handle,
@@ -320,6 +356,8 @@ def row_from(window: dict, shot: dict) -> dict:
         "top_cmprs_mb": (shot.get("top") or {}).get("cmprs_mb"),
         "top_raw": (shot.get("top") or {}).get("raw"),
         "kernel_footprint_mb": shot.get("footprint_mb"),
+        "load": shot.get("load"),
+        "busy_fraction": (shot.get("throttle") or {}).get("busy_fraction"),
     }
 
 
@@ -347,6 +385,19 @@ def main(argv=None) -> int:
                              "behaviour that made every frame peak at 13.2 GB.")
     parser.add_argument("--layer-eval", action="store_true",
                         help="also put an mx.eval after every ViT trunk layer")
+    parser.add_argument("--quiet", action="store_true",
+                        help="run the service under its own --quiet preset "
+                             "(duty cycle 0.5, nice 15, MLX memory limit "
+                             "6144 MB, mask width hint 720)")
+    parser.add_argument("--duty-cycle", type=float, default=None,
+                        help="the fraction of wall time the model may own; "
+                             "overrides --quiet's 0.5")
+    parser.add_argument("--nice", type=int, default=None)
+    parser.add_argument("--taskpolicy", action="store_true",
+                        help="launch the service under `taskpolicy -b`, the "
+                             "macOS background QoS tier. A launch wrapper, "
+                             "never a code path: this measures it rather than "
+                             "adopting it.")
     parser.add_argument("--lock-timeout-s", type=float, default=60.0,
                         help="give up rather than wait for the model lock")
     parser.add_argument("--ready-s", type=float, default=900.0,
@@ -399,7 +450,13 @@ def main(argv=None) -> int:
               "memory_limit_mb": args.memory_limit_mb,
               "attention_chunk": args.attention_chunk,
               "layer_eval": bool(args.layer_eval),
+              "quiet": bool(args.quiet),
+              "duty_cycle": args.duty_cycle,
+              "nice": args.nice,
+              "taskpolicy": bool(args.taskpolicy),
+              "load_before": load_average(),
               "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    say(f"load average before anything started: {result['load_before']}")
     rows: list[dict] = []
     try:
         proc, handle = start_service(args, port, run_dir / "data", log_path)
@@ -410,7 +467,9 @@ def main(argv=None) -> int:
         result["backend"] = health.get("backend")
         result["limits"] = ((health.get("memory") or {}).get("backend") or {}) \
             .get("limits")
+        result["throttle_at_start"] = health.get("throttle")
         say(f"backend {health.get('backend')}, limits {result['limits']}")
+        say(f"throttle {result['throttle_at_start']}")
 
         loaded = sample(proc.pid, base)
         result["after_load"] = loaded
@@ -467,7 +526,10 @@ def main(argv=None) -> int:
         time.sleep(5.0)      # MLX gives the memory back a moment after the free
         result["after_job"] = sample(proc.pid, base)
         result["rows"] = rows
-        result["health_final"] = get(base, "/health").get("memory")
+        final = get(base, "/health")
+        result["health_final"] = final.get("memory")
+        result["throttle_final"] = final.get("throttle")
+        result["load_after"] = load_average()
     finally:
         if proc is not None:
             stop_service(proc, handle)
@@ -512,6 +574,25 @@ def main(argv=None) -> int:
     if mlx_peaks:
         print(f"MLX's own peak, worst window: {max(mlx_peaks):.0f} MB.")
         result["mlx_peak_mb"] = max(mlx_peaks)
+
+    quiet = result.get("throttle_final") or {}
+    if quiet:
+        print(f"\nduty cycle asked for: {quiet.get('duty_cycle')} "
+              f"(enabled {quiet.get('enabled')}, nice {quiet.get('nice')})")
+        print(f"busy fraction MEASURED: {quiet.get('busy_fraction')} "
+              f"over {quiet.get('busy_s')}s busy and {quiet.get('idle_s')}s "
+              f"idle in {quiet.get('rests')} rests")
+    frames_done = (result.get("job") or {}).get("done_frames") or 0
+    busy = quiet.get("busy_s") or 0
+    if frames_done and busy:
+        result["s_per_frame_busy"] = round(busy / frames_done, 3)
+        print(f"per frame, model time only: {result['s_per_frame_busy']} s "
+              f"over {frames_done} frames (the number to compare between "
+              f"launchers: wall time under a duty cycle is busy plus rest)")
+    loads = [result.get("load_before")] + \
+        [row.get("load") for row in rows] + [result.get("load_after")]
+    print(f"load average before / per window / after: "
+          + " | ".join(str(entry) for entry in loads if entry))
     (run_dir / "result.json").write_text(json.dumps(result, indent=2, default=str))
     print(f"\nwritten: {run_dir / 'result.json'}")
     print(f"service log: {log_path}")

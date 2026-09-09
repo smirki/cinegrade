@@ -107,7 +107,30 @@ class SamClient:
     # -- C3 routes -------------------------------------------------------
 
     def health(self, timeout: float = 5.0) -> dict:
-        """`GET /health` -> {ok, backend, model, loaded, busy, queue}."""
+        """`GET /health` -> {ok, backend, model, loaded, busy, queue, ...}.
+
+        Four fields are worth naming because a caller usually wants them and
+        would otherwise guess:
+
+        * `model_holder` is the job the shared model is working on right now,
+          or null. `queue.running` is the same job id; this is the whole record
+          (clip_key, done_frames, matte_ids). Two callers polling two jobs both
+          read `state: "running"` while only one of them has the model, so this
+          is the field that answers "is the model on MY job" (checkpoint
+          gap 21).
+        * every job in `queue.jobs` carries `holds_model` (that same answer,
+          per job) and `matte_states` (its own mattes' states, which can no
+          longer disagree with `state`: the mattes move to running first).
+        * `model_lock.held` is the truth and nothing else; `bypassed` is the
+          separate "the lock is disabled, so nothing was in our way" case. It
+          used to read `held or --no-model-lock`, so a service that took no
+          lock reported itself as the holder (round 1 finding 11).
+        * `paths` says where the service may write: `data_dir`,
+          `allowed_roots`, `confined` (true when it was started with
+          `--allow-out-dir`), `external_out_dirs` (roots outside its data dir
+          it has already been given, which is normal here: the studio owns the
+          matte store) and `matte_id_pattern`.
+        """
         return self._call("GET", "/health", timeout=timeout)
 
     def segment(self, image: str, prompts: dict, max_instances: int | None = None,
@@ -133,7 +156,8 @@ class SamClient:
               matte_ids: dict | None = None,
               timeout: float = 15.0) -> dict:
         """`POST /track` -> {job_id, matte_ids, mattes, state, total_frames,
-        fps}, per M1's checkpoint. Answers as soon as the job is accepted and
+        fps, seeded_from}, per M1's checkpoint. Answers as soon as the job is
+        accepted and
         every matte slot it will produce is known (one per object slot: each
         `boxes` entry, all of `points` together, each `masks` entry, each
         `text` phrase times max_instances), not once tracking finishes. The
@@ -141,8 +165,29 @@ class SamClient:
         itself is stuck, not that tracking is taking a while.
 
         Either `prompts` (a fresh detect) or `pick` + `select` (seed from a
-        prior `segment()`'s own boxes: the instance the caller actually
-        chose, not a repeat of the detector's guess). Give one, not both.
+        prior `segment()`: the instance the caller actually chose, not a repeat
+        of the detector's guess). Give one, not both.
+
+        With `pick` + `select`, the answer's `seeded_from` says which of the
+        pick's two descriptions actually started the track, and it changes what
+        the result means (checkpoint gap 20):
+
+        * `"mask"`: the pick's own mask pixels seeded it, which is what a
+          reviewed shape deserves. The objects are named `k0`, `k1`, ... in the
+          order they were selected.
+        * `"box"`: the fallback, taken when the backend cannot accept a mask
+          prompt (torch) or the pick's PNGs are no longer on disk. The objects
+          are named `b0`, `b1`, ..., and `warnings` says in plain words that the
+          tracked region can grow past the shape that was reviewed. A caller
+          that needs the exact reviewed shape should say so to the user, or
+          track a text prompt instead.
+
+        Either way each matte's `index.json` keeps the pick's own instance id in
+        `picked_from`, its `seeded_from`, and `score_kind`, which says whether
+        `scores` is the tracker's own confidence (`"tracker"`: mlx, stub) or
+        only the mask's own maximum (`"presence"`: torch). A matte belongs to
+        the backend that made it and two backends' curves are not comparable
+        frame by frame (round 1 finding 29).
         `clip`, `clip_key`, `rotation`, `recipe` are stored verbatim in the
         matte's own index.json by the service (contract C2); studio hands
         them through rather than writing its own copy of that file.
@@ -198,7 +243,13 @@ class SamClient:
 
     def job(self, job_id: str, timeout: float = 10.0) -> dict:
         """`GET /jobs/<id>` -> {state, done_frames, total_frames, fps,
-        elapsed_s, matte_ids, error}."""
+        elapsed_s, matte_ids, mattes, matte_states, holds_model, error}.
+
+        `state` is one state and its mattes agree with it. `holds_model` is
+        false while the job waits its turn behind another one, which is the
+        difference between "running" and "the model is on this" (checkpoint
+        gap 21); `/health.model_holder` names whichever job that is.
+        """
         return self._call("GET", f"/jobs/{job_id}", timeout=timeout)
 
     def job_cancel(self, job_id: str, timeout: float = 10.0) -> dict:

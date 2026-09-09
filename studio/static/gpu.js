@@ -1215,8 +1215,14 @@
           var a = ux / g.ax, b = uy / g.ay;
           var d = g.rect ? Math.max(Math.abs(a), Math.abs(b))
                          : Math.sqrt(a * a + b * b);
-          m = g.den <= 0 ? (d <= 1 ? 1 : 0)
-                         : Math.max(0, Math.min(1, (g.hi - d) / g.den));
+          /* On `soft`, not on `den`. cinegrade takes its hard edge branch on
+           * `soft <= 0` (window_matte, four places), and den is q(2*soft, 10),
+           * which rounds to zero for any softness at or below 5e-11: on those
+           * values the engine would divide by a zero denominator while this
+           * took the hard branch. Nobody will ever type 5e-11, but one rule in
+           * one shape is worth more than a hair of agreement in three. */
+          m = g.soft <= 0 ? (d <= 1 ? 1 : 0)
+                          : Math.max(0, Math.min(1, (g.hi - d) / g.den));
         }
         if (g.invert) m = 1 - m;
         out[y * W + x] = q8(m) / 255;
@@ -1263,10 +1269,14 @@
          * same hop a window PNG takes, so it lands on the 8 bit lattice and
          * NOT on an arbitrary 16 bit value. Truncating a k/255 float at
          * 65535 would land a code low half the time, because k/255 * 65535 is
-         * 257k only to within a double's last bit. This models the frame
-         * served AT THE RENDER WIDTH, which is what gpu.js asks for; a frame
-         * the server could only give at another size is resampled, and that
-         * resampler is not the same one on the two sides either way. */
+         * 257k only to within a double's last bit.
+         *
+         * `sample.matte` is the frame ALREADY at W by H. Both real callers get
+         * there the way the engine does (`scale=W:H:flags=bilinear` over the
+         * store's PNG): matteTexPass runs the ported swscale bilinear filter
+         * on the card, and a test that wants to check the scaling gives this
+         * a sample function that has resampled already. This function does not
+         * scale anything itself, so it cannot disagree with either. */
         m = new Float64Array(n);
         for (y = 0; y < H; y++) {
           for (x = 0; x < W; x++) {
@@ -1375,14 +1385,22 @@
           + "component now and has to survive the ops and the feather as a "
           + "matte. A key component reads a second baked cube: the qualifier "
           + "as greyscale, applied tetrahedrally, which is what lut3d does on "
-          + "the other side. Reported CLOSE rather than exact until the mask "
-          + "parity fixtures have been run against the engine: the formulas "
-          + "are ported from the engine but nothing has measured them "
-          + "together yet, the clean knee is a geq evaluated in double on "
-          + "the ffmpeg side and in 32 bit float here so a value sitting on "
-          + "an integer boundary can truncate the other way, and a matte "
-          + "component served at a size other than the render's is resampled "
-          + "by the card here and by swscale there. An absent or undecoded "
+          + "the other side. MEASURED against the engine, not assumed: the "
+          + "mask fixture block of the parity gate renders 52 component "
+          + "stacks (window, key, luma and matte components, all three ops, "
+          + "per component invert and feather, and every finesse control "
+          + "including a tracked matte at a size other than the render's) "
+          + "through both this shader chain and ffmpeg, and all 52 come back "
+          + "EXACT, meaning no channel of any pixel differs by more than one "
+          + "8 bit code. A matte component is scaled to the render size by "
+          + "the ported swscale bilinear filter this file already uses for "
+          + "halation, so that step is the engine's filter and not the "
+          + "card's. Two things are still only CLOSE and a layer row says so "
+          + "when it has them: the clean knee is a geq that ffmpeg evaluates "
+          + "in double and this evaluates in 32 bit float, so a value sitting "
+          + "on an integer boundary inside the knee can truncate the other "
+          + "way, and a matte component depends on a frame arriving over "
+          + "HTTP. An absent or undecoded "
           + "matte frame is 0, so an "
           + "INVERTED matte component with nothing decoded selects the whole "
           + "frame; ready() waits for the first frame of every matte to keep "
@@ -1513,6 +1531,14 @@
       lys.forEach(function (L, li) {
         var bits = [], on = layerActive(L), v2 = maskUsesComponents(L.mask);
         var lag = [];
+        /* Why this row is not exact, if it is not. A v2 stack used to claim
+         * "close" no matter what it held, which was written before anything
+         * had measured it; the fixture block in parity-gate.mjs measures 52
+         * rows of window, key, luma, matte, op, feather and finesse stacks and
+         * every one of them is EXACT. So the row only steps down now when this
+         * particular stack contains one of the two things that genuinely
+         * cannot promise exactness, and it says which. */
+        var why = [];
         if (v2) {
           maskComponents(L.mask).forEach(function (c) {
             var b = c.op + " " + c.type;
@@ -1520,6 +1546,15 @@
             if (c.type === "matte") {
               var id = (c.matte && c.matte.id) || "(none)";
               b += " " + id;
+              if (!why.length || why[0].indexOf("matte") !== 0) {
+                why.unshift("matte components read the store over HTTP, so a "
+                  + "frame that has not arrived yet is served as the last one "
+                  + "that did while the engine always reads the frame the time "
+                  + "asks for. The pixels of a frame that HAS arrived match "
+                  + "(the scale to the render size is swscale's own bilinear, "
+                  + "ported, not the card's); the frame NUMBER can be behind, "
+                  + "and the row says so when it is.");
+              }
               var st = live && live[id];
               if (st) {
                 b += " [" + st.state + (st.lagging ? ", matte lagging" : "") + "]";
@@ -1550,6 +1585,14 @@
             bits.push("finesse blur " + fmt(+f.blur, 4) + ", grow " + fmt(+f.grow, 4)
               + ", clean " + fmt(+f.clean_black, 3) + "/" + fmt(+f.clean_white, 3));
           }
+          if (+f.clean_black > 0 || +f.clean_white > 0) {
+            why.push("the clean black and clean white knee is a geq expression, "
+              + "which ffmpeg evaluates in double and this evaluates in 32 bit "
+              + "float, so a matte value landing exactly on an integer boundary "
+              + "inside the knee can truncate the other way. Measured EXACT on "
+              + "the fixture stacks; it is the one step whose worst case is a "
+              + "code rather than nothing.");
+          }
         } else {
           if (L.mask.window.enabled) bits.push("power window");
           if (L.mask.key.enabled) bits.push("colour key");
@@ -1561,10 +1604,12 @@
         rows.push({
           id: "layer" + li,
           name: "Layer " + (li + 1) + (L.name ? " (" + L.name + ")" : ""),
-          active: on, status: on ? (v2 ? "close" : "exact") : "off",
+          active: on, status: on ? (why.length ? "close" : "exact") : "off",
           lagging: lag.length ? lag : undefined,
           note: (v2 ? STAGE_NOTES.mask_components : STAGE_NOTES.layers)
               + " This one runs " + L.placement + ": " + bits.join(", ") + "."
+              + (why.length ? " Close rather than exact here because " + why.join(" Also, ")
+                            : "")
               + (lag.length ? " Matte lagging: " + lag.join("; ") + "." : "")
         });
       });
@@ -1930,7 +1975,10 @@
     "uniform vec2 uWinCentre;",     // cx*W, cy*H in pixels
     "uniform vec2 uWinAxis;",       // the two half axes in pixels
     "uniform vec2 uWinRot;",        // (cos, sin) of the rotation
-    "uniform vec2 uWinFeather;",    // (1+softness, 2*softness); y 0 is a hard edge
+    "uniform vec2 uWinFeather;",    // (1+softness, 2*softness)
+    // Whether the edge is hard is decided from `softness` itself, not from the
+    // rounded denominator: see the comment in windowMatteCPU.
+    "uniform int uWinHard;",
     "float winMatte(ivec2 q) {",
     "  float dx = float(q.x) - uWinCentre.x;",
     "  float dy = float(q.y) - uWinCentre.y;",
@@ -1939,7 +1987,7 @@
     "  float a = ux / uWinAxis.x;",
     "  float b = uy / uWinAxis.y;",
     "  float d = uWinRect == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
-    "  float m = uWinFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
+    "  float m = uWinHard == 1 ? (d <= 1.0 ? 1.0 : 0.0)",
     "          : clamp((uWinFeather.x - d) / uWinFeather.y, 0.0, 1.0);",
     "  if (uWinInvert == 1) m = 1.0 - m;",
     "  return floor(m * 255.0 + 0.5);",
@@ -2031,7 +2079,7 @@
     "uniform vec2 uFeather;",
     "uniform float uSpan;",       // linear: w * frame width, in pixels (wpx)
     "uniform float uEase;",       // linear: the ease exponent (0.05..8)
-    "uniform int uHard;",         // linear: 1 when softness is 0
+    "uniform int uHard;",         // 1 when softness is 0, all three shapes
     "out vec4 oCol;"
   ].concat(LIB_MERGE).concat([
     "void main() {",
@@ -2061,7 +2109,9 @@
     "    float a = ux / uAxis.x;",
     "    float b = uy / uAxis.y;",
     "    float d = uShape == 1 ? max(abs(a), abs(b)) : sqrt(a * a + b * b);",
-    "    m = uFeather.y <= 0.0 ? (d <= 1.0 ? 1.0 : 0.0)",
+    // uHard again, not the denominator: the engine's own branch is on
+    // `softness` (see windowMatteCPU), and this is the same shape's rule.
+    "    m = uHard == 1 ? (d <= 1.0 ? 1.0 : 0.0)",
     "      : clamp((uFeather.x - d) / uFeather.y, 0.0, 1.0);",
     "  }",
     "  if (uInvert == 1) m = 1.0 - m;",
@@ -2098,19 +2148,28 @@
 
   /* A matte component: a frame fetched from GET /api/matte/<id>/frame.
    *
-   * The frame is asked for at exactly this render's width, so the common case
-   * is a texel for texel read. When the server could only serve another size
-   * (a matte tracked at the working width against a bigger output) the
-   * texture is sampled with hardware bilinear instead, which is the "scaled
-   * to the output with a soft edge" of design rule 6. uHave 0 means nothing
-   * is decoded yet: the matte is 0 and the caller flags it. */
+   * The frame is fetched at the matte's OWN size and, when that is not the
+   * render's size, scaled here by `Instance.resample` with swscale's own
+   * bilinear filter (the ported one this file already uses for halation), so
+   * this pass only ever reads texel for texel. That is why there is no
+   * hardware bilinear branch left and no uTexSize: hardware bilinear is a two
+   * tap tent, swscale's is not (it widens the tent by the scale factor on a
+   * downscale, see swsFilter), and asking the server for the render's width
+   * instead does not fix it either, because grade/mattes.py's resize_bilinear
+   * is a two tap tent as well. The engine's own chain is
+   * `format=gray16le,scale=W:H:flags=bilinear` over the store's PNG, and that
+   * is now the chain here, filter for filter.
+   *
+   * uScaled says which of the two arrived: 0 is the store's 8 bit frame, whose
+   * code IS its 16 bit value (the engine lifts it by 257), 1 is the resampled
+   * one, already on the 16 bit lattice. uHave 0 means nothing is decoded yet:
+   * the matte is 0 and the caller flags it. */
   var FS_MATTE_TEX = src([
     "#version 300 es",
     "precision highp float;",
     "precision highp int;",
     "uniform sampler2D uTex;",
-    "uniform ivec2 uTexSize;",
-    "uniform ivec2 uSize;",
+    "uniform int uScaled;",
     "uniform int uCompInvert;",
     "uniform int uHave;",
     "out vec4 oCol;"
@@ -2118,15 +2177,8 @@
     "void main() {",
     "  ivec2 p = ivec2(gl_FragCoord.xy);",
     "  float m = 0.0;",
-    "  bool oneToOne = uTexSize == uSize;",
-    "  if (uHave == 1) {",
-    "    if (oneToOne) m = texelFetch(uTex, p, 0).r;",
-    "    else m = texture(uTex, (gl_FragCoord.xy) / vec2(uSize)).r;",
-    "  }",
-    // Texel for texel the frame is an 8 bit PNG lifted by 257, so the 8 bit
-    // code is the answer. Scaled, the engine runs swscale bilinear at 16
-    // bits, so round to 16 and accept that the resampler is not the same one.
-    "  m = oneToOne ? q8(m) : c16r(m) / WCODE;",
+    "  if (uHave == 1) m = texelFetch(uTex, p, 0).r;",
+    "  m = uScaled == 1 ? c16r(m) / WCODE : q8(m);",
     "  if (uCompInvert == 1) m = 1.0 - m;",
     "  oCol = vec4(m, m, m, 1.0);",
     "}"
@@ -3032,6 +3084,14 @@
     this.matteLive = {};
     this.matteSeen = {};
     this.matteInFlight = {};
+    /* `matteGen` is a per matte generation counter bumped by invalidateMatte,
+     * so a fetch already in flight when a re-track lands cannot upload the
+     * frame it was carrying; `matteIdCount` is how many mattes the last
+     * config named and `matteBytesPerFrame` the largest decoded frame seen,
+     * the two numbers matteCacheMax sizes the LRU from. */
+    this.matteGen = {};
+    this.matteIdCount = 0;
+    this.matteBytesPerFrame = 0;
     this.playDir = 1;
     this.time = 0;
   }
@@ -3055,6 +3115,20 @@
     this.matteFrames = {};
     this.matteOrder = [];
     this.matteLast = {};
+    /* The indexes and the live report go too: a disposed instance that is
+     * later reused must not answer from a cache whose textures are gone, and
+     * a fetch still in flight has to see a bumped generation so it drops its
+     * bitmap instead of uploading it into the emptied cache. */
+    this.matteIndexes = {};
+    this.matteLive = {};
+    this.matteSeen = {};
+    Object.keys(this.matteInFlight).forEach(function (k) {
+      delete self.matteInFlight[k];
+    });
+    Object.keys(this.matteGen).forEach(function (k) {
+      self.matteGen[k] = (self.matteGen[k] || 0) + 1;
+    });
+    this.matteIdCount = 0;
   };
 
   Instance.prototype.setSource = function (u16, w, h) {
@@ -3211,9 +3285,13 @@
     /* Matte frames (C4). The first frame of every matte the config names is
      * awaited here for the same reason the LUTs are: a render that starts
      * without them would show a lagging matte on the very first frame, which
-     * is the one the user is looking at while they build the mask. */
-    var mw = (opts && opts.width) || (this.src && this.src.w);
-    if (mw) work.push(this.matteReady(cfg, mw, this.time));
+     * is the one the user is looking at while they build the mask.
+     *
+     * No width any more, and no width guard: the frame is fetched at the
+     * matte's own size, so this no longer needs to know the render size, and
+     * a caller that has not called setSource yet (render.js's worker loop)
+     * gets its matte awaited too instead of silently skipped. */
+    work.push(this.matteReady(cfg, this.time));
     // Grain plate prefetch (C3). width/height come from opts when the
     // caller has not called setSource yet (render.js's worker loop calls
     // ready() before setSource16, so this.src is still null there) and fall
@@ -3376,9 +3454,27 @@
   /* How many decoded matte frames one instance holds, and how far ahead of
    * the playhead it reads. 48 frames is about two seconds at 24 fps for one
    * matte, which is enough for playback to stay ahead of a decode without
-   * holding a whole clip's worth of textures on the card. */
+   * holding a whole clip's worth of textures on the card.
+   *
+   * 48 is a FLOOR, not the cap: matteCacheMax() below raises it with the
+   * number of mattes the config names, because a global cap with a per matte
+   * prefetch means six mattes evict each other's read ahead and the state
+   * line then says "matte lagging" for the rest of the session. It also
+   * lowers it again when the frames are big: a matte frame is a whole
+   * picture, and a 1280x2276 one is 11.6 MB as RGBA8 on the card, so a flat
+   * 48 of those would be 560 MB of texture for one layer. */
   var MATTE_CACHE_MAX = 48;
   var MATTE_PREFETCH = 8;
+  var MATTE_CACHE_BYTES = 256 * 1024 * 1024;
+
+  /* How long to wait before asking again for an index.json that failed.
+   * Without this one transient 500 (a server restart mid session) turned the
+   * matte into a permanently unindexed one: no frame numbers, so the cache
+   * keyed on the time string, every rendered time its own entry, no prefetch
+   * and a matte that read "lagging" for the rest of the session. */
+  function matteRetryDelay(tries) {
+    return Math.min(30000, 2000 * Math.pow(2, Math.max(0, tries - 1)));
+  }
 
   /* Every matte id this config actually READS, once.
    *
@@ -3411,8 +3507,16 @@
   Instance.prototype.matteIndex = function (id) {
     var self = this;
     var hit = this.matteIndexes[id];
-    if (hit !== undefined) {
-      return (hit && hit.pending) ? hit.pending : Promise.resolve(hit);
+    if (hit && hit.pending) return hit.pending;
+    var tries = 0;
+    if (hit && hit.failed) {
+      /* A failed read is remembered with a timestamp, never as a permanent
+       * null: inside the backoff this answers "no index yet" without a fetch,
+       * and after it the next ready() tries again. */
+      if (now() - hit.at < matteRetryDelay(hit.tries)) return Promise.resolve(null);
+      tries = hit.tries;
+    } else if (hit !== undefined) {
+      return Promise.resolve(hit);
     }
     var pending = fetch(this.apiBase + "/api/matte/" + encodeURIComponent(id))
       .then(function (r) {
@@ -3428,14 +3532,53 @@
         self.matteIndexes[id] = info;
         return info;
       })
-      .catch(function () { self.matteIndexes[id] = null; return null; });
+      .catch(function () {
+        self.matteIndexes[id] = { failed: true, at: now(), tries: tries + 1 };
+        return null;
+      });
     this.matteIndexes[id] = { pending: pending };
     return pending;
   };
 
   Instance.prototype.matteInfo = function (id) {
     var info = this.matteIndexes[id];
-    return (info && info.pending) ? null : (info || null);
+    if (!info || info.pending || info.failed) return null;
+    return info;
+  };
+
+  /* Everything this instance remembers about one matte, dropped.
+   *
+   * Called by the UI (masks.js's forgetMatte, through StudioLive) whenever a
+   * matte can have CHANGED under the same id: a track that just finished, a
+   * re-track, a cancel that left a partial. Design rule 3 has a matte go
+   * partial to done under one id, so without this the frames the user looked
+   * at while it was partial stay cached forever, substitutes and all, and the
+   * layer keeps grading against them after the real frames are on disk. */
+  Instance.prototype.invalidateMatte = function (id) {
+    var self = this, gl = this.gl;
+    id = String(id || "");
+    if (!id) return;
+    /* The generation is what makes this safe against a fetch already in the
+     * air: that fetch is holding the OLD bytes, so it must not upload them
+     * into the cache after this call. matteFetch captures the generation and
+     * throws its own answer away when it no longer matches. */
+    this.matteGen[id] = (this.matteGen[id] || 0) + 1;
+    delete this.matteIndexes[id];
+    delete this.matteLive[id];
+    delete this.matteLast[id];
+    Object.keys(this.matteFrames).forEach(function (k) {
+      var e = self.matteFrames[k];
+      if (!e || e.id !== id) return;
+      if (gl) gl.deleteTexture(e.tex);
+      delete self.matteFrames[k];
+    });
+    Object.keys(this.matteInFlight).forEach(function (k) {
+      if (k.indexOf(id + ":") === 0) delete self.matteInFlight[k];
+    });
+    this.matteOrder = this.matteOrder.filter(function (k) {
+      return !!self.matteFrames[k];
+    });
+    return this.matteGen[id];
   };
 
   /* round(time * fps), clamped, exactly as C2 defines the index. Null when
@@ -3451,10 +3594,17 @@
     return Math.max(0, Math.min(last, i));
   }
 
-  function matteFrameKey(id, width, info, time) {
+  /* The ONE place the cache key's format lives. There is no render width in
+   * it any more: a frame is fetched and cached at the matte's own size and
+   * scaled per pass (see FS_MATTE_TEX), so one decoded frame serves every
+   * render size instead of one texture per size. */
+  function matteFrameKeyAt(id, idx) {
+    return id + ":" + idx;
+  }
+
+  function matteFrameKey(id, info, time) {
     var idx = matteFrameIndexOf(info, time);
-    return id + ":" + width + ":"
-      + (idx === null ? "t" + (+time || 0).toFixed(3) : idx);
+    return matteFrameKeyAt(id, idx === null ? "t" + (+time || 0).toFixed(3) : idx);
   }
 
   // Most recently used last.
@@ -3486,31 +3636,68 @@
     return matteFrameIndexOf(info, time);
   };
 
-  Instance.prototype.matteKey = function (id, width, time) {
-    return matteFrameKey(id, width, this.matteInfo(id), time);
+  Instance.prototype.matteKey = function (id, time) {
+    return matteFrameKey(id, this.matteInfo(id), time);
   };
 
   Instance.prototype.matteTouch = function (key) {
     lruTouch(this.matteOrder, key);
   };
 
+  /* How many decoded frames the cache may hold, given how many mattes the
+   * config names and what one frame costs on the card.
+   *
+   * Two corrections to a flat 48. Upwards: the prefetch is PER MATTE, so N
+   * mattes need N read ahead windows or they evict each other's frames and
+   * every row says "matte lagging" from then on (a layered grade of subject,
+   * sky, ground, skin and hair reaches five without trying). Downwards: the
+   * frames are whole pictures at the matte's own size, so a byte ceiling
+   * decides when 48 of them is too many, and the floor is one prefetch window
+   * plus two, because a cache smaller than the read ahead cannot work at all.
+   *
+   * A module function so it can be tested without a GPU. */
+  function matteCacheCap(idCount, bytesPerFrame) {
+    var floor = MATTE_PREFETCH + 2;
+    var want = Math.max(MATTE_CACHE_MAX, (idCount || 1) * floor);
+    var per = bytesPerFrame || 0;
+    if (per > 0) {
+      want = Math.min(want, Math.max(floor, Math.floor(MATTE_CACHE_BYTES / per)));
+    }
+    return want;
+  }
+
+  Instance.prototype.matteCacheMax = function () {
+    return matteCacheCap(this.matteIdCount, this.matteBytesPerFrame);
+  };
+
   Instance.prototype.matteEvict = function () {
     var gl = this.gl;
-    lruEvict(this.matteOrder, this.matteFrames, this.matteLast, MATTE_CACHE_MAX,
+    lruEvict(this.matteOrder, this.matteFrames, this.matteLast,
+             this.matteCacheMax(),
              function (e) { gl.deleteTexture(e.tex); });
   };
 
-  /* Fetch and decode ONE matte frame. Never called from the render path
-   * synchronously: the render reads matteLookup, which only ever looks in the
-   * cache and asks for a fetch in the background. */
-  Instance.prototype.matteFetch = function (id, width, time) {
+  /* Fetch and decode ONE matte frame, at the matte's OWN size.
+   *
+   * No `width` in the request on purpose. The engine scales the store's frame
+   * itself (`format=gray16le,scale=W:H:flags=bilinear`), so the browser has to
+   * start from the same bytes and run the same filter, which it does in
+   * matteTexPass. Asking the server for the render's width instead moves the
+   * scale into grade/mattes.py's resize_bilinear, a plain two tap tent that is
+   * not swscale's, and no filter on this side can undo that.
+   *
+   * Never called from the render path synchronously: the render reads
+   * matteLookup, which only ever looks in the cache and asks for a fetch in
+   * the background. */
+  Instance.prototype.matteFetch = function (id, time) {
     var self = this;
-    var key = this.matteKey(id, width, time);
+    var key = this.matteKey(id, time);
     var hit = this.matteFrames[key];
     if (hit) { this.matteTouch(key); return Promise.resolve(hit); }
     if (this.matteInFlight[key]) return this.matteInFlight[key];
+    var gen = this.matteGen[id] || 0;
     var url = this.apiBase + "/api/matte/" + encodeURIComponent(id)
-      + "/frame?time=" + encodeURIComponent(+time || 0) + "&width=" + width;
+      + "/frame?time=" + encodeURIComponent(+time || 0);
     var state = "unknown", frame = -1;
     var p = fetch(url).then(function (r) {
       if (!r.ok) throw new Error("matte frame " + id + ": " + r.status);
@@ -3524,12 +3711,20 @@
         colorSpaceConversion: "none", premultiplyAlpha: "none"
       });
     }).then(function (bmp) {
+      /* Invalidated while this was in the air: these are the old bytes, so
+       * they go in the bin rather than into the cache under the new
+       * generation's key. */
+      if ((self.matteGen[id] || 0) !== gen) {
+        if (bmp.close) bmp.close();
+        if (self.matteInFlight[key] === p) delete self.matteInFlight[key];
+        return null;
+      }
       var entry = self.uploadMatte(bmp, id, key, state, isNaN(frame) ? -1 : frame);
       if (bmp.close) bmp.close();
-      delete self.matteInFlight[key];
+      if (self.matteInFlight[key] === p) delete self.matteInFlight[key];
       return entry;
     }).catch(function (e) {
-      delete self.matteInFlight[key];
+      if (self.matteInFlight[key] === p) delete self.matteInFlight[key];
       throw e;
     });
     this.matteInFlight[key] = p;
@@ -3552,12 +3747,13 @@
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
-    /* LINEAR so a matte served at another size scales with a soft edge
-     * (design rule 6). A matte at the render's own size is read with
-     * texelFetch, which ignores the filter entirely, so the common case is
-     * still texel for texel. */
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    /* NEAREST, not LINEAR: every read of this texture is a texelFetch now
+     * (matteTexPass at the matte's own size, FS_RESAMPLE otherwise), and
+     * hardware filtering is exactly what a matte must not be scaled with:
+     * swscale's bilinear is not a two tap tent (see swsFilter). CLAMP_TO_EDGE
+     * still matters, because the resampler clamps its own taps the same way. */
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     var entry = { tex: tex, w: bmp.width, h: bmp.height, id: id, key: key,
@@ -3565,6 +3761,11 @@
     this.matteFrames[key] = entry;
     this.matteTouch(key);
     this.matteLast[id] = entry;
+    /* What one frame costs on the card, so matteCacheMax can hold the whole
+     * cache under a byte ceiling rather than a frame count that means
+     * something different for every matte size. */
+    var bytes = bmp.width * bmp.height * 4;
+    if (bytes > (this.matteBytesPerFrame || 0)) this.matteBytesPerFrame = bytes;
     this.matteEvict();
     return entry;
   };
@@ -3573,15 +3774,27 @@
    * decoded yet NEVER stalls the picture. The most recent decoded frame of
    * that matte is used instead, the state line says "matte lagging", and the
    * missing frame is fetched in the background for next time. */
-  Instance.prototype.matteLookup = function (id, width, time) {
+  Instance.prototype.matteLookup = function (id, time) {
     var info = this.matteInfo(id);
-    var key = this.matteKey(id, width, time);
+    var key = this.matteKey(id, time);
     var want = this.matteFrameIndex(info, time);
     var hit = this.matteFrames[key];
     if (hit) {
       this.matteTouch(key);
-      this.matteLive[id] = { id: id, state: hit.state, want: want,
-                             got: hit.frame, lagging: false, empty: false };
+      /* Lagging is decided by the FRAME, not by whether the key was in the
+       * cache. A matte whose store stops short of the playhead (still
+       * tracking, or a clip longer than the tracked range) clamps `want` to
+       * the last frame it has, so the key hits, the picture is right, and the
+       * old code called that "not lagging" while the matte had in fact
+       * stopped advancing. The honest answer is that this frame is not the
+       * frame this time asked for. `want === null` means there is no index to
+       * count in at all, which is a different fault (reported as `empty` or by
+       * the state line), not a lag. */
+      this.matteLive[id] = {
+        id: id, state: hit.state, want: want, got: hit.frame,
+        lagging: hit.frame >= 0 && want !== null && hit.frame !== want,
+        empty: false
+      };
       return hit;
     }
     var last = this.matteLast[id] || null;
@@ -3590,19 +3803,20 @@
       want: want, got: last ? last.frame : null,
       lagging: true, empty: !last
     };
-    this.matteFetch(id, width, time).catch(function () { /* reported above */ });
+    this.matteFetch(id, time).catch(function () { /* reported above */ });
     return last;
   };
 
   /* Awaited by ready(): the first frame of every matte the config names, so
    * the first render after a config change is never a lagging one. */
-  Instance.prototype.matteReady = function (cfg, width, time) {
+  Instance.prototype.matteReady = function (cfg, time) {
     var self = this;
     var ids = configMattes(cfg);
     if (!ids.length) return Promise.resolve([]);
+    this.matteIdCount = ids.length;
     return Promise.all(ids.map(function (id) {
       return self.matteIndex(id).then(function () {
-        return self.matteFetch(id, width, time).catch(function () { return null; });
+        return self.matteFetch(id, time).catch(function () { return null; });
       });
     }));
   };
@@ -3610,9 +3824,11 @@
   /* Design rule 10: read ahead of the playhead along the play direction.
    * Needs the index (a frame number to add to), so a server without the index
    * route gets no prefetch rather than a guess. */
-  Instance.prototype.mattePrefetch = function (cfg, width, time) {
+  Instance.prototype.mattePrefetch = function (cfg, time) {
     var self = this, dir = this.playDir >= 0 ? 1 : -1;
-    configMattes(cfg).forEach(function (id) {
+    var ids = configMattes(cfg);
+    this.matteIdCount = ids.length;
+    ids.forEach(function (id) {
       var info = self.matteInfo(id);
       if (!info || !(info.fps > 0)) return;
       var base = self.matteFrameIndex(info, time);
@@ -3621,9 +3837,13 @@
         var idx = base + dir * k;
         if (idx < 0) break;
         if (info.frames > 0 && idx > info.frames - 1) break;
-        var key = id + ":" + width + ":" + idx;
+        /* The same formatter the cache itself uses. Spelling the key out here
+         * by hand is how a prefetch quietly stops skipping frames it already
+         * holds: the strings drift apart, every hit misses, and the prefetch
+         * re-fetches the whole read ahead window on every single frame. */
+        var key = matteFrameKeyAt(id, idx);
         if (self.matteFrames[key] || self.matteInFlight[key]) continue;
-        self.matteFetch(id, width, idx / info.fps)
+        self.matteFetch(id, idx / info.fps)
           .catch(function () { /* a prefetch that fails is not an error */ });
       }
     });
@@ -4144,6 +4364,7 @@
       gl.uniform2f(G2.loc(pr, "uWinAxis"), wg.ax, wg.ay);
       gl.uniform2f(G2.loc(pr, "uWinRot"), wg.cr, wg.sr);
       gl.uniform2f(G2.loc(pr, "uWinFeather"), wg.hi, wg.den);
+      gl.uniform1i(G2.loc(pr, "uWinHard"), wg.soft <= 0 ? 1 : 0);
     });
     this.passCount++;
     return out;
@@ -4203,18 +4424,29 @@
   };
 
   Instance.prototype.matteTexPass = function (comp, W, H) {
-    var gl = this.gl, self = this;
+    var gl = this.gl, self = this, G = this.G;
     var id = (comp.matte && comp.matte.id) || "";
-    var hit = id ? this.matteLookup(id, W, this.time) : null;
+    var hit = id ? this.matteLookup(id, this.time) : null;
+    /* The store keeps the matte at the size SAM produced it at, which is
+     * rarely the render's size, and the engine's chain scales it with
+     * swscale's bilinear before the stack ever sees it. So does this: the
+     * ported filter, on the card, then texel for texel below. The card's own
+     * LINEAR filter is not the same filter and would put this branch off the
+     * engine by a code or more along every soft edge. */
+    var scaled = null;
+    if (hit && (hit.w !== W || hit.h !== H)) {
+      scaled = this.resample(hit.tex, hit.w, hit.h, W, H, "bilinear");
+    }
     var out = this.simple("mattetex", FS_MATTE_TEX, W, H, function (pr, G2) {
       // Something valid always has to be bound, even on the branch that never
       // samples it (see the SCRATCH_UNIT comment): the source will do.
-      G2.bindTex(pr, "uTex", 0, hit ? hit.tex : self.src.tex);
-      gl.uniform2i(G2.loc(pr, "uTexSize"), hit ? hit.w : 0, hit ? hit.h : 0);
-      gl.uniform2i(G2.loc(pr, "uSize"), W, H);
+      G2.bindTex(pr, "uTex", 0,
+                 scaled ? scaled.tex : (hit ? hit.tex : self.src.tex));
+      gl.uniform1i(G2.loc(pr, "uScaled"), scaled ? 1 : 0);
       gl.uniform1i(G2.loc(pr, "uCompInvert"), comp.invert ? 1 : 0);
       gl.uniform1i(G2.loc(pr, "uHave"), hit ? 1 : 0);
     });
+    if (scaled) G.release(scaled);
     this.passCount++;
     return out;
   };
@@ -4762,7 +4994,7 @@
     var report = stageReport(cfg, this.matteLive);
     // Read ahead of the playhead for the next frame. Fire and forget: nothing
     // in the grading loop waits on it (design rule 1).
-    this.mattePrefetch(cfg, W, this.time);
+    this.mattePrefetch(cfg, this.time);
     return { ms: ms, passes: this.passCount, width: W, height: H,
              config: cfg, plan: plan, report: report,
              mattes: this.matteStatus() };
@@ -5053,9 +5285,13 @@
       // playback side (design rule 10), no GPU needed to test any of it
       frameIndex: matteFrameIndexOf,
       frameKey: matteFrameKey,
+      frameKeyAt: matteFrameKeyAt,
+      retryDelay: matteRetryDelay,
+      cacheCap: matteCacheCap,
       lruTouch: lruTouch,
       lruEvict: lruEvict,
       CACHE_MAX: MATTE_CACHE_MAX,
+      CACHE_BYTES: MATTE_CACHE_BYTES,
       PREFETCH: MATTE_PREFETCH
     },
 

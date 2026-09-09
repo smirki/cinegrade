@@ -99,6 +99,16 @@ from stats import (  # noqa: E402  (same reason)
     StatsError, HUE_FAMILIES, SAT_FLOOR, CLIP_BLACK, CLIP_WHITE,
 )
 
+# Checkpoint gap 22: the engine's GENERATED caches (baked layer cubes, the
+# window / flat / radial mattes, the Color Slice cube) used to be hardcoded
+# under grade/luts/ whatever run was using them. Told here, once, they land
+# under this server's own cache dir instead, beside its frames, proxies and
+# segments, so a run started with its own --data-dir or --cache-dir keeps its
+# generated files with the rest of its evidence and cannot collide with
+# another run on the same clip. Nothing already in grade/luts/ is moved or
+# deleted; a bare CLI run with nothing set still reads and writes there.
+CG.set_cache_root(CACHE)
+
 # studio/ itself, so `import auth` and `import db` resolve no matter how this
 # file was invoked. Running it as a script already puts its own folder on
 # sys.path, but at whatever index it landed at before GRADE was pushed in
@@ -477,6 +487,10 @@ def set_cache_dir(path) -> Path:
     MASK_FRAME_CACHE = CACHE / "mask_frame"
     MASK_PICK_CACHE = CACHE / "mask_pick"
     os.environ["STUDIO_CACHE_DIR"] = str(CACHE)
+    # And the engine's own generated caches (gap 22), for the same reason the
+    # three globals above are rebound: --cache-dir has to move every file this
+    # process bakes, not only the ones this file names.
+    CG.set_cache_root(CACHE)
     return CACHE
 
 
@@ -2177,6 +2191,13 @@ def start_render(payload: dict, user_id=None) -> Job:
     # which _dispatch already turns into a 400 naming the layer and matte.
     if not payload.get("allow_partial"):
         CG.require_complete_mattes(cfg, info, seek=start, duration=duration)
+    # The coverage rule above says whether a matte is finished. It does not say
+    # whether it is a matte of THIS clip, and nothing outside the browser
+    # checked that: a render could stretch a portrait matte tracked on another
+    # clip over this picture and write the file with no warning at all.
+    # Unconditional, for both engines, because allow_partial means "I accept an
+    # unfinished matte" and never "I accept the wrong clip's matte".
+    _require_render_mattes_match(cfg, clip)
     if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
         return RG.start_gpu_render(payload, user_id=user_id)
     scale = payload.get("scale")            # optional preview downscale
@@ -2838,10 +2859,165 @@ def _write_matte_index(clip_key: str, matte_id: str, **fields) -> dict:
 
 
 def _matte_info(matte_id: str):
+    """One matte by id, or a 404, for every route that names one.
+
+    The id is checked as an ID (MT.check_matte_id) before it is ever joined
+    onto a path, and MT.resolve then refuses a directory that leaves the
+    store. Both, not either: the pattern stops a traversal written into the
+    URL and the containment check stops a symlink on disk. The check is
+    repeated here rather than left to resolve() because this is the funnel
+    every `matte/...` route goes through, and the route segment arrives
+    straight off the wire (_dispatch does not unquote it, so a plain absolute
+    path in the URL used to reach this function intact).
+    """
     try:
+        MT.check_matte_id(matte_id)
         return MT.resolve(MT.matte_root(), matte_id)
     except MT.MatteMissing as exc:
         raise HttpError(404, str(exc)) from exc
+
+
+def _require_deletable_matte(info) -> None:
+    """The last thing asked before DELETE /api/matte/<id> removes a directory.
+
+    Everything else on that route can be a no-op: `_guard_read` and
+    `_require_admin` both return immediately when logins are off, which is the
+    documented default and the agent case, so with logins off this is the only
+    thing between the request and an `rmtree`. It asks two questions of the
+    RESOLVED PATH rather than of the id, so a symlink cannot answer them for
+    somebody else's directory:
+
+      is it inside the matte store, and does it look like a matte at all
+      (an index.json, or at least one NNNNNN.png frame)
+
+    A no to either is a 400 rather than a 404: the directory was found, and
+    refusing to delete it is a statement about the request. This is deliberate
+    belt and braces on top of MT.check_matte_id and MT.resolve's own
+    containment check, because it is the one route in the studio that destroys
+    data and the cost of asking twice is two `stat` calls.
+    """
+    root = MT.matte_root()
+    path = Path(info.path)
+    if not MT.is_under(root, path):
+        raise HttpError(400, f"refusing to delete {path}: it is not inside "
+                             f"the matte store at {root}")
+    frames = "[0-9]" * MT.FRAME_DIGITS + ".png"
+    if not (path / MT.INDEX_NAME).is_file() and not any(path.glob(frames)):
+        raise HttpError(400, f"refusing to delete {path}: it holds no "
+                             f"{MT.INDEX_NAME} and no matte frames, so it is "
+                             f"not a matte this store wrote")
+
+
+def _matte_clip_refusal(info, clip_key: str, clip_name: str = "") -> str | None:
+    """The sentence to refuse with when a matte belongs to a different clip.
+
+    index.json records the clip and the clip_key the track ran on (C2) and
+    until now nothing outside the browser compared either with the clip in
+    front of it: a landscape clip measured through a portrait matte tracked on
+    another clip answered with numbers, no warning and exit 0, and a render
+    stretched that matte over the wrong picture and wrote the file. The only
+    thing that ever objected was the picker, which simply never offers a
+    mismatched matte, so every scripted caller was unprotected.
+
+    Compared on clip_key, the content key a matte, a project and a saved grade
+    already share, so a rename or a move does not read as a mismatch. A matte
+    with no clip_key recorded (a hand built fixture, an older service) cannot
+    be checked and is allowed through: this can only ever refuse a matte that
+    positively names a different clip.
+
+    Returns None when there is nothing to refuse.
+    """
+    have = str(getattr(info, "clip_key", "") or "").strip()
+    want = str(clip_key or "").strip()
+    if not have or not want or have == want:
+        return None
+    return (f"matte {info.matte_id} was tracked on "
+            f"{info.clip or have} and this is {clip_name or want}: a matte is "
+            f"a per clip thing (a frame sequence at that clip's own rate and "
+            f"framing), so using it here would stretch another clip's subject "
+            f"over this picture. Track the subject on "
+            f"{clip_name or want} and use that matte")
+
+
+def _matte_infos_for_stack(mask: dict) -> list:
+    """Every matte a mask STACK reaches, resolved, skipping what cannot be.
+
+    Missing ids and ids that name nothing are somebody else's job: the stats
+    route's own `_mask_stack_weight` 404s on them and the render's coverage
+    rule refuses them by name. This is only here to answer "whose clip is
+    this matte" about the ones that do resolve.
+    """
+    out = []
+    try:
+        layer = CG.mask_stack_layer(mask)
+    except (CG.GradeError, StudioError, ValueError):
+        return out
+    for matte_id in CG.mask_stack_matte_ids(layer):
+        if not MT.valid_matte_id(matte_id):
+            continue
+        try:
+            out.append(MT.resolve(MT.matte_root(), matte_id))
+        except MT.MatteError:
+            continue
+    return out
+
+
+def _require_stats_mattes_match(clip, matte_info, mask_param) -> None:
+    """Refuse a measurement weighted by another clip's matte (400).
+
+    Both ways a measurement can be weighted: `matte: ID`, already resolved by
+    the route, and `mask: {...}`, a component stack whose matte ids are
+    resolved here. `clip` is a clip NAME; the `path` and `ref` forms of
+    POST /api/stats carry no clip this server can key, so they are left alone
+    rather than guessed at.
+    """
+    name = str(clip or "").strip()
+    if not name:
+        return
+    try:
+        key = mask_clip_key(name)
+    except (StudioError, HttpError, OSError):
+        return              # a name this server cannot resolve: the route's own error
+    infos = [matte_info] if matte_info is not None else []
+    if isinstance(mask_param, dict):
+        infos += _matte_infos_for_stack(mask_param)
+    for info in infos:
+        message = _matte_clip_refusal(info, key, name)
+        if message:
+            raise StudioError(message)
+
+
+def _require_render_mattes_match(cfg: dict, clip) -> None:
+    """Refuse a render whose mask reaches another clip's matte (400).
+
+    Same shape as CG.require_complete_mattes' refusal, deliberately: one line
+    per bad component naming the layer, the component and both clips, so the
+    message says what to fix without opening index.json. Runs for both engines
+    and whatever `allow_partial` says, because allow_partial means "I accept an
+    unfinished matte", never "I accept the wrong clip's matte".
+    """
+    try:
+        key = mask_clip_key(clip)
+    except (StudioError, HttpError, OSError):
+        return
+    bad = []
+    for entry in CG.mask_inputs(cfg):
+        if entry.get("kind") != "matte":
+            continue
+        matte_id = str((entry.get("matte") or {}).get("id") or "").strip()
+        if not MT.valid_matte_id(matte_id):
+            continue        # no id yet, or an unusable one: the coverage rule's job
+        try:
+            info = MT.resolve(MT.matte_root(), matte_id)
+        except MT.MatteError:
+            continue        # not in the store: the coverage rule's job too
+        message = _matte_clip_refusal(info, key, str(clip))
+        if message:
+            bad.append(f"  layer {entry['layer']} component "
+                       f"{entry['component']}: {message}")
+    if bad:
+        raise StudioError("this render's mask reaches a matte that was tracked "
+                          "on another clip:\n" + "\n".join(bad))
 
 
 def list_all_mattes() -> list:
@@ -3026,35 +3202,64 @@ def _recipe_cache_get(clip_key: str, rhash: str) -> list[str] | None:
     return good or None
 
 
-def _matte_request_window(info, start, end) -> tuple[int, int]:
-    """The frame range a `start`/`end` (seconds) request asks of THIS matte,
-    clamped to the range the matte itself says it covers.
+def _request_frame_window(params: dict, start, end) -> tuple[int, int, int]:
+    """`(total_frames, start_frame, end_frame)` for a track request, in the
+    frame numbering of the clip's own mask proxy.
 
-    Clamping to the matte's own declared `[start_frame, end_frame)` is what
-    keeps a request for more than the clip has (`--end 20` on a 16 second
-    clip) from looking like a permanently missing tail and re-queueing on
-    every repeat call. Widening a matte's window is a separate thing and
-    still mints a separate matte, since the service's own id includes the
-    range (checkpoint gap 2, out of scope here).
+    One function, called both by the cache decision and by the wire call, so
+    "the window this call asked for" can never mean two different ranges in
+    one request. `end_frame` is an EXCLUSIVE upper bound (C3), and both ends
+    are clamped to the clip's real frame count, which is what keeps a request
+    for more than the clip has (`--end 20` on a 16 second clip) from reading
+    as a permanently missing tail and re-queueing on every repeat call.
+
+    Round 1 finding 5: the clamp used to be against the MATTE's own declared
+    window instead of the clip's. That made every wider ask look already
+    covered, so `mask track --end 6` after `--end 2` answered `cached: true`
+    and the matte still stopped at 2 seconds. Clamping to the clip keeps the
+    "more than the clip has" protection and drops the false coverage.
     """
-    fps = float(info.fps or 0.0)
+    fps = float(params.get("fps") or 0.0)
+    total = max(1, int(round(float(params.get("duration") or 0.0) * fps)))
+    start_frame = 0
+    if start is not None:
+        start_frame = min(total, max(0, int(round(float(start) * fps))))
+    end_frame = total
+    if end is not None:
+        end_frame = min(total, max(start_frame, int(round(float(end) * fps))))
+    return total, start_frame, end_frame
+
+
+def _matte_declared_window(info) -> tuple[int, int]:
+    """The `[start_frame, end_frame)` this matte says it is for.
+
+    From index.json when the service wrote it (it always does, C2), falling
+    back to `[0, frames)` for a matte written by hand or by an older service.
+    """
     raw = info.raw or {}
     m_start = int(raw.get("start_frame") or 0)
     m_end = int(raw.get("end_frame") or info.total_frames or 0)
-    w_start, w_end = m_start, m_end
-    if fps > 0 and start is not None:
-        w_start = max(m_start, int(round(float(start) * fps)))
-    if fps > 0 and end is not None:
-        w_end = min(m_end, int(round(float(end) * fps)))
-    return w_start, max(w_start, w_end)
+    return m_start, max(m_start, m_end)
 
 
-def _matte_first_missing(info, start, end) -> int | None:
-    """The first frame of that window this matte has not written, or None
-    when the window is fully covered."""
-    w_start, w_end = _matte_request_window(info, start, end)
+def _matte_reaches_past(info, w_start: int, w_end: int) -> bool:
+    """True when `[w_start, w_end)` asks for frames outside this matte's own
+    declared window, at either end: the request is WIDER than the matte, so
+    no amount of what is on disk can answer it (round 1 finding 5)."""
+    m_start, m_end = _matte_declared_window(info)
+    return w_start < m_start or w_end > m_end
+
+
+def _matte_first_missing(info, w_start: int, w_end: int) -> int | None:
+    """The first frame of `[w_start, w_end)` this matte has not written, or
+    None when every frame of it is on disk.
+
+    Frame indices, not seconds: the caller resolves the request to frames
+    once (`_request_frame_window`) so the cache decision and the track call
+    cannot disagree about what was asked for.
+    """
     written = set(info.written_indices(refresh=True))
-    for i in range(w_start, w_end):
+    for i in range(int(w_start), int(w_end)):
         if i not in written:
             return i
     return None
@@ -3066,6 +3271,11 @@ def _matte_first_missing(info, start, end) -> int | None:
 # why both spellings are here and why `partial` alone is not enough to judge
 # on (a partial matte that covers the window asked for is fine, checkpoint
 # gap 12 and the render refusal).
+# Round 1 finding 21: `stale` is in this tuple for callers that only ask "is
+# this matte finished", but the track cache decision in `queue_mask_track`
+# judges `stale` BEFORE coverage and before this tuple, so a stale matte that
+# happens to cover the window still gets re-tracked with its own message
+# ("the recipe changed") instead of the generic dead one.
 _MATTE_DEAD_STATES = ("failed", "stale", "cancelled")
 
 
@@ -3313,8 +3523,13 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     Returns {"job_id": str|None, "mattes": [...]}, plus `cached: true` on a
     pure cache hit (design rule 5: that call cost nothing, there is no fresh
     job, and the caller reads the existing matte's own state instead) or
-    `resumed`/`restarted` with a `message` when this call picked a stalled
-    matte back up. job_id is None only on a cache hit.
+    `resumed`/`widened`/`restarted` with a `message` when this call picked a
+    stalled or too-short matte back up. job_id is None only on a cache hit,
+    and a cache hit means every frame of the window THIS call asked for is on
+    disk (or a live job is tracking a window that contains it), never merely
+    that a matte for this recipe exists: `--end 6` after `--end 2` widens the
+    matte rather than reporting the shorter one as already covering the
+    request (round 1 finding 5).
 
     `force` is the full redo (checkpoint gap 12): the previously written
     frames for this recipe are deleted and the whole window tracked again,
@@ -3346,16 +3561,36 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         except MT.MatteMissing:
             continue
 
-    # Checkpoint gap 12. The cache used to hand back whatever it remembered
-    # with no look at that matte's own state, so a cancelled or failed track
-    # answered an identical retry with the same dead matte and job_id None,
-    # and the only way to get a fresh attempt was to change the prompt text.
-    # Now the cache is a hit only while the answer is still usable:
+    # The window this call asks for, in frames, resolved ONCE from the clip's
+    # own mask proxy parameters. `_mask_proxy_params` is a cached probe and no
+    # encode, so reading it here (before the cache decision) costs nothing;
+    # `ensure_mask_proxy_ready` below returns the same dict and the same
+    # numbers, which is why the cache decision and the wire call cannot
+    # disagree about what "this request" means.
+    req_params = _mask_proxy_params(clip, rot)
+    _, req_start, req_end = _request_frame_window(req_params, start, end)
+
+    # Checkpoint gap 12, and round 1 findings 5 and 21. The cache used to hand
+    # back whatever it remembered with no look at that matte's own state, so a
+    # cancelled or failed track answered an identical retry with the same dead
+    # matte and job_id None, and the only way to get a fresh attempt was to
+    # change the prompt text. Now the cache is a hit only while the answer is
+    # still usable, and the order the questions are asked in is the fix:
     #
-    #   a live job for this recipe        hit (asking twice is free, and the
+    #   stale                             RESTART: stale means "made for
+    #                                     something else", so it is wrong
+    #                                     however many frames it holds. Read
+    #                                     FIRST, before coverage, or a stale
+    #                                     matte that happens to cover the
+    #                                     window is served as a cache hit and
+    #                                     grades the wrong clip (finding 21).
+    #   a live job covering this window    hit (asking twice is free, and the
     #                                     work is already happening)
     #   every frame of the window written hit, whatever the state says
-    #   failed / stale / cancelled        RESTART: re-queue the whole window
+    #   failed / cancelled                RESTART: re-queue the whole window
+    #   a window WIDER than the matte     WIDEN: re-queue the frames outside
+    #                                     the matte's own declared range,
+    #                                     keeping the ones inside it
     #   a gap in the window               RESUME: re-queue from the first
     #                                     missing frame, keeping every frame
     #                                     already on disk
@@ -3368,36 +3603,75 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     # or stalled, which is how a cancelled job that wrote something settles,
     # is not a dead state and does resume.
     #
-    # A resume and a restart both go through the same track call below with
-    # `matte_ids` naming the existing mattes, so the frames land back in the
-    # same matte and the state moves to queued/running again instead of
+    # A resume, a widen and a restart all go through the same track call below
+    # with `matte_ids` naming the existing mattes, so the frames land back in
+    # the same matte and the state moves to queued/running again instead of
     # staying dead.
     resume_from = None
-    resume_kind = ""                 # "resume", "restart" or "force"
+    resume_kind = ""       # "resume", "widen", "restart" or "force"
     restart_reason = ""
     resume_ids: dict[str, str] = {}
     if cached_infos and not force:
         live = JOBS.get(_matte_jobs.get(rhash) or "")
         live_now = live is not None and live.status in ("queued", "running")
-        gaps = [g for g in (_matte_first_missing(i, start, end)
+        # Only a live job whose OWN window covers this request answers it. A
+        # job tracking [0, 48) is not an answer to a request for [0, 144):
+        # counting it as one is finding 5 again, one step further along. Jobs
+        # registered before this field existed (a server upgraded under a
+        # running job) read as covering, which is the old behaviour and the
+        # safe direction: it can delay a widen by one job, never lose one.
+        live_window = (live.extra or {}).get("window") if live_now else None
+        live_covers = live_now and (
+            live_window is None
+            or (int(live_window[0]) <= req_start and int(live_window[1]) >= req_end))
+        stale = [i for i in cached_infos if i.state == "stale"]
+        dead = [i for i in cached_infos if i.state in _MATTE_DEAD_STATES
+                and i.state != "stale"]
+        wider = [i for i in cached_infos
+                 if _matte_reaches_past(i, req_start, req_end)]
+        gaps = [g for g in (_matte_first_missing(i, req_start, req_end)
                             for i in cached_infos) if g is not None]
-        dead = [i for i in cached_infos if i.state in _MATTE_DEAD_STATES]
         # "Covered" is frames really on disk, not merely an absence of gaps:
         # a matte whose declared window is empty (a bootstrap index written
         # before the service said how long the track is) has no missing
         # frame to find, and must not read as a hit on that technicality.
         covered = not gaps and all(i.written_count for i in cached_infos)
-        if live_now or covered:
-            return {"job_id": _matte_jobs.get(rhash), "cached": True,
-                    "mattes": [{"matte_id": i.matte_id, "recipe": i.recipe,
-                                "state": i.state} for i in cached_infos]}
-        if dead or not gaps:
-            resume_from = min(_matte_request_window(i, start, end)[0]
-                              for i in cached_infos)
+        if stale:
+            resume_from = req_start
             resume_kind = "restart"
             restart_reason = (
                 f"restarting from frame {resume_from}: "
-                f"{', '.join(sorted({i.state for i in (dead or cached_infos)}))}")
+                f"{len(stale)} matte(s) are stale (tracked for a different "
+                f"clip, rotation or working width than this request)")
+        elif live_covers or covered:
+            return {"job_id": _matte_jobs.get(rhash), "cached": True,
+                    "start_frame": req_start, "end_frame": req_end,
+                    "mattes": [{"matte_id": i.matte_id, "recipe": i.recipe,
+                                "state": i.state} for i in cached_infos]}
+        elif dead:
+            resume_from = req_start
+            resume_kind = "restart"
+            restart_reason = (
+                f"restarting from frame {resume_from}: "
+                f"{', '.join(sorted({i.state for i in dead}))}")
+        elif wider:
+            # Round 1 finding 5. This is the ask that used to be answered
+            # `cached: true` with the words "already covers this request"
+            # while the matte stopped a third of the way in.
+            resume_from = min(gaps) if gaps else req_start
+            resume_kind = "widen"
+            widest = [f"{i.matte_id} covers frames "
+                      f"{_matte_declared_window(i)[0]} to "
+                      f"{_matte_declared_window(i)[1]}" for i in wider]
+            restart_reason = (
+                f"widening from frame {resume_from}: this request wants frames "
+                f"{req_start} to {req_end} and {'; '.join(widest)}")
+        elif not gaps:
+            resume_from = req_start
+            resume_kind = "restart"
+            restart_reason = (
+                f"restarting from frame {resume_from}: "
+                f"{', '.join(sorted({i.state for i in cached_infos}))}")
         else:
             resume_from = min(gaps)
             resume_kind = "resume"
@@ -3425,14 +3699,11 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     out_dir = MT.matte_root() / clip_key
     # end_frame is an EXCLUSIVE upper bound (C3: "frames (=end_frame,
     # exclusive upper bound)"), so the full clip is [0, total_frames), not
-    # [0, total_frames - 1] as an inclusive last index would read.
-    total_frames = max(1, int(round(params["duration"] * params["fps"])))
-    start_frame = 0
-    if start is not None:
-        start_frame = min(total_frames, max(0, int(round(float(start) * params["fps"]))))
-    end_frame = total_frames
-    if end is not None:
-        end_frame = min(total_frames, max(start_frame, int(round(float(end) * params["fps"]))))
+    # [0, total_frames - 1] as an inclusive last index would read. Resolved by
+    # the same helper the cache decision above used, against the same params
+    # dict, so the window this call asked for is one number pair and not two
+    # derivations that can drift apart.
+    total_frames, start_frame, end_frame = _request_frame_window(params, start, end)
     if resume_from is not None:
         # Re-queue the missing part only, and keep the matte's own declared
         # end so its `frames` (and therefore its area/score arrays, and
@@ -3486,7 +3757,12 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     label = f"mask track {clip} {','.join(matte_ids)[:60]}"
     job = _register(Job("mask_track", label))
     job.extra = {"matte_ids": matte_ids, "clip": clip, "clip_key": clip_key,
-                "rotation": rot, "sam_job_id": sam_job_id, "mattes": sam_mattes}
+                "rotation": rot, "sam_job_id": sam_job_id, "mattes": sam_mattes,
+                # The frame window THIS job is tracking, so the cache decision
+                # above can tell "the work is already happening" from "a job
+                # is running for a narrower window than you just asked for"
+                # (round 1 finding 5).
+                "window": [int(start_frame), int(end_frame)]}
     _matte_jobs[rhash] = job.id
     _recipe_cache_put(clip_key, rhash, matte_ids)
 
@@ -3514,7 +3790,14 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     out = {"job_id": job.id, "mattes": mattes_out, "cached": False,
            "start_frame": start_frame, "end_frame": end_frame}
     if resume_kind:
+        # Exactly one of these three is true, and which one it is says what
+        # happened: resumed (a hole in the window this matte already declares),
+        # widened (a window bigger than the one it declares) or restarted (the
+        # matte was unusable, or `force`). They are three separate flags rather
+        # than "not resumed means restarted" because a caller has to be able to
+        # tell a widen from a redo: a widen keeps every frame already tracked.
         out["resumed"] = resume_kind == "resume"
+        out["widened"] = resume_kind == "widen"
         out["restarted"] = resume_kind in ("restart", "force")
         out["resumed_from"] = resume_from
         out["message"] = restart_reason
@@ -3571,6 +3854,73 @@ def _matte_weight_for(info, time_s: float, meta: dict):
         x, y, w, h = meta["region_pixels"]
         arr = np.ascontiguousarray(arr[y:y + h, x:x + w])
     return arr, served, warning
+
+
+def _mask_stack_weight(mask: dict, time_s: float, rgb, guard=None):
+    """The HxW weight array for a whole mask STACK (checkpoint gap 19).
+
+    `mask` is a layer's own `mask` block: a list of matte, key, luma and
+    window components combined with add, intersect and subtract, each with
+    its own `invert` and `feather`, plus the `finesse` block on the result.
+    `POST /api/stats {"matte": ID}` measures through one stored matte, which
+    cannot say "the person matte intersected with a skin key" at all; this
+    can, in one call, in the same dict the layer that will render it carries.
+
+    Composed by `CG.mask_matte`, the engine's own numpy reference for a
+    layer's matte (the one the parity suite renders against through ffmpeg),
+    at the measured frame's own size, so the weight and the picture line up
+    with nothing resampled between them and a measurement agrees with a
+    render by construction rather than by a separate check.
+
+    `guard` is called with each matte component's clip so this route's own
+    read guard runs on every matte the stack reaches, not only on a single
+    `matte` field. Every matte id is resolved first: an id that names nothing
+    is a 404, where `mask_matte` on its own would treat it as a black matte
+    and answer "no coverage", which for a typo is the worst possible answer.
+    Returns (weight, warnings, matte_ids).
+    """
+    layer = CG.mask_stack_layer(mask)                 # refuses a no-op mask
+    warnings_out = []
+    matte_ids = CG.mask_stack_matte_ids(layer)
+    for matte_id in matte_ids:
+        info = _matte_info(matte_id)                  # 404 when unknown
+        if guard is not None:
+            guard(info.clip)
+        try:
+            _served, warn = MT.served_frame(info, time_s)
+        except MT.MatteMissing as exc:
+            raise StudioError(str(exc)) from exc
+        if warn:
+            warnings_out.append(warn)
+    for _j, comp in CG.stack_components(layer):
+        if CG.component_type(comp) == "matte" and not str(
+                CG.component_matte_ref(comp).get("id") or "").strip():
+            raise StudioError(
+                "mask: a matte component has no matte id yet (it needs a pick "
+                "and a track first); measuring through it would measure a "
+                "black matte and report no coverage")
+    h, w = int(rgb.shape[0]), int(rgb.shape[1])
+    weight = CG.mask_matte(layer, {"width": w, "height": h},
+                           np.asarray(rgb, dtype=np.float64) / 255.0, time_s)
+    return np.asarray(weight, dtype=np.float64), warnings_out, matte_ids
+
+
+def _stamp_coverage(row: dict) -> dict:
+    """Hoist `coverage` and `no_coverage` out of a stats block onto the row.
+
+    `frame_stats` puts both inside `stats` on any WEIGHTED measurement
+    (checkpoint gaps 19 and 23) and neither on an unweighted one, so this
+    copies them up when they are there and adds nothing when they are not:
+    an unweighted answer keeps exactly the envelope it always had. Beside
+    `measured_width`, a row then says what it looked at as well as what it
+    found, and a script walking a list of timestamps can skip a frame the
+    mask covers nothing of with one read instead of digging.
+    """
+    stats_out = row.get("stats") or {}
+    if stats_out.get("coverage") is not None:
+        row["coverage"] = stats_out["coverage"]
+        row["no_coverage"] = bool(stats_out.get("no_coverage"))
+    return row
 
 
 def resolve_preset_mask_recipes(clip: str, rotation, cfg: dict) -> tuple[dict, list]:
@@ -5908,6 +6258,46 @@ class Handler(BaseHTTPRequestHandler):
             if matte_param:
                 matte_info = _matte_info(str(matte_param))
                 self._guard_read(matte_info.clip)
+            # Checkpoint gap 19, "measure by the whole mask": `mask` is a
+            # layer's own mask block (a component stack), which says the one
+            # thing `matte` cannot, "this matte intersected with this colour
+            # key". Refused alongside `matte` (two ways to say one thing) and
+            # alongside `region` (a stack is written in the whole frame's
+            # coordinates, so composing it inside a crop would move every
+            # window and misalign every matte; a `window` component says any
+            # rectangle the stack needs). Validated here, before the first
+            # render, so a bad description costs no ffmpeg.
+            mask_param = payload.get("mask")
+            # `is not None` throughout, never truthiness: {"mask": {}} would
+            # be dropped by a falsy check and the whole frame measured while
+            # the caller believed a mask was applied. It is refused instead.
+            has_mask = mask_param is not None
+            if has_mask and not isinstance(mask_param, dict):
+                raise StudioError(
+                    "mask has to be an object: a layer's own mask block, "
+                    "{\"components\": [...], \"finesse\": {...}}")
+            if has_mask and matte_param:
+                raise StudioError(
+                    "matte and mask both weight the measurement; send one. "
+                    "\"matte\": ID is the one-component shortcut for "
+                    "{\"components\": [{\"type\": \"matte\", \"op\": \"add\", "
+                    "\"matte\": {\"id\": ID}}]}")
+            if has_mask and payload.get("region") is not None:
+                raise StudioError(
+                    "mask and region do not compose: a component stack is "
+                    "written in the whole frame's coordinates, so composing it "
+                    "inside a crop would move every window and misalign every "
+                    "matte. Say the rectangle with a window component inside "
+                    "mask instead, or drop region")
+            if has_mask:
+                CG.mask_stack_layer(mask_param)      # refuse a no-op now
+            # Whichever way the weight was asked for, it has to be a matte of
+            # THIS clip: measuring one clip through another clip's matte used
+            # to answer with numbers, no warning and exit 0. Once, here,
+            # before the first frame is rendered, so a mismatch costs no
+            # ffmpeg.
+            _require_stats_mattes_match(payload.get("clip"), matte_info,
+                                       mask_param)
             times = payload.get("times")
             if times:
                 results = []
@@ -5915,11 +6305,18 @@ class Handler(BaseHTTPRequestHandler):
                     rgb, meta = resolve_stats_frame(payload, self._uid(), float(t))
                     row = {"time": float(t), "key": meta["key"]}
                     weight = None
+                    warns = []
                     if matte_info is not None:
                         weight, _served, warn = _matte_weight_for(
                             matte_info, float(t), meta)
                         if warn:
-                            row["warnings"] = [warn]
+                            warns.append(warn)
+                    elif has_mask:
+                        weight, warns, mask_ids = _mask_stack_weight(
+                            mask_param, float(t), rgb, self._guard_read)
+                        row["mask_mattes"] = mask_ids
+                    if warns:
+                        row["warnings"] = warns
                     try:
                         row["stats"] = frame_stats(rgb, weight=weight)
                     except StatsError as exc:
@@ -5933,6 +6330,7 @@ class Handler(BaseHTTPRequestHandler):
                     # numbers from the two paths cannot be compared without
                     # noticing they came from different samples.
                     row["measured_width"] = int(row["size"][0])
+                    _stamp_coverage(row)                    # gaps 19 and 23
                     if "region" in meta:
                         row["region"] = meta["region"]
                         row["region_pixels"] = meta["region_pixels"]
@@ -5943,10 +6341,14 @@ class Handler(BaseHTTPRequestHandler):
             rgb, meta = resolve_stats_frame(payload, self._uid(), time_used)
             weight = None
             warnings = []
+            mask_ids = None
             if matte_info is not None:
                 weight, _served, warn = _matte_weight_for(matte_info, time_used, meta)
                 if warn:
                     warnings.append(warn)
+            elif has_mask:
+                weight, warnings, mask_ids = _mask_stack_weight(
+                    mask_param, time_used, rgb, self._guard_read)
             try:
                 stats_out = frame_stats(rgb, weight=weight)
             except StatsError as exc:
@@ -5955,11 +6357,14 @@ class Handler(BaseHTTPRequestHandler):
                    "size": [meta.get("width", rgb.shape[1]),
                             meta.get("height", rgb.shape[0])]}
             out["measured_width"] = int(out["size"][0])       # gap 11, above
+            _stamp_coverage(out)                             # gaps 19 and 23
             if "region" in meta:
                 out["region"] = meta["region"]
                 out["region_pixels"] = meta["region_pixels"]
             if matte_info is not None:
                 out["matte"] = matte_info.matte_id
+            if mask_ids is not None:
+                out["mask_mattes"] = mask_ids
             if warnings:
                 out["warnings"] = warnings
             self._json(out)
@@ -6256,9 +6661,45 @@ class Handler(BaseHTTPRequestHandler):
                 health = {"ok": False, "error": str(exc)}
                 ok = False
             with JOBS_LOCK:
-                jobs = [j.as_dict() for j in JOBS.values()
-                       if j.kind in ("mask_track", "mask_proxy")]
+                jobs = []
+                for j in JOBS.values():
+                    if j.kind not in ("mask_track", "mask_proxy"):
+                        continue
+                    view = j.as_dict()
+                    # The service's own answer for this job, forwarded rather
+                    # than re-derived, so this route and the SAM service can
+                    # never disagree about it (checkpoint gap 21). A studio job
+                    # reads `status: "running"` from the moment it is queued,
+                    # which is honest about the studio and says nothing about
+                    # the model: `service_state` is the SAM side's one state,
+                    # `holds_model` is false while the job waits its turn behind
+                    # another one, `matte_states` is that job's own mattes (they
+                    # move to running before the job does, so they cannot lag
+                    # behind it), and `queue_position` is how many are ahead.
+                    sam_state = view.get("sam_state") or {}
+                    if sam_state:
+                        view["service_state"] = sam_state.get("state")
+                        view["holds_model"] = bool(sam_state.get("holds_model"))
+                        view["matte_states"] = sam_state.get("matte_states") or []
+                        view["queue_position"] = sam_state.get("queue_position")
+                    jobs.append(view)
             self._json({"ok": ok, "service": health, "jobs": jobs,
+                        # Which mask job the shared model is on RIGHT NOW, or
+                        # null, straight from /health. Two callers polling two
+                        # tracks both read "running" while only one of them has
+                        # the model, and "the model is busy with somebody else's
+                        # clip" is the answer to "why is mine not moving"
+                        # (checkpoint gap 21).
+                        "model_holder": health.get("model_holder"),
+                        # Quiet mode, lifted out of `service` to the top level
+                        # because it is the answer to "why has this track not
+                        # moved in three minutes": under a duty cycle the
+                        # service is deliberately asleep between windows, and a
+                        # poller that only reads `jobs` cannot tell that from a
+                        # stuck model. `duty_cycle` is the setting,
+                        # `busy_fraction` is what actually happened, `resting`
+                        # and `rest_left_s` are the live state.
+                        "throttle": health.get("throttle"),
                         # The same three paths GET /api/health carries, so a
                         # mask-only caller (the CLI's `mask` group, an agent
                         # already polling this route) does not need a second
@@ -6360,7 +6801,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._guard_read(clip)
                 infos = list_clip_mattes(mask_clip_key(clip))
             else:
-                infos = list_all_mattes()
+                # The `?clip=` branch above guards, so this one has to as
+                # well, or it is simply the way around it: a matte summary
+                # carries the clip's own file name and the matte's recipe,
+                # which for a text prompt is the prompt words themselves. Any
+                # signed in account could read back the name of every clip
+                # anyone on this server has ever tracked a matte on, which is
+                # exactly what _guard_read exists to stop.
+                #
+                # Per matte, dropping what this caller may not read rather
+                # than refusing the whole list: a shared server's list route
+                # has to stay usable while somebody else's matte is in the
+                # store. With logins off _guard_read is a no-op, so the local
+                # and the agent case answer what they always answered.
+                infos = [i for i in list_all_mattes() if self._may_read(i.clip)]
             # Checkpoint gap 6: the summary is the default here and the per
             # frame arrays are opt in (`?full=1`). `GET /api/matte/<id>`
             # below is unchanged and still carries them, so the one caller
@@ -6399,6 +6853,13 @@ class Handler(BaseHTTPRequestHandler):
             # and the agent case both) this is a no-op, same as every other
             # admin gate in this file.
             self._require_admin()
+            # Both guards above return immediately with logins off, so this is
+            # the only check left in the default configuration: the directory
+            # about to go has to be a real matte inside the store. Without it
+            # this route deleted any directory on the machine whose path was
+            # spelled in the URL (footage, grade/out, studio/data), because a
+            # matte id used to be allowed to BE a path.
+            _require_deletable_matte(info)
             shutil.rmtree(info.path, ignore_errors=True)
             MT.forget_cache()
             self._json({"deleted": matte_id})
@@ -6520,6 +6981,22 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                                     # noqa: BLE001
             path = ""
         LIB.guard_read(self._uid(), path)
+
+    def _may_read(self, name) -> bool:
+        """_guard_read asked as a question, for a LIST route.
+
+        The refusal shape is right for a route that was handed one clip and
+        wrong for one that answers with many: `GET /api/matte` with no clip
+        has to drop what this account may not see, not 403 the whole list
+        because somebody else's matte is in the store. Same rule, same
+        function, so the two cannot drift apart; True for everyone when
+        logins are off, since _guard_read returns immediately then.
+        """
+        try:
+            self._guard_read(name)
+            return True
+        except AUTH.AuthError:
+            return False
 
     def _guard_read_key(self, key: str) -> None:
         """The same rule for a route that carries only a cache key.

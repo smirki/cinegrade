@@ -74,7 +74,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -97,24 +96,21 @@ SAM_PYTHON = str(SAM / ".venv" / "bin" / "python")
 SAM_SERVER = str(SAM / "server.py")
 FIXTURE_CLIP = "A001_09011336_C002.MOV"
 
+sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(GRADE))
 import mattes as MT                                           # noqa: E402
-
-FORBIDDEN_PORTS = (7431, 7560, 7614, 7615)
+# One shared forbidden port list (round 1 finding 20). This file's own tuple
+# and test_mask_routes.py's disagreed, and neither covered 7632, the port a
+# live agent seat's studio was on while the review ran.
+from ports import FORBIDDEN_PORTS, free_port as _free_port    # noqa: E402
 
 
 # --------------------------------------------------------------------------
 # process and HTTP helpers (deliberately not imported from test_mask_routes.py:
-# that file is M5's own, this lane adds new files rather than extending theirs)
+# that file is M5's own, this lane adds new files rather than extending theirs.
+# The port picker IS shared, because a list of ports that must never be bound
+# is exactly the kind of thing that must not exist twice.)
 # --------------------------------------------------------------------------
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = int(s.getsockname()[1])
-    if port in FORBIDDEN_PORTS:
-        return _free_port()
-    return port
 
 
 def _get(url: str, timeout: float = 30.0, headers=None):
@@ -328,6 +324,16 @@ class MaskStubE2ETest(unittest.TestCase):
     # -- segment: candidates from the real stub detector -------------------
 
     def test_segment_returns_real_candidates_with_working_previews(self):
+        """Round 1 finding 39: `0.0 <= score <= 1.0` and the same test on
+        every number in the box are true by construction (both are normalised
+        before they leave the service), so a backend answering with a constant
+        score of 0 and a zero sized box passed this test.
+
+        What a picker actually needs from a candidate is checked instead: the
+        box is a real rectangle, the reported area is a real fraction that the
+        mask preview itself agrees with, and two candidates from one prompt
+        are scored differently rather than stamped with one number.
+        """
         out = _post(self.base + "/mask/segment", {
             "clip": self.clip, "time": 0.2, "prompts": {"text": ["a subject"]}})
         self.assertIn("pick_id", out)
@@ -335,14 +341,46 @@ class MaskStubE2ETest(unittest.TestCase):
         inst = out["instances"][0]
         for key in ("id", "score", "box", "area", "overlay", "mask"):
             self.assertIn(key, inst)
-        self.assertTrue(0.0 <= inst["score"] <= 1.0)
+        self.assertGreater(inst["score"], 0.0,
+                           "a candidate nobody is confident about is not a "
+                           "candidate; a constant 0 would pass the old range "
+                           "check")
+        self.assertLessEqual(inst["score"], 1.0)
+        x0, y0, x1, y1 = inst["box"]
         self.assertEqual(len(inst["box"]), 4)
         self.assertTrue(all(0.0 <= v <= 1.0 for v in inst["box"]))
+        self.assertLess(x0, x1, "a box with no width is not a box")
+        self.assertLess(y0, y1, "a box with no height is not a box")
+        box_area = (x1 - x0) * (y1 - y0)
+        self.assertGreater(inst["area"], 0.0)
+        self.assertLessEqual(inst["area"], box_area + 1e-6,
+                             "the mask cannot cover more of the frame than "
+                             "its own bounding box does")
 
-        ov_bytes, _ = _get_raw(self.base[:-4] + inst["overlay"])
+        ov_bytes, ov_headers = _get_raw(self.base[:-4] + inst["overlay"])
         self.assertGreater(len(ov_bytes), 0)
-        mk_bytes, _ = _get_raw(self.base[:-4] + inst["mask"])
+        mk_bytes, mk_headers = _get_raw(self.base[:-4] + inst["mask"])
         self.assertGreater(len(mk_bytes), 0)
+        # The preview really holds the mask the numbers describe: its white
+        # fraction is the reported area. This is the assertion that makes
+        # `area` mean something, and it is what fails if the mask route ever
+        # serves a different instance's picture (the ids are in the URL).
+        arr = MT.decode_png(mk_bytes).astype(np.float32) / 255.0
+        white = float((arr >= 0.5).mean())
+        self.assertAlmostEqual(white, inst["area"], delta=0.01,
+                               msg=f"mask preview covers {white:.4f} of the "
+                                   f"frame, the response says "
+                                   f"{inst['area']:.4f}")
+        self.assertEqual(arr.shape[1], 160,
+                         "the preview is the working width this server was "
+                         "started with, which is also what the service was "
+                         "shown")
+        if len(out["instances"]) > 1:
+            scores = [i["score"] for i in out["instances"]]
+            self.assertNotEqual(scores[0], scores[1],
+                                f"two candidates from one prompt carry one "
+                                f"score, so the score is a label and not a "
+                                f"measurement: {scores}")
 
     def test_segment_with_no_prompt_is_refused(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -399,23 +437,56 @@ class MaskStubE2ETest(unittest.TestCase):
         # same behaviour functionally). Part B added the thin route per
         # PLAN.md C4's own list; this proves it end to end against the real
         # stub rather than just reading the code.
-        result = self._track(start=0.0, end=0.6,
+        #
+        # Round 1 finding 39: this asserted the state was one of
+        # ("cancelled", "failed", "done"), twice. "done" means the job ran to
+        # completion, so a cancel route that answered 200 and ignored the
+        # request passed, and so did one that crashed the job. The state has
+        # to be "cancelled", and the track has to actually stop: the window
+        # here is 1.2s (29 frames at 150ms of stub delay each, over four
+        # seconds of work) and the cancel goes in after two frames, so
+        # finishing first is not a race this can lose.
+        result = self._track(start=0.0, end=1.2,
                              prompts={"text": ["m7 cancel route subject"]})
         job_id = result["job_id"]
         self.assertIsNotNone(job_id)
+        matte_id = result["mattes"][0]["matte_id"]
+        deadline = time.time() + 25.0
+        info = None
+        while time.time() < deadline:
+            info = _get(self.base + f"/matte/{matte_id}")
+            if info["written_count"] >= 2:
+                break
+            time.sleep(0.1)
+        self.assertGreaterEqual(info["written_count"], 2,
+                                "the track never started, so cancelling it "
+                                "proves nothing")
+        total = info["total_frames"]
+        self.assertGreater(total, info["written_count"],
+                           "the track is still mid flight when it is "
+                           "cancelled, which is the only interesting case")
+
         out = _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
         self.assertEqual(out["id"], job_id)
-        self.assertIn(out["state"], ("cancelled", "failed", "done"))
-        # Whatever terminal state the stub settles on, the job must leave
-        # "queued"/"running" behind: this is the same field and vocabulary
-        # GET /api/mask/jobs/<id> uses, so a caller reads one shape either
-        # way (M1's checkpoint contract, mirrored by _mask_job_view).
-        deadline = time.time() + 15.0
-        final = out
-        while final["state"] not in ("cancelled", "failed", "done") and time.time() < deadline:
-            time.sleep(0.2)
-            final = _get(self.base + f"/mask/jobs/{job_id}")
-        self.assertIn(final["state"], ("cancelled", "failed", "done"))
+        self.assertEqual(out["state"], "cancelled",
+                         "a cancel that answers 'done' did not cancel "
+                         "anything")
+        # The same field and vocabulary GET /api/mask/jobs/<id> uses, so a
+        # caller reads one shape either way (M1's checkpoint contract,
+        # mirrored by _mask_job_view), and it stays cancelled.
+        final = _get(self.base + f"/mask/jobs/{job_id}")
+        self.assertEqual(final["state"], "cancelled")
+        # And the work really stopped: the matte keeps the frames it had
+        # written, says why it stopped, and never reaches the end of the
+        # window it was queued for.
+        stopped = self._wait_matte_state(matte_id, ("partial", "failed"))
+        self.assertEqual(stopped["state"], "partial")
+        self.assertTrue(stopped["is_partial"])
+        self.assertGreaterEqual(stopped["written_count"], 2)
+        self.assertLess(stopped["written_count"], total,
+                        "a cancelled track that wrote every frame of its "
+                        "window did not stop")
+        self.assertEqual(stopped["error"], "cancelled")
 
     def test_cancel_route_404s_for_an_unknown_job_id(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -504,8 +575,19 @@ class MaskStubE2ETest(unittest.TestCase):
         written for real, then the whole track call raises, and
         sam/server.py's own _end_job turns that into matte state "partial"
         (frames written, but short of the range) rather than "failed"
-        (nothing written at all). Shared by two tests below, each starting
-        its own job so neither depends on the other's timing.
+        (nothing written at all).
+
+        Shared by two tests below. They do NOT get independent mattes: the
+        phrase has to be exactly "__fail__" for the stub to crash on it
+        (sam/backends/stub.py checks list membership), and design rule 5 keys
+        a track by the recipe, so the second caller lands on the first
+        caller's matte. Whether that second call is a cache hit (the first
+        job still live) or a resume of the two frames that are missing
+        depends on how long the tests in between took, and a resume writes
+        two more frames before crashing again. Callers must therefore read
+        the returned `info` for how far this matte really got rather than
+        assuming the first crash's numbers, which is what the frame route
+        test below had hardcoded.
         """
         result = self._track(prompts={"text": ["__fail__"]}, start=0.0, end=1.0)
         matte_id = result["mattes"][0]["matte_id"]
@@ -521,16 +603,30 @@ class MaskStubE2ETest(unittest.TestCase):
     # -- the frame route: nearest written frame, real partial headers ------
 
     def test_frame_route_serves_nearest_written_frame_with_state_headers(self):
-        matte_id = self._track_a_crashing_job()["matte_id"]
-        # frame 999 of a matte that only ever wrote frames 0 and 1: the
-        # nearest-written-frame fallback (grade/mattes.py's load_time,
-        # shared by this route) must serve frame 1 rather than 404 or 500.
+        crashed = self._track_a_crashing_job()
+        matte_id = crashed["matte_id"]
+        span = crashed["info"]["span"]
+        # A moment far past anything this matte tracked: the
+        # nearest-written-frame fallback (grade/mattes.py's load_time, shared
+        # by this route) serves the LAST WRITTEN frame rather than a 404 or a
+        # 500, and says it did.
+        #
+        # The frame it lands on is read off the matte's own span, not written
+        # here as a constant. It used to be `<= 1`, which was true only while
+        # the two tests sharing this crashing recipe ran close enough together
+        # for the second to be a cache hit; once anything slowed the suite
+        # down in between, the second call resumed, wrote two more frames and
+        # crashed again, and a correct fallback to frame 3 failed a test that
+        # was asserting a coincidence.
         png, headers = _get_raw(
             self.base + f"/matte/{matte_id}/frame?time=999&width=32")
         self.assertGreater(len(png), 0)
         self.assertEqual(headers.get("X-Matte-State"), "partial")
-        self.assertIn("X-Matte-Frame", headers)
-        self.assertLessEqual(int(headers["X-Matte-Frame"]), 1)
+        self.assertEqual(int(headers["X-Matte-Frame"]), span["end_frame"] - 1,
+                         f"the last written frame answers for everything past "
+                         f"it; the matte's span is {span}")
+        self.assertIn("is not tracked yet", headers.get("X-Matte-Warning") or "",
+                      "a served fallback frame has to say it is one")
 
     # -- render refuses a partial matte unless allow_partial ---------------
 

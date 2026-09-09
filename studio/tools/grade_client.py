@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,6 +63,22 @@ DEFAULT_BASE = "http://127.0.0.1:7431"
 # timeout and an explicit -t on any video read, so a bad file or a hung pipe
 # cannot leave a caller waiting forever.
 FFMPEG_TIMEOUT = 60.0
+
+# What a matte id may look like. This string is a copy of grade/mattes.py's
+# MATTE_ID_PATTERN, kept here because this module is standalone by design
+# (stdlib plus numpy, usable against a studio on another machine with no
+# content/grade checkout beside it); grade/tests/test_mask_tools.py asserts
+# the two strings are identical, so the copy cannot drift.
+#
+# It matters here and not only on the server because `matte` and `matte_frame`
+# put the id straight into a URL PATH. An id holding a slash silently asks for
+# a different route (or a whole different resource) instead of failing, and
+# "/tmp/something" as an id is what made DELETE on the matte route able to
+# delete any directory on the machine. Refusing locally means a caller gets
+# told what is wrong with its own argument rather than reading a 404 from a
+# route it did not mean to call.
+MATTE_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"
+_MATTE_ID_RE = re.compile(MATTE_ID_PATTERN)
 
 
 # --------------------------------------------------------------------------
@@ -96,6 +113,21 @@ class StudioError(Exception):
         else:
             text = f"{route} -> {message}" if route else message
         super().__init__(text)
+
+
+def check_matte_id(matte_id) -> str:
+    """The id back, stripped, or StudioError saying what an id looks like.
+
+    See MATTE_ID_PATTERN above for why a client bothers checking this itself.
+    """
+    text = str(matte_id or "").strip()
+    if not text or text in (".", "..") or not _MATTE_ID_RE.fullmatch(text):
+        raise StudioError(
+            f"{text!r} is not a matte id: an id is a name like "
+            f"m_5214be94f217 (letters, digits, underscore, dot and hyphen, up "
+            f"to 64 of them, starting with a letter or a digit), never a path. "
+            f"Matte ids come back from track() and mattes()")
+    return text
 
 
 def _server_message(raw: bytes) -> str:
@@ -313,7 +345,8 @@ class Studio:
 
     def stats(self, clip: str | None = None, time: float = 0.0,
              config: dict | None = None, width: int = 640, region=None,
-             path: str | None = None, matte: str | None = None) -> dict:
+             path: str | None = None, matte: str | None = None,
+             mask: dict | None = None) -> dict:
         """POST /api/stats: {"key", "stats", "size"} for one frame.
 
         Same argument shape as `frame` on purpose (a measure and a look are
@@ -327,6 +360,34 @@ class Studio:
         field on `/api/stats` answers as if `matte` was never sent, so
         check the response's own `"stats"` dict for the weighting asked
         for rather than assuming silence means it ran.
+
+        `mask` (checkpoint gap 19) weights the measurement by a whole mask
+        STACK instead of one matte id, and it is a layer's own `mask` block,
+        so the description can be copied out of a preset's
+        `layers[N]["mask"]` and what is measured is what that layer renders
+        (the server folds it with the engine's own `mask_matte`, the same
+        code the layer renderer uses). Components are `matte`, `key`, `luma`
+        and `window`, combined with `add`, `intersect` and `subtract`, each
+        with its own `invert` and `feather`, plus the `finesse` block on the
+        result. The one measurement `matte` alone cannot express:
+
+            person_intersect_skin = {"components": [
+                {"type": "matte", "op": "add",
+                 "matte": {"id": "m_5214be94f217"}},
+                {"type": "key", "op": "intersect",
+                 "key": {"hue_center": 17, "hue_width": 26, "hue_soft": 5,
+                         "sat_low": 0.18, "sat_high": 0.85,
+                         "lum_low": 0.12, "lum_high": 0.9}}]}
+            studio.stats(clip, time=1.5, width=960,
+                         mask=person_intersect_skin)
+
+        Refused together with `matte` (two ways to say one thing) and with
+        `region` (a stack is written in the whole frame's coordinates: a
+        `window` component says any rectangle it needs). A weighted answer,
+        either kind, also carries `measured_width` and `coverage` (how much
+        of the frame the mask covers), plus `no_coverage: true` with the
+        numbers null on a frame the mask covers nothing of (gap 23), which
+        is a row to write down rather than an error to catch.
         """
         body = self._with_rotation({"time": time, "width": width,
                                     "config": config or {}})
@@ -337,11 +398,14 @@ class Studio:
         if region is not None:
             body["region"] = region
         if matte is not None:
-            body["matte"] = matte
+            body["matte"] = check_matte_id(matte)
+        if mask is not None:
+            body["mask"] = mask
         return self.request("POST", "/api/stats", body=body)
 
     def stats_at(self, clip: str, times, config: dict | None = None,
-                width: int = 640, matte: str | None = None) -> dict:
+                width: int = 640, matte: str | None = None,
+                mask: dict | None = None) -> dict:
         """POST /api/stats with a `times` list (contract G3): one call, one
         render per time, returns the route's own envelope unchanged,
         `{"results": [...]}`, each entry `{time, key, size, stats}` (round 2
@@ -350,12 +414,18 @@ class Studio:
         what the route answers; `cinegrade stats --times --json` prints
         this identical shape). On a server that has not shipped this route
         yet, `"results"` is simply absent from what comes back: check for it
-        rather than assuming the key is always there. `matte` weights every
-        one of those measurements the same way it does on `stats` above."""
+        rather than assuming the key is always there. `matte` and `mask`
+        weight every one of those measurements the same way they do on
+        `stats` above, which is the point of this call for a mask: one
+        request measures a composed mask at a dozen timestamps, and a
+        timestamp the mask covers nothing of comes back as a row with
+        `no_coverage: true` rather than failing the whole list."""
         body = self._with_rotation({"clip": clip, "times": list(times),
                                     "width": width, "config": config or {}})
         if matte is not None:
-            body["matte"] = matte
+            body["matte"] = check_matte_id(matte)
+        if mask is not None:
+            body["mask"] = mask
         return self.request("POST", "/api/stats", body=body)
 
     def ref_stats(self, name: str, region=None) -> dict:
@@ -510,8 +580,13 @@ class Studio:
                                    **({"full": "1"} if full else {})})
 
     def matte(self, matte_id: str) -> dict:
-        """GET /api/matte/<id>: one matte's whole index, arrays included."""
-        return self.request("GET", f"/api/matte/{matte_id}")
+        """GET /api/matte/<id>: one matte's whole index, arrays included.
+
+        The id is checked here (check_matte_id) before it becomes part of a
+        URL path, so a path or a typo is a message about the argument rather
+        than a request to a route this caller did not mean to reach.
+        """
+        return self.request("GET", f"/api/matte/{check_matte_id(matte_id)}")
 
     def wait(self, job_id: str, poll: float = 1.0, timeout: float | None = None,
              on_progress=None) -> dict:
@@ -562,9 +637,9 @@ class Studio:
         params = {"time": time}
         if width is not None:
             params["width"] = width
-        data, headers = self.request("GET", f"/api/matte/{matte_id}/frame",
-                                     params=params, want_json=False,
-                                     return_headers=True)
+        data, headers = self.request(
+            "GET", f"/api/matte/{check_matte_id(matte_id)}/frame",
+            params=params, want_json=False, return_headers=True)
         result = {"data": data, "state": headers.get("X-Matte-State"),
                  "frame": headers.get("X-Matte-Frame")}
         if out is not None:

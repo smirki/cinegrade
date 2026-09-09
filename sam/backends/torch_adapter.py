@@ -41,16 +41,25 @@ from typing import Any, Iterator
 import numpy as np
 
 from .base import (Backend, BackendError, BackendUnavailable, Instance,
-                   TrackedMask, mask_box, normalize_prompts, plan_objects,
-                   window_meter)
+                   TrackedMask, duty_cycle, mask_box, normalize_prompts,
+                   plan_objects, window_meter)
 
 CHUNK_FRAMES = 48
 
 
 class TorchAdapter(Backend):
+    # `torch_backend.track` takes text, points and boxes and refuses anything
+    # else, so a reviewed pick cannot be seeded by its mask on this backend and
+    # the service says so on the job instead (checkpoint gap 20).
+    supports_mask_prompts = False
+    # The inner backend reports no per frame confidence, so `split_mask_score`
+    # falls back to the mask's own maximum: that is "the object is present",
+    # not "the tracker is sure" (round 1 finding 29).
+    score_kind = "presence"
+
     def __init__(self, device: str = "auto", repo_id: str | None = None,
                  outer_lock_held: bool = True, chunk_frames: int = CHUNK_FRAMES,
-                 log=print):
+                 duty_cycle_fraction: float = 1.0, log=print):
         self._device = device
         self.chunk_frames = max(2, int(chunk_frames))
         self._repo_id = repo_id
@@ -58,6 +67,9 @@ class TorchAdapter(Backend):
         self._log = log
         self._inner = None
         self.meter = window_meter(log=log)
+        # Quiet mode, the same as the MLX backend: see sam/throttle.py. 1.0
+        # (the default) never sleeps.
+        self.throttle = duty_cycle(duty_cycle_fraction, log=log)
         self.name = "torch-mps" if device == "mps" else "torch-cpu"
         self.model = repo_id or "jetjodh/sam3"
 
@@ -75,14 +87,16 @@ class TorchAdapter(Backend):
                 "Install them with: uv sync --project sam --extra torch"
             ) from exc
 
-        if self._outer_lock_held:
-            # We are already inside the machine wide lock; do not let the
-            # backend take it again and deadlock against ourselves.
-            module.acquire_model_lock = lambda *args, **kwargs: None
-            module.release_model_lock = lambda *args, **kwargs: None
-
         try:
-            self._inner = module.TorchBackend(device=self._device, repo_id=self._repo_id)
+            # `use_model_lock=False` when we are already inside the machine
+            # wide lock, so the inner backend does not deadlock against
+            # ourselves. This used to replace the module's two lock functions
+            # with no-ops for the whole process and never put them back, which
+            # left every later TorchBackend in that process unlocked (round 1
+            # finding 47).
+            self._inner = module.TorchBackend(
+                device=self._device, repo_id=self._repo_id,
+                use_model_lock=not self._outer_lock_held)
             self._inner.load()
         except Exception as exc:                                # noqa: BLE001
             raise BackendUnavailable(f"the torch backend would not load: {exc}") from exc
@@ -211,59 +225,71 @@ class TorchAdapter(Backend):
         last_mask: dict[str, np.ndarray] = {}
 
         for window_index, (start, window) in enumerate(self._windows(frames)):
+            # Quiet mode's gap, between two windows and after the previous
+            # one's memory has gone: see sam/throttle.py and the same call in
+            # mlx_backend.track. A no op at the default duty cycle of 1.
+            self.settle()
+            token = self.throttle.begin()
             window_size = len(window)
             self.window = {"start": start, "end": start + window_size,
                            "frames": window_size, "size": self.chunk_frames}
             self.meter.start(start=start, end=start + window_size,
                              frames=window_size)
-            if window_index == 0:
-                seeded, order = inner_prompts, None
-            else:
-                # Later windows are seeded from where the objects ended up,
-                # because the previous session is gone: box prompts, in a
-                # known order, so the returned integer ids map back without
-                # any discovery.
-                held = [slot for slot in group
-                        if last_mask.get(slot.id) is not None
-                        and last_mask[slot.id].any()]
-                if not held:
-                    raise BackendError("every tracked object was lost before "
-                                       "the end of the clip")
-                seeded = {"boxes": [list(mask_box(last_mask[slot.id]))
-                                    for slot in held]}
-                order = held
-
-            mapping: dict[int, str] = {}
-
-            def relabel(index: int, masks: dict, start=start,
-                        window_index=window_index, order=order,
-                        mapping=mapping) -> None:
-                if index == 0 and window_index > 0:
-                    return              # the overlap frame, already emitted
-                renamed = {}
-                for object_id, value in masks.items():
-                    key = int(object_id)
-                    if key not in mapping:
-                        if order is not None:
-                            # Box prompts come back as 1..n in the order they
-                            # were given (see torch_backend's obj_ids_batch).
-                            position = key - 1
-                            if not 0 <= position < len(order):
-                                continue
-                            mapping[key] = order[position].id
-                        elif len(mapping) < len(group):
-                            mapping[key] = group[len(mapping)].id
-                        else:
-                            continue    # more instances than slots: ignore
-                    mask = value.mask if isinstance(value, TrackedMask) else value
-                    mask = np.asarray(mask, dtype=np.float32)
-                    renamed[mapping[key]] = mask
-                    if mask.any():
-                        last_mask[mapping[key]] = mask
-                on_frame(start + index, renamed)
-                self.meter.sample()
-
+            # Everything from here to the `finally` is inside the window, so a
+            # raise anywhere in it still closes the window on /health and still
+            # closes the meter. The seeding below can raise (every object
+            # lost), and it used to raise BEFORE this try: /health then
+            # reported a window that was not loaded any more, and
+            # memory.windows.current never closed, in exactly the situation
+            # somebody reads /health to understand (round 1 finding 27).
             try:
+                if window_index == 0:
+                    seeded, order = inner_prompts, None
+                else:
+                    # Later windows are seeded from where the objects ended up,
+                    # because the previous session is gone: box prompts, in a
+                    # known order, so the returned integer ids map back without
+                    # any discovery.
+                    held = [slot for slot in group
+                            if last_mask.get(slot.id) is not None
+                            and last_mask[slot.id].any()]
+                    if not held:
+                        raise BackendError("every tracked object was lost before "
+                                           "the end of the clip")
+                    seeded = {"boxes": [list(mask_box(last_mask[slot.id]))
+                                        for slot in held]}
+                    order = held
+
+                mapping: dict[int, str] = {}
+
+                def relabel(index: int, masks: dict, start=start,
+                            window_index=window_index, order=order,
+                            mapping=mapping) -> None:
+                    if index == 0 and window_index > 0:
+                        return              # the overlap frame, already emitted
+                    renamed = {}
+                    for object_id, value in masks.items():
+                        key = int(object_id)
+                        if key not in mapping:
+                            if order is not None:
+                                # Box prompts come back as 1..n in the order they
+                                # were given (see torch_backend's obj_ids_batch).
+                                position = key - 1
+                                if not 0 <= position < len(order):
+                                    continue
+                                mapping[key] = order[position].id
+                            elif len(mapping) < len(group):
+                                mapping[key] = group[len(mapping)].id
+                            else:
+                                continue    # more instances than slots: ignore
+                        mask = value.mask if isinstance(value, TrackedMask) else value
+                        mask = np.asarray(mask, dtype=np.float32)
+                        renamed[mapping[key]] = mask
+                        if mask.any():
+                            last_mask[mapping[key]] = mask
+                    on_frame(start + index, renamed)
+                    self.meter.sample()
+
                 self._inner.track(iter(window), fps, seeded, "all", relabel)
             finally:
                 # The inner backend materialises whatever iterator it is given
@@ -272,7 +298,10 @@ class TorchAdapter(Backend):
                 # generator is still holding too.
                 window.clear()
                 self.meter.finish(freed=self.release)
-        self.window = None
+                # The next window takes this rest, or the service does once
+                # the job is reported (Service._run_job).
+                self.throttle.owe(token)
+                self.window = None
 
     def _windows(self, frames: Iterator[np.ndarray]):
         """Windows of frames with a one frame overlap, and the absolute index

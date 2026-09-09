@@ -160,6 +160,77 @@ def test_frame_stats_matches_a_pinned_fixture(ctx):
                          t, 0.0, 0.01)
 
 
+# --------------------------------------------------------------------------
+# no coverage, and the coverage number itself (checkpoint gap 23)
+# --------------------------------------------------------------------------
+
+def test_zero_weight_is_a_no_coverage_row_not_an_error(ctx):
+    """A matte covering nothing in this frame is a NORMAL outcome.
+
+    A sky matte after the camera tilts down genuinely has no sky, and a
+    person matte inside its own tracking gap genuinely has nobody. This used
+    to raise StatsError, so a script measuring a dozen timestamps died on the
+    first empty one and lost every row it had not written yet (which is what
+    happened to a round 4 measurement helper). It now returns a row that says
+    so, and the numbers are None rather than zero: a zero here would read as
+    a real measurement of a black frame.
+    """
+    arr = _band_fixture()
+    out = ST.frame_stats(arr, weight=np.zeros(arr.shape[:2]))
+    ctx.expect_eq("no_coverage flag is set", out["no_coverage"], True)
+    ctx.expect_eq("coverage is exactly zero", out["coverage"], 0.0)
+    for name in ST.MEASURED_BLOCKS:
+        ctx.expect_true(f"{name} is present and None, not missing and not 0",
+                        name in out and out[name] is None, repr(out.get(name)))
+    ctx.expect_true("definitions survive (they describe the formula, not "
+                    "this frame)", "families" in out["definitions"],
+                    sorted(out["definitions"]))
+    ctx.expect_eq("no_coverage_result() is the documented shape this returns",
+                  set(out), set(ST.no_coverage_result()))
+
+
+def test_a_weighted_measurement_says_how_much_it_covered(ctx):
+    """`coverage` is the mean of the weight: what share of the frame the mask
+    covers, counting a half lit pixel as half. On an unweighted call neither
+    key appears at all, so every envelope written before this is unchanged."""
+    arr = _band_fixture()
+    h, w = arr.shape[:2]
+    plain = ST.frame_stats(arr)
+    ctx.expect_true("an unweighted answer carries no coverage keys",
+                    "coverage" not in plain and "no_coverage" not in plain,
+                    sorted(plain))
+    solid = ST.frame_stats(arr, weight=np.ones((h, w)))
+    ctx.expect_eq("a weight of all ones covers the whole frame",
+                  solid["coverage"], 1.0)
+    ctx.expect_eq("and is not flagged as empty", solid["no_coverage"], False)
+    top = np.zeros((h, w))
+    top[:h // 2] = 1.0
+    half = ST.frame_stats(arr, weight=top)
+    ctx.expect_close("half the frame, solid, reads 0.5", half["coverage"],
+                     0.5, 1e-9)
+    faint = ST.frame_stats(arr, weight=np.full((h, w), 0.5))
+    ctx.expect_close("the whole frame at half strength also reads 0.5 (the "
+                     "same weight, spread differently)", faint["coverage"],
+                     0.5, 1e-9)
+    ctx.expect_true("the two 0.5 coverages measured different pixels, so the "
+                    "numbers themselves differ",
+                    half["luma"]["mean"] != faint["luma"]["mean"],
+                    (half["luma"]["mean"], faint["luma"]["mean"]))
+
+
+def test_a_bad_weight_shape_is_still_an_error(ctx):
+    """Gap 23 turned an empty matte into a row, not every weight problem into
+    one: a weight that is not the frame's size is a caller bug, and nothing a
+    frame can honestly be, so it still raises."""
+    arr = _band_fixture()
+    try:
+        ST.frame_stats(arr, weight=np.ones((3, 3)))
+        ctx.check(False, "a mismatched weight shape was accepted")
+    except ST.StatsError as exc:
+        ctx.expect_true("the message names both shapes",
+                        "does not match the frame" in str(exc), str(exc))
+
+
 def test_bands_neutral_rows_are_exactly_zero(ctx):
     """The six untouched rows are grey: warm and tint read exactly 0.0, not
     merely small, proving the neutral case is not just "close" by luck."""
@@ -589,6 +660,15 @@ def register(suite):
     suite.add(g, "frame_stats_matches_a_pinned_fixture",
               test_frame_stats_matches_a_pinned_fixture,
               doc="a fixed synthetic frame's numbers, hand verified and pinned")
+    suite.add(g, "zero_weight_is_a_no_coverage_row_not_an_error",
+              test_zero_weight_is_a_no_coverage_row_not_an_error,
+              doc="an empty matte reports no coverage instead of raising")
+    suite.add(g, "a_weighted_measurement_says_how_much_it_covered",
+              test_a_weighted_measurement_says_how_much_it_covered,
+              doc="coverage is the mean weight; absent on an unweighted call")
+    suite.add(g, "a_bad_weight_shape_is_still_an_error",
+              test_a_bad_weight_shape_is_still_an_error,
+              doc="a wrong sized weight is a caller bug and still raises")
     suite.add(g, "bands_neutral_rows_are_exactly_zero",
               test_bands_neutral_rows_are_exactly_zero,
               doc="a grey row reads exactly 0.0 warm and tint")

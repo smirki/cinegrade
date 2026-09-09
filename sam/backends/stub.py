@@ -29,8 +29,9 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from .base import (Backend, Instance, ObjectSlot, TrackedMask, mask_area,
-                   mask_box, normalize_prompts, plan_objects, window_meter)
+from .base import (Backend, Instance, ObjectSlot, TrackedMask, duty_cycle,
+                   mask_area, mask_box, normalize_prompts, plan_objects,
+                   window_meter)
 
 # How far the ellipse wanders, as a fraction of the frame, and how fast.
 DRIFT_X = 0.18
@@ -115,12 +116,27 @@ FAIL_PHRASE = "__fail__"
 class StubBackend(Backend):
     name = "stub"
     model = "stub-ellipse"
+    # It accepts a mask prompt (one slot per mask, like every other prompt
+    # kind), so the pick-to-track path the studio's own tests drive is the same
+    # path the MLX backend takes. The pixels are ignored here for the same
+    # reason a box's pixels are: there is no model, only a drifting ellipse.
+    supports_mask_prompts = True
+    # The stub reports a real per frame number of its own, so the score curve
+    # has the same MEANING here as on MLX even though the value is synthetic.
+    score_kind = "tracker"
 
     def __init__(self, delay_ms: float = 0.0, chunk_frames: int = 48,
-                 log=print) -> None:
+                 duty_cycle_fraction: float = 1.0, log=print) -> None:
         self._loaded = False
         self.delay_ms = float(delay_ms or 0.0)
         self._log = log
+        # The stub honours the duty cycle for real, sleeping the same way the
+        # MLX backend does. That is deliberate: without it, quiet mode could
+        # only be tested by loading 1.7 GB of weights and taking the machine
+        # wide model lock, so the timing would never be checked in the gate.
+        # With it, `--stub --stub-delay-ms 20 --duty-cycle 0.5` is a two second
+        # test of the arithmetic, the log line and the cancel path.
+        self.throttle = duty_cycle(duty_cycle_fraction, log=log)
         # The stub has no MLX allocator to bound, but it does report the same
         # per window memory record the real backends report, so the /health
         # fields, the CLI and the browser can be built and tested against it
@@ -197,26 +213,52 @@ class StubBackend(Backend):
         ellipses = {slot.id: _Ellipse(slot) for slot in live}
         fps = float(fps) if fps and fps > 0 else 24.0
 
-        for index, frame in enumerate(frames):
-            if index % self.chunk_frames == 0:
-                if self.window is not None:
-                    self.meter.finish()
-                self.window = {"start": index, "end": index + self.chunk_frames,
-                               "frames": self.chunk_frames,
-                               "size": self.chunk_frames}
-                self.meter.start(start=index, end=index + self.chunk_frames,
-                                 frames=self.chunk_frames)
-            if FAIL_PHRASE in prompts["text"] and index >= 2:
-                raise RuntimeError("the stub was asked to fail on purpose")
-            if self.delay_ms:
-                time.sleep(self.delay_ms / 1000.0)
-            height, width = frame.shape[:2]
-            time_s = index / fps
-            masks = {slot_id: TrackedMask(ell.render(width, height, time_s),
-                                          round(ell.score(time_s), 4))
-                     for slot_id, ell in ellipses.items()}
-            on_frame(index, masks)
-            self.meter.sample()
-        if self.window is not None:
-            self.meter.finish()
-        self.window = None
+        token = self.throttle.begin()
+        try:
+            for index, frame in enumerate(frames):
+                if index % self.chunk_frames == 0:
+                    if self.window is not None:
+                        self.meter.finish()
+                        # After the window's own memory is accounted for, not
+                        # before: resting while still holding a window would
+                        # give the machine back the GPU and not the memory.
+                        try:
+                            self.rest(token)
+                        finally:
+                            # Refreshed even when the rest raises Cancelled, so
+                            # the `finally` below cannot owe a stretch that has
+                            # already been rested for and count it twice.
+                            token = self.throttle.begin()
+                    self.window = {"start": index, "end": index + self.chunk_frames,
+                                   "frames": self.chunk_frames,
+                                   "size": self.chunk_frames}
+                    self.meter.start(start=index, end=index + self.chunk_frames,
+                                     frames=self.chunk_frames)
+                if FAIL_PHRASE in prompts["text"] and index >= 2:
+                    raise RuntimeError("the stub was asked to fail on purpose")
+                if self.delay_ms:
+                    time.sleep(self.delay_ms / 1000.0)
+                height, width = frame.shape[:2]
+                time_s = index / fps
+                masks = {slot_id: TrackedMask(ell.render(width, height, time_s),
+                                              round(ell.score(time_s), 4))
+                         for slot_id, ell in ellipses.items()}
+                on_frame(index, masks)
+                self.meter.sample()
+            if self.window is not None:
+                self.meter.finish()
+            self.window = None
+        finally:
+            # The window closes however this returned. The deliberate failure
+            # above (FAIL_PHRASE) used to leave both the window and the meter
+            # open forever, so /health reported a window that was not loaded
+            # and memory.windows.current never closed (round 1 finding 27).
+            # A no-op on the ordinary path, which has already closed both.
+            if self.window is not None:
+                self.meter.finish()
+                self.window = None
+            # The last window is owed a rest rather than taking one here,
+            # whether the clip finished, failed or was cancelled: the service
+            # takes it after the job has been reported, so no job ever reads
+            # as 100 percent complete and still running.
+            self.throttle.owe(token)

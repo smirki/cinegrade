@@ -24,9 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -34,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 import harness as H
+from ports import free_port as _shared_free_port
 
 cg = H.cg
 
@@ -192,18 +191,11 @@ def test_studio_url_env_beats_port(ctx):
 # match, preset, grade, and whoami's project_clip: a real server
 # --------------------------------------------------------------------------
 
-def _free_port() -> int:
-    for _ in range(60):
-        port = random.randint(20000, 60000)
-        if port in (7431, 7614):
-            continue
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise RuntimeError("no free port")
+# Round 1 finding 20: this file's own two-port exclusion list disagreed with
+# the three others in the tree and covered neither 7560, 7615 nor 7632. The
+# list lives in studio/tests/forbidden-ports.json now and `ports.free_port`
+# is the one picker every suite here uses.
+_free_port = _shared_free_port
 
 
 def _make_footage_dir() -> Path:

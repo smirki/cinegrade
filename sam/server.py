@@ -53,8 +53,11 @@ from backends import (Cancelled, KNOWN, load_backend, normalize_prompts,   # noq
 from backends.base import recipe_digest                                    # noqa: E402
 from frames import FrameSource, VideoError, probe_rotation_tag, read_image  # noqa: E402
 import memstat                                                             # noqa: E402
+import modellock                                                           # noqa: E402
 from modellock import ModelLock                                            # noqa: E402
-from store import MatteWriter, utc_now                                     # noqa: E402
+from store import (ID_PATTERN, MatteWriter, StoreError, safe_id, under,    # noqa: E402
+                   utc_now)
+import throttle as throttling                                              # noqa: E402
 
 DEFAULT_PORT = 7560
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -113,13 +116,22 @@ class Job:
         elapsed = self.elapsed_s
         return round(self.done_frames / elapsed, 4) if elapsed > 0 and self.done_frames else 0.0
 
-    def as_dict(self, queue_position: int | None = None) -> dict:
+    def as_dict(self, queue_position: int | None = None,
+                holds_model: bool = False) -> dict:
         rate = self.rate_fps
         left = max(0, self.total_frames - self.done_frames)
         return {
             "job_id": self.id,
             "kind": self.kind,
             "state": self.state,
+            # One state, and then the one thing `state` cannot say: whether the
+            # shared model is on this job at this instant. A job is "running"
+            # from the moment the worker takes it, and its mattes move to
+            # "running" in the same breath, so the two can no longer disagree;
+            # `holds_model` is what a second caller's job reads as False while
+            # it waits its turn (checkpoint gap 21).
+            "holds_model": bool(holds_model and self.state == "running"),
+            "matte_states": sorted({m.index.get("state") for m in self.mattes}),
             "done_frames": self.done_frames,
             "total_frames": self.total_frames,
             "fps": round(self.source.fps, 4),
@@ -144,6 +156,12 @@ class Job:
 
 
 _PEAK_FOOTPRINT = {"mb": 0.0}
+
+# What `--nice` did at startup, reported on /health. Module level because
+# renicing is a property of the PROCESS, not of a Service instance: two
+# Services in one process (a test) share one niceness, and pretending
+# otherwise on /health would be a lie about the machine.
+NICE: dict = {"requested": 0, "nice": None, "error": None}
 
 
 def memory() -> dict:
@@ -207,11 +225,31 @@ class _Pick:
 
 
 class Service:
-    def __init__(self, args, backend_kwargs: dict | None = None):
+    def __init__(self, args, backend_kwargs: dict | None = None,
+                 quiet_applied: dict | None = None):
         self.args = args
         self.backend_kwargs = dict(backend_kwargs or {})
+        # Which values came from `--quiet` rather than from a typed flag, so
+        # /health can say so and a run's own log can be checked against what
+        # was asked for instead of inferred from how it behaved.
+        self.quiet_applied = dict(quiet_applied or {})
         self.data_dir = Path(args.data_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Where a request is allowed to say "put the mattes here". The data dir
+        # always, plus whatever --allow-out-dir named. See _resolve_out_dir:
+        # with at least one --allow-out-dir the service is CONFINED and refuses
+        # anything else; with none it keeps the C3 behaviour (the studio owns
+        # the matte store and names it on every call) but says so on /health
+        # and in the log instead of writing silently (round 1 finding 13).
+        self.out_dir_roots = [self.data_dir]
+        for raw in getattr(args, "allow_out_dir", None) or []:
+            root = Path(raw).expanduser().resolve()
+            if root not in self.out_dir_roots:
+                self.out_dir_roots.append(root)
+        self.confined = len(self.out_dir_roots) > 1
+        # Distinct roots outside the allowed set that a caller has already been
+        # given, so /health can name them and one log line covers each.
+        self.external_out_dirs: list[str] = []
         self.requested_backend = "stub" if args.stub else args.backend
         self.backend = None
         self.backend_errors: list[dict] = []
@@ -249,7 +287,12 @@ class Service:
             self.lock.acquire()
         self.backend, self.backend_errors = load_backend(
             self.requested_backend, log=log,
-            outer_lock_held=self.lock.held or self.args.no_model_lock,
+            # "do not take the lock again inside the backend", which is true
+            # both when this process holds it and when it is disabled. Not the
+            # same question as "does this process hold the lock", which is what
+            # /health reports and which `held` alone now answers (round 1
+            # finding 11).
+            outer_lock_held=self.lock.held or self.lock.bypassed,
             **self.backend_kwargs)
         if self.backend is None:
             self.lock.release()
@@ -262,6 +305,7 @@ class Service:
 
     def stop(self) -> None:
         self.stopping.set()
+        self._interrupt_rest()
         with self.mutex:
             for job in self.jobs.values():
                 if job.state in ("queued", "running"):
@@ -307,6 +351,66 @@ class Service:
         waiting = self.queued_jobs()
         return waiting.index(job) + 1 if job in waiting else None
 
+    # -- where a request may write ----------------------------------------
+
+    def _resolve_out_dir(self, raw, default: Path, warnings: list) -> Path:
+        """The directory a request's output goes in, checked before anything is
+        created in it.
+
+        `out_dir` is part of contract C3 on purpose: the studio owns the matte
+        store (`<studio data>/mattes/<clip_key>`) and this service, which has
+        its own `--data-dir`, writes into it. So a caller naming a root is
+        normal and cannot simply be refused. What is not normal, and what this
+        refuses outright, is a relative path, a `..` anywhere in it, or a root
+        that is really a file. `--allow-out-dir` turns the rest into a hard
+        allowlist for a launcher that wants one.
+        """
+        if not raw:
+            return default
+        given = Path(str(raw)).expanduser()
+        if not given.is_absolute():
+            raise ServiceError(400, f"out_dir must be an absolute path, not "
+                                    f"{given}")
+        if ".." in given.parts:
+            raise ServiceError(400, f"out_dir may not contain '..': {given}")
+        resolved = given.resolve()
+        if resolved.parent == resolved:
+            raise ServiceError(400, f"out_dir may not be a filesystem root: "
+                                    f"{resolved}")
+        if resolved.exists() and not resolved.is_dir():
+            raise ServiceError(400, f"out_dir {resolved} is not a directory")
+        inside = any(resolved == root or resolved.is_relative_to(root)
+                     for root in self.out_dir_roots)
+        if inside:
+            return given
+        if self.confined:
+            raise ServiceError(
+                400, f"out_dir {resolved} is outside every allowed root "
+                     f"({', '.join(str(r) for r in self.out_dir_roots)}). This "
+                     f"service was started with --allow-out-dir, so it writes "
+                     f"only under those.")
+        key = str(resolved)
+        if key not in self.external_out_dirs:
+            self.external_out_dirs.append(key)
+            log(f"[paths] writing outside the data dir, at the caller's "
+                f"request: {key} (data dir {self.data_dir}). Start with "
+                f"--allow-out-dir to refuse anything else.")
+        warnings.append(f"out_dir {key} is outside this service's data dir "
+                        f"({self.data_dir}); it was accepted because no "
+                        f"--allow-out-dir was given")
+        return given
+
+    def paths_report(self) -> dict:
+        """The write rules, on /health, so "where can this service write" is
+        answerable without reading its command line."""
+        return {
+            "data_dir": str(self.data_dir),
+            "allowed_roots": [str(r) for r in self.out_dir_roots],
+            "confined": self.confined,
+            "external_out_dirs": list(self.external_out_dirs),
+            "matte_id_pattern": ID_PATTERN,
+        }
+
     def memory_report(self) -> dict:
         """One block on /health that answers "what is this costing me".
 
@@ -329,8 +433,61 @@ class Service:
                 out["windows"] = None
         return out
 
+    def throttle_report(self) -> dict:
+        """Quiet mode on /health: what was asked for, and what happened.
+
+        `duty_cycle` is the setting and `busy_fraction` is the measurement, and
+        they are both here on purpose: a run whose measured fraction is well
+        above its setting was cut short by cancels or by windows longer than
+        `max_rest_s`, and a run whose measured fraction is null has not
+        finished a unit of work yet. `resting` plus `rest_left_s` are what make
+        a deliberately idle service readable as idle rather than as stuck,
+        which is the difference between "quiet mode is working" and "the model
+        has hung", the one question this block exists to answer.
+        """
+        out = {
+            "duty_cycle": float(self.args.duty_cycle),
+            "quiet": bool(self.args.quiet),
+            "quiet_applied": dict(self.quiet_applied),
+            "nice": dict(NICE),
+            "mask_width_hint": self.args.mask_width_hint,
+        }
+        if self.backend is not None:
+            try:
+                # The backend's own throttle is the one actually in force, so
+                # its `duty_cycle` overwrites the flag above rather than sitting
+                # next to it: two numbers that could disagree is how a run gets
+                # measured against a setting it never had.
+                out.update(self.backend.throttle.stats())
+            except Exception as exc:                           # noqa: BLE001
+                out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    def model_holder(self) -> dict | None:
+        """Which job the model is working on RIGHT NOW, or null.
+
+        A queue with a running job is not the same thing as a model that is
+        busy: two callers polling two jobs both used to read "running" while
+        only one of them had the model, and their mattes said so correctly
+        (checkpoint gap 21). This is the one field that answers "is the shared
+        model on my job".
+        """
+        job = self.current
+        if job is None or job.state != "running":
+            return None
+        return {
+            "job_id": job.id,
+            "clip_key": job.request.get("clip_key"),
+            "kind": job.kind,
+            "started": job.started,
+            "done_frames": job.done_frames,
+            "total_frames": job.total_frames,
+            "matte_ids": [m.matte_id for m in job.mattes],
+        }
+
     def health(self) -> dict:
-        running = self.current.id if self.current else None
+        holder = self.model_holder()
+        running = holder["job_id"] if holder else None
         return {
             "ok": self.backend is not None,
             "backend": self.backend.name if self.backend else None,
@@ -341,17 +498,29 @@ class Service:
             "queue": {
                 "running": running,
                 "queued": len(self.queued_jobs()),
-                "jobs": [j.as_dict(self.queue_position(j))
+                "jobs": [j.as_dict(self.queue_position(j), holds_model=j is self.current)
                          for j in list(self.jobs.values())[-20:][::-1]],
             },
+            # Which job has the model right now, spelled out rather than left to
+            # be inferred from `queue.running` (checkpoint gap 21).
+            "model_holder": holder,
             "window": getattr(self.backend, "window", None) if self.backend else None,
             "memory": self.memory_report(),
+            "throttle": self.throttle_report(),
+            "paths": self.paths_report(),
             "backend_errors": self.backend_errors,
             "data_dir": str(self.data_dir),
             "uptime_s": round(time.time() - self.started_at, 1),
             "jobs_done": self.jobs_done,
             "jobs_failed": self.jobs_failed,
-            "model_lock": {"held": self.lock.held, "enabled": self.lock.enabled},
+            # `held` is now the truth and nothing else: it used to read
+            # `held or --no-model-lock`, so a service that deliberately took no
+            # lock reported itself as the holder (round 1 finding 11).
+            # `bypassed` is that case, said plainly.
+            "model_lock": {"held": self.lock.held, "enabled": self.lock.enabled,
+                           "bypassed": self.lock.bypassed,
+                           "dir": str(self.lock.dir),
+                           "owner": modellock.owner(self.lock.dir)},
             "version": API_VERSION,
         }
 
@@ -384,6 +553,7 @@ class Service:
             if pick in self.pending_picks:
                 self.pending_picks.remove(pick)
         self.busy = True
+        token = self.backend.throttle.begin() if self.backend is not None else None
         try:
             pick.result = self._segment(pick.payload)
         except Exception as exc:                               # noqa: BLE001
@@ -391,18 +561,39 @@ class Service:
             log(f"[pick] failed: {pick.error}")
         finally:
             pick.done.set()
+        # AFTER the answer is on its way, never before: a pick is somebody
+        # clicking the picture and waiting, so quiet mode must not make the
+        # click slower. What it delays is the next piece of model work, which
+        # is the part that competes with the founder's own machine. The rest is
+        # skipped when the pick was served between two frames of a running
+        # track, because that window's own rest already covers the gap and
+        # resting twice would double it.
+        if token is not None and self.current is None:
+            try:
+                self.backend.throttle.rest(token, unit="pick")
+            except Exception as exc:                           # noqa: BLE001
+                log(f"[quiet] the pick's rest failed: {type(exc).__name__}: {exc}")
 
     def _run_job(self, job: Job) -> None:
         if job.cancel_requested:
             self._end_job(job, "cancelled", "cancelled before it started")
             return
+        if self.backend is not None:
+            # Forget any earlier interrupt, so the previous job's cancel cannot
+            # abort this job's first rest.
+            self.backend.throttle.resume()
         self.current = job
         self.busy = True
+        # The mattes move first, then the job. The other order left a window in
+        # which a poll read a running job whose mattes still said queued, which
+        # is exactly the "which of these two is true" confusion checkpoint gap
+        # 21 is about. Now the job never claims to be further along than its own
+        # mattes.
+        for matte in job.mattes:
+            matte.set_state("running")
         job.state = "running"
         job.started = utc_now()
         job.started_at = time.time()
-        for matte in job.mattes:
-            matte.set_state("running")
         log(f"[job {job.id}] running: {job.total_frames} frames, "
             f"{len(job.mattes)} matte(s), backend {self.backend.name}")
 
@@ -430,19 +621,25 @@ class Service:
                 self._serve_pending_picks()
 
         try:
-            self.backend.track(
-                job.source.frames(job.start, job.end),
-                job.source.fps, dict(job.prompts, max_instances=job.request.get("max_instances", 1)),
-                job.select, on_frame)
-        except Cancelled:
-            self._end_job(job, "cancelled", "cancelled")
-            return
-        except Exception as exc:                               # noqa: BLE001
-            log(f"[job {job.id}] failed: {type(exc).__name__}: {exc}")
-            log(traceback.format_exc(limit=6))
-            self._end_job(job, "failed", f"{type(exc).__name__}: {exc}")
-            return
-        self._end_job(job, "done", None)
+            try:
+                self.backend.track(
+                    job.source.frames(job.start, job.end),
+                    job.source.fps, dict(job.prompts, max_instances=job.request.get("max_instances", 1)),
+                    job.select, on_frame)
+            except Cancelled:
+                self._end_job(job, "cancelled", "cancelled")
+            except Exception as exc:                           # noqa: BLE001
+                log(f"[job {job.id}] failed: {type(exc).__name__}: {exc}")
+                log(traceback.format_exc(limit=6))
+                self._end_job(job, "failed", f"{type(exc).__name__}: {exc}")
+            else:
+                self._end_job(job, "done", None)
+        finally:
+            # The last window's gap, taken with the job already reported: the
+            # queue moves on afterwards, so the next track starts on a machine
+            # that has had its turn. A cancel returns from here at once,
+            # because the wake event that ended the job is still set.
+            self._settle_rest(f"job {job.id}")
 
     def _end_job(self, job: Job, state: str, error: str | None) -> None:
         expected = job.total_frames
@@ -498,7 +695,12 @@ class Service:
         union = None
         for instance in instances:
             mask = np.clip(np.asarray(instance.mask, dtype=np.float32), 0.0, 1.0)
-            path = out_dir / f"{instance.id}.png"
+            # An instance id is a file name here, so it goes through the same
+            # one path segment rule a matte id does. These ids are the planner's
+            # own ("t0_0", "b1"), so this is a guard against a backend, not
+            # against the caller, and it fails loudly rather than writing a PNG
+            # up a directory (round 1 finding 13).
+            path = under(out_dir, f"{safe_id(instance.id, 'instance id')}.png")
             Image.fromarray((mask * 255.0 + 0.5).astype(np.uint8), mode="L").save(path)
             union = mask if union is None else np.maximum(union, mask)
             out.append({
@@ -512,7 +714,7 @@ class Service:
             })
         semantic = None
         if union is not None:
-            semantic = out_dir / "semantic.png"
+            semantic = under(out_dir, "semantic.png")
             Image.fromarray((union * 255.0 + 0.5).astype(np.uint8), mode="L").save(semantic)
         if not out:
             warnings.append("the model found nothing for these prompts")
@@ -552,7 +754,9 @@ class Service:
             warnings.append("exemplar prompts are accepted and ignored: mlx-cv "
                             "0.0.4 has no exemplar entry point")
         pick_id = "p_" + uuid.uuid4().hex[:8]
-        out_dir = body.get("out_dir") or (self.data_dir / "picks" / pick_id)
+        out_dir = self._resolve_out_dir(body.get("out_dir"),
+                                       self.data_dir / "picks" / pick_id,
+                                       warnings)
 
         pick = _Pick({"image": image, "prompts": prompts, "max_instances": max_instances,
                       "out_dir": str(out_dir), "pick_id": pick_id, "warnings": warnings})
@@ -584,6 +788,7 @@ class Service:
         select = body.get("select", "all")
         picked_from: dict[str, str] = {}
         labels: dict[str, str] = {}
+        seeded_from = None
         if pick_id:
             pick = self.picks.get(pick_id)
             if pick is None:
@@ -593,15 +798,39 @@ class Service:
                 [i for i in pick["instances"] if i["id"] in set(select)]
             if not wanted:
                 raise ServiceError(400, f"none of {select} is an instance of pick {pick_id}")
-            prompts = {"boxes": [i["box"] for i in wanted]}
+            # Seed from the pick's own MASK PIXELS when the backend takes a mask
+            # prompt, not from its bounding box. A box seed is why a reviewed
+            # pick could visibly grow past the shape that was approved and then
+            # go empty: the box is a much weaker description of the object than
+            # the mask already sitting on disk beside it (checkpoint gap 20).
+            masks = [i.get("mask") for i in wanted]
+            can_seed_by_mask = (
+                bool(getattr(self.backend, "supports_mask_prompts", False))
+                and all(m and Path(m).is_file() for m in masks))
+            if can_seed_by_mask:
+                seeded_from = "mask"
+                prompts = {"masks": [str(m) for m in masks]}
+                prefix = "k"
+            else:
+                seeded_from = "box"
+                prompts = {"boxes": [i["box"] for i in wanted]}
+                prefix = "b"
+                why = ("this backend cannot seed a track from a mask"
+                       if not getattr(self.backend, "supports_mask_prompts", False)
+                       else "the pick's mask files are not on disk any more")
+                warnings.append(
+                    f"seeded from the pick's BOUNDING BOX, not its mask, because "
+                    f"{why}. The tracked region can grow past the shape that was "
+                    f"reviewed. Track a text prompt instead when the exact "
+                    f"reviewed shape matters.")
             for position, instance in enumerate(wanted):
-                picked_from[f"b{position}"] = instance["id"]
-                labels[f"b{position}"] = instance["label"] or instance["id"]
+                picked_from[f"{prefix}{position}"] = instance["id"]
+                labels[f"{prefix}{position}"] = instance["label"] or instance["id"]
             select = "all"
-            warnings.append("seeded from a pick: the tracked objects are named "
-                            "b0, b1, ... in the order they were selected; "
-                            "index.json keeps the pick's own instance id in "
-                            "picked_from")
+            warnings.append(f"seeded from a pick {seeded_from}: the tracked "
+                            f"objects are named {prefix}0, {prefix}1, ... in the "
+                            f"order they were selected; index.json keeps the "
+                            f"pick's own instance id in picked_from")
         else:
             try:
                 prompts = normalize_prompts(body.get("prompts"))
@@ -624,6 +853,22 @@ class Service:
             raise ServiceError(400, str(exc)) from None
         if source.kind == "dir" and not body.get("fps"):
             warnings.append(f"no fps given for a frame directory: assuming {source.fps}")
+        hint = self.args.mask_width_hint
+        if hint and source.width > int(hint):
+            # Guidance, not enforcement: the service cannot choose the caller's
+            # width, and it is honest about what a narrower one buys. The model
+            # resizes every frame to 1008x1008 before the trunk sees it, so a
+            # narrower proxy does NOT make the model's own memory smaller
+            # (measured: MLX's peak is identical at 720 and at 1280). What it
+            # makes smaller is the decode, the numpy buffers and the mattes
+            # around the model, which on a shared machine is still worth asking
+            # for. So it is a warning on the job, not a refusal.
+            warnings.append(
+                f"quiet mode suggests tracking at {int(hint)} wide or less and "
+                f"this clip is {source.width} wide. Pass width={int(hint)} (or "
+                f"set STUDIO_MASK_WIDTH) to shrink the decode, the buffers and "
+                f"the mattes. It does not shrink the model itself: every frame "
+                f"is resized to 1008x1008 before the tracker sees it.")
 
         try:
             slots = plan_objects(prompts, max_instances=max_instances, select=select)
@@ -642,7 +887,14 @@ class Service:
         rotation = resolve_rotation(
             body.get("rotation"),
             body.get("rotation_probe_path") or body.get("clip") or video)
-        out_dir = Path(body.get("out_dir") or (self.data_dir / "mattes" / clip_key))
+        # `clip_key` is a directory name ONLY when the caller named no out_dir,
+        # so it is checked there and not when it is merely a field in
+        # index.json: a direct caller's clip_key of "../.." would otherwise pick
+        # the directory this service writes into.
+        raw_out = body.get("out_dir")
+        out_dir = (self._resolve_out_dir(raw_out, self.data_dir, warnings)
+                   if raw_out
+                   else self.data_dir / "mattes" / safe_id(clip_key, "clip_key"))
         # The prompt block carries max_instances for the backends; the recipe
         # states it once at the top level instead of twice with two meanings.
         recipe_prompts = {k: v for k, v in prompts.items() if k != "max_instances"}
@@ -660,13 +912,43 @@ class Service:
         # keeps the tail landing in the same directory; MatteWriter carries
         # that matte's own areas/scores/ious forward rather than blanking
         # them. Ignored for any slot it does not name.
-        resume_ids = {str(k): str(v)
-                      for k, v in (body.get("matte_ids") or {}).items()}
+        # Every named id is checked before it is used as a directory name. An id
+        # of "../../x" walked up out of the store and an absolute id replaced the
+        # root outright, both proved in round 1 finding 13; a 400 here is the
+        # honest answer, because a caller sending a path as an id has a bug.
+        try:
+            resume_ids = {str(k): safe_id(v, "matte id")
+                          for k, v in (body.get("matte_ids") or {}).items()}
+        except StoreError as exc:
+            raise ServiceError(400, str(exc)) from None
         mattes = []
         for slot in slots:
             matte_id = resume_ids.get(str(slot.id)) or \
                 "m_" + recipe_digest(clip_key, rotation, source.width,
                                      recipe, slot.id, steady, start, end)
+            # A matte carries no backend in its id (its recipe hash cannot: the
+            # studio's own recipe cache decides reuse before this service is
+            # asked at all), so a resume can land in a matte another backend
+            # started. The conventions differ (torch returns a hard binary mask
+            # for text and a soft one for points, and reports no per frame
+            # confidence), so this says so on the job rather than mixing two
+            # kinds of frame in one matte silently (round 1 finding 29).
+            previous_backend = None
+            if slot.id in resume_ids:
+                try:
+                    previous_backend = json.loads(
+                        (under(out_dir, matte_id) / "index.json").read_text()
+                    ).get("backend")
+                except (OSError, ValueError, StoreError):
+                    previous_backend = None
+            if previous_backend and previous_backend != self.backend.name:
+                warnings.append(
+                    f"matte {matte_id} was started on backend "
+                    f"{previous_backend} and is being continued on "
+                    f"{self.backend.name}. Mask softness and the meaning of the "
+                    f"score curve differ between backends, so this matte will "
+                    f"mix two conventions. Track it again from scratch if that "
+                    f"matters.")
             header = {
                 "clip": str(body.get("clip") or source.path),
                 "clip_key": clip_key,
@@ -687,8 +969,17 @@ class Service:
                 "kind": slot.kind,
                 "picked_from": picked_from.get(slot.id),
                 "pick": pick_id,
+                # "mask" or "box" when this came from a pick, else null: which
+                # of the pick's two descriptions actually seeded the track
+                # (checkpoint gap 20). What the score curve means depends on the
+                # backend, so that is recorded too (round 1 finding 29).
+                "seeded_from": seeded_from,
+                "score_kind": getattr(self.backend, "score_kind", "unknown"),
             }
-            mattes.append(MatteWriter(out_dir, matte_id, header, steady=steady))
+            try:
+                mattes.append(MatteWriter(out_dir, matte_id, header, steady=steady))
+            except StoreError as exc:
+                raise ServiceError(400, str(exc)) from None
 
         job = Job(job_id, dict(body, max_instances=max_instances, rotation=rotation), source,
                   start, end, mattes, prompts, select, warnings)
@@ -708,6 +999,10 @@ class Service:
             "queue_position": self.queue_position(job),
             "total_frames": job.total_frames,
             "fps": round(source.fps, 4),
+            # "mask", "box", or null when this was not seeded from a pick. A
+            # caller that needs the exact shape it reviewed can read this
+            # instead of inferring it from the mattes (checkpoint gap 20).
+            "seeded_from": seeded_from,
             "warnings": warnings,
         }
 
@@ -718,9 +1013,49 @@ class Service:
         if job.state in ("done", "failed", "cancelled"):
             return {"ok": True, "job_id": job_id, "state": job.state}
         job.cancel_requested = True
+        if job.state == "running":
+            # Only the RUNNING job's cancel wakes the worker: waking it for a
+            # queued job's cancel would abort whichever track happens to be
+            # resting, which is somebody else's job.
+            self._interrupt_rest()
         if job.state == "queued":
             self._end_job(job, "cancelled", "cancelled while queued")
         return {"ok": True, "job_id": job_id, "state": job.state}
+
+    def _interrupt_rest(self) -> None:
+        """Cut a duty cycle rest short, now.
+
+        Called when the running job is cancelled and when the service is
+        stopping. Without it, a cancel arriving one second into a 150 second
+        rest would be noticed 149 seconds later and quiet mode would read as a
+        hung service; with it the worker wakes on the same event and the job
+        ends the way a cancel between two frames ends it.
+        """
+        if self.backend is not None:
+            try:
+                self.backend.throttle.interrupt()
+            except Exception:                                  # noqa: BLE001
+                pass
+
+    def _settle_rest(self, why: str) -> None:
+        """Take the rest the last window of a job is owed, AFTER the job has
+        been reported finished.
+
+        The gap belongs between two pieces of model work, but a job that sits
+        at `done_frames == total_frames` in state `running` for a whole window
+        reads as broken. So the backend owes the rest, `_end_job` reports the
+        job, and the worker sleeps here before it takes the next item off the
+        queue. Interrupted by `_interrupt_rest` like any other rest, so a
+        cancel or a shutdown does not wait for it.
+        """
+        if self.backend is None:
+            return
+        try:
+            if self.backend.throttle.owed:
+                log(f"[quiet] {why}: resting before the next piece of work")
+            self.backend.throttle.settle()
+        except Exception as exc:                               # noqa: BLE001
+            log(f"[quiet] {why}: the rest failed: {type(exc).__name__}: {exc}")
 
     def _release_backend(self, why: str) -> None:
         """Drop everything that is not the model, and say what it bought.
@@ -820,10 +1155,14 @@ class Handler(BaseHTTPRequestHandler):
                 jobs = list(self.service.jobs.values())[::-1]
                 if clip_key:
                     jobs = [j for j in jobs if j.request.get("clip_key") == clip_key]
+                holder = self.service.model_holder()
                 return self._send(200, {
                     "ok": True,
-                    "jobs": [j.as_dict(self.service.queue_position(j)) for j in jobs],
-                    "running": self.service.current.id if self.service.current else None,
+                    "jobs": [j.as_dict(self.service.queue_position(j),
+                                       holds_model=j is self.service.current)
+                             for j in jobs],
+                    "running": holder["job_id"] if holder else None,
+                    "model_holder": holder,
                     "queued": len(self.service.queued_jobs()),
                 })
             if path.path.endswith("/cancel"):
@@ -833,9 +1172,11 @@ class Handler(BaseHTTPRequestHandler):
                 job = self.service.jobs.get(job_id)
                 if job is None:
                     return self._error(404, f"no job {job_id}")
-                return self._send(200, dict(job.as_dict(self.service.queue_position(job)),
-                                            ok=True, backend=self.service.backend.name
-                                            if self.service.backend else None))
+                return self._send(200, dict(
+                    job.as_dict(self.service.queue_position(job),
+                                holds_model=job is self.service.current),
+                    ok=True, backend=self.service.backend.name
+                    if self.service.backend else None))
             if path.path.startswith("/picks/"):
                 pick_id = path.path.split("/")[2]
                 pick = self.service.picks.get(pick_id)
@@ -896,6 +1237,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="no model at all: synthetic drifting mattes, for tests")
     parser.add_argument("--data-dir", default=str(Path(os.environ.get("TMPDIR", "/tmp")) / "fixxr-sam"),
                         help="where picks and mattes go when the caller does not say")
+    parser.add_argument("--allow-out-dir", action="append", default=None,
+                        metavar="DIR",
+                        help="a directory a request's out_dir may be inside, "
+                             "as well as the data dir. Repeatable. Give it at "
+                             "least once and the service refuses every other "
+                             "out_dir; give it never and a caller's own root is "
+                             "accepted (the studio owns the matte store, so "
+                             "that is the normal case) but named on /health and "
+                             "in the log rather than written to silently.")
     parser.add_argument("--model", default=None, help="override the weights repo id")
     parser.add_argument("--chunk-frames", type=int, default=None,
                         help="frames per tracker window (default 48). Halving "
@@ -932,6 +1282,42 @@ def build_parser() -> argparse.ArgumentParser:
                              "peak by 9 MB and cost 23% of the time: the trunk "
                              "was never where the memory went. Here so that "
                              "can be re-measured rather than re-argued.")
+    # -- quiet mode (2026-09-09): sharing the machine ----------------------
+    #
+    # These four are about the founder's own machine staying usable while a
+    # track runs, not about the track running well. See sam/throttle.py.
+    parser.add_argument("--quiet", action="store_true",
+                        help="one flag for sharing this Mac: duty cycle "
+                             f"{throttling.QUIET_DUTY_CYCLE}, nice "
+                             f"{throttling.QUIET_NICE}, MLX memory limit "
+                             f"{throttling.QUIET_MLX_MEMORY_LIMIT_MB} MB and a "
+                             f"mask width hint of {throttling.QUIET_MASK_WIDTH}. "
+                             "Any of those flags given explicitly wins. NOT the "
+                             "studio server's --quiet, which is about logging.")
+    parser.add_argument("--duty-cycle", type=float, default=None,
+                        help="the fraction of wall time the model may own, "
+                             "greater than 0 and at most 1. Default 1: no "
+                             "throttling. At 0.5 every tracking window and "
+                             "every pick is followed by a sleep as long as the "
+                             "work took, so the GPU is free half the time and "
+                             "the track takes about twice as long. Cancel and "
+                             "/health stay responsive during the sleep, and "
+                             "the fraction actually achieved is measured and "
+                             "reported as /health.throttle.busy_fraction.")
+    parser.add_argument("--nice", type=int, default=None,
+                        help="os.nice at startup, default 0. CPU priority "
+                             "only: it helps the decode, the PNG writes and "
+                             "the HTTP server get out of the way and it does "
+                             "nothing at all to Metal work, which is where the "
+                             "model's time goes. That is what --duty-cycle is "
+                             "for. A negative value needs privilege and is "
+                             "reported as an error rather than raised.")
+    parser.add_argument("--mask-width-hint", type=int, default=None,
+                        help="advertise a working width on /health and warn on "
+                             "a track wider than it. Guidance, never enforced: "
+                             "the model resizes every frame to 1008x1008, so a "
+                             "narrower proxy shrinks the decode, the buffers "
+                             "and the mattes, and not the model.")
     parser.add_argument("--no-model-lock", action="store_true",
                         help="do not take /tmp/fixxr-sam-model.lock (tests only)")
     parser.add_argument("--lock-retry-s", type=float, default=20.0)
@@ -956,10 +1342,31 @@ def main(argv=None) -> int:
         raise SystemExit(f"--host {args.host} is not loopback. This service "
                          f"binds {', '.join(sorted(LOOPBACK))} only: it runs "
                          f"models on the founder's machine and has no auth.")
+
+    # Quiet mode, before anything expensive starts. Every flag the preset
+    # covers defaults to None, so "not None" means a person typed it and
+    # --quiet leaves it alone: that is the whole of the override rule.
+    try:
+        quiet_applied = throttling.resolve_quiet(args)
+    except ValueError as exc:
+        raise SystemExit(f"--duty-cycle: {exc}") from None
+    if quiet_applied:
+        log("[quiet] --quiet set " + ", ".join(
+            f"{name.replace('_', '-')} {value}"
+            for name, value in sorted(quiet_applied.items())))
+    NICE.update(throttling.apply_nice(args.nice, log=log))
+    if args.duty_cycle < 1.0:
+        log(f"[quiet] duty cycle {args.duty_cycle:g}: the model may own about "
+            f"{args.duty_cycle * 100:.0f} percent of the wall clock. A track "
+            f"will take about {1 / args.duty_cycle:.1f} times as long and the "
+            f"machine is free in between.")
     # Only the MLX backend takes these, so they are dropped for the others
     # rather than handed to a constructor that would reject them.
     backend_name = "stub" if args.stub else args.backend
     backend_kwargs = {}
+    if args.duty_cycle < 1.0:
+        # Every backend takes this one, unlike the MLX only flags below.
+        backend_kwargs["duty_cycle_fraction"] = args.duty_cycle
     if backend_name in ("auto", "mlx"):
         if args.model:
             backend_kwargs["repo_id"] = args.model
@@ -979,7 +1386,7 @@ def main(argv=None) -> int:
         if args.chunk_frames:
             backend_kwargs["chunk_frames"] = args.chunk_frames
 
-    service = Service(args, backend_kwargs)
+    service = Service(args, backend_kwargs, quiet_applied=quiet_applied)
     service.start()
     atexit.register(service.stop)
 

@@ -237,8 +237,14 @@
         inst.setSource(src.data, src.w, src.h);
         uploadedTag = tag;
       }
-      return inst.ready(cfg, { pixelScale: factor }).then(function () {
-        var r = inst.render(cfg, { pixelScale: factor });
+      /* time is the CLIP time this still is of, and it has to reach both
+       * calls: ready() awaits the matte frame at that time and render() binds
+       * it. Without it every matte component in every mode read frame 0 of the
+       * store, so a tracked matte sat on the subject's first position while
+       * the picture moved (design rule 10, acceptance A1). */
+      var opts = { pixelScale: factor, time: +p.time || 0 };
+      return inst.ready(cfg, opts).then(function () {
+        var r = inst.render(cfg, opts);
         lastMattesReport_ = r.mattes || null;
         return {
           ms: r.ms, passes: r.passes, width: r.width, height: r.height,
@@ -385,10 +391,15 @@
         lastIdx = idx;
       }
       var cfg = withResolvedInput(getCfg(), resolvedInput);
+      /* The clip time of the frame just uploaded, which is what the matte
+       * store is indexed by. Loop playback is the mode A1 is judged in, so
+       * this is the one that mattered most: without it the matte held frame 0
+       * for the whole loop while the subject walked out of it. */
+      var lopts = { pixelScale: factor, time: loopBuf.start + idx / loopBuf.fps };
       busy = true;
-      inst.ready(cfg, { pixelScale: factor }).then(function () {
+      inst.ready(cfg, lopts).then(function () {
         if (!running || gen !== loopGen) { busy = false; return; }
-        inst.render(cfg, { pixelScale: factor });
+        inst.render(cfg, lopts);
         busy = false;
         var t = now();
         fpsWindow.push(t);
@@ -698,8 +709,15 @@
     }
     var factor = proxyFactor(opts);
     uploadVideoFrame(proxyVideo);
-    return inst.ready(cfg, { pixelScale: factor }).then(function () {
-      var r = inst.render(cfg, { pixelScale: factor });
+    /* CLIP time, not the proxy's own currentTime: the matte store is indexed
+     * against the clip (C2, index = round(time * fps)) and a proxy can start
+     * at a different origin. proxyToClipTime is the same conversion the
+     * playhead reports with, so the matte advances with the picture in
+     * playback, seeking and frame stepping alike. */
+    var popts = { pixelScale: factor,
+                  time: proxyToClipTime(proxyVideo.currentTime) };
+    return inst.ready(cfg, popts).then(function () {
+      var r = inst.render(cfg, popts);
       lastMattesReport_ = r.mattes || null;
       return {
         ms: r.ms, passes: r.passes, width: r.width, height: r.height,
@@ -1001,6 +1019,23 @@
     return lastMattesReport_;
   }
 
+  /* Throw away everything this renderer holds for one matte: its index.json,
+   * its decoded frames and the fallback frame a lagging render binds.
+   *
+   * The UI calls this whenever the STORE for a matte changed under it: a
+   * re-track of the same id writes different pixels to the same frame numbers,
+   * and a matte that finishes tracking turns a short index into a long one, so
+   * a cache keyed only by id and frame number would serve the old pixels for
+   * the rest of the session with no way to notice. Returns the matte's new
+   * generation number, so a caller can tell an unknown id (0) from a real
+   * invalidation.
+   *
+   * Safe to call before init: with no renderer there is nothing cached. */
+  function invalidateMatte(id) {
+    if (!inst || !id) return 0;
+    return inst.invalidateMatte(String(id));
+  }
+
   // Frames per second this renderer achieved, what it skipped, and what the
   // decoder dropped underneath it. Null until something has played.
   function proxyPlaybackStats() {
@@ -1059,6 +1094,7 @@
     stepProxy: stepProxy,
     proxyPlaybackStats: proxyPlaybackStats,
     lastMattesReport: lastMattesReport,
+    invalidateMatte: invalidateMatte,
     stopProxy: stopProxy
   };
 })(typeof window !== "undefined" ? window : this);

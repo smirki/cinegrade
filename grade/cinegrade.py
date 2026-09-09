@@ -56,6 +56,110 @@ FOOTAGE = CONTENT / "footage"
 APPLE_LOG_STOP = 0.08492
 
 
+# --------------------------------------------------------------------------
+# where GENERATED cache files go (checkpoint gap 22)
+# --------------------------------------------------------------------------
+#
+# LUT_TECH and LUT_LOOKS above are INPUTS: cubes that ship in the checkout and
+# are read, never written. The three folders resolved below are the opposite,
+# files the engine BAKES on demand and keys by a hash of the settings that
+# made them: layer cubes (layer_lut), the window / flat / radial mattes
+# (window_mask, flat_mask, radial_mask) and the Color Slice cube
+# (grade/slice.py). Those were hardcoded under grade/luts/ whatever run was
+# using the engine, so two runs on one clip wrote into the same folder and a
+# run that wanted its generated files kept with the rest of its evidence had
+# to redirect the module constants for its own process and then separately
+# prove the redirect still rendered the same pixels (see
+# bakeoff/masks-codex/measurement-path-parity.json, which had to be built for
+# exactly that reason).
+#
+# Now the folder resolves from the same cache root the rest of the studio
+# already uses, in this order:
+#
+#   1. set_cache_root(PATH), which studio/server.py calls with its own CACHE
+#      so anything imported into the server lands where the server's frames,
+#      proxies and segments already go. An explicit call wins outright.
+#   2. CINEGRADE_CACHE_DIR, this CLI's own override.
+#   3. STUDIO_CACHE_DIR, which studio/server.py's set_cache_dir() exports for
+#      its children, so a tool the server shells out to agrees with it.
+#   4. STUDIO_DATA_DIR + /cache, the same rule the server's own
+#      _default_cache_dir() uses: a run given its own data folder is a test
+#      or a throwaway and gets its own cache inside it.
+#   5. grade/ itself, i.e. grade/luts/..., exactly where every file already
+#      on disk sits. Nothing there is moved or deleted by this: a bare CLI
+#      run with no server and no variables set reads and writes the same
+#      paths it always did.
+#
+# The three constants below are kept as module attributes because callers read
+# them (grade/tests/legacy_parity.py normalises absolute paths out of a graph
+# fingerprint with LUT_LAYERS and LUT_MASKS). They hold the LAST resolved
+# value: the accessor functions re-resolve on every call and rebind them, so
+# an environment variable set after this module was imported is still picked
+# up rather than baked in at import.
+CACHE_ROOT_OVERRIDE: Path | None = None
+
+
+def cache_root() -> Path:
+    """The folder generated cache files are written under, resolved fresh.
+
+    Returns the PARENT of `luts/`, so `cache_root() / "luts" / "layers"` is
+    the layer cube folder. The precedence is written out in the comment
+    above this function; `grade/` (giving the historical `grade/luts/...`)
+    is the last fallback and is what a bare CLI run with nothing set gets.
+    """
+    if CACHE_ROOT_OVERRIDE is not None:
+        return CACHE_ROOT_OVERRIDE
+    for name in ("CINEGRADE_CACHE_DIR", "STUDIO_CACHE_DIR"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return Path(value).expanduser().resolve()
+    data = os.environ.get("STUDIO_DATA_DIR", "").strip()
+    if data:
+        return Path(data).expanduser().resolve() / "cache"
+    return ROOT
+
+
+def set_cache_root(path=None) -> Path:
+    """Pin the generated cache root for this process, or clear the pin.
+
+    `path=None` drops the override and goes back to reading the
+    environment. studio/server.py calls this with its own CACHE at import
+    and again from set_cache_dir(), which is what makes "under the studio,
+    the studio's cache dir" true rather than only "if somebody exported the
+    variable".
+    """
+    global CACHE_ROOT_OVERRIDE
+    CACHE_ROOT_OVERRIDE = (None if path is None
+                           else Path(path).expanduser().resolve())
+    lut_layers_dir()
+    lut_masks_dir()
+    return cache_root()
+
+
+def lut_layers_dir() -> Path:
+    """Where baked LAYER cubes go, re-resolved and rebound onto LUT_LAYERS."""
+    global LUT_LAYERS
+    LUT_LAYERS = cache_root() / "luts" / "layers"
+    return LUT_LAYERS
+
+
+def lut_masks_dir() -> Path:
+    """Where baked window / flat / radial mattes go, rebound onto LUT_MASKS."""
+    global LUT_MASKS
+    LUT_MASKS = cache_root() / "luts" / "masks"
+    return LUT_MASKS
+
+
+def lut_slice_dir() -> Path:
+    """Where grade/slice.py's baked Color Slice cubes go.
+
+    Lives here rather than in slice.py so all three generated caches answer
+    to one resolver; slice.py imports this lazily (it is imported BY this
+    module, so it cannot import it back at module level).
+    """
+    return cache_root() / "luts" / "slice"
+
+
 class GradeError(Exception):
     """A user-fixable problem: a missing LUT, an unknown preset, a bad graph.
 
@@ -1780,7 +1884,10 @@ def f_slice(cfg) -> list[str]:
 # frame. The window half stays a spatial matte, because position is the one
 # thing a colour cube cannot know.
 
-LUT_LAYERS = ROOT / "luts" / "layers"
+# The last resolved layer cube folder (checkpoint gap 22). Read it through
+# lut_layers_dir(), which re-resolves and rebinds this; the constant itself is
+# kept because callers outside this module read it by name.
+LUT_LAYERS = cache_root() / "luts" / "layers"
 
 # The template every layer is filled in from. A layer in a config may name
 # only the fields it changes; config_layers() deep merges each one over this,
@@ -2076,8 +2183,9 @@ def layer_lut(layer: dict, variant: str = "key"):
     layer = deep_merge(LAYER_DEFAULTS, layer or {})
     h = hashlib.sha1(json.dumps(_layer_cube_key(layer, variant),
                                 sort_keys=True).encode()).hexdigest()[:16]
-    LUT_LAYERS.mkdir(parents=True, exist_ok=True)
-    path = LUT_LAYERS / f"layer_{h}.cube"
+    layers_dir = lut_layers_dir()                    # checkpoint gap 22
+    layers_dir.mkdir(parents=True, exist_ok=True)
+    path = layers_dir / f"layer_{h}.cube"
     if path.exists():
         return path
 
@@ -2539,8 +2647,9 @@ def flat_mask(value: int, w: int, h: int):
     ffmpeg call, cached by size and value.
     """
     v = max(0, min(255, int(value)))
-    LUT_MASKS.mkdir(parents=True, exist_ok=True)
-    p = LUT_MASKS / f"flat_{v}_{w}x{h}.png"
+    masks_dir = lut_masks_dir()                       # checkpoint gap 22
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    p = masks_dir / f"flat_{v}_{w}x{h}.png"
     if not p.exists():
         subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
@@ -3112,7 +3221,9 @@ def morph2d(a, passes: int, grow: bool):
 # what geq's X and Y actually are. A shader sampling at pixel centres has to
 # subtract the half itself.
 
-LUT_MASKS = ROOT / "luts" / "masks"
+# The last resolved generated-matte folder (checkpoint gap 22), the same
+# arrangement LUT_LAYERS has above: read it through lut_masks_dir().
+LUT_MASKS = cache_root() / "luts" / "masks"
 
 # How an 8-bit matte gets into the 16-bit merge: a multiply by exactly 257, so
 # code 255 arrives as 65535 and applies the whole correction. Both mattes use
@@ -3292,8 +3403,9 @@ def window_mask(cfg, w: int, h: int):
     win = _window_block(cfg)
     key = json.dumps(win, sort_keys=True)
     tag = hashlib.sha1(key.encode()).hexdigest()[:16]
-    LUT_MASKS.mkdir(parents=True, exist_ok=True)
-    p = LUT_MASKS / f"window_{w}x{h}_{tag}.png"
+    masks_dir = lut_masks_dir()                       # checkpoint gap 22
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    p = masks_dir / f"window_{w}x{h}_{tag}.png"
     if not p.exists():
         subprocess.run(
             ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
@@ -3519,7 +3631,7 @@ def radial_mask(w, h, start, end):
     Writing straight into a gray plane costs nothing and lands the exact code.
     The matte is still an 8-bit PNG; this is the scaling, not the depth.
     """
-    d = ROOT / "luts" / "masks"
+    d = lut_masks_dir()                               # checkpoint gap 22
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"radial_{w}x{h}_{start:.2f}_{end:.2f}.png"
     if not p.exists():
@@ -4376,8 +4488,156 @@ def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict):
     return full, warns
 
 
+# --------------------------------------------------------------------------
+# measuring through a whole mask STACK, not one matte id (checkpoint gap 19)
+# --------------------------------------------------------------------------
+#
+# `--matte ID` measures through one stored matte. A graded LAYER's mask is not
+# one matte: it is a component stack (matte, key, luma and window components
+# combined with add, intersect and subtract, each with its own feather and
+# invert, then the finesse block on the result). The one measurement the round
+# 4 skin anchor actually needed, "the person matte intersected with a skin
+# colour key", could not be said at all, so it was hand built against the
+# engine's internal modules and then separately proved to match a real server
+# render pixel for pixel before any number from it could be trusted.
+#
+# `--mask` says it directly, and it says it in the SAME dict a layer's
+# `mask` block already is, so the description can be copied straight out of a
+# preset's `layers[N].mask` and what is measured is what will render. There is
+# no second implementation of the fold here: mask_matte() is the engine's own
+# numpy reference for a layer's matte, the one the parity suite renders
+# against through ffmpeg, so a measurement and a render agree by construction
+# rather than by a check somebody remembered to run.
+
+
+def mask_stack_layer(mask: dict) -> dict:
+    """A throwaway layer carrying `mask`, filled in from LAYER_DEFAULTS.
+
+    Refuses the two shapes that would silently measure the whole frame:
+    a component stack no component reaches (the fold starts at zero, so the
+    first enabled component has to be an `add`), and a legacy pair with
+    neither the window nor the key switched on.
+    """
+    layer = deep_merge(LAYER_DEFAULTS, {"mask": mask or {}})
+    block = layer["mask"]
+    if has_components(layer):
+        if not stack_components(layer):
+            raise GradeError(
+                "mask: no component reaches the matte. The stack folds from "
+                "zero, so the first ENABLED component has to be an 'add'; an "
+                "'intersect' or a 'subtract' at the top of a stack is one "
+                "times nothing and cannot select anything.")
+    elif not ((block.get("window") or {}).get("enabled")
+              or (block.get("key") or {}).get("enabled")):
+        raise GradeError(
+            "mask: nothing to measure through. Give 'components': a list of "
+            "{type: matte|key|luma|window, op: add|intersect|subtract} "
+            "entries (each may also carry 'invert' and 'feather'), or the "
+            "legacy pair with window.enabled or key.enabled on. A mask that "
+            "selects everything is not a mask: leave --mask off for that.")
+    return layer
+
+
+def mask_stack_matte_ids(layer: dict) -> list[str]:
+    """Every matte id the stack's matte components name, in stack order."""
+    out = []
+    for _j, comp in stack_components(layer):
+        if component_type(comp) != "matte":
+            continue
+        matte_id = str(component_matte_ref(comp).get("id") or "").strip()
+        if matte_id and matte_id not in out:
+            out.append(matte_id)
+    return out
+
+
+def _mask_weight_for_frame(mask: dict, t: float, rgb, size: tuple):
+    """The HxW weight array for `stats --mask`, and its warnings (gap 19).
+
+    `rgb` is the frame being measured, uint8 (h, w, 3), display referred: the
+    same pixels a key component sees when this layer renders, so the qualifier
+    keys on the picture actually being measured rather than a second decode of
+    it. `size` is (width, height) of that frame, and the mask is composed at
+    exactly that size, so the weight and the picture line up with no resample
+    in between.
+
+    Every matte component's id is resolved BEFORE composing, and an id that
+    names nothing is refused by name. mask_matte() on its own treats an
+    unresolvable matte as black, which is right for a preview (a queued track
+    still has to draw something) and wrong for a measurement: it would answer
+    "no coverage" for a typo in an id.
+    """
+    import numpy as np                                        # noqa: PLC0415
+    MT = _mattes()
+
+    layer = mask_stack_layer(mask)
+    ensure_matte_root_from_server()                    # checkpoint gap 5
+    warns = []
+    for matte_id in mask_stack_matte_ids(layer):
+        try:
+            minfo = MT.resolve(MT.matte_root(), matte_id)
+            _served, warn = MT.served_frame(minfo, t)
+        except MT.MatteMissing as exc:
+            raise GradeError(f"--mask: {exc}") from exc
+        if warn:
+            warns.append(warn)
+        elif getattr(minfo, "state", "done") != "done":
+            warns.append(f"matte {matte_id} is {minfo.state}, not done yet")
+    for _j, comp in stack_components(layer):
+        if component_type(comp) == "matte" and not str(
+                component_matte_ref(comp).get("id") or "").strip():
+            raise GradeError(
+                "--mask: a matte component has no matte id yet (it needs a "
+                "pick and a track first). Measuring through it would measure "
+                "a black matte and report no coverage.")
+
+    w, h = int(size[0]), int(size[1])
+    picture = np.asarray(rgb, dtype=np.float64) / 255.0
+    weight = mask_matte(layer, {"width": w, "height": h}, picture, t)
+    return np.asarray(weight, dtype=np.float64), warns
+
+
+def parse_mask_arg(value: str) -> dict:
+    """`--mask` as a dict: a path to a JSON file, or inline JSON.
+
+    A file first, because that is what an agent building a stack of several
+    components in a checkpoint actually has, and inline JSON second for the
+    one-liner case. Either way the dict is a layer's own `mask` block, so
+    `python -c "import json;print(json.load(open('preset.json'))['layers'][0]
+    ['mask'])"` piped in here measures exactly the mask that layer renders.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise GradeError("--mask needs a JSON object or a path to one")
+    p = Path(text).expanduser()
+    if p.is_file():
+        try:
+            text = p.read_text()
+        except OSError as exc:
+            raise GradeError(f"--mask {p}: {exc}") from exc
+    elif not text.startswith("{"):
+        raise GradeError(
+            f"--mask: {text!r} is neither an existing file nor JSON (a JSON "
+            f"object starts with '{{'). Pass the mask block of a layer, e.g. "
+            f"--mask '{{\"components\": [{{\"type\": \"matte\", \"op\": "
+            f"\"add\", \"matte\": {{\"id\": \"m_abc\"}}}}]}}'")
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise GradeError(f"--mask is not valid JSON: {exc}") from exc
+    if not isinstance(out, dict):
+        raise GradeError(
+            f"--mask has to be a JSON object (a layer's own 'mask' block), "
+            f"got {type(out).__name__}")
+    # A whole layer, or a whole preset, pasted in by mistake: reach for the
+    # mask block rather than refusing something that plainly contains one.
+    if "mask" in out and not any(
+            k in out for k in ("components", "window", "key", "finesse")):
+        out = out["mask"] or {}
+    return out
+
+
 def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
-                       width=None, matte=None) -> dict:
+                       width=None, matte=None, mask=None) -> dict:
     """One graded frame of `a.input`, measured through grade.stats.frame_stats.
 
     The same numbers `POST /api/stats` returns for the same clip, config,
@@ -4401,6 +4661,14 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
     (a fallback to its nearest written frame, or a state short of `done`)
     land on the returned row's own `"warnings"` list, the same field name
     contract C1 uses for a partial matte on a frame response.
+
+    `mask`, a layer's own `mask` block (checkpoint gap 19), weights the
+    measurement by the WHOLE composed stack instead of one matte id, through
+    the engine's own `mask_matte`. Refused together with `matte` (two ways to
+    say one thing) and with `region` (a component stack is written in the
+    whole frame's coordinates; see `cmd_stats`). Any row measured through a
+    weight, either kind, also carries `coverage`, and `no_coverage: true` on a
+    frame the mask covers nothing of.
     """
     import numpy as np                                        # noqa: PLC0415
     from stats import frame_stats                            # noqa: PLC0415
@@ -4418,6 +4686,12 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
                          + r.stderr.decode("utf-8", "replace")[-1200:])
     rgb = np.frombuffer(r.stdout[:want], np.uint8).reshape(h, w, 3)
     weight, warns = (None, [])
+    if matte and mask is not None:
+        raise GradeError(
+            "--matte and --mask both weight the measurement; use one. "
+            "--matte ID is the one-component shortcut for "
+            "--mask '{\"components\": [{\"type\": \"matte\", \"op\": \"add\", "
+            "\"matte\": {\"id\": \"ID\"}}]}'")
     if matte:
         weight, warns = _matte_weight_for_frame(matte, t, region, info)
         if weight.shape != (h, w):
@@ -4426,9 +4700,22 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
                 Image.fromarray((np.clip(weight, 0.0, 1.0) * 255.0)
                                 .astype("uint8")).resize((w, h), Image.BILINEAR),
                 dtype=np.float32) / 255.0
+    elif mask is not None:
+        # Composed at the measured frame's own size (gap 19), so no resample
+        # sits between the weight and the picture it weights.
+        weight, warns = _mask_weight_for_frame(mask, t, rgb, (w, h))
     row = {"time": t, "key": f"{Path(src).name}@{t:g}s",
           "size": [w, h], "measured_width": int(w),
           "stats": frame_stats(rgb, weight=weight)}
+    if weight is not None:
+        # Gap 19: the coverage of the mask actually measured through, beside
+        # the width it was measured at, so a row says what it looked at as
+        # well as what it found. Also hoisted out of `stats` so a script
+        # looping over timestamps can skip an empty frame with one read.
+        row["coverage"] = row["stats"].get("coverage")
+        row["no_coverage"] = bool(row["stats"].get("no_coverage"))
+        if mask is not None:
+            row["mask_mattes"] = mask_stack_matte_ids(mask_stack_layer(mask))
     if warns:
         row["warnings"] = warns
     return row
@@ -4437,14 +4724,25 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
 def _print_stats_block(label: str, row: dict) -> None:
     s = row["stats"]
     w, h = row["size"]
-    lu, sa, ch, fam = s["luma"], s["saturation"], s["channels"], s["families"]
-    cl, bd = s["clipped"], s["bands"]
     # "measured at N wide" spelled out, not left to be inferred from the
     # size (checkpoint gap 11): this CLI measures the source's own
     # resolution while POST /api/stats measures a 640 wide preview unless
     # told otherwise, and mixing the two paths for one anchor silently
     # compares two different samples.
-    print(f"{label}  {w}x{h}  measured at {w} wide")
+    head = f"{label}  {w}x{h}  measured at {w} wide"
+    if s.get("coverage") is not None:
+        head += f"  mask coverage {s['coverage']:.6f}"
+    print(head)
+    # Checkpoint gap 23: a mask that covers nothing in this frame is an
+    # ordinary row, printed and moved past, not a crash halfway down a list
+    # of timestamps. The numbers are absent rather than zero, because zero
+    # would read as a real measurement of a black frame.
+    if s.get("no_coverage"):
+        print("  no coverage: the mask covers no pixel of this frame, so "
+              "there is nothing to measure here")
+        return
+    lu, sa, ch, fam = s["luma"], s["saturation"], s["channels"], s["families"]
+    cl, bd = s["clipped"], s["bands"]
     print(f"  luma     p5 {lu['p5']:.4f}  p25 {lu['p25']:.4f}  p50 {lu['p50']:.4f}  "
           f"p75 {lu['p75']:.4f}  p95 {lu['p95']:.4f}  mean {lu['mean']:.4f} "
           f"({lu['mean8']:.1f}/255)")
@@ -4511,17 +4809,56 @@ def cmd_stats(a):
     cropping first and the matte weighting what is left (contract C4). See
     "Masks" in `.claude/skills/studio-grading/SKILL.md` for how to pick,
     track, verify and measure by a matte before relying on this flag.
+
+    `--mask JSON_OR_FILE` (checkpoint gap 19) weights the measurement by a
+    whole mask STACK instead of one matte id: the same dict a layer's own
+    `mask` block is, so "the person matte intersected with a skin key" is one
+    call and what is measured is what that layer renders. A clip only, and
+    refused together with `--matte` (two ways to say one thing) or `--region`.
+    The region refusal is not laziness: a component stack is written in the
+    whole frame's coordinates (a window's fractions are fractions of the
+    frame, a matte's pixels are aligned to it), so composing it inside a crop
+    would move every shape. A stack can say any rectangle itself with a
+    `window` component, so nothing is out of reach.
+
+    Every measurement taken through a weight, `--matte` or `--mask`, also
+    reports `coverage` (how much of the frame the mask covers) and, on a
+    frame it covers nothing of, `no_coverage: true` with the numbers null
+    instead of an error (checkpoint gap 23), so a loop over timestamps
+    survives the frames where a tracked subject is genuinely not there.
     """
     from stats import frame_stats, decode_image              # noqa: PLC0415
 
     region = getattr(a, "region", None)
     matte = getattr(a, "matte", None)
+    mask_arg = getattr(a, "mask", None)
+    # `is not None` throughout, never truthiness: `--mask '{}'` parses to an
+    # empty dict, and a falsy check would drop it and measure the whole frame
+    # while the caller believed a mask was applied. It is refused instead.
+    mask = parse_mask_arg(mask_arg) if mask_arg else None
+    if mask is not None:
+        mask_stack_layer(mask)               # refuse a no-op mask up front
     if a.image and a.input:
         raise GradeError(
             f"stats got both a clip ({a.input!r}) and --image "
             f"({a.image!r}); use one or the other, not both")
     if a.image and matte:
         raise GradeError("--matte measures a clip; --image is one still")
+    if a.image and mask is not None:
+        raise GradeError("--mask measures a clip; --image is one still")
+    if matte and mask is not None:
+        raise GradeError(
+            "--matte and --mask both weight the measurement; use one. "
+            "--matte ID is the one-component shortcut for "
+            "--mask '{\"components\": [{\"type\": \"matte\", \"op\": \"add\", "
+            "\"matte\": {\"id\": \"ID\"}}]}'")
+    if mask is not None and region is not None:
+        raise GradeError(
+            "--mask and --region do not compose: a component stack is written "
+            "in the whole frame's coordinates, so composing it inside a crop "
+            "would move every window and misalign every matte. Say the "
+            "rectangle with a window component inside --mask instead, or drop "
+            "--region.")
     if a.image:
         if getattr(a, "times", None):
             raise GradeError("--times measures a clip; --image is one still")
@@ -4562,11 +4899,13 @@ def cmd_stats(a):
     info = probe(a.input, rotation=cli_rotation(a, cfg))
     if getattr(a, "times", None):
         times = [float(t) for t in a.times.split(",")]
-        results = [_grade_frame_stats(a, cfg, info, t, region, matte=matte)
+        results = [_grade_frame_stats(a, cfg, info, t, region, matte=matte,
+                                      mask=mask)
                   for t in times]
         _print_stats(a, {"results": results})
         return
-    row = _grade_frame_stats(a, cfg, info, a.time, region, matte=matte)
+    row = _grade_frame_stats(a, cfg, info, a.time, region, matte=matte,
+                             mask=mask)
     # _grade_frame_stats always stamps "time" on, because the --times list
     # above needs it on every row; a single frame has no second row to tell
     # itself apart from, so it is dropped here to match --image's envelope
@@ -5841,10 +6180,28 @@ def _cmd_mask_track(a, base: str, hdr: dict) -> None:
                 # Checkpoint gap 12: a cache hit has no job to wait on, and
                 # that is not an error. Say which matte answered instead of
                 # dying on a missing job_id.
+                #
+                # Round 1 finding 5: this line used to say "already covers
+                # this request" on nothing but the presence of `cached`,
+                # which was a lie whenever the request was wider than the
+                # matte (the old server clamped the ask down to the matte's
+                # own length, so `--end 6` after `--end 2` "matched"). The
+                # server now reports the frame window it judged covered, so
+                # print those two numbers and let the reader check them. An
+                # older studio that sends no window gets a message that
+                # claims only what it actually knows.
                 mattes = ", ".join(str(m.get("matte_id"))
                                    for m in (queued.get("mattes") or []))
-                print(f"cached: {mattes or '(none)'} already covers this "
-                     f"request, nothing to wait on", file=sys.stderr)
+                s_f = queued.get("start_frame")
+                e_f = queued.get("end_frame")
+                if s_f is not None and e_f is not None:
+                    covered = (f"already holds frames {s_f} to {e_f}, the "
+                              f"window this request asked for")
+                else:
+                    covered = ("answered this request (this studio did not "
+                              "say which frames it checked)")
+                print(f"cached: {mattes or '(none)'} {covered}, nothing to "
+                     f"wait on", file=sys.stderr)
             else:
                 raise GradeError(
                     f"mask track did not return a job_id to wait on: {out}")
@@ -5857,6 +6214,18 @@ def _cmd_mask_track(a, base: str, hdr: dict) -> None:
         print(f"  {queued['message']}", file=sys.stderr)
     state = out.get("state") or ("cached" if queued.get("cached") else "?")
     print(f"job {job_id}  state={state}")
+    # Round 1 finding 5 again, on the human readable path: the frames this
+    # call actually queued, and which of the four things happened to get
+    # them. Without this line a widen (frames outside an existing matte
+    # re-queued, the ones inside it kept) is indistinguishable on screen
+    # from a plain first track, which is how the bug survived a whole arc.
+    if queued.get("start_frame") is not None:
+        kind = ("widened" if queued.get("widened") else
+                "resumed" if queued.get("resumed") else
+                "restarted" if queued.get("restarted") else
+                "cached" if queued.get("cached") else "queued")
+        print(f"  frames    {queued['start_frame']} to "
+             f"{queued.get('end_frame')}  ({kind})")
     for m in queued.get("mattes") or out.get("mattes") or []:
         print(f"  matte {m.get('matte_id')}  state={m.get('state')}")
 
@@ -6652,7 +7021,31 @@ def main():
                          "region crops first, the matte weights what is "
                          "left); a clip only, refused with --image. Read "
                          "off disk through grade/mattes.py, not a server "
-                         "call, so no --port/--url is needed for this flag")
+                         "call, so no --port/--url is needed for this flag. A "
+                         "frame the matte covers nothing of is a no coverage "
+                         "row (coverage 0, every block null, no_coverage true) "
+                         "and exit 0, not an error, so --times survives a "
+                         "frame the subject has left")
+    st.add_argument("--mask", metavar="JSON_OR_FILE",
+                    help="weight the measurement by a whole mask STACK: a "
+                         "layer's own mask block, as inline JSON or a path to "
+                         "a JSON file, e.g. '{\"components\": [{\"type\": "
+                         "\"matte\", \"op\": \"add\", \"matte\": {\"id\": "
+                         "\"m_abc\"}}, {\"type\": \"key\", \"op\": "
+                         "\"intersect\", \"key\": {\"hue_center\": 17, "
+                         "\"hue_width\": 26}}]}' measures a person matte "
+                         "intersected with a skin key in one call. Components "
+                         "are matte/key/luma/window, ops add/intersect/"
+                         "subtract, each with its own invert and feather, plus "
+                         "the finesse block, folded by the engine's own "
+                         "mask_matte so a measurement and a render agree. A "
+                         "clip only; refused with --matte (--matte ID is the "
+                         "one-component shortcut) and with --region (a stack "
+                         "is written in the whole frame's coordinates: say the "
+                         "rectangle with a window component instead). The "
+                         "answer adds coverage, no_coverage and mask_mattes "
+                         "beside measured_width; a stack that covers no pixel "
+                         "of a frame is a no coverage row, not an error")
     st.set_defaults(fn=cmd_stats)
 
     sw = sub.add_parser(

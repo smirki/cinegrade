@@ -15,18 +15,34 @@ rather than inferred.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (FAILED, call, centroid, check, free_port, load_mask,     # noqa: E402
-                    make_frames, make_video, report, start, stop, wait_for_job)
+                    make_frames, make_video, report, skip, start, stop,
+                    wait_for_job)
 
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="sam-e2e-"))
+    try:
+        return _run(tmp)
+    finally:
+        # Removed however this ended: this suite writes mattes, PNG picks and a
+        # decoded clip and used to leave the whole tree in /var/folders on every
+        # run (round 1 finding 41). Best effort, because a failed run's evidence
+        # is worth less than a suite that cannot finish.
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run(tmp: Path) -> int:
     frames_dir = make_frames(tmp / "clip_frames", count=24)
     video = make_video(tmp / "clip.mp4", seconds=1)
     port = free_port()
@@ -64,7 +80,22 @@ def main() -> int:
               and all(0.0 <= i["area"] <= 1.0 for i in pick["instances"]))
         check("a semantic union mask is written too",
               pick["semantic"] and Path(pick["semantic"]).is_file())
-        check("the call is timed", pick["elapsed_s"] >= 0)
+        # A real measurement, not `>= 0`, which a hardcoded zero satisfied
+        # (round 1 finding 39). The still is big enough that the stub's own
+        # ellipse rendering takes milliseconds rather than microseconds, so
+        # "greater than zero" is a statement about the clock and not a race.
+        big = tmp / "big.png"
+        Image.fromarray(np.zeros((720, 1280, 3), dtype=np.uint8)).save(big)
+        began = time.time()
+        timed = call(base, "/segment", {"image": str(big), "max_instances": 4,
+                                        "prompts": {"text": ["person", "sky",
+                                                             "car", "tree"]}})
+        wall = time.time() - began
+        check("the call is timed with the service's own clock: elapsed_s is "
+              "above zero and inside the wall clock the caller measured",
+              isinstance(timed["elapsed_s"], float) and timed["elapsed_s"] > 0.0
+              and timed["elapsed_s"] <= wall,
+              f"{timed['elapsed_s']}s inside {wall:.3f}s")
         check("a pick id comes back, so a track can be seeded from it",
               pick["pick_id"].startswith("p_"))
         check("exemplars are accepted and the answer says they did nothing",
@@ -97,10 +128,30 @@ def main() -> int:
         check("track answers at once with a job id and matte ids",
               job["job_id"].startswith("j_") and len(job["matte_ids"]) == 1,
               str(job["matte_ids"]))
-        check("the matte exists in state queued before any work is done",
-              job["mattes"][0]["state"] in ("queued", "running", "done"))
-        check("the job knows how many frames it will do", job["total_frames"] == 24)
         matte_dir = Path(job["mattes"][0]["path"])
+        # What the old check here asserted was "the state is one of the three
+        # states it could possibly be in", which no behaviour can fail (round 1
+        # finding 39). The state before any work is done is proved
+        # deterministically further down, by cancelling a job that is still
+        # queued behind another one. What is worth asserting here is that the
+        # matte is on disk with the header the caller asked for, the instant
+        # track answers, so a reader never meets a job whose matte does not
+        # exist yet.
+        opened = json.loads((matte_dir / "index.json").read_text())
+        check("the matte's index.json is on disk as soon as track answers, "
+              "carrying the clip, rotation and steady the caller asked for",
+              opened["clip"] == "/footage/C015.mov"
+              and opened["clip_key"] == "C015-rot0"
+              and opened["rotation"] == 0 and opened["steady"] == 3
+              and opened["state"] in ("queued", "running"),
+              f"{opened.get('state')} / steady {opened.get('steady')}")
+        check("and its per frame arrays are the length of the whole clip, "
+              "empty, so a reader can plot them before a frame exists",
+              len(opened["areas"]) == 24 and len(opened["scores"]) == 24
+              and len(opened["ious"]) == 24
+              and not any(a is not None for a in opened["areas"]),
+              str(len(opened["areas"])))
+        check("the job knows how many frames it will do", job["total_frames"] == 24)
         check("the matte's directory is under the out_dir the caller gave",
               str(matte_dir).startswith(str(tmp / "data" / "mattes" / "C015-rot0")))
 
@@ -229,7 +280,10 @@ def main() -> int:
                   "CG.probe() reads on the studio side",
                   tagged_index["rotation"] == 90, str(tagged_index["rotation"]))
         else:
-            print(f"  skip: {real_clip} is not on this machine")
+            skip("\"auto\" against a real clip resolves to that clip's own "
+                 "display-matrix tag",
+                 f"{real_clip} is not on this machine, so the one check that "
+                 f"needs a real rotated file could not run")
 
         print("\ntrack: seeded from a pick")
         seeded = call(base, "/track", {

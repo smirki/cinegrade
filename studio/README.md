@@ -294,6 +294,15 @@ content/
       agent_grade.py         the Agent API proof: measure, patch, save, on a loop,
                              now built on grade_client.py instead of its own copies
     tests/                  puppeteer-core UI harness against real Chrome, npm test
+      run.mjs                the spec suite: real server, real SAM stub, real Chrome
+      parity-gate.mjs        GPU versus ffmpeg, every stage, plus the mask
+                             component fixtures (on by default, a FAILED row
+                             fails the gate)
+      mask-stack-ref.mjs     the mask model v2 arithmetic (C1) on plain arrays,
+                             no browser and no GPU: the fold from zero, the three
+                             ops, invert before feather, the finesse order, the
+                             two roundings, the frame index and the frame cache.
+                             Run it directly or as spec 31 of run.mjs
     cache/                  derived frames and JPEGs, safe to delete (gitignored,
                              keyed off --data-dir/--cache-dir, see "Run it" above)
   grade/
@@ -304,7 +313,13 @@ content/
     presets/*.json          shared with the CLI, this is where Save writes
     luts/looks/*.cube       the look list, this is where Import writes
     luts/layers/            layer correction cubes, one 33 point cube per layer (gitignored)
+    luts/masks/             layer mask and window mattes, baked per layer (gitignored)
     luts/slice/             Color Slice / Tetra cubes, 33 point (gitignored)
+                             (these three are GENERATED and hash named; they live
+                             here only for the bare CLI. Under the studio, or with
+                             CINEGRADE_CACHE_DIR/STUDIO_CACHE_DIR/STUDIO_DATA_DIR
+                             set, they live in that run's own cache instead, see
+                             "Per caller identity" below)
     luts/technical/         input transform cubes (HLG, PQ, Rec.709), from
                              grade/tools/make_cst.py, see "Input transforms" below
     out/                    finished renders
@@ -357,8 +372,14 @@ when a `region` was given): read `luma` off `response["stats"]`, not off the
 top level, or the first field access is a `KeyError`. `grade_client.py`'s
 `Studio.stats()` returns that same wrapped shape (`.stats(...)["stats"]`);
 its `brief()` and `diff()` expect the unwrapped inner dict, matching the
-usage in "The first party client module" below. The list below describes
-what lives inside `stats`:
+usage in "The first party client module" below. A WEIGHTED measurement (by
+`matte` or by `mask`, below) adds two more fields at both levels: `coverage`,
+the mean of the weight over the frame, which is the share of the picture the
+numbers were taken from, and `no_coverage`, true on a frame the weight is
+zero everywhere on. On a `no_coverage` row every measurement block is `null`
+rather than 0, because nothing was measured there; see "A frame the mask
+covers nothing of" below. The list below describes what lives inside
+`stats`:
 
 - luma percentiles at 5, 25, 50, 75 and 95, as 0 to 1
 - mean saturation, computed as `(max - min) / max` per pixel. This falls
@@ -434,7 +455,7 @@ defaults, so a partial config is legal everywhere.
 | `state` | GET | defaults, clips (each with a `source` block and rotation tags, see "Input transforms" and "Rotation" below), presets, looks, refs, renders, stat definitions, and this caller's own identity under `caller` |
 | `clips` | GET | probe info for everything in `footage/` |
 | `frame` | POST | render one preview frame, returns JPEG. Takes `region`/`zoom` (see "What the numbers mean" above), `mask_layer` when `mode` is `"mask"` (which layer's matte to show; absent is the first enabled one), and a read only `path` (an absolute file outside the footage root, logins off only, see "Reading a file directly" below) |
-| `stats` | POST | the numbers above for one frame. Takes `ref` (a name under `content/refs`, measured instead of a clip), `times` (a list of seconds, answers `{"results": [...]}` instead of one block), `region`, and the same read only `path` |
+| `stats` | POST | the numbers above for one frame. Takes `ref` (a name under `content/refs`, measured instead of a clip), `times` (a list of seconds, answers `{"results": [...]}` instead of one block), `region`, `width`, the same read only `path`, and one of `matte` (an id) or `mask` (a whole component stack, see `POST /api/stats` below) to weight the measurement |
 | `scope` | POST | histogram, waveform, parade or vectorscope as a JPEG |
 | `thumb` | GET | timeline thumbnail, ungraded |
 | `ref` | GET | a reference image from `content/refs/` |
@@ -565,7 +586,7 @@ which is a human's own live studio.
 | `compare IN -o OUT` | `--time`; `--width` (default 560); `--region`, `--zoom`; `--looks a,b,c`; `--presets a,b,c`; `--open` (Preview.app) | a grid of the same frame under several looks or presets |
 | `scopes IN -o OUT` | `--time`; `--width` (default 700); `--open` | histogram, waveform, parade and vectorscope as one image |
 | `orient IN` | `--time`; `--height` (default 600); `--open`; `--json` (prints `{tag, candidates, rotation_tag_suspect, rotation_tag_note, ...}` instead of rendering the default sheet; see "Rotation" above); `--sheet OUT.jpg` (a labelled 2x2 of the four fixed candidates, 0/90/180/270; independent of `--json`, both together write both and the JSON dict gains a `"sheet"` key naming the path) | the default hand drawn row sheet, a labelled 2x2, the JSON facts, or (with both flags) all of the JSON plus the 2x2; `rotation_tag_suspect` is a prompt to go look, not a verdict, and `rotation_tag_note` says why in one sentence, see "Rotation" |
-| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`); `--matte ID` (weights every percentile, band and hue family by that matte's value, resolved straight off disk under `grade/mattes.py`, no running server needed; `region` crops first, then `matte` weights what is left; refused together with `--image`, a matte measures a clip over time, a still is one frame; a time past what the matte has tracked so far falls back to its nearest written frame and the response gains a `warnings` field saying so; a matte that covers nothing at the requested region and time is refused rather than silently averaged to nothing) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "measured_width", "stats"}` envelope, the numbers live one level down under `stats`; `measured_width` is the width the measurement was actually taken at (the printed block says `1920x1080  measured at 1920 wide`), so two numbers taken at different sizes cannot be compared by accident; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
+| `stats [IN]` | `--time`; `--image FILE` (measure a still instead of a clip; `input` becomes optional and a clip positional given alongside `--image` is refused, naming both; `--preset` and the look/primaries flags are ignored); `--json`; `--region X0 Y0 X1 Y1`; `--times a,b,c` (a list of seconds, prints one row per time instead of one block; not with `--image`); `--matte ID` (weights every percentile, band and hue family by that matte's value, resolved straight off disk under `grade/mattes.py`, no running server needed; `region` crops first, then `matte` weights what is left; refused together with `--image`, a matte measures a clip over time, a still is one frame; a time past what the matte has tracked so far falls back to its nearest written frame and the response gains a `warnings` field saying so; a matte that covers nothing at the requested region and time is a NO COVERAGE row, not a refusal: `coverage` 0, `no_coverage: true`, every measurement block `null`, printed and returned like any other row, so a loop over timestamps survives a frame the subject has walked out of); `--mask JSON_OR_FILE` (a whole mask description instead of one matte id: the same `mask` block a graded layer carries, `{"components": [{"type": "matte|key|luma|window", "op": "add|intersect|subtract", ...}], "finesse": {...}}`, each component with its own `invert` and `feather`, folded by the engine's own `mask_matte`, the code the layer renderer uses, so a measurement and a render agree by construction. Inline JSON or a path to a JSON file; a pasted whole layer dict is accepted and its `mask` block taken. `--mask` with one matte component measures exactly what `--matte ID` measures. The response adds `coverage`, `no_coverage` and `mask_mattes` (the matte ids the stack reached, in stack order) beside `measured_width`. Refused together with `--matte` (two ways to say one thing), with `--region` (a stack is written in the whole frame's coordinates: say the rectangle with a `window` component instead) and with `--image`; refused when the stack starts with an `intersect` or a `subtract` (the fold starts at zero, so the first enabled component has to be an `add`), when the description selects nothing at all (`{}` would measure the whole frame), and when a matte component names an id that does not exist or has no id yet) | the same measurement dict `POST /api/stats` returns, see "What the numbers mean" above; `--json` on a single clip or a single `--image` prints exactly the `{"key", "size", "measured_width", "stats"}` envelope, the numbers live one level down under `stats`; `measured_width` is the width the measurement was actually taken at (the printed block says `1920x1080  measured at 1920 wide`), so two numbers taken at different sizes cannot be compared by accident; `--times` rows come back as `{"results": [...]}`, one `{"time", "key", "size", "stats"}` row per second. A still-format file (`.jpg/.jpeg/.png/.tif/.tiff/.webp`) passed as the clip positional, not via `--image`, is refused and told to use `--image` instead. `--image` on a still is measured as display referred rec709 (a stderr line says so) unless `--input-space`/`--working-space` is given explicitly, in which case that flag now really applies the transform |
 | `sweep IN` | `--time`; `--param DOTTED.PATH` (required, e.g. `fx.halation.strength` or `layers.0.correct.exposure`); `--values v1,v2,...` (required, comma separated: a bool, a number or a string, tried in that order; a leading negative parses unquoted, `--values -0.1,0,0.1`, as well as with an `=`); `--width` (default 640, scaled down from the source, matching `POST /api/stats`'s own default; this used to always measure at the source's full resolution); `--json` (stdout stays pure JSON even with `--sheet`, which then prints its path to stderr instead); `--sheet OUT.jpg` (a labelled panel per value, through the same code `sheet` uses) | one stats row per value; reports what each value measures, never which to pick (no numeric distance score exists anywhere in this tool on purpose) |
 | `sheet A B C -o OUT` | `inputs` (one or more: PNG, JPG, or any ffmpeg-readable video, one frame at `--time` from each); `--height N` / `--width N` (mutually exclusive; default height 480; `--height` fixes every panel's height, `--width` fixes the sheet's own width and solves the shared height); `--grid COLSxROWS` (e.g. `2x3`; default is one row); `--labels a,b,c` (default: each input's filename stem); `--time` (default 0, for any video input); `--region X0 Y0 X1 Y1` (crops each panel to fractions of ITS OWN size, after loading, before the shared height is solved; no `--zoom`, a cropped panel is already rescaled to the shared height afterwards) | a labelled comparison image, common height, padded, mixed aspect ratios never fail |
 | `docs [SECTION]` | `SECTION` (a heading's text, matched case insensitively at any level, skipping headings inside fenced code blocks; omit to list); `--list` (list every heading and exit; a `SECTION` that matches nothing also lists them, rather than failing) | prints one section of this file, or the whole table of contents |
@@ -2324,6 +2345,21 @@ no explicit `--cache-dir` the cache becomes `<data-dir>/cache`; with neither
 it stays `studio/cache`, unaffected), which is what stops a throwaway test
 server from evicting a real one's cached frames just by running alongside it.
 
+That now covers the LUTs the ENGINE bakes as well as the frames the server
+decodes. The three generated cube caches (`luts/layers` for layer
+corrections, `luts/masks` for layer mask and window mattes, `luts/slice` for
+Color Slice and Tetra) are hash named, and they used to be fixed folders
+under `grade/`, so every run on one machine baked into the same three places
+whatever `--data-dir` it was started with: two runs on one clip could land on
+one file, and a run had no folder of its own to point at. They resolve from
+the run's cache root instead. The order is `CINEGRADE_CACHE_DIR`, then
+`STUDIO_CACHE_DIR` (which is what the server sets for its own children), then
+`<STUDIO_DATA_DIR>/cache`, then `grade/` itself as the last fallback for the
+bare CLI, so a plain `cinegrade render` with nothing set writes exactly where
+it always did. Nothing already in `grade/luts` moved or was deleted; the
+shipped inputs (`luts/looks`, `luts/technical`) are not caches and never
+resolve this way.
+
 The request log is one line per request on stderr by default:
 `HH:MM:SS caller METHOD /route clip=NAME status Nms`, with `>N` appended after
 the caller's name while attached to user `N`. `--quiet` turns it off, except
@@ -2607,6 +2643,38 @@ out (`{"mattes": [...], "full": false}`); `?full=1` puts `areas`, `scores`
 and `ious` back. One matte by id always carries them, because `cinegrade mask
 show ID --strip` plots its area curve from exactly that response.
 
+`GET /api/matte` with NO `clip` lists the whole store, filtered to the mattes
+the caller may read: the same read guard `?clip=` runs, per matte, dropping
+what this account has not been shown rather than refusing the whole list. It
+matters because a summary carries the clip's own file name and the matte's
+recipe, which for a text prompt is the prompt words. With logins off the guard
+is a no-op, so a local or agent caller sees everything, as before.
+
+**A matte id is an id, never a path.** One pattern everywhere an id enters
+(these three routes, `cinegrade --matte`, `grade_client.matte`/`matte_frame`/
+`stats(matte=)`, and `mattes.resolve()` itself): a name of letters, digits,
+underscore, dot and hyphen, up to 64 of them, starting with a letter or a
+digit (`grade/mattes.py`'s `MATTE_ID_PATTERN`, the service's own ids being
+`m_` plus a 12 hex digit digest). Anything else is a 404 on all three
+`matte/...` routes, and a matte directory that leaves the store through a
+symlink is a 404 too. `DELETE /api/matte/<id>` then asks the same two
+questions again of the directory it is about to remove and answers 400 when it
+is not inside the store or holds no `index.json` and no frames: with logins
+off both the read guard and the admin gate are no-ops, so that check is the
+only thing standing between the request and an `rmtree`. Before this an id was
+allowed to BE a path, so `DELETE /api/matte//path/to/anything` deleted any
+directory on the machine, footage and `studio/data` included.
+
+**A matte belongs to one clip.** `POST /api/stats` (both `matte: ID` and a
+`mask` component stack) and `POST /api/render` (both engines, whatever
+`allow_partial` says) refuse a matte whose `clip_key` names a different clip,
+in a message naming both clips, and the render's refusal also names the layer
+and the component. Nothing outside the browser used to check this, so a
+landscape clip measured through a portrait matte from another clip answered
+with numbers, no warning and exit 0. A matte with no `clip_key` recorded (a
+hand built fixture) cannot be checked and is allowed through, so the refusal
+only ever fires on a matte that positively names another clip.
+
 `span` is the window the matte really answers for, computed from the frames on
 disk rather than the declared `frames` count: `{"start_frame", "end_frame"
 (exclusive), "written", "declared_frames", "contiguous", "start_s", "end_s",
@@ -2671,6 +2739,58 @@ way it does without a matte. `POST /api/frame`'s shape is unchanged; a
 `warnings` field may name a matte that fell back to its nearest written
 frame.
 
+**`POST /api/stats {"mask": {...}}`** measures through a whole mask
+DESCRIPTION rather than one matte id. `mask` is the same block a graded layer
+carries: `components`, a list of `{"type": "matte"|"key"|"luma"|"window",
+"op": "add"|"intersect"|"subtract"}` entries, each with its own `invert` and
+`feather`, plus the `finesse` block (`clean_black`, `clean_white`, `grow`,
+`blur`) and a final `invert` on the result. So "the person matte intersected
+with a skin key", the measurement a skin anchor is actually built on, is one
+documented call:
+
+```json
+{"clip": "A001.mov", "time": 1.5, "width": 960, "config": {},
+ "mask": {"components": [
+   {"type": "matte", "op": "add", "matte": {"id": "m_5214be94f217"}},
+   {"type": "key", "op": "intersect",
+    "key": {"hue_center": 17, "hue_width": 26, "hue_soft": 5,
+            "sat_low": 0.18, "sat_high": 0.85,
+            "lum_low": 0.12, "lum_high": 0.9}}]}}
+```
+
+The stack is folded by `cinegrade.mask_matte`, the engine's own numpy
+reference for a layer's matte and the code the parity suite renders against,
+at the measured frame's own size, so a measurement and a render agree by
+construction instead of by a separate proof. A one component matte stack
+returns exactly what `"matte": ID` returns; that shortcut form keeps working
+untouched. The answer adds `coverage` (the share of the frame the weight
+covers), `no_coverage`, and `mask_mattes` (the matte ids the stack reached,
+in stack order) beside `measured_width`, on a single row and on every `times`
+row. Refused 400: `mask` together with `matte`, `mask` together with `region`
+(a stack is written in the whole frame's coordinates, so composing it inside
+a crop would move every window and misalign every matte: say the rectangle
+with a `window` component instead), a `mask` that is not an object, a stack
+whose first enabled component is an `intersect` or a `subtract` (the fold
+starts at zero, so nothing would reach the matte), and a description that
+selects nothing at all, including `{}`, which would otherwise measure the
+whole frame while the caller believed a mask was applied. A matte id in the
+stack that names nothing is 404, and a matte component with no id yet (still
+waiting on a pick and a track) is refused rather than measured as black.
+`cinegrade stats --mask JSON_OR_FILE` and `Studio.stats(..., mask=...)` /
+`Studio.stats_at(..., mask=...)` are the same thing on the CLI and in the
+client.
+
+**A frame the mask covers nothing of.** A weight that sums to zero (the
+subject left the frame, the key found no skin at this second) used to be a
+`StatsError`, which meant a 400 on the route and a non zero exit on the CLI,
+which killed any loop over timestamps at the first empty frame. It is a
+normal answer now: `coverage` 0, `no_coverage: true`, and every measurement
+block (`luma`, `saturation`, `channels`, `families`, `clipped`, `bands`)
+`null` rather than 0, so nothing averages a frame that was never measured.
+The CLI prints `no coverage: the mask covers no pixel of this frame ...` in
+place of the numbers and exits 0. Only a weight of the wrong SHAPE is still
+an error, since that is a caller bug rather than a fact about the frame.
+
 `cinegrade mask segment|track|jobs|list|show` and `cinegrade stats --matte`
 are the CLI equivalents ("CLI reference" above); `.claude/skills/
 studio-grading/SKILL.md`'s Masks section covers the method: verifying a
@@ -2729,8 +2849,10 @@ studio.grade_save(clip, {"primaries": {"saturation": 1.1}}, message="warmer")
 ```
 
 Methods: `state`, `health`, `whoami`, `project_open(clip, rotation=None,
-by=None)`, `project`, `frame`, `stats(..., matte=None)`, `stats_at(clip,
-times, ..., matte=None)`, `ref_stats`, `match`, `segment(clip, time=0.0,
+by=None)`, `project`, `frame`, `stats(..., matte=None,
+mask=None)`, `stats_at(clip, times, ..., matte=None, mask=None)` (`mask` is a
+whole component stack, see `POST /api/stats` above; one of the two, not
+both), `ref_stats`, `match`, `segment(clip, time=0.0,
 prompts=None, text=None, points=None, boxes=None, exemplars=None,
 rotation=None)`, `track(clip, text=None, pick_id=None, select=None,
 start=None, end=None, steady=None, rotation=None, prompts=None,

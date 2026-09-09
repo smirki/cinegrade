@@ -5,8 +5,10 @@ that prints a line per assertion and collects failures, no test framework and
 therefore no extra dependency in the service's uv project.
 
 Every server started here runs on a random high port with its own temporary
-data directory, and is stopped by the process id captured at spawn. Ports
-7431, 7614, 7615 and 7560 are never used by a test.
+data directory, and is stopped by the process id captured at spawn. Which
+ports are never used by a test is `sam/ports.py`, one list read by everything
+that picks a port: four copies of it used to disagree and none of them covered
+a port that was live at the time (round 1 finding 20).
 """
 
 from __future__ import annotations
@@ -31,10 +33,18 @@ ROOT = SAM.parent
 # The project's own interpreter, so a test never depends on which shell it was
 # started from. `uv run --project sam` creates and fills this.
 PYTHON = SAM / ".venv" / "bin" / "python"
-FORBIDDEN_PORTS = {7431, 7560, 7614, 7615}
+if str(SAM) not in sys.path:
+    sys.path.insert(0, str(SAM))
+from ports import FORBIDDEN_PORTS, PORT_RANGE                  # noqa: E402
 
 FAILED: list[str] = []
 STEPS = 0
+# Checks that could not run, with the reason. Counted and printed separately:
+# a suite that quietly drops four checks when a clip is missing used to shrink
+# the numerator and the denominator together, so 358/358 stayed 358/358 and a
+# reader could not see that anything had stopped being tested (round 1
+# finding 41).
+SKIPPED: list[str] = []
 
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
@@ -47,9 +57,16 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def skip(label: str, why: str) -> None:
+    """A check that could not run. Never counted as a pass: it prints as a skip
+    here and again in the gate's summary (round 1 finding 41)."""
+    print(f"  SKIP {label}   {why}", flush=True)
+    SKIPPED.append(f"{label} ({why})")
+
+
 def free_port() -> int:
     for _ in range(200):
-        port = random.randint(20000, 60000)
+        port = random.randint(*PORT_RANGE)
         if port in FORBIDDEN_PORTS:
             continue
         with socket.socket() as probe:
@@ -169,7 +186,14 @@ def make_video(path: Path, seconds: int = 1, fps: int = 24,
 
 
 def report(name: str) -> int:
+    """The line `sam/tests/run.py` parses. Skips are printed on their own line
+    with their own count, so the gate can add them up and say so instead of a
+    smaller total looking identical to a passing one (round 1 finding 41)."""
     print(f"\n{name}: {STEPS - len(FAILED)}/{STEPS} checks passed")
+    if SKIPPED:
+        print(f"{name}: {len(SKIPPED)} checks skipped")
+        for line in SKIPPED:
+            print(f"  SKIPPED: {line}")
     if FAILED:
         for line in FAILED:
             print(f"  FAILED: {line}")

@@ -27,7 +27,7 @@ sys.path.insert(0, str(TESTS))
 warnings.filterwarnings("ignore", module="colour")
 
 import harness as H           # noqa: E402
-from suite import Suite, FAIL, ERROR, XPASS   # noqa: E402
+from suite import Suite, FAIL, ERROR, XPASS, SKIP   # noqa: E402
 
 import cases_color            # noqa: E402
 import cases_golden           # noqa: E402
@@ -52,13 +52,24 @@ import cases_sheet            # noqa: E402
 import cases_input            # noqa: E402
 import cases_stats            # noqa: E402
 import cases_mask             # noqa: E402
+import cases_harness          # noqa: E402
+
+# Round 1 finding 41: the number of tests this suite is declared to
+# register, checked at the end of a full run. A FLOOR, not an equality: adding
+# tests must never turn a run red, and several lanes add to these modules.
+# What it catches is the opposite case, a module that quietly stops
+# registering (a rename, a bad merge, a `register()` that returns early), which
+# used to shrink both the numerator and the denominator of the printed total
+# and stay green.
+EXPECTED_TESTS = 341
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,
            cases_slice, cases_grain, cases_layers, cases_detail,
            cases_rotation, cases_match_crop, cases_region, cases_cli,
            cases_cli_project, cases_cli_render, cases_cli_agent,
-           cases_sheet, cases_input, cases_stats, cases_mask]
+           cases_sheet, cases_input, cases_stats, cases_mask,
+           cases_harness]
 
 
 def main():
@@ -97,8 +108,10 @@ def main():
         print("UPDATE MODE: golden fingerprints will be rewritten, not checked.\n")
 
     H.WORK.mkdir(parents=True, exist_ok=True)
-    # Files the engine's caches already held before the run. Anything in that
-    # set is left alone even if the suite used it.
+    # Round 1 finding 44: this run's generated caches live under its own
+    # scratch (harness.CACHE_ROOT), so nothing here can delete a file another
+    # run is using. `pre_existing` is kept for the case where a test points
+    # the engine somewhere else on purpose.
     pre_existing = set()
     for d in H.CACHE_DIRS:
         if d.exists():
@@ -107,10 +120,26 @@ def main():
     suite.run(only_groups=a.group, only_names=a.name, verbose=a.verbose)
 
     rs = H.render_stats()
-    counts = suite.print_summary(extra_lines=[
-        f"{rs['renders']} ffmpeg renders, {rs['cache_hits']} served from cache, "
-        f"{rs['ffmpeg_seconds']:.1f}s in ffmpeg",
-    ])
+    counts = suite.summary()
+    skipped = [r for r in suite.results if r["status"] == SKIP]
+    extra = [f"{rs['renders']} ffmpeg renders, {rs['cache_hits']} served from "
+             f"cache, {rs['ffmpeg_seconds']:.1f}s in ffmpeg",
+             f"generated caches under {H.CACHE_ROOT} (this run's own)"]
+    # Round 1 finding 41: a skip used to be a quieter green line and nothing
+    # else, so a fixture going missing shrank the reported total with no
+    # reader able to see it. Every skip is now named in the summary, and the
+    # declared floor below fails the run when the suite shrinks at all.
+    if skipped:
+        extra.append(f"{len(skipped)} SKIPPED, each one a check that did not "
+                     f"run:")
+        extra += [f"  {r['test'].full}: {r['ctx'].skip_reason}"
+                  for r in skipped]
+    ran = len(suite.results)
+    selected = bool(a.group or a.name)
+    if not selected:
+        extra.append(f"{ran} of {len(suite.tests)} registered tests ran "
+                     f"(declared floor {EXPECTED_TESTS})")
+    counts = suite.print_summary(extra_lines=extra)
 
     if not a.keep_work:
         if H.WORK.exists():
@@ -130,9 +159,15 @@ def main():
                 removed += 1
         if removed:
             print(f"  cleaned up {removed} cache files this run baked "
-                  f"under grade/luts/")
+                  f"outside its own cache root")
 
     bad = counts.get(FAIL, 0) + counts.get(ERROR, 0) + counts.get(XPASS, 0)
+    if not selected and len(suite.tests) < EXPECTED_TESTS:
+        print(f"  FAIL  {len(suite.tests)} tests are registered, fewer than "
+              f"the {EXPECTED_TESTS} this suite declares: a cases_*.py module "
+              f"stopped registering. Raise EXPECTED_TESTS when you add tests; "
+              f"lowering it to make a run green is what it exists to stop.")
+        bad += 1
     return 1 if bad else 0
 
 

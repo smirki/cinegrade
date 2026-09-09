@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,15 @@ ENGINE = str(GRADE / "cinegrade.py")
 PASS = 0
 FAIL = 0
 NOTES: list[str] = []
+
+# Round 1 finding 19: the count this suite is declared to run, checked in
+# main(). Three blocks used to be able to vanish on an ImportError and the run
+# still exited 0 behind a smaller printed number, which no reader could tell
+# from a pass. A FLOOR rather than an equality on purpose: adding checks must
+# never turn a suite red, and more than one lane adds to this file, so the
+# rule is "never fewer". Raise it deliberately when you add checks; lowering
+# it to make a run green is the thing this exists to stop.
+EXPECTED_CHECKS = 227
 
 
 def ok(label: str, cond: bool, detail: str = "") -> None:
@@ -100,9 +110,28 @@ def test_mask_cli(base: str) -> None:
         r2 = run_cli(["mask", "segment", "C015.mov", "--time", "1.0",
                      "--text", "person", "--json", "-o", d], env=env)
         ok("segment -o DIR: exit 0", r2.returncode == 0, r2.stderr[-300:])
-        files = list(Path(d).glob("*.png"))
-        ok("segment -o DIR: downloaded overlay+mask files", len(files) == 4,
-           f"found {len(files)}: {[f.name for f in files]}")
+        # A `*` glob, not `*.png` (round 1 finding 16): the CLI takes the
+        # extension from the preview URL, and the real server's preview URLs
+        # (/api/mask/pick/<pick>/<inst>/overlay) have none, so every file is
+        # named .png whatever the bytes are. Counting only *.png hid that.
+        files = sorted(q for q in Path(d).iterdir() if q.is_file())
+        ok("segment -o DIR: downloaded one overlay and one mask per instance",
+           len(files) == 4, f"found {len(files)}: {[f.name for f in files]}")
+        heads = {q.name: q.read_bytes()[:4] for q in files}
+        ok("segment -o DIR: every downloaded preview is real image bytes",
+           all(v.startswith(b"\x89PNG") or v.startswith(b"\xff\xd8\xff")
+               for v in heads.values()), heads)
+        jpegs = sorted(name for name, v in heads.items()
+                       if v.startswith(b"\xff\xd8\xff"))
+        if jpegs:
+            # Recorded, not asserted as correct: the mislabel is in
+            # `_cmd_mask_segment` (grade/cinegrade.py), which this lane does
+            # not own. See ROUND1-FIXES-tests.md, finding 16.
+            note(f"the overlay preview arrives as image/jpeg (the real "
+                 f"server's own content type for an overlay) and is written "
+                 f"into a .png name, because the extension comes from a URL "
+                 f"that has none: {jpegs}. CLI lane's to fix in "
+                 f"_cmd_mask_segment")
 
     r3 = run_cli(["mask", "track", "C015.mov", "--text", "person",
                  "--wait", "--json"], env=env)
@@ -128,7 +157,23 @@ def test_mask_cli(base: str) -> None:
     r5 = run_cli(["mask", "jobs", "--json"], env=env)
     ok("jobs: exit 0", r5.returncode == 0, r5.stderr[-300:])
     jobs = json.loads(r5.stdout).get("jobs") or []
-    ok("jobs: at least the two jobs queued above", len(jobs) >= 2, jobs)
+    # Round 1 finding 39: this said `>= 2` when exactly two were queued, so a
+    # queue that leaked a job per call passed too. This block is the first one
+    # main() runs, so two is the whole queue, and each one's state is the
+    # outcome its own track had: one ran to done under --wait, the FAIL_CLIP
+    # one failed.
+    ok("jobs: exactly the two jobs queued above and no others",
+       len(jobs) == 2, jobs)
+    ok("jobs: one finished and one failed, which is what was queued",
+       sorted(j.get("state") for j in jobs) == ["done", "failed"], jobs)
+    # The real server's job view keys this `id` (studio/server.py
+    # `_mask_job_view`), and `_cmd_mask_jobs` falls back to it; the fake used
+    # to send `job_id` so that fallback was never exercised (finding 16).
+    ok("jobs: every row carries the `id` the real server sends",
+       all(bool(j.get("id")) for j in jobs), jobs)
+    r5t = run_cli(["mask", "jobs"], env=env)
+    ok("jobs (text): prints the job ids, not a row of question marks",
+       all(str(j["id"]) in r5t.stdout for j in jobs), r5t.stdout[:300])
 
     r6 = run_cli(["mask", "list", "C015.mov", "--json"], env=env)
     ok("list: exit 0", r6.returncode == 0, r6.stderr[-300:])
@@ -273,11 +318,22 @@ def test_frame_stats_weight() -> None:
        abs(only_left["luma"]["mean"] - expect_luma) < 1e-3,
        (only_left["luma"]["mean"], expect_luma))
 
-    try:
-        ST.frame_stats(rgb, weight=np.zeros((8, 8)))
-        ok("all-zero weight raises StatsError", False)
-    except ST.StatsError:
-        ok("all-zero weight raises StatsError", True)
+    # DELIBERATELY RE-POINTED (gap 23). This used to assert that an all-zero
+    # weight raises StatsError. It does not any more: a mask that happens to
+    # cover no pixel of one frame is a normal thing on a moving subject, not a
+    # broken call, so frame_stats now answers with a no-coverage row that a
+    # caller looping over timestamps can print and move past.
+    empty = ST.frame_stats(rgb, weight=np.zeros((8, 8)))
+    ok("all-zero weight returns a no-coverage row instead of raising",
+       empty.get("no_coverage") is True, empty)
+    ok("no-coverage row says coverage is exactly zero",
+       empty.get("coverage") == 0.0, empty.get("coverage"))
+    ok("no-coverage row nulls every measurement block, it does not zero them",
+       all(empty[name] is None for name in ST.MEASURED_BLOCKS),
+       {name: empty[name] for name in ST.MEASURED_BLOCKS})
+    ok("no-coverage row still carries the definitions block",
+       isinstance(empty.get("definitions"), dict) and bool(empty["definitions"]),
+       empty.get("definitions"))
 
     try:
         ST.frame_stats(rgb, weight=np.ones((3, 3)))
@@ -303,14 +359,15 @@ def _make_synthetic_clip(path: Path) -> None:
 
 
 def test_stats_matte() -> None:
-    print("\n== stats --matte (needs grade/mattes.py, contract C6) ==")
-    try:
-        import mattes as MT
-    except ImportError:
-        note("grade/mattes.py is not on this branch yet (owned by lane M2, "
-            "contract C6); stats --matte was tested for its CLI wiring "
-            "and refusal paths only, see checkpoint")
-        return
+    print("\n== stats --matte (contract C6) ==")
+    # Round 1 finding 19: this block used to open with `try: import mattes
+    # except ImportError: note(...); return`, guarding against grade/mattes.py
+    # "not being on this branch yet". It is on this branch. All that guard
+    # could do was turn a real breakage (a bad import inside mattes.py) into
+    # a quieter green run with dozens of checks silently missing, which the
+    # exit code and the printed total could not distinguish from a pass. A
+    # missing module is now an ImportError that stops the suite.
+    import mattes as MT
 
     with tempfile.TemporaryDirectory(prefix="mask_matte_root_") as root_s:
         root = Path(root_s)
@@ -372,8 +429,56 @@ def test_stats_matte() -> None:
             row = json.loads(r_matte.stdout)
         except json.JSONDecodeError:
             row = {}
-        ok("stats --matte: differs from the plain measurement",
-           row.get("stats") != json.loads(r_plain.stdout).get("stats"))
+        # Round 1 finding 17. This used to be
+        #     row["stats"] != json.loads(r_plain.stdout)["stats"]
+        # with r_plain measured at --time 1.0 and r_matte at --time 0.5: two
+        # different frames, so the two blocks already differ before --matte
+        # does anything. The control below proves that on this very clip (the
+        # saturation mean moves between 0.5 s and 1.0 s), which is why the old
+        # assertion would have passed with --matte implemented as a no-op.
+        #
+        # What replaces it is a hand-checkable equality, not an inequality.
+        # The fixture matte is the LEFT HALF of the frame and nothing else, so
+        # weighting by it must land on what measuring the left half by region
+        # lands on, and nowhere near the right half. Measured on this clip:
+        # plain 0.5022, matte 0.4035, region left 0.3979, region right 0.6065.
+        r_plain_same = run_cli(["stats", str(clip_path), "--time", "0.5",
+                               "--json"], env=env)
+        plain_same = json.loads(r_plain_same.stdout) if \
+            r_plain_same.returncode == 0 else {}
+        ok("control: two unweighted measurements at different times already "
+           "differ, so comparing across times proves nothing about --matte",
+           plain_same.get("stats") != json.loads(r_plain.stdout).get("stats"),
+           (plain_same.get("stats", {}).get("saturation", {}).get("mean"),
+            json.loads(r_plain.stdout).get("stats", {})
+            .get("saturation", {}).get("mean")))
+        r_left = run_cli(["stats", str(clip_path), "--time", "0.5",
+                         "--region", "0", "0", "0.5", "1", "--json"], env=env)
+        r_right = run_cli(["stats", str(clip_path), "--time", "0.5",
+                          "--region", "0.5", "0", "1", "1", "--json"], env=env)
+        left = json.loads(r_left.stdout) if r_left.returncode == 0 else {}
+        right = json.loads(r_right.stdout) if r_right.returncode == 0 else {}
+        m_luma = ((row.get("stats") or {}).get("luma") or {}).get("mean")
+        p_luma = ((plain_same.get("stats") or {}).get("luma") or {}).get("mean")
+        l_luma = ((left.get("stats") or {}).get("luma") or {}).get("mean")
+        r_luma = ((right.get("stats") or {}).get("luma") or {}).get("mean")
+        ok("stats --matte: the weighted mean is not the whole frame's mean, "
+           "measured at the SAME time",
+           None not in (m_luma, p_luma) and abs(m_luma - p_luma) > 0.05,
+           (m_luma, p_luma))
+        ok("stats --matte on a left-half matte reads the left half: it agrees "
+           "with --region 0 0 0.5 1 to better than a code value",
+           None not in (m_luma, l_luma) and abs(m_luma - l_luma) < 0.01,
+           (m_luma, l_luma))
+        ok("... and is nowhere near the half it does not cover",
+           None not in (m_luma, r_luma) and abs(m_luma - r_luma) > 0.15,
+           (m_luma, r_luma))
+        # Finding 39, the same rule on the CLI side: C4's coverage is
+        # written / span_len, and half the frame is 0.5 exactly.
+        ok("stats --matte: coverage is the fraction of the frame the matte "
+           "really covers, to the number",
+           abs(float(row.get("coverage") or 0.0) - 0.5) < 0.02,
+           row.get("coverage"))
 
         r_fallback = run_cli(["stats", str(clip_path), "--time", "2.0",
                              "--matte", "m_partial", "--json"], env=env)
@@ -389,12 +494,45 @@ def test_stats_matte() -> None:
         ok("stats --matte + --region together: exit 0",
            r_region.returncode == 0, r_region.stderr[-500:])
 
+        # Checkpoint gap 23, DELIBERATELY RE-POINTED. This used to assert a
+        # non-zero exit and an error message. A matte that covers nothing in
+        # a frame is a normal, expected outcome (a sky matte after the camera
+        # tilts down, a person matte inside its own tracking gap), and
+        # failing on it meant a script measuring a list of timestamps died on
+        # the first empty one. It is now an ordinary row saying so, and the
+        # numbers are null rather than zero, which a caller cannot mistake
+        # for a real measurement of a black frame.
         r_zero = run_cli(["stats", str(clip_path), "--time", "0.0",
                          "--matte", "m_zero"], env=env)
-        ok("stats --matte with a matte that covers nothing: exits non zero",
-           r_zero.returncode != 0)
-        ok("stats --matte with nothing covered: message says so",
-           "nothing" in r_zero.stderr.lower(), r_zero.stderr[:300])
+        ok("stats --matte with a matte that covers nothing: exits 0 (gap 23)",
+           r_zero.returncode == 0, r_zero.stderr[-300:])
+        ok("stats --matte with nothing covered: the printed row says so",
+           "no coverage" in r_zero.stdout.lower(), r_zero.stdout[:300])
+        r_zero_j = run_cli(["stats", str(clip_path), "--time", "0.0",
+                           "--matte", "m_zero", "--json"], env=env)
+        zrow = json.loads(r_zero_j.stdout) if r_zero_j.returncode == 0 else {}
+        ok("no coverage: the flag is on the row and inside stats",
+           zrow.get("no_coverage") is True
+           and zrow.get("stats", {}).get("no_coverage") is True, zrow)
+        ok("no coverage: coverage is exactly zero",
+           zrow.get("coverage") == 0.0, zrow.get("coverage"))
+        ok("no coverage: every measurement block is null, not zero",
+           all(zrow.get("stats", {}).get(k, "missing") is None
+               for k in ("luma", "saturation", "channels", "families",
+                         "clipped", "bands")),
+           sorted((zrow.get("stats") or {}).items())[:3])
+
+        # A loop over timestamps has to survive the empty ones: one call, one
+        # row per time, the covered frames measured and the empty one flagged.
+        r_times = run_cli(["stats", str(clip_path), "--times", "0.0,0.5",
+                          "--matte", "m_partial", "--json"], env=env)
+        ok("stats --times --matte: exit 0", r_times.returncode == 0,
+           r_times.stderr[-300:])
+        rows = (json.loads(r_times.stdout).get("results")
+                if r_times.returncode == 0 else []) or []
+        ok("stats --times --matte: one row per time", len(rows) == 2, len(rows))
+        ok("stats --times: every row says its coverage",
+           all(r.get("coverage") is not None for r in rows), rows)
 
         r_missing = run_cli(["stats", str(clip_path), "--time", "0.0",
                             "--matte", "does-not-exist"], env=env)
@@ -407,6 +545,162 @@ def test_stats_matte() -> None:
            r_image.returncode != 0 and "still" in r_image.stderr.lower(),
            r_image.stderr[:200])
 
+        _check_stats_mask(clip_path, env)
+
+
+def _check_stats_mask(clip_path: Path, env: dict) -> None:
+    """`stats --mask`: a whole mask STACK, not one matte id (gap 19).
+
+    The measurement the round 4 skin anchor needed, "the person matte
+    intersected with a skin key", could not be said through the documented
+    tools at all, so it was hand built against the engine's internal modules
+    and then separately proved against a real server render before any number
+    from it could be trusted. What is pinned here is the property that makes
+    that proof unnecessary: `--mask` folds the stack with the engine's OWN
+    mask_matte, the same code the layer renderer uses, so the one component
+    stack that names a single matte measures byte for byte what `--matte`
+    measures, and every op then changes the answer in the direction it says.
+    """
+    print("\n== stats --mask, a whole component stack (gap 19) ==")
+
+    def measure(spec, extra=(), time="0.5"):
+        args = ["stats", str(clip_path), "--time", time, "--json"]
+        if spec is not None:
+            args += ["--mask", json.dumps(spec) if isinstance(spec, dict) else spec]
+        r = run_cli(args + list(extra), env=env)
+        if r.returncode != 0:
+            return None, r
+        try:
+            return json.loads(r.stdout), r
+        except json.JSONDecodeError:
+            return None, r
+
+    one_matte = {"components": [{"type": "matte", "op": "add",
+                                 "matte": {"id": "m_partial"}}]}
+    stack_row, r_stack = measure(one_matte)
+    ok("stats --mask (one matte component): exit 0", stack_row is not None,
+       r_stack.stderr[-400:])
+    r_matte = run_cli(["stats", str(clip_path), "--time", "0.5",
+                      "--matte", "m_partial", "--json"], env=env)
+    matte_row = json.loads(r_matte.stdout) if r_matte.returncode == 0 else {}
+    if stack_row:
+        ok("a one-component stack measures exactly what --matte measures: the "
+           "stack is not a second implementation of the fold",
+           stack_row["stats"] == matte_row.get("stats"),
+           (stack_row["stats"]["luma"]["mean"],
+            matte_row.get("stats", {}).get("luma", {}).get("mean")))
+        ok("stats --mask says which mattes it reached",
+           stack_row.get("mask_mattes") == ["m_partial"],
+           stack_row.get("mask_mattes"))
+        ok("stats --mask reports coverage and the width it measured at",
+           stack_row.get("coverage") is not None
+           and stack_row.get("measured_width") == stack_row["size"][0],
+           (stack_row.get("coverage"), stack_row.get("measured_width")))
+
+    # The matte fixture is the LEFT half of the frame. Intersecting it with a
+    # luma key can only take pixels away, subtracting a window can only take
+    # pixels away, and inverting the component turns it into the right half:
+    # three ops, three directions, all against the one number above.
+    base_coverage = (stack_row or {}).get("coverage")
+    narrowed, r_narrow = measure({"components": [
+        {"type": "matte", "op": "add", "matte": {"id": "m_partial"}},
+        {"type": "luma", "op": "intersect",
+         "key": {"lum_low": 0.5, "lum_high": 1.0, "lum_soft": 0.02}}]})
+    ok("stats --mask (matte intersect luma key): exit 0", narrowed is not None,
+       r_narrow.stderr[-400:])
+    if narrowed and base_coverage is not None:
+        ok("intersecting a key with the matte covers LESS of the frame than "
+           "the matte alone", narrowed["coverage"] < base_coverage,
+           (narrowed["coverage"], base_coverage))
+        ok("and the numbers move with it, they are not the matte's own",
+           narrowed["stats"]["luma"]["mean"]
+           != (stack_row or {})["stats"]["luma"]["mean"],
+           (narrowed["stats"]["luma"]["mean"],
+            (stack_row or {})["stats"]["luma"]["mean"]))
+
+    subtracted, r_sub = measure({"components": [
+        {"type": "matte", "op": "add", "matte": {"id": "m_partial"}},
+        {"type": "window", "op": "subtract",
+         "window": {"shape": "rect", "w": 0.5, "h": 0.5, "softness": 0.0}}]})
+    ok("stats --mask (matte subtract window): exit 0", subtracted is not None,
+       r_sub.stderr[-400:])
+    if subtracted and base_coverage is not None:
+        ok("subtracting a window covers less than the matte alone",
+           subtracted["coverage"] < base_coverage,
+           (subtracted["coverage"], base_coverage))
+
+    flipped, r_flip = measure({"components": [
+        {"type": "matte", "op": "add", "matte": {"id": "m_partial"},
+         "invert": True}]})
+    ok("stats --mask (inverted matte component): exit 0", flipped is not None,
+       r_flip.stderr[-400:])
+    if flipped and stack_row:
+        ok("inverting the component measures the other half of the picture",
+           flipped["stats"]["luma"]["mean"] != stack_row["stats"]["luma"]["mean"],
+           (flipped["stats"]["luma"]["mean"],
+            stack_row["stats"]["luma"]["mean"]))
+
+    feathered, r_feather = measure({"components": [
+        {"type": "matte", "op": "add", "matte": {"id": "m_partial"},
+         "feather": 0.05}]})
+    ok("stats --mask honours a component's own feather", feathered is not None,
+       r_feather.stderr[-400:])
+
+    # A mask description can also be a FILE, which is what an agent building a
+    # stack of several components in a checkpoint actually has on disk.
+    spec_file = clip_path.parent / "skin-stack.json"
+    spec_file.write_text(json.dumps(one_matte))
+    from_file, r_file = measure(str(spec_file))
+    ok("stats --mask FILE reads the same description off disk",
+       from_file is not None and from_file["stats"] == (stack_row or {}).get("stats"),
+       r_file.stderr[-400:])
+
+    # A stack that covers nothing is the gap 23 row, not a crash: the same
+    # rule a bare matte id follows.
+    empty, r_empty = measure({"components": [
+        {"type": "matte", "op": "add", "matte": {"id": "m_zero"}}]}, time="0.0")
+    ok("stats --mask on a stack that covers nothing: exit 0 and no_coverage",
+       empty is not None and empty.get("no_coverage") is True,
+       r_empty.stderr[-300:] if empty is None else empty.get("no_coverage"))
+
+    # Refusals. Every one of these would otherwise be a silently wrong number.
+    def refuses(label, args, wanted):
+        r = run_cli(["stats", str(clip_path), "--time", "0.5"] + args, env=env)
+        ok(f"refused: {label}",
+           r.returncode != 0 and wanted in r.stderr.lower(),
+           f"exit {r.returncode}: {r.stderr[-220:]}")
+
+    refuses("--mask with an unknown matte id",
+            ["--mask", json.dumps({"components": [
+                {"type": "matte", "op": "add",
+                 "matte": {"id": "no-such-matte"}}]})], "no-such-matte")
+    refuses("--mask with a matte component that has no id yet",
+            ["--mask", json.dumps({"components": [
+                {"type": "matte", "op": "add", "matte": {"id": ""}}]})],
+            "no matte id yet")
+    refuses("--mask whose stack starts with an intersect (folds from zero)",
+            ["--mask", json.dumps({"components": [
+                {"type": "luma", "op": "intersect"}]})],
+            "no component reaches the matte")
+    refuses("--mask '{}' (an empty description would measure everything)",
+            ["--mask", "{}"], "nothing to measure through")
+    refuses("--mask together with --matte",
+            ["--mask", json.dumps(one_matte), "--matte", "m_partial"],
+            "both weight the measurement")
+    refuses("--mask together with --region",
+            ["--mask", json.dumps(one_matte), "--region", "0", "0", "0.5", "1"],
+            "do not compose")
+    refuses("--mask that is not JSON and not a file",
+            ["--mask", "person intersect skin"], "neither an existing file")
+    # No clip positional on this one: --image and a positional together is a
+    # different refusal ("use one or the other"), and the rule under test here
+    # is that a component stack needs a clip's own frames over time.
+    r_still = run_cli(["stats", "--image", str(clip_path),
+                      "--mask", json.dumps(one_matte)], env=env)
+    ok("refused: --mask on a still (--image)",
+       r_still.returncode != 0 and "one still" in r_still.stderr,
+       f"exit {r_still.returncode}: {r_still.stderr[-220:]}")
+
 
 # --------------------------------------------------------------------------
 # 5. render --allow-partial, end to end through the CLI (integration lane
@@ -417,13 +711,11 @@ def test_stats_matte() -> None:
 
 def test_render_allow_partial() -> None:
     print("\n== render --allow-partial ==")
-    try:
-        import mattes as MT
-        import cinegrade as cg
-    except ImportError as exc:
-        note(f"grade/mattes.py or grade/cinegrade.py not importable: {exc}; "
-            "render --allow-partial was not exercised")
-        return
+    # Round 1 finding 19: no ImportError guard. Both modules are on this
+    # branch, and a suite that skips its own subject on an import error and
+    # still exits 0 is worse than one that stops.
+    import cinegrade as cg
+    import mattes as MT
     import numpy as np
     from copy import deepcopy
 
@@ -577,6 +869,43 @@ def test_mask_gaps(base: str) -> None:
        (forced.get("mattes") or [{}])[0].get("matte_id") == cached_matte,
        forced)
 
+    # -- round 1 finding 40: rotation is part of the cache key -------------
+    # Design rule 5 keys a track by clip identity, rotation, working width and
+    # recipe hash. Every track in this suite ran at one rotation, so the
+    # rotation could have been dropped from the key (or from the payload) and
+    # nothing would have gone red, while a matte tracked upright answered a
+    # request for the rotated clip: the same words, a different picture.
+    r_rot = run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
+                    "--rotate", "90", "--json"], env=env)
+    ok("track at another rotation: exit 0", r_rot.returncode == 0,
+       r_rot.stderr[-300:])
+    rotated = json.loads(r_rot.stdout) if r_rot.returncode == 0 else {}
+    ok("the same words at a different rotation are NOT a cache hit",
+       rotated.get("cached") is False, rotated)
+    rotated_matte = (rotated.get("mattes") or [{}])[0].get("matte_id")
+    ok("and they get their own matte, not the upright one",
+       bool(rotated_matte) and rotated_matte != cached_matte,
+       [rotated_matte, cached_matte])
+    r_show = run_cli(["mask", "show", rotated_matte or "none", "--json"],
+                    env=env)
+    shown = json.loads(r_show.stdout or "{}") if r_show.returncode == 0 else {}
+    ok("and the matte itself remembers the rotation it was tracked at, so a "
+       "caller can check the matte against the request",
+       str(shown.get("rotation")) == "90", shown.get("rotation"))
+    # Let the rotated track finish before asking again: an unfinished matte
+    # is a resume, not a cache hit, and the control below is about the KEY,
+    # not about how far the track got.
+    run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
+            "--rotate", "90", "--wait", "--json"], env=env)
+    r_rot2 = run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
+                     "--rotate", "90", "--json"], env=env)
+    rotated_again = json.loads(r_rot2.stdout or "{}")
+    ok("the control: that rotated request repeated IS a cache hit, so what "
+       "changed above was the rotation and not merely a second call",
+       rotated_again.get("cached") is True
+       and (rotated_again.get("mattes") or [{}])[0].get("matte_id")
+       == rotated_matte, rotated_again)
+
     # -- gaps 13 and 18: a matte that is still running, and a bad track ----
     r5 = run_cli(["mask", "track", "SUSPECT_CLIP", "--text", "face",
                  "--json"], env=env)
@@ -633,6 +962,31 @@ def test_mask_gaps(base: str) -> None:
 
     _advance(base, job_id, times=3)             # to done, 9 of 9
 
+    # -- finding 15: the drift rule that needs an `ious` array -------------
+    # `low_iou` is the one of quality()'s three rules that cannot fire from
+    # `areas` alone: it needs the per frame overlap the store writes (C2,
+    # checkpoint gap 18). Nothing in the arc had ever seen it fire, because
+    # the stand-in hardcoded the count to 0 and wrote no ious at all. This
+    # matte loses its object at frame 2 and latches onto something several
+    # times bigger at frame 4, so frame 4 overlaps almost nothing that came
+    # before it.
+    r_iou = run_cli(["mask", "show", bad_matte, "--json"], env=env)
+    q_all = (json.loads(r_iou.stdout or "{}").get("quality") or {})
+    ok("show: the quality block says the ious came from the index",
+       q_all.get("iou_source") == "index", q_all.get("iou_source"))
+    ok("show: the frame that jumped to another object is flagged low_iou",
+       (q_all.get("reasons") or {}).get("low_iou") == 1, q_all.get("reasons"))
+    jumped = [f for f in (q_all.get("suspect_frames") or [])
+              if "low_iou" in (f.get("reasons") or [])]
+    ok("show: the low_iou frame is the one that jumped, and carries its own "
+       "overlap number",
+       len(jumped) == 1 and jumped[0]["index"] == 4
+       and float(jumped[0]["iou"]) < 0.3,
+       jumped)
+    ok("show: a clean stretch of the same matte is not flagged",
+       all(f["index"] in (2, 4) for f in (q_all.get("suspect_frames") or [])),
+       q_all.get("suspect_frames"))
+
     # -- gap 6: the list is a summary; --full is the old payload -----------
     r10 = run_cli(["mask", "list", "SUSPECT_CLIP", "--json"], env=env)
     ok("list: exit 0", r10.returncode == 0, r10.stderr[-300:])
@@ -662,6 +1016,165 @@ def test_mask_gaps(base: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# 6b. the four things a repeated track can be, through the CLI (round 1
+#     findings 5, 16, 21 and 39)
+#
+#     None of this could be tested here before: the stand-in server answered
+#     a DEAD matte with `resumed: True, restarted: False, resumed_from:
+#     <done_frames>`, which is the pre-fix server behaviour verbatim, so a CLI
+#     test written against the corrected server would have failed against the
+#     fixture rather than against the code. The fake now makes the same
+#     decision the real route makes, in the same order.
+# --------------------------------------------------------------------------
+
+def _raw_headers(url: str) -> tuple:
+    """One GET, returning (bytes, headers). The CLI has no verb that prints
+    the matte frame headers, and grade_client drops X-Matte-Warning, so the
+    header is read off the wire."""
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return r.read(), dict(r.headers)
+
+
+def test_mask_resume_paths(base: str) -> None:
+    print("\n== a repeated track: resume, widen, restart, cache hit ==")
+    env = {"STUDIO_URL": base}
+
+    # -- a DEAD matte restarts, it does not resume (findings 16 and 21) ----
+    r1 = run_cli(["mask", "track", "FAIL_CLIP", "--text", "dead-and-retried",
+                 "--json"], env=env)
+    ok("a track that fails: exit 0 on the queue call itself",
+       r1.returncode == 0, r1.stderr[-300:])
+    first = json.loads(r1.stdout or "{}")
+    dead_matte = (first.get("mattes") or [{}])[0].get("matte_id")
+    ok("a track that fails: its matte says failed",
+       (first.get("mattes") or [{}])[0].get("state") == "failed", first)
+
+    r2 = run_cli(["mask", "track", "FAIL_CLIP", "--text", "dead-and-retried",
+                 "--json"], env=env)
+    again = json.loads(r2.stdout or "{}")
+    ok("a dead matte is not answered from the cache",
+       again.get("cached") is False, again)
+    ok("a dead matte RESTARTS: `restarted` true and `resumed` false, not the "
+       "other way round", again.get("restarted") is True
+       and again.get("resumed") is False, again)
+    ok("a dead matte restarts from the start of the window, not from where "
+       "the dead attempt stopped", again.get("resumed_from") == 0, again)
+    ok("a restart writes back into the same matte, so nothing is orphaned",
+       (again.get("mattes") or [{}])[0].get("matte_id") == dead_matte, again)
+    ok("and the reason reaches the caller in words",
+       "restarting" in (again.get("message") or "")
+       and "failed" in (again.get("message") or ""), again.get("message"))
+
+    # -- a WIDER window widens the matte (finding 5) -----------------------
+    # 3 frames then 9, of a 9 frame fake clip at 24 fps.
+    r3 = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                 "--end", "0.125", "--json"], env=env)
+    narrow = json.loads(r3.stdout or "{}")
+    widen_matte = (narrow.get("mattes") or [{}])[0].get("matte_id")
+    ok("a windowed track: the queue answer says which frames it queued",
+       narrow.get("start_frame") == 0 and narrow.get("end_frame") == 3, narrow)
+    _advance(base, narrow.get("job_id"), times=4)      # queued -> done, 3 of 3
+    r3b = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                  "--end", "0.125", "--json"], env=env)
+    ok("the same narrow window again is a real cache hit",
+       json.loads(r3b.stdout or "{}").get("cached") is True, r3b.stdout[:300])
+
+    r4 = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                 "--end", "0.375", "--json"], env=env)
+    wider = json.loads(r4.stdout or "{}")
+    ok("a window WIDER than the matte is not a cache hit: this is finding 5, "
+       "and it is the assertion the old fixture could not carry",
+       wider.get("cached") is False, wider)
+    ok("a wider window WIDENS: `widened` true, `resumed` and `restarted` false",
+       wider.get("widened") is True and wider.get("resumed") is False
+       and wider.get("restarted") is False, wider)
+    ok("a widen starts at the first frame the matte does not have, so every "
+       "frame already tracked is kept", wider.get("resumed_from") == 3, wider)
+    ok("a widen queues the frames outside the matte and nothing else",
+       wider.get("start_frame") == 3 and wider.get("end_frame") == 9, wider)
+    ok("a widen names the window asked for, so a reader can check the claim",
+       "widening" in (wider.get("message") or "")
+       and "9" in (wider.get("message") or ""), wider.get("message"))
+    ok("a widen writes back into the same matte",
+       (wider.get("mattes") or [{}])[0].get("matte_id") == widen_matte, wider)
+
+    _advance(base, wider.get("job_id"), times=4)       # to done, 9 of 9
+    r5 = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                 "--end", "0.375", "--json"], env=env)
+    wide_again = json.loads(r5.stdout or "{}")
+    ok("once it is wide, the wide window is itself a cache hit",
+       wide_again.get("cached") is True, wide_again)
+    ok("and the cache hit says which frames it decided were covered",
+       wide_again.get("start_frame") == 0
+       and wide_again.get("end_frame") == 9, wide_again)
+    r6 = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                 "--end", "0.125", "--json"], env=env)
+    ok("a window INSIDE what the matte holds is still a cache hit: widening "
+       "must not turn every repeat call into a re-track",
+       json.loads(r6.stdout or "{}").get("cached") is True, r6.stdout[:300])
+
+    # -- what the human readable output says about all of that -------------
+    r7 = run_cli(["mask", "track", "C015.mov", "--text", "widen-me",
+                 "--end", "0.125", "--wait"], env=env)
+    ok("track --wait on a cache hit: exit 0", r7.returncode == 0,
+       r7.stderr[-300:])
+    ok("the cached message names the frames it holds instead of claiming it "
+       "'already covers this request' on the word `cached` alone",
+       "already holds frames 0 to 3" in r7.stderr, r7.stderr[-300:])
+    ok("the printed block says the window and which of the four things "
+       "happened", "frames    0 to 3  (cached)" in r7.stdout, r7.stdout[:400])
+
+    # -- the freeze outside the span, and the header that says so (39) -----
+    r8 = run_cli(["mask", "track", "C015.mov", "--text", "frozen-probe",
+                 "--json"], env=env)
+    frozen = json.loads(r8.stdout or "{}")
+    frozen_matte = (frozen.get("mattes") or [{}])[0].get("matte_id")
+    _advance(base, frozen.get("job_id"), times=2)       # running, 3 of 9
+    inside, h_in = _raw_headers(
+        f"{base}/api/matte/{frozen_matte}/frame?time=0.0417&width=48")
+    ok("a frame inside the span is served as itself, with no warning",
+       h_in.get("X-Matte-Frame") == "1" and "X-Matte-Warning" not in h_in,
+       {k: v for k, v in h_in.items() if k.startswith("X-Matte")})
+    outside, h_out = _raw_headers(
+        f"{base}/api/matte/{frozen_matte}/frame?time=0.3&width=48")
+    ok("a frame past the span is answered with the nearest written frame, "
+       "which is what `frozen outside span` MEANS",
+       h_out.get("X-Matte-Frame") == "2", h_out.get("X-Matte-Frame"))
+    ok("and the response says out loud that it held an older frame: the one "
+       "header the whole arc asserted nowhere",
+       "not tracked yet" in (h_out.get("X-Matte-Warning") or ""),
+       h_out.get("X-Matte-Warning"))
+    ok("the held frame is real image bytes, not an error page",
+       outside.startswith(b"\x89PNG"), outside[:8])
+    ok("the state header still says the matte is unfinished",
+       h_out.get("X-Matte-State") == "running", h_out.get("X-Matte-State"))
+
+    # -- the refusals the real routes make, which the fake now makes too ---
+    def refused(label, path, payload, wanted):
+        req = urllib.request.Request(
+            f"{base}/api/{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            ok(f"refused: {label}", False, "answered 200")
+        except urllib.error.HTTPError as exc:
+            body = json.loads(exc.read() or b"{}")
+            ok(f"refused: {label}",
+               exc.code == 400 and wanted in str(body.get("error", "")),
+               f"{exc.code}: {body}")
+
+    refused("track with no prompt and no pick", "mask/track",
+            {"clip": "C015.mov"}, "at least one prompt")
+    refused("track with both a prompt and a pick", "mask/track",
+            {"clip": "C015.mov", "prompts": {"text": ["x"]},
+             "pick_id": "pick1"}, "not both")
+    refused("track from a pick the server has never heard of", "mask/track",
+            {"clip": "C015.mov", "pick_id": "pick-nope"}, "no such pick")
+    refused("segment with no prompt at all", "mask/segment",
+            {"clip": "C015.mov", "time": 1.0}, "at least one prompt")
+
+
+# --------------------------------------------------------------------------
 # 7. where the CLI looks for things: a bare clip name and a matte store
 #    resolved through the server (gaps 4 and 5), and --preset's two
 #    namespaces (gap 17)
@@ -669,11 +1182,9 @@ def test_mask_gaps(base: str) -> None:
 
 def test_cli_paths(base: str) -> None:
     print("\n== a bare clip name and a matte store through the server ==")
-    try:
-        import mattes as MT
-    except ImportError:
-        note("grade/mattes.py is not importable; gaps 4 and 5 not exercised")
-        return
+    # Round 1 finding 19: the third of the three guards that could delete a
+    # block of checks and leave the suite green. Deleted.
+    import mattes as MT
     import numpy as np
 
     with tempfile.TemporaryDirectory(prefix="mask_cli_paths_") as root_s:
@@ -782,6 +1293,103 @@ def test_cli_paths(base: str) -> None:
         cg.set_preset_source("auto")
 
 
+# --------------------------------------------------------------------------
+# 8. a matte id is an ID, never a path (round 1 blocker 1)
+#
+#    `mattes.resolve()` used to accept a matte id that was itself a filesystem
+#    path, which is what let `DELETE /api/matte//tmp/.../VICTIM` delete any
+#    directory on the machine. The CLI and the client are the other two doors
+#    the same id walks through, so the pattern is checked at all three.
+# --------------------------------------------------------------------------
+
+def test_matte_id_is_never_a_path(base: str) -> None:
+    print("\n== a matte id is an id, never a path ==")
+    import mattes as MT
+    import numpy as np
+
+    import grade_client as GC
+
+    ok("the client's id pattern is grade/mattes.py's, character for character",
+       GC.MATTE_ID_PATTERN == MT.MATTE_ID_PATTERN,
+       f"{GC.MATTE_ID_PATTERN!r} vs {MT.MATTE_ID_PATTERN!r}")
+    for bad in ("/tmp", "/tmp/mattes/m_x", "..", "../m_x", "a/b", "a\\b",
+                ".", ".hidden", "", "m" * 65):
+        ok(f"not an id: {bad!r}", not MT.valid_matte_id(bad))
+    for good in ("m_5214be94f217", "m_paths", "m_m7_left", "not-a-real-matte"):
+        ok(f"still an id: {good!r}", MT.valid_matte_id(good))
+
+    with tempfile.TemporaryDirectory(prefix="mask_id_guard_") as root_s:
+        root = Path(root_s)
+        clip_path = root / "guard.mp4"
+        _make_synthetic_clip(clip_path)
+        store = root / "mattes"
+        matte_dir = store / "guardkey" / "m_guard"
+        matte_dir.mkdir(parents=True)
+        mw, mh, fps, frames = 32, 24, 10.0, 10
+        for i in range(frames):
+            arr = np.zeros((mh, mw), dtype=np.uint8)
+            arr[:, :mw // 2] = 255
+            MT.write_gray_png(matte_dir / MT.frame_name(i), arr)
+        (matte_dir / "index.json").write_text(json.dumps({
+            "matte_id": "m_guard", "clip": "guard.mp4",
+            "clip_key": "guardkey", "rotation": "auto", "fps": fps,
+            "frames": frames, "width": mw, "height": mh, "recipe": {},
+            "state": "done", "done_frames": frames,
+            "areas": [0.5] * frames, "scores": [0.9] * frames,
+            "created": time.time(), "model": "stub", "backend": "stub",
+        }))
+        # A matte directory OUTSIDE the store, reachable through a symlink
+        # inside it: the id is well formed and the bytes are somebody else's.
+        outside = root / "outside" / "m_escape"
+        outside.mkdir(parents=True)
+        shutil.copy(matte_dir / "index.json", outside / "index.json")
+        shutil.copy(matte_dir / MT.frame_name(0),
+                    outside / MT.frame_name(0))
+        (store / "m_escape").symlink_to(outside, target_is_directory=True)
+
+        env = {"CINEGRADE_MATTE_ROOT": str(store), "STUDIO_URL": ""}
+
+        r_id = run_cli(["stats", str(clip_path), "--time", "0.2",
+                       "--matte", "m_guard", "--json"], env=env)
+        ok("stats --matte <id>: measures", r_id.returncode == 0,
+           r_id.stderr[-300:])
+
+        r_path = run_cli(["stats", str(clip_path), "--time", "0.2",
+                         "--matte", str(matte_dir), "--json"], env=env)
+        ok("stats --matte <the matte's own directory>: refused",
+           r_path.returncode != 0, r_path.stdout[:200])
+        ok("... and says an id is not a path",
+           "not a matte id" in r_path.stderr, r_path.stderr[-300:])
+
+        r_up = run_cli(["stats", str(clip_path), "--time", "0.2",
+                       "--matte", "../guardkey/m_guard", "--json"], env=env)
+        ok("stats --matte ../<something>: refused", r_up.returncode != 0,
+           r_up.stdout[:200])
+
+        r_link = run_cli(["stats", str(clip_path), "--time", "0.2",
+                         "--matte", "m_escape", "--json"], env=env)
+        ok("a matte directory that is a symlink out of the store: refused",
+           r_link.returncode != 0, r_link.stdout[:200])
+        ok("... and says it left the store",
+           "outside the matte store" in r_link.stderr, r_link.stderr[-300:])
+
+    studio = GC.Studio(base=base)
+    for bad in ("/tmp/anything", "..", "m_ok/../..", ""):
+        for label, call_it in (("matte", lambda: studio.matte(bad)),
+                              ("matte_frame",
+                               lambda: studio.matte_frame(bad, time=0.0)),
+                              ("stats(matte=)",
+                               lambda: studio.stats(clip="C015.mov",
+                                                    matte=bad))):
+            try:
+                call_it()
+                ok(f"client {label}({bad!r}): refused", False, "no error")
+            except GC.StudioError as exc:
+                ok(f"client {label}({bad!r}): refused before the request",
+                   "not a matte id" in str(exc) and exc.status is None,
+                   str(exc)[:160])
+
+
 def main() -> int:
     print("starting the fake studio server...")
     srv, th, port = FAKE.start(0)
@@ -791,14 +1399,26 @@ def main() -> int:
         test_mask_cli(base)
         test_grade_client(base)
         test_mask_gaps(base)
+        test_mask_resume_paths(base)
         test_cli_paths(base)
         test_frame_stats_weight()
         test_stats_matte()
         test_render_allow_partial()
+        test_matte_id_is_never_a_path(base)
     finally:
         srv.shutdown()
 
+    total = PASS + FAIL
     print(f"\n{PASS} passed, {FAIL} failed" + (f", {len(NOTES)} note(s)" if NOTES else ""))
+    if total < EXPECTED_CHECKS:
+        print(f"  FAIL  this run made {total} checks, fewer than the "
+              f"{EXPECTED_CHECKS} this file declares: a whole block did not "
+              f"run. A suite that quietly shrinks is a suite that quietly "
+              f"stops testing things.")
+        return 1
+    if total > EXPECTED_CHECKS:
+        print(f"  note  {total} checks, {total - EXPECTED_CHECKS} more than "
+              f"the declared {EXPECTED_CHECKS}: raise EXPECTED_CHECKS.")
     return 1 if FAIL else 0
 
 

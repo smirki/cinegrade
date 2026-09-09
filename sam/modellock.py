@@ -62,10 +62,18 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def owner() -> dict | None:
+def _dir(lock_dir=None) -> Path:
+    """Which directory IS the lock. Resolved at call time, never cached, so a
+    test that points `modellock.LOCK_DIR` at a temporary directory (and
+    `torch_backend`, which keeps its own constant) both work without either
+    of them reaching inside this module."""
+    return Path(lock_dir) if lock_dir is not None else LOCK_DIR
+
+
+def owner(lock_dir=None) -> dict | None:
     """Who holds the lock right now, as far as the filesystem can say."""
     try:
-        raw = (LOCK_DIR / OWNER_FILE).read_text()
+        raw = (_dir(lock_dir) / OWNER_FILE).read_text()
     except OSError:
         return None
     try:
@@ -74,11 +82,12 @@ def owner() -> dict | None:
         return None
 
 
-def _age_s() -> float:
+def _age_s(lock_dir=None) -> float:
     """How long the lock directory has sat there untouched."""
+    here = _dir(lock_dir)
     try:
-        newest = LOCK_DIR.stat().st_mtime
-        for entry in LOCK_DIR.iterdir():
+        newest = here.stat().st_mtime
+        for entry in here.iterdir():
             newest = max(newest, entry.stat().st_mtime)
     except OSError:
         return 0.0
@@ -86,30 +95,39 @@ def _age_s() -> float:
 
 
 def _reclaim_if_dead(log, steal_stale: bool = False,
-                    stale_s: float = STALE_S) -> bool:
+                    stale_s: float = STALE_S, lock_dir=None) -> bool:
     """True when a lock left behind by a holder that is definitely gone was
     removed. See the module docstring."""
-    info = owner()
+    here = _dir(lock_dir)
+    info = owner(here)
     if not info:
-        age = _age_s()
+        age = _age_s(here)
         if not steal_stale or age < stale_s:
             return False
         log(f"[model-lock] --steal-stale-lock was given and the lock at "
-            f"{LOCK_DIR} has named no owner for {age / 60:.0f} minutes, so it "
+            f"{here} has named no owner for {age / 60:.0f} minutes, so it "
             f"is being removed. If a model really is loaded in another "
             f"process, stop this one now.")
         try:
-            shutil.rmtree(LOCK_DIR)
+            shutil.rmtree(here)
         except OSError:
             return False
         return True
     pid = int(info.get("pid", 0) or 0)
     if _pid_alive(pid):
         return False
+    # Read the owner again, immediately before deleting anything. Between the
+    # first read above and this line another process can have taken the lock
+    # for itself (the dead holder's directory removed and remade), and
+    # deleting THAT holder's lock is the bug this re-read exists to stop:
+    # round 1 finding 11's third part.
+    fresh = owner(here)
+    if fresh != info:
+        return False
     log(f"[model-lock] reclaiming the lock from pid {pid}, which is gone "
         f"(held since {info.get('since')}, backend {info.get('backend')})")
     try:
-        shutil.rmtree(LOCK_DIR)
+        shutil.rmtree(here)
     except OSError:
         return False
     return True
@@ -124,39 +142,60 @@ class ModelLock:
 
     def __init__(self, backend: str = "?", retry_s: float = RETRY_S,
                  enabled: bool = True, log=None, steal_stale: bool = False,
-                 stale_s: float = STALE_S):
+                 stale_s: float = STALE_S, lock_dir=None):
         self.backend = backend
         self.retry_s = float(retry_s)
         self.enabled = bool(enabled)
         self.steal_stale = bool(steal_stale)
         self.stale_s = float(stale_s)
+        # `held` means "this object took the lock and owns the directory".
+        # `bypassed` means "the lock is disabled, so nothing is in our way".
+        # They are separate because they were once the same flag, and a
+        # disabled run then reported itself as the holder AND deleted the real
+        # holder's lock directory on the way out (round 1 finding 11).
         self.held = False
+        self.bypassed = False
+        self._lock_dir = lock_dir
         self._log = log or (lambda message: print(message, flush=True))
+
+    @property
+    def dir(self) -> Path:
+        """The directory this lock is, resolved now rather than at
+        construction, so `modellock.LOCK_DIR` can be redirected by a test."""
+        return _dir(self._lock_dir)
 
     def acquire(self, timeout_s: float | None = None) -> bool:
         """Block until the lock is ours. Returns True when held.
+
+        True means "go ahead and load a model", which is also the answer when
+        the lock is disabled. Whether this process actually OWNS the lock
+        directory is `held`, and only a holder may release it.
 
         `timeout_s` None means wait forever, which is what a service wants:
         the other holder is another model run on this machine and it will
         finish. A timeout returns False rather than raising so the caller can
         decide (the tests use a short one).
         """
-        if not self.enabled or self.held:
-            self.held = True
+        if not self.enabled:
+            self.bypassed = True
             return True
+        if self.held:
+            return True
+        here = self.dir
         deadline = None if timeout_s is None else time.time() + timeout_s
         waited = False
         last_said = 0.0
         while True:
             try:
-                LOCK_DIR.mkdir()
+                here.mkdir()
             except FileExistsError:
-                if _reclaim_if_dead(self._log, self.steal_stale, self.stale_s):
+                if _reclaim_if_dead(self._log, self.steal_stale, self.stale_s,
+                                    lock_dir=here):
                     continue
                 if deadline is not None and time.time() >= deadline:
                     return False
                 if not waited or time.time() - last_said >= NAG_S:
-                    info = owner() or {}
+                    info = owner(here) or {}
                     who = (f"pid {info.get('pid')} ({info.get('backend')}, since "
                            f"{info.get('since')})" if info else "a process that "
                            "left no owner file")
@@ -164,11 +203,12 @@ class ModelLock:
                               f"{self.retry_s:.0f}s. Only one SAM model may be "
                               f"resident on this machine at a time.")
                     if not info:
-                        self._log(f"[model-lock] nothing in {LOCK_DIR} says who "
-                                  f"holds it (it has sat there {_age_s() / 60:.0f} "
+                        self._log(f"[model-lock] nothing in {here} says who "
+                                  f"holds it (it has sat there "
+                                  f"{_age_s(here) / 60:.0f} "
                                   f"minutes). Check for a python process with a "
                                   f"model loaded; if there is none, remove it by "
-                                  f"hand with `rmdir {LOCK_DIR}`, or start this "
+                                  f"hand with `rmdir {here}`, or start this "
                                   f"with --steal-stale-lock.")
                     waited = True
                     last_said = time.time()
@@ -176,7 +216,7 @@ class ModelLock:
                 continue
             self.held = True
             try:
-                (LOCK_DIR / OWNER_FILE).write_text(json.dumps({
+                (here / OWNER_FILE).write_text(json.dumps({
                     "pid": os.getpid(),
                     "backend": self.backend,
                     "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -189,15 +229,31 @@ class ModelLock:
             return True
 
     def release(self) -> None:
+        """Give the lock back, but only if it is ours to give.
+
+        The owner file is checked first, by pid. A process that never took the
+        lock (`--no-model-lock`, or a second `release()` after the first) must
+        not remove the directory: doing that erased a real holder's lock while
+        a 5 GB model was resident in it, and the machine then had room for a
+        second one (round 1 finding 11).
+        """
+        self.bypassed = False
         if not self.held:
             return
         self.held = False
+        here = self.dir
+        info = owner(here)
+        if info is not None and int(info.get("pid", 0) or 0) != os.getpid():
+            self._log(f"[model-lock] not releasing {here}: it says pid "
+                      f"{info.get('pid')} holds it and this is pid "
+                      f"{os.getpid()}")
+            return
         try:
-            (LOCK_DIR / OWNER_FILE).unlink()
+            (here / OWNER_FILE).unlink()
         except OSError:
             pass
         try:
-            LOCK_DIR.rmdir()
+            here.rmdir()
         except OSError:
             # Not ours any more, or not empty: leave it rather than take
             # somebody else's lock away.

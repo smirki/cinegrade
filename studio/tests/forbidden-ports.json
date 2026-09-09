@@ -1,0 +1,34 @@
+{
+  "comment": [
+    "The one list of ports no test in this repo may ever bind (round 1 finding 20).",
+    "Before this file there were four lists in four files and they disagreed: the",
+    "studio route suite avoided 7431/7614/7615 but not 7560, the browser harness",
+    "picked freely from 20000-60000 with no exclusions at all, and nothing avoided",
+    "7632, which is where a live agent seat's studio was actually running while the",
+    "review was written. A test that lands on one of these takes down something",
+    "somebody is using.",
+    "Data, not Python, because node (studio/tests/run.mjs) reads it too. The three",
+    "readers are studio/tests/py/ports.py, grade/tests/ports.py and run.mjs itself;",
+    "add a port HERE and all three pick it up."
+  ],
+  "ports": [
+    7431,
+    7560,
+    7614,
+    7615,
+    7632,
+    8756,
+    22929,
+    28958
+  ],
+  "why": {
+    "7431": "the founder's live studio (studio/server.py's own default port)",
+    "7560": "sam/server.py's own default port: the SAM service a real studio expects",
+    "7614": "reserved by this workspace for a studio a person is using",
+    "7615": "reserved by this workspace for a studio a person is using",
+    "7632": "a Codex agent seat's studio, running out of this same worktree",
+    "8756": "the always-on launchd Granite ASR 5 server on this machine",
+    "22929": "a real server found squatting this port while the spike ran",
+    "28958": "a real server found squatting this port while the spike ran"
+  }
+}

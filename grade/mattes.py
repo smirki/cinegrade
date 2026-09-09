@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import zlib
 from dataclasses import dataclass, field
@@ -62,6 +63,26 @@ INDEX_NAME = "index.json"
 # tuple so a caller can validate rather than guess at spellings.
 STATES = ("queued", "running", "done", "failed", "stale", "partial")
 
+# What a matte id may look like, stated ONCE, for every place an id enters a
+# process: a URL segment on the studio's matte routes, a --matte argument on
+# the CLI, a grade_client call, and resolve() below.
+#
+# A matte id is a NAME and never a path. The service mints "m_" plus a 12 hex
+# digit digest (sam/backends/base.py's recipe_digest) and a fixture uses a
+# short readable name of the same shape, so nothing real needs a separator, a
+# leading dot or a 200 character id. The pattern is narrow on purpose rather
+# than "whatever a filesystem will accept", because every id is joined onto
+# the matte root to make a directory: with no "/" and no "\" in the pattern,
+# "../../etc" and "/tmp/anything" cannot be spelled at all, and requiring the
+# first character to be alphanumeric rules out "." and ".." twice over.
+#
+# studio/tools/grade_client.py carries this same string as MATTE_ID_PATTERN
+# (it is standalone by design, stdlib plus numpy, and cannot import this
+# module), and grade/tests/test_mask_tools.py asserts the two are identical,
+# so the copy cannot drift away from this one.
+MATTE_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"
+MATTE_ID_RE = re.compile(MATTE_ID_PATTERN)
+
 
 class MatteError(Exception):
     """A matte that cannot be read at all."""
@@ -69,6 +90,55 @@ class MatteError(Exception):
 
 class MatteMissing(MatteError):
     """No matte with that id under the given root."""
+
+
+def valid_matte_id(matte_id) -> bool:
+    """Whether this is a matte id at all. False for anything path shaped."""
+    text = str(matte_id or "")
+    if text in (".", ".."):
+        return False
+    return MATTE_ID_RE.fullmatch(text) is not None
+
+
+def check_matte_id(matte_id) -> str:
+    """The id back, stripped, or MatteMissing saying what was refused.
+
+    MatteMissing rather than a new exception type: every caller already
+    handles "there is no such matte" gracefully (the engine turns it into a
+    render warning, the studio into a 404), and a string that cannot name
+    anything in the store is exactly that case. The message says what an id
+    looks like, because the two ways to get here are a typo and a caller
+    passing a directory where an id belongs.
+    """
+    text = str(matte_id or "").strip()
+    if not text:
+        raise MatteMissing("no matte id given")
+    if not valid_matte_id(text):
+        raise MatteMissing(
+            f"{text!r} is not a matte id: an id is a name like "
+            f"m_5214be94f217 (letters, digits, underscore, dot and hyphen, "
+            f"up to 64 of them, starting with a letter or a digit), never a "
+            f"path. A caller that genuinely holds a matte DIRECTORY calls "
+            f"info_from_dir() with it instead")
+    return text
+
+
+def is_under(root, path) -> bool:
+    """Whether `path` really sits inside `root`, symlinks resolved.
+
+    Both sides are resolved before the comparison, so a matte directory that
+    is a symlink pointing somewhere else is not under the root even though
+    the string looks like it is. That is the second half of the id rule: the
+    pattern above stops a traversal spelled in the id, this stops one spelled
+    on disk, and every caller that is about to read or delete a matte
+    directory asks both questions rather than either one.
+    """
+    try:
+        r = Path(root).resolve()
+        p = Path(path).resolve()
+    except OSError:                                       # pragma: no cover
+        return False
+    return p == r or r in p.parents
 
 
 # --------------------------------------------------------------------------
@@ -308,11 +378,10 @@ _RESOLVE_CACHE: dict[tuple, MatteInfo] = {}
 def resolve(root, matte_id: str, use_cache: bool = True) -> MatteInfo:
     """Find a matte by id under `root` (contract C6).
 
-    `root` is the `mattes/` directory. Three shapes are accepted, in order:
+    `root` is the `mattes/` directory. Two shapes are accepted, in order:
 
       1. `root/<id>/`            a flat store, which is what the tests build
       2. `root/<clip-key>/<id>/` the real layout C2 fixes
-      3. `matte_id` itself being a path to a matte directory
 
     Searching rather than requiring the clip key is deliberate: a matte id is
     already unique (it is a hash of the recipe plus the clip identity), and a
@@ -320,17 +389,27 @@ def resolve(root, matte_id: str, use_cache: bool = True) -> MatteInfo:
     engine reconstruct a clip key it does not otherwise need would be a
     second identity rule to keep in step with the server's.
 
-    Raises MatteMissing when there is no such directory.
+    An id is ONLY ever an id here (`check_matte_id`), and the directory it
+    names has to stay inside `root` (`is_under`). This used to accept a third
+    shape, "matte_id is itself a path to a matte directory", and that one line
+    made `DELETE /api/matte/<absolute path>` delete any directory on the
+    machine: `info_from_dir` builds a MatteInfo for any directory at all, both
+    of that route's guards are no-ops with logins off (the documented default
+    and the agent case), and the route then rmtree'd `info.path`. A caller that
+    genuinely holds a directory rather than an id calls `info_from_dir()`,
+    which is what the engine's own fixtures do; nothing in the product ever
+    passed a path here.
+
+    Raises MatteMissing when the id is not an id, when there is no such
+    directory, and when the directory that matches leaves `root` (a symlink:
+    the id can be perfectly well formed and the bytes still be somebody
+    else's).
 
     The result is cached against index.json's mtime, because a render resolves
     the same matte once per layer per pass and re-reading a small JSON file is
     not free inside a playback loop.
     """
-    if not matte_id:
-        raise MatteMissing("no matte id given")
-    direct = Path(matte_id)
-    if direct.is_dir():
-        return info_from_dir(direct)
+    matte_id = check_matte_id(matte_id)
 
     root = Path(root) if root is not None else matte_root()
     candidates = [root / matte_id]
@@ -339,6 +418,11 @@ def resolve(root, matte_id: str, use_cache: bool = True) -> MatteInfo:
     for cand in candidates:
         if not cand.is_dir():
             continue
+        if not is_under(root, cand):
+            raise MatteMissing(
+                f"matte {matte_id!r} resolves to {cand.resolve()}, which is "
+                f"outside the matte store at {Path(root).resolve()}; "
+                f"refusing to read it")
         key = ()
         if use_cache:
             try:
@@ -445,15 +529,16 @@ def load_frame(info: MatteInfo, index: int, size: tuple[int, int] | None = None
     return out
 
 
-def load_time(info: MatteInfo, time_s: float,
-              size: tuple[int, int] | None = None) -> tuple:
-    """The matte at a moment, with the fallback applied and reported.
+def served_frame(info: MatteInfo, time_s: float) -> tuple:
+    """Which frame answers a moment, and the warning to carry if it is not
+    the one asked for. Returns (index_served, warning_or_None).
 
-    Returns (array, index_served, warning_or_None). The warning is the
-    sentence a caller puts in a `warnings` list: which matte, which frame was
-    asked for, which was served. This is the one place the "nearest written
-    frame" rule is implemented, so the engine, the server's frame route and
-    the CLI all fall back the same way.
+    The "nearest written frame" rule and its sentence, written once. Split
+    out of `load_time` (which now calls it) so a caller that only needs to
+    know WHETHER a fallback happened does not have to decode the PNG to find
+    out: the composed mask path (`stats` with a `mask` stack) walks several
+    components and would otherwise read every frame twice, once for the
+    warning and once for the pixels. Costs a couple of `is_file()` checks.
     """
     want = frame_index(info, time_s)
     served = want if frame_path(info, want) is not None else nearest_written(info, want)
@@ -464,6 +549,21 @@ def load_time(info: MatteInfo, time_s: float,
         warn = (f"matte {info.matte_id}: frame {want} is not tracked yet, "
                 f"showing frame {served} ({info.state}, {info.written_count} "
                 f"of {info.total_frames} frames)")
+    return served, warn
+
+
+def load_time(info: MatteInfo, time_s: float,
+              size: tuple[int, int] | None = None) -> tuple:
+    """The matte at a moment, with the fallback applied and reported.
+
+    Returns (array, index_served, warning_or_None). The warning is the
+    sentence a caller puts in a `warnings` list: which matte, which frame was
+    asked for, which was served. This is the one place the "nearest written
+    frame" rule is implemented (in `served_frame` above, which this calls),
+    so the engine, the server's frame route and the CLI all fall back the
+    same way.
+    """
+    served, warn = served_frame(info, time_s)
     return load_frame(info, served, size), served, warn
 
 
@@ -633,10 +733,24 @@ def frame_ious(info: MatteInfo, width: int = 128) -> dict:
     buys nothing here). Returns `{index: iou}` for every written frame after
     the first.
 
-    Only called when a caller asks for it (`quality(..., compute_iou=True)`,
-    which is `mask show` and the strip, one matte at a time). A list of a
-    clip's mattes never pays for this: the SAM service writes its own
-    `ious` into index.json as it tracks, and `quality()` prefers those.
+    Only called when a caller asks for it (`quality(..., compute_iou=True)`),
+    because a list of a clip's mattes must not pay for reading every frame of
+    every one of them: the SAM service writes its own `ious` into index.json
+    as it tracks, and `quality()` prefers those whenever they are there.
+
+    Round 1 finding 15: this docstring used to say the caller was "`mask show`
+    and the strip, one matte at a time". It is not, and never was. Nothing in
+    the product passes `compute_iou=True`, so this function only runs from the
+    tests that cover it directly (`grade/tests/cases_mask.py`, group `mask`:
+    frame_ious_reads_the_shapes_off_disk). It is kept rather than deleted
+    because it is the ONLY way to judge drift on a matte tracked before the
+    service started writing `ious`, and the wiring it needs is one argument on
+    one line: `MT.quality(info, limit=..., compute_iou=full)` in
+    studio/server.py's `_matte_summary`, where `full` is already the "this is
+    one matte, send the per frame arrays" flag. That line belongs to the matte
+    route lane, is written down in
+    plan/2026-09-08-studio-masks/review/ROUND1-FIXES-tests.md, and is not
+    changed here rather than being changed quietly from a test lane.
     """
     idx = info.written_indices()
     out: dict[int, float] = {}
@@ -680,7 +794,9 @@ def quality(info: MatteInfo, area_jump=None, min_iou=None,
     frames off disk instead, for a matte tracked before the service started
     writing them. With neither, the IoU rule simply does not run and
     `iou_source` says `"none"`: an absent rule is stated, never silently
-    passed.
+    passed. Read `iou_source` before believing a `low_iou` count of 0; that
+    is what it is for, and round 1 finding 15 was a whole arc of tests that
+    asserted the count without ever asserting the source.
 
     `limit` caps `suspect_frames` (the counts and the first suspect are
     always the true ones) so a route that lists many mattes cannot answer

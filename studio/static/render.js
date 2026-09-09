@@ -75,6 +75,39 @@
       });
   }
 
+  /* Every matte id this config's component stacks name.
+   *
+   * Needed because a matte component is the one part of the config whose
+   * pixels depend on WHEN the frame is, so a render that cannot work out the
+   * time of a frame must refuse rather than grade every frame against matte
+   * frame 0 and hand back a file with a still mask on a moving subject. */
+  function configMatteIds(config) {
+    var ids = [];
+    StudioGPU.configLayers(StudioGPU.fullConfig(config)).forEach(function (L) {
+      if (!L || !L.mask || !StudioGPU.mask.usesComponents(L.mask)) return;
+      StudioGPU.mask.components(L.mask).forEach(function (c) {
+        var id = c && c.type === "matte" && c.matte && c.matte.id;
+        if (id && ids.indexOf(id) < 0) ids.push(id);
+      });
+    });
+    return ids;
+  }
+
+  /* The matte rows of a render's report that did not get the frame they
+   * asked for, as sentences. Empty when every matte served its own frame. */
+  function lagging(mattes) {
+    var out = [];
+    Object.keys(mattes || {}).forEach(function (id) {
+      var st = mattes[id];
+      if (!st || !st.lagging) return;
+      out.push(id + " (" + st.state + ") wanted frame "
+        + (st.want === null ? "?" : st.want)
+        + (st.empty ? " and has nothing decoded"
+                    : ", served frame " + st.got));
+    });
+    return out;
+  }
+
   function rendererString(gl) {
     try {
       var dbg = gl.getExtension("WEBGL_debug_renderer_info");
@@ -104,11 +137,36 @@
                                    expected: plan.expected }));
     }
 
+    /* The clip time of a frame, from the plan's own timebase.
+     *
+     * X-Frame-Index counts from 0 at the START of the render range (the
+     * decoder is seeded with -ss), so the clip time of frame i is
+     * start + i/fps, which is the number the matte store is indexed by (C2).
+     * A plan without fps cannot say when any frame is, and a matte component
+     * would then read frame 0 for the whole file: that is refused out loud
+     * here instead of shipped as a silently wrong render. */
+    var fps = +plan.fps || 0;
+    var startAt = +plan.start || 0;
+    var matteIds = configMatteIds(plan.config);
+    if (matteIds.length && !(fps > 0)) {
+      throw new Error(
+        "this render's plan carries no frame rate, so the time of each frame "
+        + "is unknown, and this config uses tracked matte "
+        + (matteIds.length === 1 ? "component " : "components ")
+        + matteIds.join(", ") + ", whose pixels change with time. Refusing "
+        + "rather than rendering every frame against the matte's first frame. "
+        + "The GPU render plan needs \"fps\" and \"start\" (studio/render_gpu.py).");
+    }
+    function frameTime(index) {
+      return fps > 0 ? startAt + index / fps : startAt;
+    }
+
     // width/height explicit: this worker calls ready() before setSource16
     // ever runs (the loop below fetches the first frame after ready()
     // resolves), so this.src is still null and the grain plate prefetch in
     // ready() has nothing to fall back to unless told the size directly.
-    var opts = { pixelScale: plan.pixelScale, width: plan.width, height: plan.height };
+    var opts = { pixelScale: plan.pixelScale, width: plan.width,
+                 height: plan.height, time: frameTime(0) };
     var maxPosts = Math.max(1, Math.min(3, plan.window || 2));
 
     return inst.ready(plan.config, opts).then(async function () {
@@ -121,8 +179,24 @@
         if (!got) break;
         next = fetchFrame();                   // decode overlaps the grade
         if (!t0) t0 = performance.now();
+        var t = frameTime(got.index);
         inst.setSource16(got.data, plan.width, plan.height);
-        inst.render(plan.config, { pixelScale: plan.pixelScale, want16: true });
+        /* A FINAL render waits for the matte frame; only the preview is
+         * allowed to run on ahead of it (design rule 10 is about not stalling
+         * the picture a user is watching). A file is written once, so a frame
+         * graded against a matte frame that had not arrived yet would be a
+         * permanently wrong file. Resolves off the cache when the read ahead
+         * has already fetched it, which after the first frame it has. */
+        if (matteIds.length) await inst.matteReady(plan.config, t);
+        var r = inst.render(plan.config, { pixelScale: plan.pixelScale,
+                                           want16: true, time: t });
+        var lag = lagging(r.mattes);
+        if (lag.length) {
+          throw new Error("frame " + got.index + " at " + t.toFixed(3)
+            + "s could not get the matte frame it needs: " + lag.join("; ")
+            + ". Track the whole range (or shorten the render range) and try "
+            + "again; a still matte on a moving subject will not be written.");
+        }
         var out = inst.readOutput();
         info.readback = out.format;
         // let, not var: the callback below closes over THIS iteration's

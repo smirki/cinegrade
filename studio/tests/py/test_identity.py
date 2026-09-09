@@ -34,10 +34,12 @@ import os
 import random
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
 import unittest
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -148,17 +150,21 @@ def setUpModule() -> None:
         raise SystemExit("refusing to run: the temp data dir is inside the "
                          "real studio/data")
 
-    # One account, before either server starts, so the gated server below has
-    # somebody to sign in as.
-    made = cli("--create-user", "ada", "--role", "user", "--password-stdin",
-               stdin=PASSWORD + "\n")
-    if made.returncode != 0:
-        raise unittest.SkipTest(f"could not create the test account: "
-                                f"{made.stderr}")
+    # Two accounts, before either server starts, so the gated server below has
+    # somebody to sign in as. `ida` is an admin because two of the rules this
+    # file pins are about the difference: the matte list shows an account only
+    # the mattes it may read, and deleting a matte needs an admin.
+    for who, role in (("ada", "user"), ("ida", "admin")):
+        made = cli("--create-user", who, "--role", role, "--password-stdin",
+                   stdin=PASSWORD + "\n")
+        if made.returncode != 0:
+            raise unittest.SkipTest(f"could not create the {who} test "
+                                    f"account: {made.stderr}")
 
     start_server("primary")
     start_server("gated", "--auth")
     STATE["ada"] = login("ada")
+    STATE["ida"] = login("ida")
 
 
 def tearDownModule() -> None:
@@ -229,6 +235,107 @@ def log_text() -> str:
         return path.read_text(errors="replace")
     except OSError:
         return ""
+
+
+# --------------------------------------------------------------------------
+# fixtures for the two matte route tests at the end of this file: an account's
+# own cookie, a clip that really is private to one account, and a matte on
+# disk. Written by hand rather than tracked, because this file never starts a
+# SAM service and what those tests need is a matte whose CLIP is known.
+# --------------------------------------------------------------------------
+
+def as_user(who: str) -> dict:
+    """The headers a signed in account's own browser tab would send.
+
+    `Sec-Fetch-Site: same-origin` is not decoration: a cookie authenticated
+    POST, PUT or DELETE with neither that header nor a matching Origin is
+    refused by the CSRF rule (contract C2, auth.csrf_ok), on purpose, because a
+    script should carry an agent token rather than somebody's session cookie.
+    Every browser sends it, so this is what the studio page's own writes look
+    like, and without it these tests would be measuring the CSRF rule instead
+    of the permission rules they are named for.
+    """
+    return {"Cookie": STATE[who]["cookie"], "Sec-Fetch-Site": "same-origin"}
+
+
+def uid_of(who: str) -> int:
+    out = call("/api/auth/me", headers=as_user(who), server="gated")
+    return int((out.get("user") or {}).get("id") or 0)
+
+
+def tiny_clip(path: Path, colour: str = "blue", seconds: float = 0.4) -> bool:
+    """A real, tiny video file, because /api/open probes what it opens.
+
+    Bounded by an explicit -t like every other ffmpeg call in this repo.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c={colour}:s=64x64:r=10", "-t", str(seconds),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)],
+        capture_output=True)
+    return done.returncode == 0 and path.is_file()
+
+
+def private_library_clip(who: str) -> str | None:
+    """A clip in `who`'s OWN library, opened so the server knows its name.
+
+    Read permission is decided on the path a clip name resolves to
+    (library.owner_of_path), and only a file inside an account's library root
+    is private to it: the shared footage folder is a read only common area
+    every account may see, and a path from anywhere else on the Mac belongs to
+    nobody. So this writes a real file into that account's library and opens it
+    as that account, which is how a library clip gets a name the matte routes
+    can carry. None when anything about that did not work, so the caller can
+    skip rather than assert on a setup failure.
+    """
+    uid = uid_of(who)
+    if not uid:
+        return None
+    target = (Path(STATE["tmp"]) / "users" / str(uid) / "footage"
+              / f"private-{who}.mp4")
+    if not tiny_clip(target):
+        return None
+    out = call("/api/open", {"path": str(target)}, headers=as_user(who),
+               server="gated")
+    if out.get("status") != 200:
+        return None
+    return out.get("name")
+
+
+def grey_png(path: Path, value: int = 200, size: int = 8) -> Path:
+    """One 8 bit greyscale PNG, stdlib only (this file imports no numpy)."""
+    raw = b"".join(b"\x00" + bytes([value]) * size for _ in range(size))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xffffffff))
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b""))
+    return path
+
+
+def write_matte(matte_id: str, clip: str, frames: int = 2) -> Path:
+    """One matte directory under the two servers' shared data dir (C2)."""
+    d = Path(STATE["tmp"]) / "mattes" / "fixtures" / matte_id
+    d.mkdir(parents=True, exist_ok=True)
+    for i in range(frames):
+        grey_png(d / f"{i:06d}.png")
+    (d / "index.json").write_text(json.dumps({
+        "matte_id": matte_id, "clip": clip, "clip_key": "fixtures",
+        "rotation": 0, "fps": 10.0, "frames": frames,
+        "start_frame": 0, "end_frame": frames, "width": 8, "height": 8,
+        "recipe": {"prompts": {"text": ["a private subject"]}},
+        "state": "done", "done_frames": frames,
+        "areas": [0.5] * frames, "scores": [0.9] * frames,
+        "created": time.time(), "model": "fixture", "backend": "fixture",
+    }))
+    return d
 
 
 # --------------------------------------------------------------------------
@@ -533,6 +640,77 @@ class Identity(unittest.TestCase):
                     "caller"):
             self.assertIn(key, out)
         self.assertEqual(len(out["clips"]), len(STATE["clips"]))
+
+    # --- the matte routes, with logins ON --------------------------------
+
+    def test_22_the_matte_list_shows_only_the_mattes_an_account_may_read(self):
+        """`GET /api/matte?clip=` guarded and `GET /api/matte` did not.
+
+        A matte summary carries the clip's own file name and the matte's
+        recipe, which for a text prompt is the prompt words, so the no-clip
+        branch handed any signed in account the name of every clip anybody on
+        this server had ever tracked a matte on. That is the exact thing
+        _guard_read exists to stop ("without this a signed in account could
+        name a file it has never been shown").
+
+        The private clip is a real file in ida's own library, opened as ida so
+        the server knows the name, which is what makes it a clip ada may not
+        read rather than one this server cannot resolve.
+        """
+        private = private_library_clip("ida")
+        if private is None:
+            self.skipTest("could not put a clip in ida's library")
+        write_matte("m_privateida", private)
+        write_matte("m_sharedclip", STATE["clips"][0])
+
+        as_ada = call("/api/matte", headers=as_user("ada"), server="gated")
+        self.assertEqual(as_ada.get("status"), 200, as_ada)
+        ada_ids = [m["matte_id"] for m in as_ada.get("mattes", [])]
+        self.assertNotIn("m_privateida", ada_ids,
+                         "the list handed out a matte of a clip in somebody "
+                         "else's library")
+        self.assertIn("m_sharedclip", ada_ids,
+                      "the filter dropped a matte of the shared footage "
+                      "folder, which every account may read")
+
+        # The owner still sees it, so this is a permission filter and not a
+        # route that stopped answering.
+        as_ida = call("/api/matte", headers=as_user("ida"), server="gated")
+        self.assertIn("m_privateida",
+                      [m["matte_id"] for m in as_ida.get("mattes", [])])
+
+        # The single-matte route was already guarded; asserted here because it
+        # is what the list route now agrees with.
+        one = call("/api/matte/m_privateida", headers=as_user("ada"),
+                   server="gated")
+        self.assertEqual(one.get("status"), 403, one)
+
+        # And with logins off nothing is filtered: the local and the agent
+        # case answer exactly what they answered before.
+        local = call("/api/matte")
+        self.assertEqual(
+            {"m_privateida", "m_sharedclip"} -
+            {m["matte_id"] for m in local.get("mattes", [])}, set(),
+            "the primary server (logins off) should still list every matte")
+
+    def test_23_deleting_a_matte_needs_an_admin(self):
+        """The one route in the arc that destroys data had no test at all: its
+        `_delete` helper in test_mask_routes.py was defined and never called,
+        which is how the path-shaped-id blocker shipped. Both sides here: a
+        signed in non-admin is refused and the directory survives, an admin
+        succeeds and it is gone."""
+        matte = write_matte("m_deleteme", STATE["clips"][0])
+        refused = call("/api/matte/m_deleteme", method="DELETE",
+                       headers=as_user("ada"), server="gated")
+        self.assertEqual(refused.get("status"), 403, refused)
+        self.assertIn("admin", refused.get("error", ""))
+        self.assertTrue(matte.is_dir(), "a non-admin DELETE removed it anyway")
+
+        done = call("/api/matte/m_deleteme", method="DELETE",
+                    headers=as_user("ida"), server="gated")
+        self.assertEqual(done.get("status"), 200, done)
+        self.assertEqual(done.get("deleted"), "m_deleteme")
+        self.assertFalse(matte.exists(), "an admin DELETE left it on disk")
 
 
 if __name__ == "__main__":

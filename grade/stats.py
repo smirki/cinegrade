@@ -55,6 +55,48 @@ CLIP_WHITE = 253
 DEFAULT_BAND_EDGES = [i / 8.0 for i in range(9)]
 
 
+# The measurement blocks a normal answer carries. Named once here because the
+# "no coverage" answer (below) has to null out exactly these and nothing else.
+MEASURED_BLOCKS = ("luma", "saturation", "channels", "families", "clipped",
+                   "bands")
+
+
+def no_coverage_result(definitions: dict | None = None) -> dict:
+    """The documented answer for "the mask covers nothing here" (gap 23).
+
+    A matte that covers no pixel of a frame is a NORMAL, expected outcome,
+    not a bad request: a sky matte after the camera tilts down has genuinely
+    no sky left to measure, and a person matte inside its own tracking gap
+    has nobody. `frame_stats` used to raise `StatsError` on it, so every
+    script that loops over timestamps had to wrap each row in a try/except
+    and checkpoint its own partial results or lose them (which is exactly
+    what happened to one round 4 measurement helper, see the checkpoint).
+
+    The shape:
+
+        {"no_coverage": True, "coverage": 0.0,
+         "luma": None, "saturation": None, "channels": None,
+         "families": None, "clipped": None, "bands": None,
+         "definitions": {...}}
+
+    Every measurement block is present and None rather than absent, so a
+    caller reading `row["stats"]["luma"]` gets None (falsy, and loud the
+    moment it is subscripted) instead of a KeyError, and never a zero that
+    could be mistaken for a real measurement of a black frame. `definitions`
+    is kept because it describes the formulas, not this frame.
+    """
+    out = {"no_coverage": True, "coverage": 0.0}
+    for name in MEASURED_BLOCKS:
+        out[name] = None
+    out["definitions"] = definitions if definitions is not None else {
+        "sat_floor": SAT_FLOOR,
+        "clip_black_code": CLIP_BLACK,
+        "clip_white_code": CLIP_WHITE,
+        "families": {n: [lo, hi] for n, lo, hi in HUE_FAMILIES},
+    }
+    return out
+
+
 def _weighted_percentiles(values: np.ndarray, weight: np.ndarray, qs) -> list[float]:
     """`qs` percentiles (0..100) of `values`, weighted by `weight`.
 
@@ -117,9 +159,20 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     that cannot drift from what it always was.
 
     A `weight` that sums to zero (a matte with no coverage anywhere in this
-    frame, or in `region` if one was applied first) raises `StatsError`:
-    there is nothing to measure, and a percentile of an empty selection has
-    no honest answer to give back.
+    frame, or in `region` if one was applied first) returns
+    `no_coverage_result()` above rather than raising (checkpoint gap 23):
+    `{"no_coverage": True, "coverage": 0.0}` with every measurement block
+    None. There is still nothing to measure and no percentile of an empty
+    selection is invented; what changed is that a script looping over
+    timestamps gets a row it can write down and carry on, instead of an
+    exception on the frame where the sky genuinely left the picture.
+
+    Every WEIGHTED answer, empty or not, also carries `coverage` (the mean
+    of the weight over the frame: 1.0 for a weight of all ones, 0.25 for a
+    matte covering a quarter of it solidly, and the same 0.25 for a matte
+    covering half of it at half strength) and `no_coverage` (False on a real
+    measurement). An UNWEIGHTED call is byte for byte what it always was:
+    neither key appears, because neither means anything without a mask.
     """
     a = rgb.astype(np.float32) / 255.0
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -148,9 +201,10 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
                 f"weight shape {w.shape} does not match the frame {y.shape} "
                 f"(contract C6: weight is HxW at the picture's own size)")
         if float(w.sum()) <= 0.0:
-            raise StatsError(
-                "weight sums to zero: nothing in this frame (or region) is "
-                "covered by the matte, so there is nothing to measure")
+            # Gap 23: an expected outcome, reported, not an exception. The
+            # mismatched SHAPE above stays an error, because that is a caller
+            # bug rather than something a frame can honestly be.
+            return no_coverage_result()
 
     total = float(y.size) if w is None else float(w.sum())
     coloured = sat >= SAT_FLOOR
@@ -175,7 +229,7 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     clipped_black = _wsum_pct(raw.max(-1) <= CLIP_BLACK, w, total)
     clipped_white = _wsum_pct(raw.min(-1) >= CLIP_WHITE, w, total)
 
-    return {
+    out = {
         "luma": {
             "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),
             "p75": round(p75, 4), "p95": round(p95, 4),
@@ -208,6 +262,14 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
         },
         "bands": bands(rgb, weight=w),
     }
+    if w is not None:
+        # Gap 23 / gap 19: a weighted answer says how much of the frame it
+        # measured, so a number and the mask it came from travel together.
+        # Absent on an unweighted call on purpose: every envelope written
+        # before this change is unchanged there.
+        out["coverage"] = round(float(w.mean()), 6)
+        out["no_coverage"] = False
+    return out
 
 
 # --------------------------------------------------------------------------

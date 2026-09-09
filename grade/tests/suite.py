@@ -126,13 +126,19 @@ class Suite:
                 err = traceback.format_exc()
             elapsed = time.time() - t0
 
-            if ctx.skip_reason:
-                status = SKIP
-            elif err is not None:
+            # Round 1 finding 41: this used to read `skip_reason` FIRST, so a
+            # test that recorded a real failure (or raised) and then hit a
+            # skip condition was reported SKIP and did not touch the exit
+            # code. A skip is "this test did not run"; once a test has
+            # recorded a failure it HAS run, and the failure is the news. The
+            # order is now error, failure, skip, pass.
+            if err is not None:
                 status = XFAIL if t.xfail else ERROR
                 ctx.failures.append(err.strip().splitlines()[-1])
             elif ctx.failures:
                 status = XFAIL if t.xfail else FAIL
+            elif ctx.skip_reason:
+                status = SKIP
             else:
                 status = XPASS if t.xfail else PASS
 
