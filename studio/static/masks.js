@@ -81,6 +81,26 @@
    * matte view is the exact answer. */
   var OVERLAY_MAX_MATTES = 4;
 
+  /* How far the two blur controls may be dragged, as a fraction of frame
+   * width. Round 3 finding 83: the engines have clamped feather and
+   * finesse.blur to a tenth of frame width since round 2 finding 52, in all
+   * three implementations, and this panel went on offering 0.25 and 0.2. Past
+   * the cap the slider moved, the saved grade changed, and the picture did
+   * not: the sliders' last two thirds were inert.
+   *
+   * Read off gpu.js rather than typed again, so there is one number in the
+   * browser and it is the one the preview actually clamps to; the literal is
+   * only the fallback for a page that somehow loaded this file without that
+   * one. The maxima are the cap, and a value SAVED above it (any grade
+   * written before round 2) is shown clamped, because the number in the panel
+   * has to be the number the picture was made with. */
+  var BLUR_MAX = (global.StudioGPU && global.StudioGPU.mask
+                  && typeof global.StudioGPU.mask.BLUR_MAX === "number")
+    ? global.StudioGPU.mask.BLUR_MAX : 0.10;
+  var BLUR_CAP_NOTE = " Capped at " + BLUR_MAX.toFixed(2)
+    + " of the frame width: past that the engines clamp and the picture stops "
+    + "changing.";
+
   var display = { mode: "off", layer: -1 };   // "off" | "overlay" | "matte"
 
   var service = { state: "checking", health: null, error: "", startCmd: "" };
@@ -1353,9 +1373,10 @@
     /* Feather is per component (C1 puts it there, not in finesse), so it lives
      * in the row it belongs to rather than in the finesse fold below. */
     var feather = Ctl.slider({
-      label: "feather", min: 0, max: 0.25, step: 0.001, def: 0, precision: 3,
-      value: num(comp.feather, 0),
-      title: "A gaussian on this component alone, as a fraction of the frame width.",
+      label: "feather", min: 0, max: BLUR_MAX, step: 0.001, def: 0, precision: 3,
+      value: Math.min(num(comp.feather, 0), BLUR_MAX),
+      title: "A gaussian on this component alone, as a fraction of the frame "
+           + "width." + BLUR_CAP_NOTE,
       onChange: function (v, c) { writeField(idx, j, ["feather"], v, c); }
     });
     feather.el.setAttribute("data-mask-feather", "");
@@ -1886,8 +1907,9 @@
     sum.title = "DaVinci's matte finesse, on the COMBINED matte: clean first, then grow "
       + "or shrink, then blur. Feather is per component, in each row above.";
     det.appendChild(sum);
-    [["blur", "blur", 0, 0.2, 0.001, 0, 3,
-      "A gaussian on the finished matte, as a fraction of the frame width."],
+    [["blur", "blur", 0, BLUR_MAX, 0.001, 0, 3,
+      "A gaussian on the finished matte, as a fraction of the frame width."
+      + BLUR_CAP_NOTE],
      ["grow", "grow / shrink", -0.03, 0.03, 0.0005, 0, 4,
       "Positive grows the matte, negative shrinks it. One pixel of radius is one pass, capped at 32."],
      ["clean_black", "clean black", 0, 1, 0.005, 0, 3,
@@ -1895,9 +1917,17 @@
      ["clean_white", "clean white", 0, 1, 0.005, 0, 3,
       "Push everything above 1 minus this to 1, with a soft knee."]
     ].forEach(function (spec) {
+      /* blur only: a saved value above the cap is DISPLAYED clamped, because
+       * the engines clamp it and the panel must not show a number the picture
+       * was not made with. Not done for the others, because their maxima are
+       * the panel's own comfortable range and not a limit the engines apply:
+       * grow keeps clamping in passes at render time, so pinning its readout
+       * at 0.03 would be the same lie the other way round. */
+      var saved = num(f[spec[0]], spec[5]);
+      if (spec[0] === "blur") saved = Math.min(saved, BLUR_MAX);
       var w = Ctl.slider({
         label: spec[1], min: spec[2], max: spec[3], step: spec[4], def: spec[5],
-        precision: spec[6], title: spec[7], value: num(f[spec[0]], spec[5]),
+        precision: spec[6], title: spec[7], value: saved,
         bipolar: spec[0] === "grow",
         onChange: function (v, c) { writeFinesse(idx, spec[0], v, c); }
       });

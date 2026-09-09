@@ -150,6 +150,42 @@ def _norm(cg, text: str, root: Path) -> str:
 RADIAL_NAME = re.compile(r"(radial_\d+x\d+_)[^/\s'\":,\]\[]+(\.png)")
 
 
+def _folded_keys(keys):
+    """The folded name for each of a dict's keys, numbered when the fold makes
+    two DIFFERENT names the same.
+
+    Round 3 finding 87. `files` in a fingerprint is a dict keyed by file name,
+    so folding two names to one placeholder would have put two files in one
+    slot and one would have silently replaced the other, on both sides, with
+    the comparison then reading as green. Today every case carries exactly one
+    radial and nothing collides; a future case with two radials at the same
+    width and height (two different start/end pairs, the thing the hash was
+    added to tell apart) is what this is for.
+
+    The number is the order the graph references the files in, which is the
+    order `fingerprint()` inserted them in, and both sides are built the same
+    way, so <ID0> on one side is the same file's slot as <ID0> on the other.
+    A name that folds to something nothing else folds to is left exactly as it
+    was, so the six cases that exist today are compared byte for byte as
+    before.
+    """
+    folded = [stable(k) for k in keys]
+    counts = {}
+    for name in folded:
+        counts[name] = counts.get(name, 0) + 1
+    seen = {}
+    out = []
+    for name in folded:
+        if counts[name] == 1:
+            out.append(name)
+            continue
+        i = seen.get(name, 0)
+        seen[name] = i + 1
+        out.append(name.replace("<ID>", f"<ID{i}>") if "<ID>" in name
+                   else f"{name}#{i}")
+    return out
+
+
 def stable(data):
     """One fingerprint, or a whole dict of them, with the radial ramp's cache
     file name folded to `radial_WxH_<ID>.png`.
@@ -163,7 +199,8 @@ def stable(data):
     if isinstance(data, list):
         return [stable(v) for v in data]
     if isinstance(data, dict):
-        return {stable(k): stable(v) for k, v in data.items()}
+        keys = _folded_keys(list(data.keys()))
+        return {k: stable(v) for k, v in zip(keys, data.values())}
     return data
 
 

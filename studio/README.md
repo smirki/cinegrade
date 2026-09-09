@@ -1402,7 +1402,10 @@ has a thumbnail (the matte at the playhead, or a sketch of the shape), an
 editable name, the type, the op (`add` takes the larger of the two,
 `intersect` multiplies them, `subtract` takes this one away), `invert` (which
 flips THIS component before it combines, not the finished matte), `enabled`,
-`feather` (a gaussian on this component alone, as a fraction of frame width),
+`feather` (a gaussian on this component alone, as a fraction of frame width,
+capped at 0.10 of the frame width: the slider stops there because all three
+engines clamp there, and a grade saved before the cap existed displays its
+feather clamped rather than showing a number the picture was not made with),
 move up, move down and delete. Reorder and delete write the whole array in
 one go, so each is one undo step.
 
@@ -1454,8 +1457,9 @@ tracked keeps working, because a matte on disk needs no service.
 
 **Finesse** (`mask.finesse`, on the COMBINED matte, in the order clean, then
 grow, then blur): blur, grow (negative shrinks), clean black, clean white.
-Feather is per component and lives in its own row, because that is where C1
-puts it.
+Blur carries the same 0.10 of frame width cap feather does, and its slider
+stops there for the same reason. Feather is per component and lives in its own
+row, because that is where C1 puts it.
 
 **Display modes**, three buttons at the top of the panel:
 
@@ -2809,7 +2813,13 @@ and a grade was measured against the wrong subject without anybody knowing.
 nearest written frame served when `time` is past what a still-running track
 has reached, with `X-Matte-State` (the matte's state) and `X-Matte-Frame`
 (the index actually served) as response headers, so a caller can tell a
-fallback happened without re-parsing anything. `cinegrade mask show ID
+fallback happened without re-parsing anything. `width` has a ceiling of 3840
+(one 4K frame) and a floor of 1, and both are a CLAMP rather than a refusal:
+a caller asking for an absurd preview wants a picture. The answer says which
+it got. `X-Matte-Width` is the width actually served whenever a `width` was
+asked for, and `X-Matte-Width-Asked` is present only when the ask was not
+honoured, so its presence is how a clamp is told apart from a matte that
+happens to be 3840 wide. `cinegrade mask show ID
 --strip` builds a whole clip's worth of these, one per second, tinted over
 the picture, as a single verification image.
 
@@ -2875,7 +2885,14 @@ starts at zero, so nothing would reach the matte), and a description that
 selects nothing at all, including `{}`, which would otherwise measure the
 whole frame while the caller believed a mask was applied. A matte id in the
 stack that names nothing is 404, and a matte component with no id yet (still
-waiting on a pick and a track) is refused rather than measured as black.
+waiting on a pick and a track) is refused rather than measured as black. Two
+size limits are refused with the engine's own sentence as well: a stack
+carrying more than 32 components, and a request whose layers carry more than
+128 components between them. Each component is a fold (and, at the feather
+cap, about 59 ms of numpy at 960x540) on the thread serving the request, and
+the biggest stack in any real grade here is two components with six in a whole
+grade, so a request past either limit is a mistake rather than a grade.
+`POST /api/render` refuses the same config in the same words.
 `cinegrade stats --mask JSON_OR_FILE` and `Studio.stats(..., mask=...)` /
 `Studio.stats_at(..., mask=...)` are the same thing on the CLI and in the
 client.
@@ -3019,7 +3036,11 @@ The Limits button in the app is the honesty list. `studio/static/limits.js`
 builds it from three arrays (what genuinely is not possible here, what is
 possible but not built, and what is broken or approximate), and the parity
 sentence inside it is read from `studio/tools/parity-results.json`, the file the
-parity harness writes after an actual run, not typed by hand. When this file and
+parity harness writes after an actual run, not typed by hand. That path belongs
+to a studio running on its own defaults; a server started with `--data-dir`
+(which is every test harness, including the parity gate) writes
+`parity-results.json` into that directory instead, so running the gate never
+edits a tracked file. When this file and
 that page disagree, trust the page: it is generated from the code and from a live
 report, and this file is prose written about a moment in time.
 

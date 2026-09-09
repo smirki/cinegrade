@@ -20,7 +20,12 @@
  *   3. The add menu opens on a real click and lists every kind the plan
  *      asks for, spot checked by kind name rather than by counting rows
  *      (a group heading is not a kind and must not be miscounted as one).
- *   4. At a phone viewport (spec 22's own PHONE preset) the panel is still
+ *   4. The feather and finesse blur sliders stop at the cap all three
+ *      engines clamp to (MASK_BLUR_MAX, a tenth of frame width), say so in
+ *      their tooltips, and a grade already saved with a bigger number
+ *      DISPLAYS the clamped one, so the panel never shows a number the
+ *      picture was not made with (round 3 finding 83).
+ *   5. At a phone viewport (spec 22's own PHONE preset) the panel is still
  *      genuinely laid out: visible, non-zero, and never wider than the
  *      viewport itself, on the Grade mobile page reached the same way
  *      spec 22 reaches it.
@@ -173,7 +178,110 @@ export default async function run(ctx) {
     await page.click("body");
     await sleep(100);
 
-    // -- 4: mobile layout ----------------------------------------------------
+    // -- 4: the two blur sliders stop where the engine stops ---------------
+    /* Round 3 finding 83. `feather` and `finesse.blur` are clamped to
+     * MASK_BLUR_MAX (a tenth of frame width) by all three engines since round
+     * 2, and the panel still offered 0.25 and 0.2. Past the cap the slider
+     * moved, the number in the grade changed, the grade was saved and
+     * versioned with it, and the picture did not change at all.
+     *
+     * Two claims, and the second is the one that needs a real config: the
+     * travel now ends at the cap, AND a grade already saved with 0.2 in it
+     * displays the number the picture is actually made with. The saved value
+     * is written through Layers.emit, which is the panel's own write path
+     * (masks.js's writeComponents and writeFinesse both go through it), so
+     * this is a grade the studio itself could have saved before the cap
+     * existed. */
+    const cap = await page.evaluate(() => (window.StudioGPU && window.StudioGPU.mask
+      ? window.StudioGPU.mask.BLUR_MAX : null));
+    if (cap !== 0.1) {
+      return fail("StudioGPU.mask.BLUR_MAX reads " + cap + ", expected 0.1: the "
+        + "panel's cap and the engines' cap are the same number or this claim "
+        + "is meaningless");
+    }
+
+    const readSliders = async () => waitFor(page, (sel) => {
+      const root = document.querySelector(sel);
+      const f = root && root.querySelector("[data-mask-feather]");
+      const b = root && root.querySelector('[data-mask-finesse-field="blur"]');
+      if (!f || !b) return null;
+      const read = (el) => {
+        const val = el.querySelector(".ctl-value");
+        const knob = el.querySelector(".track .knob");
+        const lab = el.querySelector(".ctl-label");
+        const left = knob ? knob.style.left : "";
+        const m = /clamp\([^,]+,\s*([0-9.]+)%/.exec(left);
+        return {
+          text: val ? val.textContent.trim() : null,
+          pct: m ? Number(m[1]) : null,
+          title: lab ? lab.title : "",
+        };
+      };
+      return { feather: read(f), blur: read(b) };
+    }, 8000, [sectionSel]);
+
+    const setMask = async (feather, blur) => page.evaluate((args) => {
+      if (!window.Layers || !window.Layers.emit) return "no window.Layers.emit";
+      window.Layers.emit(Number(args.idx), ["mask", "components"], [{
+        type: "window", op: "add", enabled: true, feather: args.feather,
+        window: { enabled: true, shape: "rect", cx: 0.5, cy: 0.5,
+                  w: 0.6, h: 0.6, softness: 0.1 },
+      }], true);
+      window.Layers.emit(Number(args.idx), ["mask", "finesse", "blur"], args.blur, true);
+      return null;
+    }, { idx: layerIdx, feather, blur });
+
+    const emitErr = await setMask(0.2, 0.2);
+    if (emitErr) return fail(emitErr);
+    const over = await readSliders();
+    if (!over || !over.feather || over.feather.text === null) {
+      return fail(sectionSel + " never rendered a [data-mask-feather] slider and a "
+        + "finesse blur slider after the component was written: " + JSON.stringify(over));
+    }
+    if (over.feather.text !== "0.100" || over.feather.pct !== 100) {
+      return fail("a saved feather of 0.2 displays as " + over.feather.text + " at "
+        + over.feather.pct + "% of the track; the engines clamp it to 0.100, so the "
+        + "panel has to show 0.100 at the end of the travel");
+    }
+    if (over.blur.text !== "0.100" || over.blur.pct !== 100) {
+      return fail("a saved finesse blur of 0.2 displays as " + over.blur.text + " at "
+        + over.blur.pct + "%; the engines clamp it to 0.100");
+    }
+    for (const [name, s] of [["feather", over.feather], ["finesse blur", over.blur]]) {
+      if (s.title.indexOf("0.10") < 0) {
+        return fail("the " + name + " slider's tooltip does not say where the cap is: \""
+          + s.title.replace(/\n/g, " | ") + "\"");
+      }
+    }
+
+    // And a value UNDER the cap is untouched, so the check above is reading a
+    // clamp and not a slider that is pinned to its own maximum.
+    const underErr = await setMask(0.05, 0.05);
+    if (underErr) return fail(underErr);
+    const under = await waitFor(page, (sel) => {
+      const root = document.querySelector(sel);
+      const f = root && root.querySelector("[data-mask-feather] .ctl-value");
+      const b = root && root.querySelector('[data-mask-finesse-field="blur"] .ctl-value');
+      const fk = root && root.querySelector("[data-mask-feather] .track .knob");
+      if (!f || !b || !fk) return null;
+      const text = f.textContent.trim();
+      if (text !== "0.050") return null;         // the repaint has not landed yet
+      const m = /clamp\([^,]+,\s*([0-9.]+)%/.exec(fk.style.left);
+      return { feather: text, blur: b.textContent.trim(), pct: m ? Number(m[1]) : null };
+    }, 8000, [sectionSel]);
+    if (!under || under.feather !== "0.050" || under.blur !== "0.050") {
+      return fail("a feather and a blur of 0.05 do not display as themselves: "
+        + JSON.stringify(under));
+    }
+    if (under.pct !== 50) {
+      return fail("a feather of 0.05 sits at " + under.pct + "% of the track; against a "
+        + "0.10 maximum it is half way");
+    }
+    notes.push("feather and finesse blur stop at the engines' own "
+      + cap + " cap, a saved 0.2 displays as 0.100 at the end of the travel, "
+      + "0.05 sits at half travel, and both tooltips say the cap");
+
+    // -- 5: mobile layout ----------------------------------------------------
     await page.setViewport(PHONE);
     await sleep(200);
     const openedGrade = await page.evaluate(() => {

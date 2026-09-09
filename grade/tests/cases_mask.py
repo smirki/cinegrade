@@ -266,6 +266,47 @@ def test_legacy_parity_against_the_pre_change_engine(ctx):
                     not diffs, f"moved: {diffs[:8]}" if diffs else "none moved")
 
 
+def test_the_legacy_fold_cannot_lose_a_file(ctx):
+    """Round 3 finding 87: `stable()` folds a generated file name to a
+    placeholder, and `files` is a dict KEYED by that name.
+
+    Today every legacy case that carries a radial carries exactly one, so no
+    two keys fold together and the fold is harmless. The risk is a future
+    case with two radials at the same width and height, which is precisely
+    what finding 67 added the hash to distinguish: both would fold to
+    `radial_320x180_<ID>.png`, the second would silently replace the first in
+    the dict, and the comparison would then be made on one file's bytes while
+    believing it had checked two. On both sides, so it would not even fail.
+
+    The fold now numbers a collision instead of swallowing it, in the order
+    the graph references the files, so two radials stay two entries and their
+    bytes are still compared one for one.
+    """
+    two = {"files": {"<MASKS>/radial_320x180_aaaaaaaaaaaaaaaa.png": "sha-one",
+                     "<MASKS>/radial_320x180_bbbbbbbbbbbbbbbb.png": "sha-two",
+                     "<LAYERS>/layer_0_deadbeef.cube": "sha-cube"}}
+    folded = legacy_parity.stable(two)["files"]
+    ctx.expect_eq("two radials at one size stay two entries", len(folded), 3)
+    ctx.expect_eq("and both files' bytes are still in the comparison",
+                  sorted(folded.values()), ["sha-cube", "sha-one", "sha-two"])
+    ctx.expect_true("the folded names are numbered in graph order",
+                    all("<ID0>" in k or "<ID1>" in k or k.endswith(".cube")
+                        for k in folded),
+                    str(sorted(folded)))
+    ctx.expect_eq("the first radial the graph names is <ID0>",
+                  list(folded)[0], "<MASKS>/radial_320x180_<ID0>.png")
+
+    # The case that actually exists is untouched, so the blessed fixture is
+    # still compared exactly as it was.
+    one = {"files": {"<MASKS>/radial_320x180_0.55_1.00.png": "sha"}}
+    ctx.expect_eq("one radial folds to the plain placeholder, as before",
+                  list(legacy_parity.stable(one)["files"]),
+                  ["<MASKS>/radial_320x180_<ID>.png"])
+    ctx.expect_eq("and a folded string is unchanged by any of this",
+                  legacy_parity.stable("gblur=...radial_320x180_abc.png"),
+                  "gblur=...radial_320x180_<ID>.png")
+
+
 def test_empty_components_list_is_the_legacy_mask(ctx):
     """`components: []` must be exactly "no components", not "a new mask".
 
@@ -589,6 +630,101 @@ def test_the_feather_and_blur_cap(ctx):
         off = str(exc)
     ctx.expect_true("a switched off component's feather is checked as well",
                     bool(off), off[:80] or "nothing raised")
+
+
+def test_the_component_count_cap(ctx):
+    """Round 3 finding 82: the blur cap bounds ONE component and nothing
+    bounded how many components a request asks for.
+
+    The cost the round 2 cap left open, measured on this tree: one component
+    at `feather = MASK_BLUR_MAX` on a 960x540 frame costs about 59 ms in the
+    numpy reference (the same fold `POST /api/stats` runs on its request
+    thread), a component with distinct numbers serialises to roughly 180
+    bytes, and the studio's body cap is 8 MB. That is about 46,000 components
+    in one legal POST: roughly 46 minutes of CPU held by one request on a
+    threaded server that is also serving a live grading session. Every
+    component was individually inside the round 2 limits.
+
+    Two caps, because there are two ways to ask: one enormous stack, and a
+    config full of legal stacks. Both are refused rather than truncated: no
+    real grade is anywhere near them (the biggest stack in bakeoff/ is two
+    components, the biggest whole grade six), so a request that reaches one
+    is a mistake and silently measuring a truncated version of it would be a
+    worse answer than an error.
+    """
+    ctx.expect_eq("a stack may carry at most 32 components",
+                  cg.MASK_STACK_MAX_COMPONENTS, 32)
+    ctx.expect_eq("and one request at most 128 across its layers",
+                  cg.MASK_REQUEST_MAX_COMPONENTS, 128)
+    ctx.expect_gt("the request budget is the wider of the two, or a single "
+                  "legal stack could not be measured at all",
+                  cg.MASK_REQUEST_MAX_COMPONENTS, cg.MASK_STACK_MAX_COMPONENTS)
+
+    # The door every scripted caller comes through: `cinegrade stats --mask`
+    # and POST /api/stats {"mask": ...} both build their layer here.
+    at_cap = [_win(LEFT, op="add" if i == 0 else "intersect")
+              for i in range(cg.MASK_STACK_MAX_COMPONENTS)]
+    ok = ""
+    try:
+        cg.mask_stack_layer({"components": at_cap})
+    except cg.GradeError as exc:
+        ok = str(exc)
+    ctx.expect_true("a stack exactly at the cap is still built", not ok, ok[:200])
+
+    over = ""
+    try:
+        cg.mask_stack_layer({"components": at_cap + [_win(TOP, op="add")]})
+    except cg.GradeError as exc:
+        over = str(exc)
+    ctx.expect_true("one component past the cap is refused", bool(over),
+                    over[:80] or "nothing raised")
+    ctx.expect_true("and the refusal says how many it carried and what the "
+                    "limit is",
+                    "33" in over and "at most 32" in over, over[:200])
+
+    # A disabled component counts, the same way _mask_blur_controls checks a
+    # disabled component's feather: it is one toggle from being folded.
+    off = ""
+    try:
+        cg.mask_stack_layer({"components": at_cap + [_win(TOP, op="add",
+                                                          enabled=False)]})
+    except cg.GradeError as exc:
+        off = str(exc)
+    ctx.expect_true("a switched off component counts towards the cap",
+                    bool(off), off[:80] or "nothing raised")
+
+    # The request budget: every stack legal, the total not. This is the shape
+    # a per stack cap alone would let straight through.
+    legal_stack = [_win(LEFT, op="add" if i == 0 else "intersect")
+                   for i in range(cg.MASK_STACK_MAX_COMPONENTS)]
+    layers = [_layer(deepcopy(legal_stack)) for _ in range(5)]
+    total = ""
+    try:
+        cg.check_mask_components({"layers": layers})
+    except cg.GradeError as exc:
+        total = str(exc)
+    ctx.expect_true("five legal stacks in one config are refused as a total",
+                    bool(total), total[:80] or "nothing raised")
+    ctx.expect_true("and the refusal names the total and says no single "
+                    "stack was over the limit",
+                    "160" in total and "at most 128" in total, total[:200])
+
+    # And the shape of the biggest real grade on this machine passes: three
+    # layers, two components each (bakeoff/masks/grade-C015-work.json).
+    real = {"layers": [_layer([_win(LEFT), _win(TOP, op="intersect")])
+                       for _ in range(3)]}
+    refused = ""
+    try:
+        cg.check_mask_components(real, {"components": [_win(LEFT),
+                                                       _win(TOP, op="intersect")]})
+    except cg.GradeError as exc:
+        refused = str(exc)
+    ctx.expect_true("the biggest real grade here (3 layers, 6 components) "
+                    "plus a two component measurement mask is untouched",
+                    not refused, refused[:200])
+    counts = cg.mask_component_counts(real, {"components": [_win(LEFT)]})
+    ctx.expect_eq("and the counter sees every stack in the request",
+                  [n for _what, n in counts], [2, 2, 2, 1])
 
 
 def test_key_component_matches_the_qualifier(ctx):
@@ -1519,6 +1655,10 @@ def register(suite):
     suite.add(g, "legacy_parity", test_legacy_parity_against_the_pre_change_engine,
               doc="every legacy case matches the fingerprint blessed from the "
                   "pre-component engine: graph, inputs and every baked file")
+    suite.add(g, "legacy_fold_collision", test_the_legacy_fold_cannot_lose_a_file,
+              doc="two generated files that fold to one name stay two entries "
+                  "in the fingerprint instead of one silently replacing the "
+                  "other")
     suite.add(g, "empty_components_is_legacy",
               test_empty_components_list_is_the_legacy_mask,
               doc="components: [] renders the identical frame to no key at all")
@@ -1540,6 +1680,10 @@ def register(suite):
               doc="feather and finesse.blur are capped at a fraction of frame "
                   "width in all three implementations, and a value outside "
                   "[0, 1] is refused")
+    suite.add(g, "component_cap", test_the_component_count_cap,
+              doc="a mask stack may carry at most 32 components and one "
+                  "request at most 128 across its layers, both refused with "
+                  "a sentence rather than truncated")
     suite.add(g, "key_component", test_key_component_matches_the_qualifier,
               doc="a key component selects what the legacy qualifier selects")
     suite.add(g, "luma_component", test_luma_component_is_a_key_with_hue_and_sat_open,

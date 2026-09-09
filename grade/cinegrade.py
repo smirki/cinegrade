@@ -2515,6 +2515,100 @@ def mask_blur_sigma(value: float, width: float) -> float:
     return min(v, MASK_BLUR_MAX) * float(width)
 
 
+# How many components one mask stack may carry, and how many one request may
+# fold across every stack it names.
+#
+# Round 3 finding 82: MASK_BLUR_MAX above bounds the cost of ONE blur and
+# says nothing about how many blurs are asked for. Nothing counted the
+# components, so the expensive axis simply moved from "one enormous sigma" to
+# "many sigmas at the cap": measured on this tree, one component at
+# feather = MASK_BLUR_MAX on a 960x540 frame costs about 59 ms in the numpy
+# reference, a component with distinct numbers serialises to roughly 180
+# bytes, and studio/server.py's BODY_MAX_BYTES is 8 MB, so one POST /api/stats
+# could fold about 46,000 of them: roughly 46 minutes of CPU on one request
+# thread of a ThreadingHTTPServer that is also serving the founder's grading
+# session. With these two caps the same worst case is 128 * 59 ms, under 8
+# seconds.
+#
+# The numbers are far past any real grade. The largest mask stack anywhere in
+# bakeoff/ is TWO components (a person matte intersected with a skin key, in
+# bakeoff/masks/grade-C015-work.json, bakeoff/masks-sonnet/grade-C015.json and
+# the saved preset beside them), the largest whole grade is 3 layers carrying
+# 6 components between them, and the documented example in the studio-grading
+# skill is two components. So 32 per stack is sixteen times the biggest stack
+# anyone has built and 128 per request is more than twenty times the biggest
+# whole grade: a person who reaches either of these has made a mistake, which
+# is why it is REFUSED with a sentence rather than truncated.
+#
+# Counted on the block as it arrives, disabled components included, for the
+# same reason _mask_blur_controls checks a disabled component's feather: a
+# caller who pasted 40,000 components wants to hear about it, and a stack that
+# is switched off today is one toggle from being folded.
+MASK_STACK_MAX_COMPONENTS = 32
+MASK_REQUEST_MAX_COMPONENTS = 128
+
+
+def _stack_size(block) -> int:
+    """How many components a mask block declares, enabled or not."""
+    comps = (block or {}).get("components") if isinstance(block, dict) else None
+    return len(comps) if isinstance(comps, list) else 0
+
+
+def mask_component_counts(cfg=None, mask=None) -> list[tuple[str, int]]:
+    """(what it is, how many components it carries) for every mask stack one
+    request names: each of the config's layers, and the standalone `mask`
+    block a measurement is weighted by.
+
+    A whole layer dict is accepted for `mask` as well as a bare mask block,
+    because `cinegrade stats --mask` documents both.
+    """
+    out = []
+    for i, layer in enumerate(config_layers(cfg or {})):
+        block = (layer or {}).get("mask") if isinstance(layer, dict) else None
+        if isinstance(block, dict) and isinstance(block.get("components"), list):
+            out.append((f"layer {i}'s mask", _stack_size(block)))
+    if isinstance(mask, dict):
+        block = mask
+        if not isinstance(block.get("components"), list) and isinstance(
+                block.get("mask"), dict):
+            block = block["mask"]
+        if isinstance(block.get("components"), list):
+            out.append(("the mask this measurement is weighted by",
+                        _stack_size(block)))
+    return out
+
+
+def check_mask_components(cfg=None, mask=None) -> None:
+    """Refuse a request that asks this machine to fold an absurd number of
+    mask components (finding 82).
+
+    Two limits, because there are two ways to ask: one stack carrying tens of
+    thousands of components, and a config carrying tens of thousands of
+    layers that each carry a legal stack. Called from `_grade_frame_stats`
+    (so `cinegrade stats` and `cinegrade sweep` are covered) and from the
+    studio's stats and render guards, next to the ownership refusal, so the
+    CLI and the server refuse the same request in the same sentence.
+    """
+    total = 0
+    for what, n in mask_component_counts(cfg, mask):
+        if n > MASK_STACK_MAX_COMPONENTS:
+            raise GradeError(
+                f"mask: {what} carries {n} components, and a mask stack may "
+                f"carry at most {MASK_STACK_MAX_COMPONENTS}. Every component "
+                f"is folded on the thread serving this request, and the "
+                f"biggest stack in any real grade here is two (a tracked "
+                f"matte intersected with a key), so this is a mistake rather "
+                f"than a grade. Split what you are selecting into layers, or "
+                f"track one matte for it.")
+        total += n
+    if total > MASK_REQUEST_MAX_COMPONENTS:
+        raise GradeError(
+            f"mask: this request folds {total} mask components across its "
+            f"layers, and one request may fold at most "
+            f"{MASK_REQUEST_MAX_COMPONENTS}. No stack on its own is over the "
+            f"limit; the total is. A whole real grade here carries six.")
+
+
 def mask_grow_passes(grow: float, width: float) -> int:
     """The dilation/erosion pass count for a grow at this width.
 
@@ -4781,6 +4875,10 @@ def mask_stack_layer(mask: dict) -> dict:
     first enabled component has to be an `add`), and a legacy pair with
     neither the window nor the key switched on.
 
+    Since round 3 finding 82 it also refuses a stack carrying more than
+    MASK_STACK_MAX_COMPONENTS components, which is the number of blurs one
+    request can ask for rather than the width of any one of them.
+
     And, since round 2 finding 52, a feather or a finesse blur outside
     [0, 1]. Both are fractions of frame width, so 1.0 is already a gaussian
     as wide as the picture and anything past it is a mistyped number rather
@@ -4792,6 +4890,7 @@ def mask_stack_layer(mask: dict) -> dict:
     """
     layer = deep_merge(LAYER_DEFAULTS, {"mask": mask or {}})
     block = layer["mask"]
+    check_mask_components(mask=block)              # finding 82, before the fold
     for label, value in _mask_blur_controls(block):
         if not (0.0 <= value <= 1.0):
             raise GradeError(
@@ -4974,6 +5073,11 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
     # costs no ffmpeg, and against `src`, the file actually read, which is
     # `--image` on that branch of `cmd_stats` rather than `a.input`.
     require_matte_clip(cfg, src)
+    # And how much work is being asked for (round 3 finding 82), in the same
+    # place and for the same reason: before the graph and before a decode.
+    # `mask` alone would be checked by mask_stack_layer below; the config's
+    # own layers would not be checked anywhere.
+    check_mask_components(cfg, mask)
     w, h = _measure_region_size(region, info, width=width)
     extra = region_tail(region, None, width, info) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)

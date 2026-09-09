@@ -56,6 +56,9 @@ TECHNICAL = GRADE / "luts" / "technical"
 OUT = GRADE / "out"
 TOOLS = GRADE / "tools"
 STUDIO_TOOLS = STUDIO / "tools"
+# Where a normal local studio keeps the last parity report: beside parity.html
+# in the source tree, which is where that tab reads it from. A run with its own
+# data directory writes its own copy instead; see parity_report_path().
 PARITY_REPORT = STUDIO_TOOLS / "parity-results.json"
 
 
@@ -3032,27 +3035,73 @@ def _matte_clip_refusal(info, clip_key: str, clip_name: str = "",
     return message
 
 
-def _may_read_clip(user_id, name) -> bool:
-    """"May this account read this clip?", asked without a request handler.
+def _guard_read_clip(user_id, name) -> None:
+    """THE read rule, once: raise unless this account may read this clip.
 
-    The module level twin of the handler's own `_may_read`, which delegates
-    to this so the two cannot drift: `start_render` and the helpers below are
-    plain functions that carry a `user_id` rather than a `self`. True for
-    everyone when logins are off, and for a name this server cannot turn into
-    a path (the route answers "no such clip" for those, as it always did).
+    Every other read guard in this file is a caller of this function (round 3
+    finding 86). The handler's `_guard_read` is this with `self._uid()`, and
+    `_may_read_clip` below is this asked as a question, so the raising half
+    and the asking half cannot answer differently: they are the same five
+    lines, not two copies of them.
+
+    Passes for your own library, for a viewer or an editor grant, for the
+    shared `content/footage` common area, for a file opened from anywhere else
+    on this Mac, and for every caller when logins are off.
+
+    Resolution is best effort in ONE direction only: a name this server cannot
+    turn into a path is left to the route, which answers "no such clip" the
+    way it always did. It can never turn into an allow for a name that DOES
+    resolve, because the refusal comes from library.guard_read outside the try.
     """
     if not AUTH.enabled():
-        return True
+        return
     path = ""
     try:
         path = str(clip_path(str(name or "")))
     except Exception:                                         # noqa: BLE001
         path = ""
+    LIB.guard_read(user_id, path)
+
+
+def _may_read_clip(user_id, name) -> bool:
+    """"May this account read this clip?", asked without a request handler.
+
+    The question form of `_guard_read_clip`, for the plain functions that
+    carry a `user_id` rather than a `self` (`start_render` and the matte
+    ownership helpers), and the body of the handler's own `_may_read`. True
+    for everyone when logins are off, and for a name this server cannot turn
+    into a path.
+    """
     try:
-        LIB.guard_read(user_id, path)
+        _guard_read_clip(user_id, name)
         return True
     except AUTH.AuthError:
         return False
+
+
+def parity_report_path(data_dir=None) -> Path:
+    """Where POST/GET /api/parity/report keeps the last report.
+
+    Round 3 finding 85. PARITY_REPORT is anchored on the SOURCE tree, and
+    every harness that drives the parity page runs a throwaway server with its
+    own --data-dir, so running the documented gate rewrote a tracked file
+    while it ran: `git status` after a gate could not be trusted, and the
+    timings landed in the next commit.
+
+    A run that was given its own data directory keeps its report with the rest
+    of its evidence, the same rule the frame cache already follows
+    (_default_cache_dir). A run with no data directory of its own is somebody's
+    real studio, and it keeps writing where its own parity tab reads.
+
+    Resolved per request rather than at import, because --data-dir is parsed
+    in main() long after this module's constants are bound.
+    """
+    d = Path(data_dir) if data_dir is not None else DB.DATA
+    try:
+        own = d.expanduser().resolve() != (STUDIO / "data").resolve()
+    except OSError:                                           # pragma: no cover
+        own = False
+    return (d / "parity-results.json") if own else PARITY_REPORT
 
 
 def _matte_infos_for_stack(mask: dict) -> list:
@@ -3128,7 +3177,16 @@ def _require_stats_mattes_match(clip, matte_info, mask_param,
     `clip` is a clip NAME; the `path` and `ref` forms of POST /api/stats carry
     no clip this server can key, so they are left alone rather than guessed
     at.
+
+    How MUCH mask this measurement asks for is checked first, before the
+    clip name is even resolved (round 3 finding 82): the component budget is
+    about this machine rather than about whose matte it is, so it applies to
+    the `path` and `ref` forms too, and CG.check_mask_components is the same
+    function `cinegrade stats --mask` comes through, so the CLI and the route
+    refuse the same request in the same sentence. CG.GradeError answers 400
+    through the dispatcher, like every other refusal from the engine.
     """
+    CG.check_mask_components(config, mask_param)
     name = str(clip or "").strip()
     if not name:
         return
@@ -3158,7 +3216,13 @@ def _require_render_mattes_match(cfg: dict, clip, may_read=None) -> None:
     message says what to fix without opening index.json. Runs for both engines
     and whatever `allow_partial` says, because allow_partial means "I accept an
     unfinished matte", never "I accept the wrong clip's matte".
+
+    The component budget (round 3 finding 82) is asked here as well, and
+    before the clip is resolved, for the same reason: a render folds every
+    layer's stack once per frame, so an absurd config costs far more here
+    than it does on a single measured frame.
     """
+    CG.check_mask_components(cfg)
     try:
         key = mask_clip_key(clip)
     except (StudioError, HttpError, OSError):
@@ -3293,11 +3357,22 @@ def matte_frame_png(matte_id: str, time_s: float, width: int | None
     asking for something absurd gets the biggest picture this server will
     make, which is the same thing every other width in this file does
     (_preview_dims clamps to the clip's own width, grain_plate to 3840).
+
+    And it says so (round 3 finding 84). This route already answers with
+    X-Matte-State and X-Matte-Frame precisely so a caller can tell a nearest
+    written frame from an exact one; the clamp was the one fallback here that
+    happened in silence, so a tool that asked for 8000 could not tell a
+    ceiling from a matte that happens to be 3840 wide. `X-Matte-Width` states
+    the width actually served whenever one was asked for, and
+    `X-Matte-Width-Asked` appears ONLY when the answer is not the ask, so the
+    header's presence is itself the signal.
     """
     info = _matte_info(matte_id)
     size = None
+    asked = None
     if width:
-        w = max(1, min(int(width), MAX_REQUEST_WIDTH))
+        asked = int(width)
+        w = max(1, min(asked, MAX_REQUEST_WIDTH))
         h = max(1, round(w * info.height / max(1, info.width)))
         size = (w, h)
     try:
@@ -3312,6 +3387,10 @@ def matte_frame_png(matte_id: str, time_s: float, width: int | None
     finally:
         tmp.unlink(missing_ok=True)
     headers = {"X-Matte-State": info.state, "X-Matte-Frame": str(served)}
+    if size is not None:
+        headers["X-Matte-Width"] = str(size[0])
+        if asked != size[0]:
+            headers["X-Matte-Width-Asked"] = str(asked)
     if warning:
         headers["X-Matte-Warning"] = warning
     return png, headers
@@ -6447,14 +6526,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "parity/report" and method == "POST":
             payload = self._body()
-            STUDIO_TOOLS.mkdir(parents=True, exist_ok=True)
-            PARITY_REPORT.write_text(json.dumps(payload, indent=2))
+            report = parity_report_path()
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(json.dumps(payload, indent=2))
             self._json({"ok": True})
             return
 
         if route == "parity/report" and method == "GET":
-            if PARITY_REPORT.exists():
-                self._json(json.loads(PARITY_REPORT.read_text()))
+            report = parity_report_path()
+            if report.exists():
+                self._json(json.loads(report.read_text()))
             else:
                 self._json({})
             return
@@ -7224,24 +7305,12 @@ class Handler(BaseHTTPRequestHandler):
         is the read half of the same rule _guard_edit enforces on writes, and
         it runs on the same thing: the path the name resolves to.
 
-        Passes for your own library, for a viewer or an editor grant, for the
-        shared `content/footage` common area, for a file opened from anywhere
-        else on this Mac, and for every caller when logins are off.
-
-        Resolution is best effort in one direction only: a name this server
-        cannot turn into a path is left to the route, which answers "no such
-        clip" the way it always did. It can never turn into an allow for a
-        name that DOES resolve, because the refusal comes from
-        library.guard_read outside the try.
+        The rule itself is `_guard_read_clip`, the module level function this
+        handler and `_may_read` below both call, so there is one body of it in
+        this file and not one per caller shape (round 3 finding 86). What it
+        passes and what it refuses is written out there.
         """
-        if not AUTH.enabled():
-            return
-        path = ""
-        try:
-            path = str(clip_path(str(name or "")))
-        except Exception:                                     # noqa: BLE001
-            path = ""
-        LIB.guard_read(self._uid(), path)
+        _guard_read_clip(self._uid(), name)
 
     def _may_read(self, name) -> bool:
         """_guard_read asked as a question, for a LIST route.
@@ -7250,12 +7319,15 @@ class Handler(BaseHTTPRequestHandler):
         wrong for one that answers with many: `GET /api/matte` with no clip
         has to drop what this account may not see, not 403 the whole list
         because somebody else's matte is in the store. Same rule, same
-        function, so the two cannot drift apart; True for everyone when
-        logins are off, since _guard_read returns immediately then.
+        function, so the two cannot drift apart: this and `_guard_read` both
+        end up in `_guard_read_clip`, one body, and the only difference is
+        whether the refusal is raised or returned. True for everyone when
+        logins are off, since that function returns immediately then.
 
-        The body is `_may_read_clip`, the module level twin, because the
-        matte ownership helpers are plain functions that carry a user id
-        rather than a handler (round 2 finding 60).
+        The step in between is `_may_read_clip`, the module level twin, for
+        the matte ownership helpers: they are plain functions carrying a user
+        id rather than a handler (round 2 finding 60). test_identity's
+        test_26 pins the "one body" half of this by source.
         """
         return _may_read_clip(self._uid(), name)
 

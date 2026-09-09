@@ -15,7 +15,9 @@
  *   STUDIO_PYTHON       interpreter to run studio/server.py with
  *   STUDIO_FOOTAGE_SRC  folder of clips to symlink into the temp library
  *   PARITY_ONLY         substring / group / stage filter (a partial sweep is
- *                       NOT posted back to studio/tools/parity-results.json)
+ *                       NOT posted back to the server's parity-results.json,
+ *                       which since round 3 finding 85 lives in this run's own
+ *                       --data-dir and never in the source tree)
  *   PARITY_CLIP, PARITY_TIME, PARITY_WIDTHS
  *   PARITY_OUT          write the whole report as JSON here as well
  *   PARITY_MASKS        "0" turns the mask fixture block off (it is ON by

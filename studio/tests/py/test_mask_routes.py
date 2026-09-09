@@ -2064,6 +2064,65 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("no component reaches the matte", message)
 
+    def test_stats_refuses_more_mask_components_than_it_will_fold(self):
+        """Round 3 finding 82: the round 2 blur cap bounds the cost of ONE
+        component and nothing counted them.
+
+        One component at the blur cap costs about 59 ms of numpy on the
+        request thread, a component with distinct numbers is roughly 180
+        bytes of JSON, and BODY_MAX_BYTES is 8 MB, so one legal POST could
+        ask this handler to fold about 46,000 of them: roughly 46 minutes on
+        one thread of a ThreadingHTTPServer that is also serving a live
+        grading session. Every value in that request is inside the round 2
+        limits.
+
+        Both doors are asked here, because they refuse different requests:
+        one stack that is too long, and a config whose layers are each legal
+        and whose total is not. The sentence is the engine's own
+        (CG.check_mask_components), so `cinegrade stats --mask` refuses the
+        same request in the same words.
+        """
+        def window(i):
+            return {"type": "window", "op": "add" if i == 0 else "intersect",
+                    "feather": 0.001 * (i + 1),
+                    "window": {"enabled": True, "shape": "rect",
+                               "cx": 0.5, "cy": 0.5, "w": 0.6, "h": 0.6,
+                               "softness": 0.1}}
+
+        over = [window(i) for i in range(33)]
+        code, message = self._stats_error(mask={"components": over})
+        self.assertEqual(code, 400)
+        self.assertIn("at most 32", message)
+        self.assertIn("33 components", message)
+
+        # Every stack legal, the total not: this is the request a per stack
+        # cap on its own lets straight through.
+        layers = [{"enabled": True, "mask": {"components": [window(i) for i in range(30)]}}
+                  for _ in range(5)]
+        code, message = self._stats_error(config={"layers": layers})
+        self.assertEqual(code, 400)
+        self.assertIn("at most 128", message)
+
+        # And a render of the same config is refused as well, so the cap is
+        # not something a caller walks around by asking for a file instead of
+        # a measurement.
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            _post(self.base + "/render",
+                  {"clip": self.clip, "config": {"layers": layers},
+                   "start": 0, "duration": 0.1})
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("at most 128",
+                      json.loads(caught.exception.read()).get("error", ""))
+
+        # The measurement a real grade asks for is untouched: a two component
+        # stack still comes back with numbers.
+        matte_id = self._stack_matte()
+        ok = self._stats(mask={"components": [
+            {"type": "matte", "op": "add", "matte": {"id": matte_id}},
+            {"type": "luma", "op": "intersect",
+             "key": {"lum_low": 0.0, "lum_high": 1.0}}]})
+        self.assertIn("stats", ok)
+
     # -- generated caches are per run (checkpoint gap 22) ------------------
 
     def test_the_luts_this_server_bakes_land_in_its_own_cache(self):
@@ -2321,12 +2380,15 @@ class MaskRoutesTest(unittest.TestCase):
                                )["mattes"][0]["matte_id"]
         self._wait_matte_state(matte_id, ("done",))
 
-        def png_width(url):
-            png, _ = _post_none_get_raw(url)
+        def png_and_headers(url):
+            png, headers = _post_none_get_raw(url)
             # The IHDR width is bytes 16 to 20 of any PNG, so this reads the
             # real picture rather than trusting a header the route sets.
             self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
-            return int.from_bytes(png[16:20], "big")
+            return int.from_bytes(png[16:20], "big"), headers
+
+        def png_width(url):
+            return png_and_headers(url)[0]
 
         self.assertEqual(
             png_width(self.base + f"/matte/{matte_id}/frame?time=0&width=200"),
@@ -2340,6 +2402,37 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertGreaterEqual(
             png_width(self.base + f"/matte/{matte_id}/frame?time=0&width=-5"),
             1)
+
+        # Round 3 finding 84: the clamp said nothing on a route whose whole
+        # design is to announce a fallback (X-Matte-State and X-Matte-Frame
+        # exist so a caller can tell a nearest written frame from an exact
+        # one). A tool asking for 8000 got 3840 pixels with no way to tell a
+        # clamp from a matte that happens to be 3840 wide. The served width is
+        # always stated, and the width that was ASKED for appears only when it
+        # was not honoured, so the header's presence IS the signal.
+        width, headers = png_and_headers(
+            self.base + f"/matte/{matte_id}/frame?time=0&width=200")
+        self.assertEqual(headers.get("X-Matte-Width"), str(width))
+        self.assertIsNone(headers.get("X-Matte-Width-Asked"),
+                          "a width that was honoured must not look clamped")
+        width, headers = png_and_headers(
+            self.base + f"/matte/{matte_id}/frame?time=0&width=100000")
+        self.assertEqual(headers.get("X-Matte-Width"), "3840")
+        self.assertEqual(width, 3840)
+        self.assertEqual(headers.get("X-Matte-Width-Asked"), "100000",
+                         "a clamped width has to say what was asked for, or a "
+                         "clamp is indistinguishable from a 3840 wide matte")
+        # And the floor announces itself the same way.
+        width, headers = png_and_headers(
+            self.base + f"/matte/{matte_id}/frame?time=0&width=-5")
+        self.assertEqual(headers.get("X-Matte-Width"), str(width))
+        self.assertEqual(headers.get("X-Matte-Width-Asked"), "-5")
+        # A request with no width at all is untouched: nothing was asked, so
+        # nothing is announced.
+        _png, headers = _post_none_get_raw(
+            self.base + f"/matte/{matte_id}/frame?time=0")
+        self.assertIsNone(headers.get("X-Matte-Width"))
+        self.assertIsNone(headers.get("X-Matte-Width-Asked"))
 
     def test_ids_from_the_service_are_never_used_as_paths(self):
         """Round 2 finding 65: the studio joined ids that came off the SAM

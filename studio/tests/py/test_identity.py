@@ -883,6 +883,41 @@ class Identity(unittest.TestCase):
             self.assertEqual(generic.get("status"), 403, generic)
 
 
+    def test_26_the_read_rule_has_exactly_one_implementation(self):
+        """Round 3 finding 86: two copies of the read rule, under a comment
+        saying there was one.
+
+        `_may_read`'s docstring says "Same rule, same function, so the two
+        cannot drift apart". That was true while it called `_guard_read`.
+        Round 2 needed the same question outside a request handler (for
+        `_config_matte_refusals`, which is a plain function carrying a user
+        id), added the module level `_may_read_clip`, and pointed `_may_read`
+        at it: the METHOD became a thin wrapper, and the five lines it used to
+        share with `_guard_read` were copied instead. Two bodies resolving a
+        clip name and asking the library the same question, in one file, is
+        exactly the drift the docstring promised could not happen.
+
+        Pinned by source, because that is what the claim is about: there is
+        one function that turns a clip name into a path and asks
+        `LIB.guard_read`, and both the raising half and the asking half go
+        through it. The behaviour half of this rule is test_22, test_24 and
+        test_25 above, which is why nothing here calls a route.
+        """
+        text = (CONTENT / "studio" / "server.py").read_text()
+        resolves = text.count('clip_path(str(name or ""))')
+        self.assertEqual(
+            resolves, 1,
+            f"{resolves} places in studio/server.py turn a clip name into a "
+            f"path for the read guard; there has to be exactly one, or the "
+            f"raising half and the asking half can answer differently")
+        self.assertIn("def _guard_read_clip(", text)
+        for caller in ("def _may_read_clip(", "    def _guard_read(self"):
+            i = text.index(caller)
+            body = text[i:i + 2000]
+            self.assertIn("_guard_read_clip(", body,
+                          f"{caller.strip()} does not go through the shared "
+                          f"read rule")
+
     def test_25_a_refusal_does_not_name_a_clip_this_account_cannot_read(self):
         """Round 2 finding 60: the arc's own safety feature was a disclosure
         channel.
