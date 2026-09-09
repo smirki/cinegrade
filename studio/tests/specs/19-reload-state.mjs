@@ -107,10 +107,11 @@ export default async function run(ctx) {
     throw new Error("the project's rotation never became " + value);
   }
 
-  // A real click on the scrub bar's track, which is a native <input
-  // type="range">, so this is a genuine user input event and not a value
-  // assignment. The exact landing time does not matter, only that it is not
-  // zero and that it comes back.
+  // A real click on the ruler (#scrub, static/timeline.js), so this is a
+  // genuine user input event and not a value assignment. Half the track's
+  // height lands in the filmstrip lane, which is scrub surface, not in the
+  // loop range lane at the bottom. The exact landing time does not matter,
+  // only that it is not zero and that it comes back.
   async function scrubTo(fraction) {
     const box = await page.$eval("#scrub", (el) => {
       const r = el.getBoundingClientRect();

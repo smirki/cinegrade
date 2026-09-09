@@ -634,10 +634,27 @@ export default async function run(ctx) {
       await page.evaluate(() => { window.__sessionPosts = []; });
       const logRes = await fetch(base + "/api/project/log").catch(() => null);
       const logAvailable = !!(logRes && logRes.status !== 404);
+      /* This case counts commits, so it starts from a log that has stopped
+         moving: a commit still in flight from the case before it (the preset
+         load and LUT upload the GPU check just did) would otherwise land
+         inside this window and read as this one preset load making two.
+         Bounded, and it waits only for quiet, never for a number. */
       let beforeLen = null;
       if (logAvailable) {
-        const before = await logRes.json().catch(() => null);
-        beforeLen = before && Array.isArray(before.commits) ? before.commits.length : null;
+        const readLen = () => fetch(base + "/api/project/log")
+          .then((r) => r.json())
+          .then((j) => (j && Array.isArray(j.commits) ? j.commits.length : null))
+          .catch(() => null);
+        let previous = await logRes.json().catch(() => null);
+        previous = previous && Array.isArray(previous.commits) ? previous.commits.length : null;
+        beforeLen = previous;
+        for (let i = 0; i < 25; i++) {
+          await sleep(200);
+          const now = await readLen();
+          beforeLen = now === null ? beforeLen : now;
+          if (now !== null && now === previous) break;
+          previous = now;
+        }
       }
 
       await loadPresetUI("flat");

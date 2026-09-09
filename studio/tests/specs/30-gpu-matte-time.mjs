@@ -32,9 +32,9 @@
  *   2. The picture itself moves: the brightness centre on #gpuCanvas walks
  *      right across those three times, by roughly the distance the bar was
  *      built to walk.
- *   3. Through the APP: dragging #scrub to a second in and letting the app's
- *      own still render happen leaves the matte report on that second's frame
- *      (this is the app.js -> live.js -> gpu.js path, not a direct call).
+ *   3. Through the APP: pressing the #scrub ruler at a second in and letting
+ *      the app's own still render happen leaves the matte report on that
+ *      second's frame (the app.js -> live.js -> gpu.js path, not a direct call).
  *   4. Through real PLAYBACK: pressing #playBtn and sampling for a second and
  *      a half sees the matte report take several different frame numbers and
  *      the brightness centre move on the canvas while it does.
@@ -136,8 +136,9 @@ export default async function run(ctx) {
   const clipName = ctx.firstClip;
 
   /* The clip's own duration, so the times this spec probes are inside the clip
-   * on whatever footage the machine has. The scrub slider is a 0..1000 slider
-   * over the duration (app.js), so claim 3 needs the same number. */
+   * on whatever footage the machine has. The ruler spans the whole duration
+   * (static/timeline.js), so claim 3 turns a time into a fraction of its
+   * width with the same number. */
   const clips = await fetch(base + "/api/clips").then((r) => r.json())
     .then((j) => j.clips || []);
   const entry = clips.filter((c) => c.name === clipName)[0] || {};
@@ -148,6 +149,45 @@ export default async function run(ctx) {
   }
   // Three times inside the clip, the last as far in as the clip allows up to 2s.
   const TIMES = [0, Math.min(1.0, duration * 0.4), Math.min(2.0, duration * 0.8)];
+
+  /* Put the app's own playhead at a clip time, with a real mouse press on the
+   * ruler.
+   *
+   * Claims 3 and 4 used to assign #scrub.value and fire an "input" event,
+   * which was the native <input type="range"> contract. #scrub is a track you
+   * press now (static/timeline.js): the assignment was a no-op property write
+   * on a div, nothing listened for "input", and the playhead stayed at 0, so
+   * claim 3 would have measured the app path at the wrong time and claim 4
+   * would have started playback from wherever the run happened to leave it.
+   * A press is a truer user input than the assignment was and works on either
+   * shape of the control, so there is no branch here for a range input.
+   *
+   * The y offset lands in the filmstrip lane (the ruler is 80px: the tick
+   * scale, then the filmstrip, then the loop range lane at the bottom), so
+   * this scrubs rather than dragging a loop range. Same helper shape as specs
+   * 14, 24 and 28. Returns the time the app actually landed on, read off
+   * #timeLabel, so a caller can tell "the playhead did not move" apart from
+   * "the playhead moved and the matte did not follow". */
+  async function scrubTo(t) {
+    const frac = Math.max(0, Math.min(1, duration > 0 ? t / duration : 0));
+    const box = await page.evaluate(() => {
+      const card = document.querySelector('[gs-id="timeline"]');
+      if (card) card.scrollIntoView({ block: "end" });
+      const el = document.getElementById("scrub");
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.left, y: r.top + Math.min(30, r.height / 2), w: r.width };
+    });
+    if (!box || !(box.w > 10)) {
+      throw new Error("#scrub has no usable width to press, so the playhead cannot be moved");
+    }
+    // Half a pixel in from the left edge for t=0: a press exactly on the
+    // border can land on the card instead of the track.
+    await page.mouse.click(box.x + Math.max(1, box.w * frac), box.y);
+    await sleep(200);
+    return page.evaluate(() =>
+      parseFloat((document.getElementById("timeLabel") || {}).textContent) || 0);
+  }
 
   const getGrade = () => fetch(base + "/api/grade?clip=" + encodeURIComponent(clipName))
     .then((r) => r.json());
@@ -293,20 +333,18 @@ export default async function run(ctx) {
       + " (shift " + gotShift.toFixed(3) + ", fixture " + wantShift.toFixed(3) + ")");
 
     /* -- claim 3: the app's own still path -------------------------------- */
-    await page.evaluate(() => {
-      const scrub = document.getElementById("scrub");
-      scrub.value = "0";
-      scrub.dispatchEvent(new Event("input", { bubbles: true }));
-    });
+    await scrubTo(0);
     await sleep(900);
     const appTime = TIMES[1];
-    // The scrub is a 0..1000 slider over the clip's duration (app.js), so its
-    // own input listener turns this into a time the same way a human drag does.
-    await page.evaluate((v) => {
-      const scrub = document.getElementById("scrub");
-      scrub.value = String(v);
-      scrub.dispatchEvent(new Event("input", { bubbles: true }));
-    }, Math.max(1, Math.round((appTime / duration) * 1000)));
+    // A real press on the ruler, which is exactly what a person does: app.js's
+    // setTime runs, the still render goes through live.js, and gpu.js binds a
+    // matte frame for that time or does not.
+    const landed = await scrubTo(appTime);
+    if (!(Math.abs(landed - appTime) < Math.max(0.25, duration * 0.05))) {
+      return fail("pressing the ruler at " + appTime.toFixed(2) + "s of a "
+        + duration.toFixed(2) + "s clip left the playhead at " + landed
+        + "s, so the app path could not be measured at the time this claim is about");
+    }
     let appReport = null;
     const appDeadline = Date.now() + 12000;
     while (Date.now() < appDeadline) {
@@ -334,11 +372,7 @@ export default async function run(ctx) {
       notes.push("proxy not ready, so playback was not sampled");
       return { status: "PASS", evidence: notes.join("; ") };
     }
-    await page.evaluate(() => {
-      const scrub = document.getElementById("scrub");
-      scrub.value = "0";
-      scrub.dispatchEvent(new Event("input", { bubbles: true }));
-    });
+    await scrubTo(0);
     await sleep(600);
     await page.click("#playBtn");
     try {

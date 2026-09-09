@@ -46,8 +46,8 @@
  *      claims to otherwise" discipline as the Python suite's own track
  *      test.
  *   4. Acceptance A1: with the track done, switching the layer's display to
- *      "overlay" and moving the playhead across two different times (the
- *      real #scrub control) reads two different #maskOverlay data-frame
+ *      "overlay" and moving the playhead across two different times (a real
+ *      mouse press on the #scrub ruler) reads two different #maskOverlay data-frame
  *      values, because the stub's own matte is a drifting ellipse, not a
  *      static one. A real Play/pause pass over #playBtn is taken too, as
  *      corroborating evidence only (real-time headless playback timing is
@@ -150,6 +150,31 @@ export default async function run(ctx) {
       }
       return null;
     });
+  }
+
+  /* Click a button in the mask panel, retrying while it is being rebuilt.
+   *
+   * masks.js repaints the whole panel on every poll of a running job, so a
+   * handle taken a moment before one lands is a detached node by the time it
+   * is clicked and puppeteer throws "Node is detached from document" (seen
+   * on a full run, and called out in checkpoints/ROUND1-GPU.md as a spec-side
+   * race, not an app-side one). Re-querying inside a bounded retry keeps this
+   * a real click on a real button: it still fails, loudly, if the button
+   * never appears or never becomes clickable. Returns nothing; throws with a
+   * useful message on the ceiling. */
+  async function clickPanelButton(selector, ceilingMs, what) {
+    const deadline = Date.now() + (ceilingMs || 10000);
+    let lastErr = null;
+    while (Date.now() < deadline) {
+      const btn = await page.$(selector);
+      if (btn) {
+        try { await btn.click(); return; } catch (e) { lastErr = e; }
+      }
+      await sleep(200);
+    }
+    throw new Error("could not click " + (what || selector) + " within "
+      + Math.round((ceilingMs || 10000) / 1000) + "s: "
+      + (lastErr ? lastErr.message : "it never appeared"));
   }
 
   try {
@@ -274,8 +299,15 @@ export default async function run(ctx) {
     // -- 3: choose one, a real track starts, progress and states -----------
     const allBtn = await page.$(sec + " [data-mask-candidate-all]");
     const clickedAll = !!allBtn;
-    if (allBtn) await allBtn.click();
-    else await page.click(sec + ' [data-mask-candidate="' + candidates[0] + '"]');
+    // Same rebuild race as the Overlay button below: the candidate list has
+    // just landed, which is one of the moments masks.js repaints the panel.
+    try {
+      if (clickedAll) await clickPanelButton(sec + " [data-mask-candidate-all]", 8000, '"Add all"');
+      else await clickPanelButton(sec + ' [data-mask-candidate="' + candidates[0] + '"]',
+        8000, "candidate " + candidates[0]);
+    } catch (e) {
+      return fail(e.message);
+    }
     await sleep(300);
 
     // Read the row(s) back by id rather than assuming index "0" stays put:
@@ -316,18 +348,51 @@ export default async function run(ctx) {
     notes.push("real states observed before done: " + Array.from(seenStates).join(", "));
 
     // -- 4: acceptance A1, the overlay follows the playhead ------------------
-    const overlayBtn = await page.$(sec + ' [data-mask-display-mode="overlay"]');
-    if (!overlayBtn) return fail('no [data-mask-display-mode="overlay"] button');
-    await overlayBtn.click();
+    /* The track has just reached done, which is precisely when masks.js
+       repaints this panel, so this click goes through the retry helper. */
+    try {
+      await clickPanelButton(sec + ' [data-mask-display-mode="overlay"]', 10000,
+        'the layer\'s Overlay display button');
+    } catch (e) {
+      return fail(e.message);
+    }
     await sleep(400);
 
+    /* A real mouse press on the ruler at that fraction of the clip.
+     *
+     * This used to assign #scrub.value and fire an "input" event, which was
+     * the native <input type="range"> contract. #scrub is a track you press
+     * now (static/timeline.js), so the assignment was a no-op property write
+     * on a div and nothing listened for "input": the playhead never moved and
+     * A1 was measured across two identical times. A press is also a truer
+     * user input than the assignment ever was, and it works on either shape
+     * of the control, so there is no branch here for a range input.
+     *
+     * The y offset lands in the filmstrip lane (the ruler is 80px: ticks,
+     * then the filmstrip, then the loop range lane at the bottom), so this
+     * scrubs rather than dragging a loop range. Same helper shape as specs
+     * 14 and 24. */
     async function scrubTo(fraction) {
-      await page.evaluate((f) => {
-        const s = document.getElementById("scrub");
-        if (!s) return;
-        s.value = String(Math.round(f * (parseFloat(s.max) || 1000)));
-        s.dispatchEvent(new Event("input", { bubbles: true }));
-      }, fraction);
+      const box = await page.evaluate(() => {
+        const card = document.querySelector('[gs-id="timeline"]');
+        if (card) card.scrollIntoView({ block: "end" });
+        const el = document.getElementById("scrub");
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.left, y: r.top + Math.min(30, r.height / 2), w: r.width };
+      });
+      if (!box || !(box.w > 10)) {
+        throw new Error("#scrub has no usable width to press, so the playhead cannot be moved");
+      }
+      await page.mouse.click(box.x + box.w * fraction, box.y);
+      await sleep(200);
+    }
+
+    /* The playhead as the app itself reports it, so "the overlay did not
+     * follow" can be told apart from "the scrub never moved the playhead". */
+    function playheadTime() {
+      return page.evaluate(() =>
+        parseFloat((document.getElementById("timeLabel") || {}).textContent) || 0);
     }
 
     async function overlayFrame() {
@@ -339,10 +404,20 @@ export default async function run(ctx) {
     }
 
     await scrubTo(0.1);
+    const timeA = await playheadTime();
     const frameA = await overlayFrame();
     if (!frameA) return fail("#maskOverlay never turned on (data-on=\"true\") with a served frame after switching to Overlay");
 
     await scrubTo(0.85);
+    const timeB = await playheadTime();
+    /* If the two presses left the playhead in the same place there is nothing
+     * for the overlay to follow, and a "the overlay did not move" failure
+     * below would be blaming the wrong half. This is still a FAIL: A1 cannot
+     * be judged on a run where the playhead did not move. */
+    if (!(Math.abs(timeB - timeA) > 0.05)) {
+      return fail("pressing the ruler at 10% and at 85% of the clip left the playhead at "
+        + timeA + "s and " + timeB + "s, so the scrub itself moved nothing and A1 could not be measured");
+    }
     // Give the LRU/prefetch a moment to actually decode the new frame
     // before reading it, same discipline as the Python suite's polling.
     let frameB = null;
@@ -359,7 +434,8 @@ export default async function run(ctx) {
       return fail("#maskOverlay's data-frame stayed at " + frameA + " after moving the playhead from 10% to 85% "
         + "of the clip: the overlay did not follow, which is exactly what A1 requires");
     }
-    notes.push("A1: #maskOverlay data-frame moved " + frameA + " -> " + frameB + " across two scrub positions");
+    notes.push("A1: #maskOverlay data-frame moved " + frameA + " -> " + frameB
+      + " across two real ruler presses (playhead " + timeA + "s -> " + timeB + "s)");
 
     // Corroborating evidence only: real Play/pause. Never the PASS/FAIL basis
     // (headless real-time playback timing is not reliable enough for that),

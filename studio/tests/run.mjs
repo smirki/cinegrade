@@ -93,8 +93,12 @@ const SPEC_FILES = [
   "23-files.mjs",
   "24-playback-render.mjs",
   "25-viewer-zoom-frames.mjs",
-  // 26 is reserved for the timeline arc (M6/M7's own briefs both say so);
-  // masks starts at 27, lane M7 (tests).
+  /* 26 was reserved for the timeline arc while the two arcs ran side by side
+   * (M6/M7's own briefs both said so, which is why masks starts at 27); the
+   * timeline branch filled it, and this list is the merge of the two. It runs
+   * before the masks specs simply because it is numbered before them: it
+   * needs no SAM service and leaves the playhead wherever spec 25 left it. */
+  "26-timeline.mjs",
   "27-masks-panel.mjs",
   "28-masks-pick-and-track.mjs",
   "29-masks-fixture-states.mjs",

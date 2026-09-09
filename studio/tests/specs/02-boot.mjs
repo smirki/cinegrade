@@ -34,7 +34,17 @@ export default async function run(ctx) {
       evidence: consoleErrors.length + " console.error message(s) during load, first: \"" + consoleErrors[0].text + "\"",
     };
   }
-  const proj = await fetch(ctx.baseUrl + "/api/project").then((r) => r.json());
+  /* The page opens its clip's project as part of booting, and on a loaded
+     machine (or a cold frame cache) that POST lands a moment after the
+     harness's own "the app is up" signal. Poll rather than read once: the
+     claim is that the load opens a project, not that it has opened one by
+     the exact millisecond this spec starts. */
+  let proj = { open: false };
+  for (let i = 0; i < 60; i++) {
+    proj = await fetch(ctx.baseUrl + "/api/project").then((r) => r.json()).catch(() => ({ open: false }));
+    if (proj.open) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
   if (!proj.open) {
     return { status: "FAIL", evidence: "the load left no project open, so a reload has nothing to come back to" };
   }

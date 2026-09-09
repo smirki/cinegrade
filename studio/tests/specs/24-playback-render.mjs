@@ -89,12 +89,22 @@ export default async function run(ctx) {
     return page.evaluate(() => parseFloat(document.getElementById("timeLabel").textContent) || 0);
   }
 
+  /* A real press on the ruler at that time. #scrub used to be a native
+     <input type="range"> and this used to assign its .value and fire
+     "input"; the rebuilt timeline (static/timeline.js) is a track you press,
+     so this presses it, which is a truer user input than the assignment was.
+     The y offset lands in the filmstrip lane, above the range lane at the
+     bottom of the track, so this scrubs rather than dragging a loop range. */
   async function scrubTo(t) {
-    await page.evaluate((frac) => {
-      const scrub = document.getElementById("scrub");
-      scrub.value = String(Math.round(frac * 1000));
-      scrub.dispatchEvent(new Event("input", { bubbles: true }));
-    }, Math.max(0, Math.min(1, t / duration)));
+    const frac = Math.max(0, Math.min(1, t / duration));
+    const box = await page.evaluate(() => {
+      const card = document.querySelector('[gs-id="timeline"]');
+      if (card) card.scrollIntoView({ block: "end" });
+      const r = document.getElementById("scrub").getBoundingClientRect();
+      return { x: r.left, y: r.top + 30, w: r.width };
+    });
+    await page.mouse.click(box.x + box.w * frac, box.y);
+    await sleep(150);
   }
 
   async function setSecs(value) {
@@ -247,11 +257,25 @@ export default async function run(ctx) {
   // --- 4. secs persists per project, survives a reload ----------------------
   if (!problems.length) {
     await setSecs("2.5");
-    await sleep(200);
-    const proj = await fetch(base + "/api/project?clip=" + encodeURIComponent(ctx.firstClip)).then((r) => r.json());
-    if ((proj.extras || {}).play_secs !== 2.5) {
+    /* The change listener POSTs /api/project/extra, and on a project row that
+       does not exist yet it opens the project and retries, so this is up to
+       three round trips against a server that is still finishing the
+       playback this spec just stopped. A fixed 200ms sleep read the PREVIOUS
+       value (1) on a loaded machine and called the save broken. Bounded wait
+       for the value instead: it still fails, with the same message, if the
+       save never lands. */
+    let seenSecs = null;
+    const secsDeadline = Date.now() + 15000;
+    while (Date.now() < secsDeadline) {
+      const p = await fetch(base + "/api/project?clip=" + encodeURIComponent(ctx.firstClip))
+        .then((r) => r.json()).catch(() => ({}));
+      seenSecs = (p.extras || {}).play_secs;
+      if (seenSecs === 2.5) break;
+      await sleep(150);
+    }
+    if (seenSecs !== 2.5) {
       problems.push("after typing 2.5 into secs, GET /api/project extras.play_secs reads "
-        + JSON.stringify(proj.extras && proj.extras.play_secs) + ", expected 2.5");
+        + JSON.stringify(seenSecs) + ", expected 2.5");
     } else {
       await page.reload({ waitUntil: "domcontentloaded" });
       await ctx.waitForBootComplete(20000);

@@ -279,7 +279,9 @@ content/
                              select, the migration fallback for old presets
       gpu.js                 WebGL2 re-implementation of the ffmpeg filter chain,
                              used for the live preview
-      app.js               state, requests, viewer, timeline, presets, keyboard
+      app.js               state, requests, viewer, presets, keyboard
+      timeline.js           the timeline: ruler, scrub, filmstrip, mark flags,
+                             the loop range, the J K L shuttle
       login.html, login.css the login page, served instead of index.html with
                              no valid session
       auth.js               wraps window.fetch, sends a signed out browser to
@@ -287,7 +289,10 @@ content/
       grades.js             client half of per clip grades: autosave, the
                              saved indicator, the copy-grade picker
       window-editor.js      the selected layer's window, drawn and dragged on the picture
+      masks.js              the mask component stack in each layer, the SAM pick
+                             and track UI, the viewer's overlay tint
       live.js               GPU still preview, the live loop, proxy playback
+      mobile.js             the phone layout's page bar and floating preview
     tools/
       grade_client.py        first party client: Studio class, brief/bands/diff,
                              decode/measure, contact_sheet. See "Agent API" below
@@ -1779,6 +1784,79 @@ Nothing was invented to fill the gap: no `apple_log2` value exists for
 What would unblock it: Apple's own Apple Log 2 white paper PDF, placed
 somewhere this engine can read it, since that download is gated behind an
 Apple developer login the founder would have to use.
+
+## The timeline
+
+One transport row and one ruler (`studio/static/timeline.js`). It replaced a
+native `<input type="range">` with 1000 steps, a "secs" text box for the play
+length, a second row of from/to text boxes for the GPU loop, a horizontally
+scrolling filmstrip and a wrapping row of mark chips.
+
+The ruler (`#scrub`) is one pointer surface. A press anywhere in it puts the
+playhead there and a drag follows the pointer until it is released, on mouse,
+trackpad and touch alike (pointer capture, so leaving the element or the
+window does not drop the gesture). Every position is snapped to a frame,
+because the still path addresses frames and a playhead between two of them
+makes the label and the picture disagree. The proxy answers each move in the
+time of a seek, and the exact 16-bit render lands on its own debounce once the
+pointer stops, which is why a drag feels like a player rather than a slide
+show. Three lanes, top to bottom:
+
+- **Ticks.** The step is chosen from a ladder of round numbers (0.1s up to
+  10 minutes) so a label always has about 62px to itself, and the ruler is
+  rebuilt only when that choice or the clip changes, off a `ResizeObserver`.
+- **Filmstrip.** Sixteen tiles from `GET /api/thumb`, tile `i` covering
+  exactly the i-th sixteenth of the clip, so a picture always sits under the
+  moment it belongs to. It is not a pointer target: the whole ruler is one
+  scrub surface and a strip that swallowed the press would put a dead stripe
+  across the middle of it.
+- **Loop range.** A band with a draggable out handle. Drag in the empty lane
+  to draw a range, drag the handle to lengthen it, drag it back past the start
+  to loop the whole clip again. The Range button does it from the playhead to
+  the next mark, and clears it when pressed again.
+
+Hovering the ruler shows the time under the pointer in a small bubble, so a
+press lands where it was aimed rather than where it turned out to be.
+
+Marks are flags on the ruler at the time they mark: click one to jump to it,
+or the small circle above it to remove it. `S.marks` in `app.js` is still the
+only copy and the contact sheet still reads it unchanged.
+
+Nothing here owns state. The playhead is still `S.time` and moves only through
+`app.js`'s `setTime`. The loop range's in point IS the playhead, because that
+is what the engine has always done (`playLoopRange`: the whole clip when no
+length is set, otherwise the playhead plus that length), so the band is drawn
+hanging off the playhead line rather than floating free. The length itself is
+still the value of `#playDur`, still saved as `extras.play_secs` on the
+project, and the GPU loop still reads `#loopStart`/`#loopEnd`; those three are
+hidden inputs now and the ruler is the only thing that writes them, through
+the same `change` event a person leaving the old text box fired. No route,
+payload or persisted key changed.
+
+Keys (the full list is also in the Keys panel, `?`):
+
+| Key | What it does |
+| --- | --- |
+| `space`, `p` | play or pause from the playhead, looping the range |
+| `j` `k` `l` | shuttle back, stop, shuttle forward. Press `j` or `l` again for 2x, 4x, 8x |
+| `,` `.` | one frame back or forward |
+| `shift ,` `shift .` | ten frames |
+| `home` `end` | first or last frame |
+| `m` | mark this frame |
+| `[` `]` | previous or next mark |
+| `shift L` | GPU loop of the range (mode 2) |
+| arrows, `shift` arrows | one or ten frames, with the ruler focused |
+| `page up` `page down` | one second forward or back, with the ruler focused |
+| wheel over the ruler | one frame per notch, ten with `shift` |
+
+Forward at 1x is the real playback engine; every other shuttle rate is one
+proxy seek per animation frame, because a `<video>` cannot play backwards and
+the proxy answers a seek far faster than a decode.
+
+Three older bindings moved to make room, and each one kept its letter under
+`shift`: `shift J` is the raw JSON view, `shift K` the selected layer's mask,
+`shift L` the GPU loop. `v` (held) is the "see the ungraded frame" peek that
+used to be on the space bar.
 
 ## Playback
 
