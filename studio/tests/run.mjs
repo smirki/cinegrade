@@ -16,36 +16,21 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findFreePort, waitForHttp200, sleep, renderTable, pruneHarnessCache } from "./lib/util.mjs";
+import { pickPort, waitForHttp200, sleep, renderTable, pruneHarnessCache } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONTENT_DIR = path.resolve(HERE, "..", ".."); // studio/tests -> studio -> content
 const PYTHON = path.join(CONTENT_DIR, ".venv", "bin", "python");
 const CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
-const PORT_MIN = 20000;
-const PORT_MAX = 60000;
 // Round 1 finding 20: this harness picked freely from 20000-60000 with no
 // exclusions at all, and that range contains two ports a real server was
-// found on. The list of ports nothing here may ever bind now lives in ONE
-// file, studio/tests/forbidden-ports.json, read by this harness and by both
-// python suites (studio/tests/py/ports.py, grade/tests/ports.py), so adding
-// a port is one edit rather than four that drift apart.
-const FORBIDDEN_PORTS = new Set(
-  JSON.parse(fs.readFileSync(path.join(HERE, "forbidden-ports.json"), "utf8")).ports
-    .map((p) => Number(p)));
-
-/* A free port that is not on the shared list. findFreePort binds and releases,
- * so it only ever offers something nothing holds right now; the list is what
- * keeps it off a port whose owner is momentarily down. */
-async function pickPort() {
-  for (let i = 0; i < 40; i++) {
-    const port = await findFreePort(PORT_MIN, PORT_MAX, 40);
-    if (!FORBIDDEN_PORTS.has(port)) return port;
-  }
-  throw new Error("could not find a free port outside " +
-    [...FORBIDDEN_PORTS].sort((a, b) => a - b).join(", "));
-}
+// found on. The list of ports nothing here may ever bind lives in ONE file,
+// studio/tests/forbidden-ports.json, read by both python suites
+// (studio/tests/py/ports.py, grade/tests/ports.py) and, through
+// lib/util.mjs's pickPort(), by every node harness here. Round 2 finding 58
+// moved the picker itself into lib/util.mjs so parity-gate.mjs shares it
+// rather than keeping its own unguarded one liner.
 
 // Lane M7's own addition: the real SAM masking service (contract C3), always
 // started in --stub mode (no weights, synthetic drifting ellipses, the
@@ -247,7 +232,7 @@ async function main() {
   // The SAM masking service (contract C3), real, --stub, its own data dir,
   // started before studio/server.py so --sam-url points at something
   // already listening rather than something studio has to retry into
-  // existing. findFreePort is called again rather than reused: the two
+  // existing. pickPort is called again rather than reused: the two
   // servers must never be told to share one port, and a second independent
   // call (which binds and releases before returning) is how every other
   // free port in this harness is chosen too. pickPort also refuses every

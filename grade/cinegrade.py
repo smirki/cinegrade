@@ -2478,6 +2478,43 @@ MASK_GROW_MAX = 32          # passes, at MASK_GROW_REF_WIDTH
 MASK_GROW_REF_WIDTH = 1920.0
 
 
+# How wide a component feather or a finesse blur may be, as a fraction of
+# frame width, and the same cap for both because they are the same gaussian
+# at two points in the chain.
+#
+# Round 2 finding 52: grow was capped and said why, and these two were not
+# capped at all. Sigma is `value * width` and the numpy reference builds a
+# radius of 3 sigma with an np.pad and an np.convolve per row, so
+# `{"components":[{"type":"window","op":"add","feather":50}]}` at width 640
+# asked for sigma 32000, radius 96000, a (360, 192640) float64 pad of about
+# 555 MB and a length 192001 convolution per row. That is a plain
+# POST /api/stats, and with logins off (the documented default) any page the
+# founder visits can send it as a CORS simple request. Larger values raise
+# MemoryError instead.
+#
+# 0.10 of frame width is a sigma of 64 pixels on a 640 preview and 384 on a
+# 4K render: far past any edge softening a person would ask for (the parity
+# fixtures use 0.01 and 0.02), and it keeps the reference's widest pad at
+# 2.5x frame width. Like the grow cap this is a cap on the CONTROL, quoted as
+# a fraction so the preview and the render clamp at the same FRACTION of the
+# picture rather than at the same pixel count, and it is applied in all three
+# implementations (the ffmpeg graph, the numpy reference here and
+# studio/static/gpu.js) so they cannot disagree about where the cap is.
+MASK_BLUR_MAX = 0.10
+
+
+def mask_blur_sigma(value: float, width: float) -> float:
+    """The gaussian sigma for a feather or a finesse blur at this width.
+
+    One definition, used by the filter graph and by the numpy reference, and
+    ported into studio/static/gpu.js (`maskBlurSigma`) so the preview clamps
+    where the render clamps. Negative reads as zero: these controls have no
+    meaning below zero and a negative sigma is not a smaller blur.
+    """
+    v = max(0.0, float(value))
+    return min(v, MASK_BLUR_MAX) * float(width)
+
+
 def mask_grow_passes(grow: float, width: float) -> int:
     """The dilation/erosion pass count for a grow at this width.
 
@@ -2653,12 +2690,32 @@ def matte_clip_refusal(info, clip_key: str, clip_name: str = ""):
     with no clip_key recorded cannot be checked and is allowed through: this
     can only ever refuse a matte that positively names a different clip.
 
+    ONE case is decided on the recorded file NAME instead, and round 2 finding
+    71 is why. A matte whose recorded key is not a content key at all (a hand
+    built fixture, a pre-C2 service: `clipA`, `guardkey`, `synth`) cannot be
+    compared against a sha digest, and comparing them anyway refuses every
+    such matte rather than the wrong one. The engine used to exempt those
+    outright, in `matte_belongs_to`, and the studio did not, so the two halves
+    refused DIFFERENT SETS while both fix documents said "same comparison,
+    same sentence". Now, for exactly that case, both fall back to the name
+    index.json recorded (`clip`) against the name in front of them: same
+    name (or nothing recorded to compare) is allowed, a different name is
+    refused in the same words. So the rule stays "this can only ever refuse a
+    matte that positively names a different clip", and both halves refuse the
+    same set.
+
     Returns None when there is nothing to refuse.
     """
+    MT = _mattes()
     have = str(getattr(info, "clip_key", "") or "").strip()
     want = str(clip_key or "").strip()
     if not have or not want or have == want:
         return None
+    if not MT.is_clip_key(have):
+        have_name = str(getattr(info, "clip", "") or "").strip()
+        want_name = str(clip_name or "").strip()
+        if not have_name or not want_name or have_name == want_name:
+            return None
     return (f"matte {info.matte_id} was tracked on "
             f"{info.clip or have} and this is {clip_name or want}: a matte is "
             f"a per clip thing (a frame sequence at that clip's own rate and "
@@ -2670,28 +2727,21 @@ def matte_clip_refusal(info, clip_key: str, clip_name: str = ""):
 def matte_belongs_to(info, src):
     """The refusal for using this matte on the file `src`, or None.
 
-    Two exemptions, both of them "this engine cannot answer the question"
-    rather than "the answer is yes":
+    One exemption, and it is "this engine cannot answer the question" rather
+    than "the answer is yes": a source whose key cannot be computed (a file
+    that vanished between the probe and here) is not judged.
 
-    * a source whose key cannot be computed (a file that vanished between the
-      probe and here) is not judged, and
-    * a matte whose recorded clip_key is not a CONTENT key at all is not
-      judged. Hand built fixtures in this repo and any pre-C2 service file a
-      matte under a readable key (`clipA`, `guardkey`), and comparing a
-      readable name against a sha digest refuses every matte rather than the
-      wrong one. The studio makes the same kind of exemption for a matte with
-      no clip_key at all; this is that exemption with one more shape in it,
-      and it is why the guard can only refuse a matte that positively names a
-      different clip.
+    A matte whose recorded clip_key is not a CONTENT key used to be exempted
+    HERE, which made the engine allow a set the studio refused (round 2
+    finding 71). That case now lives in `matte_clip_refusal`, the sentence
+    both halves share, and is decided on the recorded file name rather than
+    waved through, so the CLI and the server refuse the same set.
 
     The SAM service is always handed the studio's own content key (C2), so
-    every matte a real track wrote is judged.
+    every matte a real track wrote is judged on its key.
     """
     MT = _mattes()
     if not src:
-        return None
-    have = str(getattr(info, "clip_key", "") or "").strip()
-    if not MT.is_clip_key(have):
         return None
     try:
         key = MT.clip_key(src)
@@ -3099,7 +3149,7 @@ def finesse_filters(finesse: dict, info: dict) -> list[str]:
         out += ["dilation" if grow > 0 else "erosion"] * passes
     blur = float(f.get("blur", 0.0) or 0.0)
     if blur > 0:
-        out.append(f"gblur=sigma={blur * width:.3f}")
+        out.append(f"gblur=sigma={mask_blur_sigma(blur, width):.3f}")
     return out
 
 
@@ -3157,7 +3207,8 @@ def mask_stack_segments(layer: dict, index: int, info: dict,
             chain.append("negate")
         feather = float(comp.get("feather", 0.0) or 0.0)
         if feather > 0:
-            chain.append(f"gblur=sigma={feather * float(info['width']):.3f}")
+            chain.append(
+                f"gblur=sigma={mask_blur_sigma(feather, info['width']):.3f}")
         op = component_op(comp)
         if op == "subtract":
             chain.append("negate")
@@ -3261,7 +3312,7 @@ def mask_matte(layer: dict, info: dict, rgb=None, time_s: float = 0.0,
             c = 1.0 - c
         feather = float(comp.get("feather", 0.0) or 0.0)
         if feather > 0:
-            c = gaussian_blur2d(c, feather * w)
+            c = gaussian_blur2d(c, mask_blur_sigma(feather, w))
         op = component_op(comp)
         if op == "add":
             acc = np.maximum(acc, c)
@@ -3281,7 +3332,7 @@ def mask_matte(layer: dict, info: dict, rgb=None, time_s: float = 0.0,
         acc = morph2d(acc, passes, grow > 0)
     blur = float(f.get("blur", 0.0) or 0.0)
     if blur > 0:
-        acc = gaussian_blur2d(acc, blur * w)
+        acc = gaussian_blur2d(acc, mask_blur_sigma(blur, w))
     if mask.get("invert"):
         acc = 1.0 - acc
     return np.clip(acc, 0.0, 1.0)
@@ -3299,11 +3350,20 @@ def gaussian_blur2d(a, sigma: float):
     s = float(sigma)
     if s <= 0:
         return np.asarray(a, dtype=np.float64)
+    # Belt and braces for round 2 finding 52. Every caller in this file goes
+    # through mask_blur_sigma(), which caps the CONTROL at a fraction of frame
+    # width; this caps the SIGMA at a quarter of the array it was handed, so a
+    # future caller that computes a sigma some other way still cannot ask for
+    # a pad wider than 2.5x the picture. Radius is 3 sigma and the pad below
+    # is (w + 2 * radius) wide, which is what turns an unbounded sigma into
+    # hundreds of MB and a length-2r+1 convolution per row.
+    arr = np.asarray(a, dtype=np.float64)
+    s = min(s, float(arr.shape[-1]) / 4.0)
     radius = max(1, int(round(s * 3.0)))
     x = np.arange(-radius, radius + 1, dtype=np.float64)
     k = np.exp(-(x * x) / (2.0 * s * s))
     k /= k.sum()
-    out = np.asarray(a, dtype=np.float64)
+    out = arr
     pad = np.pad(out, ((0, 0), (radius, radius)), mode="edge")
     out = np.apply_along_axis(lambda r: np.convolve(r, k, mode="valid"), 1, pad)
     pad = np.pad(out, ((radius, radius), (0, 0)), mode="edge")
@@ -3754,9 +3814,22 @@ def radial_mask(w, h, start, end):
     Writing straight into a gray plane costs nothing and lands the exact code.
     The matte is still an 8-bit PNG; this is the scaling, not the depth.
     """
+    import hashlib                                            # noqa: PLC0415
+
     d = lut_masks_dir()                               # checkpoint gap 22
     d.mkdir(parents=True, exist_ok=True)
-    p = d / f"radial_{w}x{h}_{start:.2f}_{end:.2f}.png"
+    # Round 2 finding 67: the name used to be `f"{start:.2f}_{end:.2f}"`, and
+    # `start` and `end` are free floats out of the config. So
+    # radial_mask(W, H, 0.301, 0.7) and radial_mask(W, H, 0.304, 0.7) named the
+    # same file and `if not p.exists()` handed the second caller the first
+    # caller's ramp, silently. window_mask five hundred lines down already does
+    # this correctly by hashing the exact block; this is the same two lines.
+    # Pre-existing, but gap 22's per run cache makes it MORE reachable, not
+    # less: which of two nearly identical radials wins now depends on the order
+    # a single run happens to bake them in.
+    tag = hashlib.sha1(json.dumps([float(start), float(end)],
+                                  sort_keys=True).encode()).hexdigest()[:16]
+    p = d / f"radial_{w}x{h}_{tag}.png"
     if not p.exists():
         expr = (f"255*clip((hypot((X-{w}/2)/({w}/2),(Y-{h}/2)/({h}/2))"
                 f"-{start})/({max(1e-3, end - start)}),0,1)")
@@ -4407,7 +4480,29 @@ def cmd_render(a):
         # would show at that size: same fraction off halation/bloom sigma,
         # radial blur, RGB split, soften and grain size.
         sys.path.insert(0, str(ROOT.parent / "studio"))
+        # Round 2 finding 61: importing studio/server.py runs its module body,
+        # and that body ends with `CG.set_cache_root(CACHE)`, where CACHE is
+        # the studio's own default (studio/cache) unless STUDIO_CACHE_DIR or
+        # STUDIO_DATA_DIR is set. `cache_root()` checks the OVERRIDE first, so
+        # that pin beats CINEGRADE_CACHE_DIR, which is the variable gap 22
+        # gave the test harness to keep each run's baked cubes and generated
+        # mattes inside its own scratch.
+        #
+        # Who it actually reached: every caller that imports this file under
+        # its own name and then renders (studio/server.py, which imports it
+        # as CG; grade/tests/harness.py, which pins the run's scratch cache;
+        # studio/tools). Running it as a script is immune by accident, since
+        # that copy is named __main__ and studio/server.py's `import
+        # cinegrade` then builds a SECOND module object and pins that one.
+        # The guard is here rather than in the caller because the caller
+        # cannot see the import happen.
+        #
+        # Snapshot, import, put it back. `set_cache_root(None)` is not the
+        # same thing (it would drop a pin a CALLER had set on purpose), so the
+        # exact previous value is restored, including "there was no pin".
+        _cache_pin = CACHE_ROOT_OVERRIDE
         import server as studio_server
+        set_cache_root(_cache_pin)
         raw_width = a.width if a.width is not None else info["width"] * a.scale
         width = max(2, int(raw_width) // 2 * 2)
         factor = width / float(info["width"])
@@ -4651,6 +4746,33 @@ def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict,
 # rather than by a check somebody remembered to run.
 
 
+def _mask_blur_controls(block: dict):
+    """Every feather and finesse blur in one mask block, with a name to say
+    it by. Read straight off the block rather than off the merged layer, so a
+    component that is switched off is still checked: a caller who typed 50
+    into a disabled component wants to hear about it before enabling it.
+    """
+    out = []
+    for j, comp in enumerate(block.get("components") or []):
+        if not isinstance(comp, dict):
+            continue
+        try:
+            value = float(comp.get("feather", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value:
+            out.append((f"component {j}'s feather", value))
+    fin = block.get("finesse")
+    if isinstance(fin, dict):
+        try:
+            value = float(fin.get("blur", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value:
+            out.append(("finesse.blur", value))
+    return out
+
+
 def mask_stack_layer(mask: dict) -> dict:
     """A throwaway layer carrying `mask`, filled in from LAYER_DEFAULTS.
 
@@ -4658,9 +4780,28 @@ def mask_stack_layer(mask: dict) -> dict:
     a component stack no component reaches (the fold starts at zero, so the
     first enabled component has to be an `add`), and a legacy pair with
     neither the window nor the key switched on.
+
+    And, since round 2 finding 52, a feather or a finesse blur outside
+    [0, 1]. Both are fractions of frame width, so 1.0 is already a gaussian
+    as wide as the picture and anything past it is a mistyped number rather
+    than an intention. It is REFUSED here, on the way in, instead of being
+    silently clamped, because this is the validation door every scripted
+    caller comes through (POST /api/stats's `mask`, `cinegrade stats --mask`)
+    and a caller who typed 50 should be told. Values inside the range are
+    still clamped to MASK_BLUR_MAX when the blur runs, the way grow clamps.
     """
     layer = deep_merge(LAYER_DEFAULTS, {"mask": mask or {}})
     block = layer["mask"]
+    for label, value in _mask_blur_controls(block):
+        if not (0.0 <= value <= 1.0):
+            raise GradeError(
+                f"mask: {label} is {value:g}, and it has to be between 0 and "
+                f"1. Feather and finesse.blur are fractions of the FRAME "
+                f"WIDTH, not pixels, so 0.02 is a two percent of frame width "
+                f"gaussian and 1 is one as wide as the picture; a value past "
+                f"1 asks for an array many times larger than the frame. "
+                f"Anything above {MASK_BLUR_MAX:g} is clamped to it when the "
+                f"blur runs, the same way grow clamps.")
     if has_components(layer):
         if not stack_components(layer):
             raise GradeError(
@@ -4821,6 +4962,18 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
     import numpy as np                                        # noqa: PLC0415
     from stats import frame_stats                            # noqa: PLC0415
     src = path if path is not None else a.input
+    # Whose mattes are these? Round 1 finding 6 was closed for `render` and
+    # for the `--matte`/`--mask` weight, and left open here, on the command
+    # its own sentence named: `cinegrade stats other.mov --preset
+    # a-look-with-a-person-matte.json` graded every measured frame through the
+    # wrong clip's matte and printed numbers with no warning and exit 0.
+    # `cmd_sweep` reaches this same function for every value it sweeps, so
+    # both verbs are closed by this one line (round 2 finding 51).
+    #
+    # Before the graph is built and before a frame is decoded, so a mismatch
+    # costs no ffmpeg, and against `src`, the file actually read, which is
+    # `--image` on that branch of `cmd_stats` rather than `a.input`.
+    require_matte_clip(cfg, src)
     w, h = _measure_region_size(region, info, width=width)
     extra = region_tail(region, None, width, info) + ["format=rgb24"]
     graph = graph_with_mask(cfg, info, tail_extra=extra, encode_out=False)
@@ -4971,7 +5124,8 @@ def cmd_stats(a):
     `window` component, so nothing is out of reach.
 
     Every measurement taken through a weight, `--matte` or `--mask`, also
-    reports `coverage` (how much of the frame the mask covers) and, on a
+    reports `coverage` (how much of the MEASURED AREA the mask covers: the
+    region when `--region` is given, the whole frame when it is not) and, on a
     frame it covers nothing of, `no_coverage: true` with the numbers null
     instead of an error (checkpoint gap 23), so a loop over timestamps
     survives the frames where a tracked subject is genuinely not there.
@@ -5115,6 +5269,12 @@ def cmd_sweep(a):
 
     rows = []
     sheet_paths, sheet_labels, tmp_dir = [], [], None
+    # Whose mattes are these (round 2 finding 51)? Asked inside
+    # `_grade_frame_stats`, which is the first thing every value in the loop
+    # below reaches, so the sweep refuses on the first value rather than
+    # printing a table graded through another clip's matte. The `--sheet`
+    # branch builds its own graph from the same cfg AFTER that call, so it is
+    # covered by the same refusal.
     if a.sheet:
         tmp_dir = tempfile.mkdtemp(prefix="cinegrade_sweep_")
     try:
@@ -6275,6 +6435,19 @@ def _image_ext(data: bytes, fallback: str = "") -> str:
     return fallback or ".bin"
 
 
+def _safe_filename_part(value, fallback: str) -> str:
+    """One wire supplied string, made safe to be part of a file NAME.
+
+    Round 2 finding 69. Everything outside [A-Za-z0-9._-] becomes an
+    underscore, so no separator, no parent, no drive letter. Leading and
+    trailing dots are stripped as well, because `..` is made of characters
+    the class allows, and an empty or all-dots result falls back to a fixed
+    word rather than to anything the caller chose.
+    """
+    text = re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "")).strip(".")
+    return text[:64] if text else fallback
+
+
 def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
     prompts = _mask_prompts(a)
     if not prompts:
@@ -6295,7 +6468,16 @@ def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
                 data = _fetch_bytes(base, url, headers=hdr)
                 # The bytes name the file, not the URL: see _image_ext.
                 ext = _image_ext(data, Path(str(url).split("?")[0]).suffix)
-                dest = outdir / f"{out.get('pick_id', 'pick')}-{iid}-{field}{ext}"
+                # Round 2 finding 69: `pick_id` and `iid` come straight off
+                # the wire and `--url` lets the caller point at any server, so
+                # a pick_id of "../../x" escaped `outdir` entirely. `ext` was
+                # already made safe (it is sniffed from the bytes); these two
+                # were not. Everything outside [A-Za-z0-9._-] becomes an
+                # underscore, which cannot spell a separator, a parent or a
+                # drive on any platform.
+                dest = outdir / (f"{_safe_filename_part(out.get('pick_id'), 'pick')}"
+                                 f"-{_safe_filename_part(iid, 'inst')}"
+                                 f"-{field}{ext}")
                 dest.write_bytes(data)
                 inst[f"{field}_file"] = str(dest)
     instances = out.get("instances") or []
@@ -7224,7 +7406,11 @@ def main():
                          "frame the matte covers nothing of is a no coverage "
                          "row (coverage 0, every block null, no_coverage true) "
                          "and exit 0, not an error, so --times survives a "
-                         "frame the subject has left")
+                         "frame the subject has left. `coverage` is the share "
+                         "of the MEASURED AREA the matte covers, so with "
+                         "--region it is the share of the region, not of the "
+                         "frame: two anchors taken with and without a region "
+                         "are not comparable on that number")
     st.add_argument("--mask", metavar="JSON_OR_FILE",
                     help="weight the measurement by a whole mask STACK: a "
                          "layer's own mask block, as inline JSON or a path to "

@@ -503,7 +503,22 @@ class Handler(BaseHTTPRequestHandler):
                 ]
                 STATE.picks[pick_id] = {"clip": body.get("clip"),
                                         "instances": instances}
-                self._json({"pick_id": pick_id, "instances": instances,
+                reported_pick, reported_ids = pick_id, None
+                if any("escape" in str(t) for t in texts):
+                    # Round 2 finding 69: a server that names its pick and its
+                    # instances anything it likes. `--url` points the CLI at
+                    # whatever server the caller says, and `mask segment -o
+                    # DIR` used to build the output filename out of these two
+                    # fields with nothing between them and the path. The
+                    # PREVIEW urls stay honest, so the download itself still
+                    # works and the only thing under test is the name the
+                    # bytes are written under.
+                    reported_pick = "../../escaped"
+                    reported_ids = ["../../../evil", ".."]
+                if reported_ids:
+                    instances = [dict(inst, id=reported_ids[i])
+                                 for i, inst in enumerate(instances)]
+                self._json({"pick_id": reported_pick, "instances": instances,
                             "candidates": len(instances)})
                 return
             if path == "/api/mask/track":

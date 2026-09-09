@@ -163,10 +163,18 @@ class DutyCycle:
         second sleep the busy fraction read 1.00, which is the opposite of what
         was happening. So anything a person or a poller looks at counts the
         part of the current rest that has already elapsed.
+
+        Read into a local first (round 2 finding 78). The worker thread clears
+        `_rest_began` in `rest()`'s `finally` the instant its sleep ends, so
+        testing the attribute and then subtracting the attribute are two reads
+        of a field another thread owns: a rest that finished in between turned
+        this into `self._clock() - None`, a TypeError on a /health served at
+        exactly the wrong moment.
         """
-        if self._rest_began is None:
+        began = self._rest_began
+        if began is None:
             return self.idle_s
-        return self.idle_s + max(0.0, self._clock() - self._rest_began)
+        return self.idle_s + max(0.0, self._clock() - began)
 
     @property
     def busy_fraction(self) -> float | None:
@@ -298,10 +306,18 @@ class DutyCycle:
     def stats(self) -> dict:
         """What /health reports. `duty_cycle` is the setting, `busy_fraction`
         is the measurement, and `resting` plus `rest_left_s` are what make a
-        deliberately idle service readable as idle rather than as stuck."""
+        deliberately idle service readable as idle rather than as stuck.
+
+        `until` is snapshotted for the same reason `idle_now` snapshots
+        `_rest_began` (round 2 finding 78): the worker thread can clear it
+        between the None test and the subtraction, and this block also has to
+        report `resting` from the SAME read, or /health could say "resting:
+        false, rest_left_s: 4.0" from two reads either side of the clear.
+        """
+        until = self._rest_until
         left = None
-        if self._rest_until is not None:
-            left = round(max(0.0, self._rest_until - self._clock()), 2)
+        if until is not None:
+            left = round(max(0.0, until - self._clock()), 2)
         return {
             "duty_cycle": self.fraction,
             "enabled": self.enabled,
@@ -310,7 +326,7 @@ class DutyCycle:
             "busy_fraction": self.busy_fraction,
             "rests": self.rests,
             "woken_early": self.woken_early,
-            "resting": self._rest_until is not None,
+            "resting": until is not None,
             "rest_left_s": left,
             "owed": self.owed,
             "max_rest_s": self.max_rest_s,

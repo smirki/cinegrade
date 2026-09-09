@@ -56,11 +56,18 @@ export default async function run_(ctx) {
   }
   /* A floor on the count as well as on the verdict. An empty or half loaded
    * gpu.js would exit 0 with almost nothing checked, and "PASS" on four checks
-   * reads exactly like "PASS" on a hundred and sixty in a table. */
-  if (passed < 150) {
+   * reads exactly like "PASS" on a hundred and sixty in a table.
+   *
+   * The floor is the EXACT live count, the way sam/tests/run.py sets its
+   * floors (round 2 finding 73). At 150 against 191 live checks, forty one
+   * of them could have been deleted with the runner none the wiser, which is
+   * the same hole this floor exists to close. Raise it whenever the file
+   * legitimately grows: that edit is the point. */
+  if (passed < 191) {
     return { status: "FAIL",
              evidence: "only " + passed + " mask reference checks ran, expected "
-               + "at least 150: something stopped gpu.js from loading fully" };
+               + "at least 191: something stopped gpu.js from loading fully, "
+               + "or checks were deleted" };
   }
   return { status: "PASS",
            evidence: passed + " mask arithmetic reference checks passed "

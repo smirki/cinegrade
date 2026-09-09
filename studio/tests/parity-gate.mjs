@@ -1,5 +1,11 @@
 /* Wave gate: run the parity harness headless and print the counts.
  *
+ * Exit status, which is the whole point of a gate:
+ *   0  everything ran and every row is EXACT or CLOSE
+ *   1  something measured wrong: a FAILED row in the sweep OR in the mask
+ *      block, the wrong number of mask rows, a page error, or an aborted run
+ *   2  the run is not a result (PARITY_MASKS=0 skipped the mask block)
+ *
  * Everything it touches is resolved from THIS FILE's own location, so the
  * gate measures the tree it lives in. It used to carry an absolute path to
  * the founder's live studio, which meant a worktree running the gate was
@@ -13,7 +19,8 @@
  *   PARITY_CLIP, PARITY_TIME, PARITY_WIDTHS
  *   PARITY_OUT          write the whole report as JSON here as well
  *   PARITY_MASKS        "0" turns the mask fixture block off (it is ON by
- *                       default, and a FAILED mask row fails the gate)
+ *                       default, a FAILED mask row fails the gate, and a run
+ *                       with it off exits 2 rather than 0)
  *   PARITY_MASK_OUT     write the mask block's own rows as JSON here
  *   PARITY_MATTE_ID     also measure this REAL tracked matte, on top of the
  *                       ones the block builds for itself
@@ -24,7 +31,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { pruneHarnessCache } from "./lib/util.mjs";
+import { pruneHarnessCache, pickPort } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));   // studio/tests
 const ROOT = path.resolve(HERE, "..", "..");                  // the studio repo root
@@ -54,7 +61,14 @@ const FOOTAGE_SRC = firstExisting([
 ]);
 if (!FOOTAGE_SRC) { console.error("no footage folder found"); process.exit(2); }
 
-const port = 20000 + Math.floor(Math.random() * 40000);
+/* Round 2 finding 58: this was `20000 + Math.floor(Math.random() * 40000)`,
+ * with no exclusion set and no bind probe, while run.mjs next door read the
+ * shared forbidden list. Two of the ports on that list (22929 and 28958, both
+ * recorded as real servers found squatting) are inside this very range, and
+ * this workspace has already had a lane take down the founder's live studio.
+ * pickPort() binds and releases a candidate before offering it AND refuses
+ * every port on studio/tests/forbidden-ports.json. */
+const port = await pickPort();
 
 // Same isolation run.mjs uses: with logins off the library's own root is
 // <root>/footage, so the gate gets a temp folder of SYMLINKS to the real
@@ -167,6 +181,30 @@ const report = await page.evaluate(() => window.parityReport || null);
 console.log("done:", done, "in", Math.round((Date.now() - t0) / 1000) + "s");
 console.log("prog:", prog);
 console.log("pageerrors:", errors.length, errors.slice(0, 3));
+
+/* ------------------------------------------------------------- the verdict
+ *
+ * Round 2 finding 50. The mask block below learned in round 1 to fail the
+ * gate on a FAILED row; the 246 row sweep sitting next to it did not. Its
+ * bad rows were printed and then dropped on the floor, and the only thing
+ * that reached process.exit was the page's own `done` flag, which parity.js
+ * sets to "1" on completion whatever the verdicts say ("error" is only
+ * reached by a thrown sweep or a missing WebGL2 context). So this gate, the
+ * arc's flagship GPU versus ffmpeg comparison, could print "0 EXACT, 246
+ * FAILED" and exit 0, and every checkpoint reading its exit status would have
+ * called it green.
+ *
+ * Three things are fatal now, each with its own flag so the summary says
+ * which one it was:
+ *   sweepBad   any sweep row whose verdict is FAILED
+ *   maskBad    any mask row FAILED, or the wrong number of mask rows
+ *   errors     anything the page threw, which used to be printed only
+ *
+ * CLOSE is deliberately NOT fatal: it is the sweep's own word for "within
+ * the documented tolerance", and 32 of the current rows are CLOSE on purpose.
+ * A missing report IS fatal, because a gate that measured nothing is not a
+ * pass. */
+let sweepBad = false;
 if (report && report.rows) {
   const bad = report.rows.filter(r => r.verdict !== "EXACT");
   for (const r of bad) {
@@ -174,10 +212,25 @@ if (report && report.rows) {
       + "  max " + (r.max === undefined ? r.error : r.max)
       + (r.blame && r.blame.length ? "  [" + r.blame.join(", ") + "]" : ""));
   }
+  const failed = report.rows.filter(r => r.verdict === "FAILED");
+  if (failed.length) {
+    console.error("sweep: " + failed.length + " of " + report.rows.length
+      + " rows FAILED, which is fatal");
+    sweepBad = true;
+  }
   if (process.env.PARITY_OUT) {
     fs.writeFileSync(process.env.PARITY_OUT, JSON.stringify(report, null, 2));
     console.log("report written to", process.env.PARITY_OUT);
   }
+} else {
+  console.error("sweep: no report came back out of the page, so nothing was "
+    + "measured, which is fatal");
+  sweepBad = true;
+}
+if (errors.length) {
+  console.error("sweep: " + errors.length + " page error(s), which is fatal: "
+    + errors.slice(0, 3).join(" | "));
+  sweepBad = true;
 }
 /* ------------------------------------------------------------ mask fixtures
  *
@@ -402,6 +455,29 @@ const MASK_FIXTURES = [
         correct: { offset: [0.22, 0.0, -0.05] } }] } }
 ];
 
+/* Round 2 finding 76: the row count check below compared
+ * `MASK_FIXTURES.length * widths.length` against a loop over that same array,
+ * so deleting a fixture from the literal shrank both sides together and the
+ * check still passed. It caught only a truncated array coming back from the
+ * page, which is not what its comment claimed. These two LITERALS are the
+ * absolute floor the comment was reaching for: they are written down here,
+ * not derived from anything, so a deleted fixture is a red gate and a new one
+ * is a deliberate edit of this line.
+ *
+ * DECLARED is the array above; BUILT is the five pushed once the matte
+ * fixtures exist (they need the sweep's own clip and render size, so they
+ * cannot live in the literal). PARITY_MATTE_ID adds one more on top, which
+ * is why it is counted separately rather than folded into BUILT. 26 + 5 at
+ * two widths is the 62 mask rows this gate reports. */
+const MASK_FIXTURES_DECLARED = 26;
+const MASK_FIXTURES_BUILT = 5;
+if (MASK_FIXTURES.length !== MASK_FIXTURES_DECLARED) {
+  console.error("mask fixtures: the literal declares " + MASK_FIXTURES.length
+    + " fixtures, this file says it should declare " + MASK_FIXTURES_DECLARED
+    + ". If you added or removed one on purpose, change that number.");
+  process.exit(1);
+}
+
 /* The matte fixture on disk.
  *
  * C2 says a matte is `<data-dir>/mattes/<clip-key>/<matte-id>/000000.png...`
@@ -463,8 +539,17 @@ function buildMatteFixture(spec) {
 
 const MASKS_ON = process.env.PARITY_MASKS !== "0";
 let maskBad = false;
+/* Round 2 finding 75: the skip used to say "this run is not a result" and
+ * then exit 0 anyway, so nothing downstream could tell a bisecting run from a
+ * full green one except by reading stdout. It now exits 2 (distinct from the
+ * 1 a real failure gives, so a caller can tell "incomplete" from "wrong"),
+ * and says so in the message. Round 1 finding 4 asked for a default-on flag
+ * OR a non-zero exit on absence; only the first half had shipped. */
+let masksSkipped = false;
 if (!MASKS_ON) {
-  console.log("mask fixtures: SKIPPED by PARITY_MASKS=0, so this run is not a result");
+  masksSkipped = true;
+  console.log("mask fixtures: SKIPPED by PARITY_MASKS=0, so this run is NOT a "
+    + "result and this gate will exit 2, not 0");
 }
 if (MASKS_ON) {
   const widths = (process.env.PARITY_WIDTHS || "640,1280").split(",").map(Number);
@@ -662,11 +747,28 @@ if (MASKS_ON) {
    * mask rows could read FAILED and the gate still exited 0. Now a FAILED row
    * is fatal, and so is the WRONG NUMBER of rows, because a fixture that
    * quietly stops being measured (deleted, renamed, or lost to a thrown
-   * fixture builder) is the same hole in a different shape. */
-  const expected = MASK_FIXTURES.length * widths.length;
+   * fixture builder) is the same hole in a different shape.
+   *
+   * Round 2 finding 50: the sweep NEXT TO this block still had the original
+   * hole, on the same exit line. It is closed up there now (`sweepBad`), and
+   * finding 76 closed the "derived from the array it counts" hole in the row
+   * count just below. */
+  /* The absolute floor (finding 76). `MASK_FIXTURES.length` is checked against
+   * the two literals at the top of the block plus the one optional real matte
+   * row FIRST, so `expected` below is a number this file wrote down rather
+   * than a number derived from the array it is about to count. */
+  const wantFixtures = MASK_FIXTURES_DECLARED + MASK_FIXTURES_BUILT + (realId ? 1 : 0);
+  if (MASK_FIXTURES.length !== wantFixtures) {
+    console.error("mask fixtures: the block holds " + MASK_FIXTURES.length
+      + " fixtures, this file says it should hold " + wantFixtures + " ("
+      + MASK_FIXTURES_DECLARED + " declared + " + MASK_FIXTURES_BUILT
+      + " built" + (realId ? " + 1 for PARITY_MATTE_ID" : "") + ")");
+    maskBad = true;
+  }
+  const expected = wantFixtures * widths.length;
   if (maskRows.length !== expected) {
     console.error("mask fixtures: measured " + maskRows.length
-      + " rows, expected " + expected + " (" + MASK_FIXTURES.length
+      + " rows, expected " + expected + " (" + wantFixtures
       + " fixtures at " + widths.length + " widths)");
     maskBad = true;
   }
@@ -678,4 +780,26 @@ if (MASKS_ON) {
 
 await browser.close();
 cleanup();
-process.exit(done === "1" && !maskBad ? 0 : 1);
+
+/* The one exit line, and every reason it can be non-zero, printed.
+ *
+ *   2  the run is not a result (the mask block was turned off): nothing was
+ *      wrong, but nothing was proved either
+ *   1  something measured wrong: a FAILED sweep row, a FAILED mask row, the
+ *      wrong number of mask rows, a page error, or a sweep that aborted
+ *   0  only when the whole thing ran and every row is EXACT or CLOSE
+ */
+const reasons = [];
+if (done !== "1") reasons.push("the sweep page finished as '" + done + "'");
+if (sweepBad) reasons.push("the sweep had FAILED rows, a page error, or no report");
+if (maskBad) reasons.push("the mask block had FAILED rows or the wrong row count");
+if (reasons.length) {
+  console.error("GATE FAILED: " + reasons.join("; "));
+  process.exit(1);
+}
+if (masksSkipped) {
+  console.error("GATE INCOMPLETE: the mask block was skipped by PARITY_MASKS=0");
+  process.exit(2);
+}
+console.log("GATE PASSED");
+process.exit(0);

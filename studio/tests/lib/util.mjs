@@ -5,6 +5,10 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));   // studio/tests/lib
+const TESTS_DIR = path.resolve(LIB_DIR, "..");                  // studio/tests
 
 export function randomPort(min, max) {
   return min + Math.floor(Math.random() * (max - min));
@@ -30,6 +34,40 @@ export async function findFreePort(min, max, attempts) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The one port picker every node harness in this repo uses
+ *
+ * Round 1 finding 20 put the list of ports nothing here may ever bind into
+ * ONE file (studio/tests/forbidden-ports.json) and taught run.mjs to read it.
+ * Round 2 finding 58: the picker itself still lived inside run.mjs, so
+ * parity-gate.mjs next door kept its own one liner
+ * (`20000 + Math.random() * 40000`) with no exclusion set and no bind probe,
+ * and two of the eight forbidden ports (22929 and 28958, both recorded as
+ * real servers found squatting) sit inside that range. The picker now lives
+ * here with the list, so a harness gets both by importing one function.
+ * ------------------------------------------------------------------------ */
+
+export const PORT_MIN = 20000;
+export const PORT_MAX = 60000;
+
+export const FORBIDDEN_PORTS = new Set(
+  JSON.parse(fs.readFileSync(path.join(TESTS_DIR, "forbidden-ports.json"), "utf8")).ports
+    .map((p) => Number(p)));
+
+/* A free port that is not on the shared list. findFreePort binds and releases,
+ * so it only ever offers something nothing holds right now; the list is what
+ * keeps it off a port whose owner is momentarily down. */
+export async function pickPort(min, max) {
+  const lo = min === undefined ? PORT_MIN : min;
+  const hi = max === undefined ? PORT_MAX : max;
+  for (let i = 0; i < 40; i++) {
+    const port = await findFreePort(lo, hi, 40);
+    if (!FORBIDDEN_PORTS.has(port)) return port;
+  }
+  throw new Error("could not find a free port outside " +
+    [...FORBIDDEN_PORTS].sort((a, b) => a - b).join(", "));
+}
+
+/* ---------------------------------------------------------------------------
  * The harness cache, and the cap on it
  *
  * run.mjs and parity-gate.mjs point the server they start at
@@ -51,11 +89,15 @@ export async function findFreePort(min, max, attempts) {
  *
  * Every entry in there is content addressed (a hash of the clip plus the
  * settings), so removing one costs a regeneration and can never cost a wrong
- * answer. The prune is deliberately paranoid about WHERE it deletes: it
- * refuses any path that is not itself a `studio/tests/.cache`, and it never
- * follows a symlink, so it cannot reach studio/cache, studio/data, footage or
- * anything else the founder owns even if a link inside the folder points
- * there.
+ * answer. The prune is deliberately paranoid about WHERE it deletes. Three
+ * separate refusals, and the reasoning for each is at the code:
+ *   the folder itself must not be a symlink (lstat),
+ *   its REAL path (realpath, so a linked parent counts too) must end in
+ *   studio/tests/.cache, and
+ *   no entry found inside it is ever followed (lstat again, in walkCache).
+ * So it cannot reach studio/cache, studio/data, footage or anything else the
+ * founder owns, whether the link is the folder, one of its parents, or
+ * something inside it.
  * ------------------------------------------------------------------------ */
 
 export const CACHE_MAX_AGE_DAYS = 7;
@@ -96,10 +138,38 @@ export function pruneHarnessCache(cacheDir, opts) {
   const o = opts || {};
   const maxAgeDays = o.maxAgeDays === undefined ? CACHE_MAX_AGE_DAYS : o.maxAgeDays;
   const maxBytes = o.maxBytes === undefined ? CACHE_MAX_BYTES : o.maxBytes;
-  const dir = path.resolve(cacheDir);
+  /* Round 2 finding 66: this guard used to be `path.resolve(cacheDir)` and a
+   * suffix test, and path.resolve is LEXICAL. The header above claims the
+   * prune never follows a symlink, but the isSymbolicLink() skip in
+   * walkCache() only ever runs on entries found INSIDE the folder, never on
+   * the folder itself, and readdirSync/rmSync both follow a link. So a
+   * studio/tests/.cache that IS a link to studio/cache passed the string test
+   * and the prune deleted the founder's real frame cache. Not hypothetical in
+   * a worktree: .venv, footage and refs at this tree's root are already
+   * symlinks into the sibling checkout, so "link the warm cache across too" is
+   * the obvious next shortcut.
+   *
+   * Two checks now, both on the folder itself:
+   *   lstat says it is not a link, and
+   *   realpath (which DOES resolve links, including in every parent segment)
+   *   still ends in studio/tests/.cache.
+   * A relative cacheDir resolves against process.cwd() before either, which is
+   * why the suffix test is kept: it is what stops a call from the wrong
+   * directory pruning the other tree. */
+  const asked = path.resolve(cacheDir);
+  let st = null;
+  try { st = fs.lstatSync(asked); } catch { /* not there yet: handled below */ }
+  if (st && st.isSymbolicLink()) {
+    throw new Error("refusing to prune " + asked + ": it is a symlink ("
+      + fs.readlinkSync(asked) + "), and this only ever prunes a real folder "
+      + "the harness itself writes");
+  }
+  const dir = st ? fs.realpathSync(asked) : asked;
   const want = path.join("studio", "tests", ".cache");
   if (!dir.endsWith(path.sep + want)) {
-    throw new Error("refusing to prune " + dir + ": this only ever prunes a "
+    throw new Error("refusing to prune " + dir
+      + (dir === asked ? "" : " (the real path of " + asked + ")")
+      + ": this only ever prunes a "
       + want + " folder, and only the one the harness itself writes");
   }
   const empty = { bytesBefore: 0, bytesAfter: 0, removed: 0, kept: 0, byAge: 0, bySize: 0 };

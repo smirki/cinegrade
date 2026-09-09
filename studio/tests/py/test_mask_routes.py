@@ -296,6 +296,17 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.picks[pick_id] = {"instances": pick_instances,
                                              "prompts": prompts}
+            if any(str(t).startswith("__escape__") for t in texts):
+                # Round 2 finding 65: a service that answers with ids that are
+                # PATHS. Studio joins pick_id and an instance id into a file
+                # name under MASK_PICK_CACHE, and `Path("/a") / "/b"` is
+                # `Path("/b")`, so an absolute id relocates the write.
+                out = [dict(instances[0], id="/tmp/fixxr-escaped-inst")]
+                if len(instances) > 1:
+                    out.append(dict(instances[1], id="../../evil"))
+                self._send(200, {"pick_id": "../../escaped-pick",
+                                 "instances": out, "elapsed_s": 0.01})
+                return
             self._send(200, {"pick_id": pick_id, "instances": instances,
                              "elapsed_s": 0.01})
             return
@@ -379,6 +390,15 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                 override = resume_ids.get(str(m.get("object_id")))
                 if override:
                     m["matte_id"] = override
+            if any(str(t).startswith("__escape__") for t in texts):
+                # The same shape on the other route: a matte id that is a
+                # path. `_matte_dir` is matte_root() / clip_key / matte_id.
+                mattes = [dict(mattes[0], matte_id="../../escaped-matte")]
+                matte_ids = [m["matte_id"] for m in mattes]
+                self._send(200, {"job_id": "job_escape", "state": "queued",
+                                 "mattes": mattes, "matte_ids": matte_ids,
+                                 "total_frames": total, "fps": fps})
+                return
             matte_ids = [m["matte_id"] for m in mattes]
             fail_texts = {t for t in texts if t.startswith("__fail__")}
             slow = "slow" in texts
@@ -1297,6 +1317,26 @@ class MaskRoutesTest(unittest.TestCase):
                          "the list route must not read every frame of every "
                          "matte to answer what state they are in")
 
+        # Round 2 finding 55: the assertion above only ever exercised the
+        # DEFAULT list route, and the read was wired to `full`, which the
+        # route takes straight from `?full=1`. So the one branch a caller
+        # actually reaches for ("send the arrays too") was the branch that
+        # decoded every PNG of every matte on the clip, inside the request
+        # handler. `?full=1` means the per frame arrays index.json already
+        # holds and nothing more.
+        full_listing = _get(self.base + f"/matte?clip={self.clip}&full=1")
+        self.assertTrue(full_listing["full"],
+                        "the control: this really is the full=1 branch")
+        full_row = next(m for m in full_listing["mattes"]
+                        if m["matte_id"] == matte_id)
+        self.assertEqual(full_row["quality"]["iou_source"], "none",
+                         "?full=1 asks for the arrays the index already "
+                         "holds, never for a decode of every frame of every "
+                         "matte on the clip")
+        self.assertIn("areas", full_row,
+                      "and it still sends those arrays, which is the whole "
+                      "point of the flag")
+
     def test_a_partial_matte_freezes_past_its_span_and_says_which_frame(self):
         """Round 1 finding 39: `assertTrue(info["frozen_outside_span"])` is a
         literal `True` in the response, so it passed whatever the studio
@@ -2208,6 +2248,152 @@ class MaskRoutesTest(unittest.TestCase):
             self.assertEqual(ok["matte"], good_id)
         finally:
             shutil.rmtree(other.parent, ignore_errors=True)
+
+    def test_stats_refuses_a_config_carrying_another_clips_matte(self):
+        """Round 2 finding 51, and the rest of round 1's finding 6.
+
+        The ownership guard only ever looked at the `matte` and `mask`
+        REQUEST parameters. A measurement can be weighted a third way: the
+        `config` itself, whose layers each carry a mask block with matte
+        components, and `_grade_frame_stats` grades the frame through those
+        layers before it measures. So the exact thing finding 6 exists to
+        stop (a landscape clip measured through a portrait matte tracked on
+        somebody else's clip, answered with numbers and exit 0) was still
+        reachable by putting the matte in the config instead of in `matte`.
+        `render` checked it; `stats` and `sweep` did not.
+
+        The refusal names the layer and the component, because a config can
+        carry a dozen of them and "one of your mattes is wrong" is not an
+        answer somebody can act on.
+        """
+        other = _write_fixture_matte(self._matte_root(), "notthisclipskey",
+                                     "m_cfgclip", "somebody-elses-clip.mov")
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/stats",
+                      {"clip": self.clip, "time": 0.1, "width": 64,
+                       "config": _matte_layer_config("m_cfgclip")})
+            self.assertEqual(caught.exception.code, 400)
+            message = json.loads(caught.exception.read()).get("error", "")
+            self.assertIn("somebody-elses-clip.mov", message)
+            self.assertIn(self.clip, message)
+            self.assertIn("layer 0 component 0", message)
+
+            # The `times` form is the same route and the same guard, and it
+            # is the one an agent loops through, so it is pinned too.
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                _post(self.base + "/stats",
+                      {"clip": self.clip, "times": [0.1, 0.2], "width": 64,
+                       "config": _matte_layer_config("m_cfgclip")})
+            self.assertEqual(caught.exception.code, 400)
+            self.assertIn("somebody-elses-clip.mov",
+                          json.loads(caught.exception.read()).get("error", ""))
+
+            # And a config carrying a matte of THIS clip still measures, so
+            # this refuses a mismatch and not every config with a matte in it.
+            good = self._track(prompts={"text": ["config matte subject"]})
+            good_id = good["mattes"][0]["matte_id"]
+            self._wait_matte_state(good_id, ("done",))
+            ok = _post(self.base + "/stats",
+                       {"clip": self.clip, "time": 0.1, "width": 64,
+                        "config": _matte_layer_config(good_id)})
+            self.assertIn("stats", ok)
+        finally:
+            shutil.rmtree(other.parent, ignore_errors=True)
+
+    def test_the_matte_frame_route_clamps_an_absurd_width(self):
+        """Round 2 finding 53: `GET /api/matte/<id>/frame?width=` was passed
+        to ffmpeg's scale with only `max(1, int(width))` on it.
+
+        A width of 100000 on a 16:9 matte is a 100000 x 56250 plane: about
+        5.6 gigapixels, and the gray16 intermediate ffmpeg scales through is
+        two bytes a pixel, so one GET could ask this machine (which is also
+        holding the model and the founder's live grading run) for more than
+        ten gigabytes. It is an unauthenticated GET with logins off, which is
+        how the studio runs on a laptop.
+
+        The cap is 3840, one 4K frame, which is wider than any preview or
+        render the studio itself asks for. It is a CLAMP rather than a
+        refusal because a caller asking for a huge matte preview wants a
+        picture, not an error, and the picture at 3840 is the same picture.
+        """
+        matte_id = self._track(prompts={"text": ["wide subject"]}
+                               )["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+
+        def png_width(url):
+            png, _ = _post_none_get_raw(url)
+            # The IHDR width is bytes 16 to 20 of any PNG, so this reads the
+            # real picture rather than trusting a header the route sets.
+            self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+            return int.from_bytes(png[16:20], "big")
+
+        self.assertEqual(
+            png_width(self.base + f"/matte/{matte_id}/frame?time=0&width=200"),
+            200)
+        self.assertEqual(
+            png_width(self.base
+                      + f"/matte/{matte_id}/frame?time=0&width=100000"),
+            3840)
+        # A negative or zero width still lands on a real picture rather than
+        # a scale filter of 0, which is the other end of the same guard.
+        self.assertGreaterEqual(
+            png_width(self.base + f"/matte/{matte_id}/frame?time=0&width=-5"),
+            1)
+
+    def test_ids_from_the_service_are_never_used_as_paths(self):
+        """Round 2 finding 65: the studio joined ids that came off the SAM
+        wire straight into filesystem paths.
+
+        `_matte_dir` is `matte_root() / clip_key / matte_id`, and the pick
+        cache writes `MASK_PICK_CACHE / f"{pick_id}_{inst_id}_overlay.jpg"`.
+        `Path("/a") / "/b"` is `Path("/b")`, which is the exact reasoning
+        sam/store.py writes out for its own side: round 1 finding 13 hardened
+        the service and left the studio trusting whatever the service
+        answered. `--sam-url` is a configuration decision rather than a
+        request, so this is a hardening rather than a live hole, but it is
+        the same two lines on both sides of one wire.
+
+        The fake service answers with a matte id of `../../escaped-matte`, a
+        pick id of `../../escaped-pick` and an instance id of
+        `/tmp/fixxr-escaped-inst` when a prompt says so.
+        """
+        strays = [Path("/tmp/fixxr-escaped-inst_overlay.jpg"),
+                  Path(self.data_dir).parent / "escaped-matte",
+                  Path(self.data_dir) / "escaped-matte"]
+        for stray in strays:
+            self.assertFalse(stray.exists(), f"{stray} exists before the test")
+
+        # track: refused outright, because a matte id is how every later
+        # route names this matte and there is nothing safe to substitute.
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self._track(prompts={"text": ["__escape__ subject"]})
+        self.assertEqual(caught.exception.code, 400)
+        message = json.loads(caught.exception.read()).get("error", "")
+        self.assertIn("matte id", message)
+
+        # segment: answered, but under this studio's own id. An instance id
+        # that is not a name is skipped rather than substituted, because an
+        # instance id is how a caller asks for that instance back.
+        out = self._segment(prompts={"text": ["__escape__ two"]})
+        self.assertNotIn("..", str(out.get("pick_id")))
+        self.assertNotIn("/", str(out.get("pick_id")))
+        for inst in out.get("instances") or []:
+            self.assertNotIn("/", str(inst.get("id")))
+            self.assertNotIn("..", str(inst.get("id")))
+
+        cache = Path(self.data_dir) / "cache" / "mask_pick"
+        if cache.is_dir():
+            for f in cache.iterdir():
+                self.assertEqual(f.name, Path(f.name).name)
+                self.assertNotIn("..", f.name)
+        for stray in strays:
+            self.assertFalse(stray.exists(),
+                             f"{stray} was written outside the store")
+        # And the ordinary path still works, so this refuses hostile ids and
+        # not every id.
+        good = self._segment(prompts={"text": ["person"]})
+        self.assertTrue(good.get("instances"))
 
     def test_the_matte_list_with_no_clip_still_answers_with_logins_off(self):
         """Major 12's fix filters the no-clip list by the same read guard the

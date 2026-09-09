@@ -42,6 +42,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PYTHON = HERE.parent / ".venv" / "bin" / "python"
 
+# The longest any one suite may take. service_e2e.py starts real servers and
+# waits on real HTTP, so this is generous on purpose; what it is really there
+# for is a suite that hangs forever.
+SUITE_TIMEOUT_S = 900
+
 # name, what it covers, the count it must not fall below, how it is run
 SUITES = [
     ("test_store.py", "the matte store and steady smoothing (C2)", 46, "script"),
@@ -57,9 +62,9 @@ SUITES = [
     ("test_memory.py", "the memory readings, the window meter and the MLX limits",
      71, "script"),
     ("test_safety.py", "the lock's ownership, the store's paths, the honest "
-     "/health, the pick's mask seed", 92, "script"),
+     "/health, the pick's mask seed", 93, "script"),
     ("test_quiet.py", "quiet mode: the duty cycle, nice, the preset, responsiveness",
-     78, "script"),
+     88, "script"),
     ("service_e2e.py", "the service over real HTTP (C3)", 88, "script"),
 ]
 
@@ -102,14 +107,28 @@ def main() -> int:
                     "-p", "no:cacheprovider"] if kind == "pytest"
                    else [str(PYTHON), str(HERE / name)])
         began = time.time()
-        result = subprocess.run(command, capture_output=True, text=True,
-                                timeout=900,
-                                # pytest only: `python -m pytest` puts the
-                                # working directory on sys.path, which is how
-                                # `from backends...` resolves without a
-                                # conftest or an installed package. The plain
-                                # scripts put sam/ on the path themselves.
-                                cwd=str(HERE.parent) if kind == "pytest" else None)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=SUITE_TIMEOUT_S,
+                                    # pytest only: `python -m pytest` puts the
+                                    # working directory on sys.path, which is
+                                    # how `from backends...` resolves without
+                                    # a conftest or an installed package. The
+                                    # plain scripts put sam/ on the path
+                                    # themselves.
+                                    cwd=str(HERE.parent) if kind == "pytest"
+                                    else None)
+        except subprocess.TimeoutExpired:
+            # Round 2 finding 74: this used to propagate straight out of
+            # main(), so a suite that hung took the remaining suites and the
+            # whole summary table with it. The exit code was still non-zero
+            # (never a false green), but the person reading it lost every
+            # other suite's result to one stuck one. Now it is one red row and
+            # the run carries on.
+            print(f"{name}: TIMED OUT after {SUITE_TIMEOUT_S}s")
+            failures.append(f"{name}: timed out after {SUITE_TIMEOUT_S}s")
+            rows.append((name, 0, 0, 0, floor))
+            continue
         out = result.stdout + result.stderr
         print(out.rstrip())
         counts = _counts(kind, out)

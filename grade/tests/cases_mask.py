@@ -234,8 +234,23 @@ def test_legacy_parity_against_the_pre_change_engine(ctx):
     cannot produce different pixels.
     """
     fixture = H.TESTS / "fixtures" / "legacy_parity.json"
-    blessed = json.loads(fixture.read_text())
-    got = legacy_parity.collect(Path(cg.ROOT))
+    raw_blessed = json.loads(fixture.read_text())
+    raw_got = legacy_parity.collect(Path(cg.ROOT))
+    # One generated file has deliberately been renamed since the blessing: the
+    # radial ramp, whose name used to round its own identity to two decimals
+    # (round 2 finding 67). `stable()` folds that name to a placeholder on both
+    # sides and folds nothing else, so what is compared is still the graph, the
+    # input ORDER and the sha1 of every file's bytes.
+    blessed = legacy_parity.stable(raw_blessed)
+    got = legacy_parity.stable(raw_got)
+    ctx.expect_true("the blessed fixture really is the pre-change engine's "
+                    "output, carrying the old rounded radial name that the "
+                    "fold exists for", raw_blessed != blessed,
+                    "nothing to fold: either the fixture was re-blessed or "
+                    "the fold has stopped matching")
+    ctx.expect_true("and this engine's radial name is the hashed one, so the "
+                    "fold is hiding a rename and not a missing file",
+                    raw_got != got, "nothing to fold on this side")
     ctx.note(f"{len(blessed)} blessed cases, {len(got)} rebuilt "
              f"({sum(len(c['files']) for c in got.values())} referenced files "
              f"hashed)")
@@ -463,6 +478,118 @@ def test_feather_softens_one_component_only(ctx):
 # --------------------------------------------------------------------------
 # (c) the key component
 # --------------------------------------------------------------------------
+
+def test_the_feather_and_blur_cap(ctx):
+    """Round 2 finding 52: feather and finesse.blur are capped, in all three
+    implementations, and a value outside [0, 1] is refused at the door.
+
+    Why it is a cap and not just a big number. Both controls are a fraction of
+    frame WIDTH, and the gaussian pads by three sigma on each side, so a
+    feather of 50 on a 1920 frame asks for a sigma of 96000 pixels and a
+    padded float64 plane of roughly 300 gigabytes. `POST /api/stats` takes a
+    whole mask block from the wire and measures it on the request thread, so
+    one request could have done that to the machine the studio and the model
+    share. The cap is on the CONTROL and quoted as a fraction, the same shape
+    as the grow cap, so the browser preview at 640 and the render at 3840
+    clamp at the same fraction of the picture rather than at the same pixel
+    count.
+
+    Four claims: the arithmetic, the numpy reference really going through it,
+    the ffmpeg graph really going through it, and the refusal for a value that
+    is a typo rather than an intention.
+    """
+    ctx.expect_eq("the cap is a tenth of frame width", cg.MASK_BLUR_MAX, 0.10)
+    ctx.expect_close("a feather under the cap is granted in full, in pixels",
+                     cg.mask_blur_sigma(0.02, 640), 12.8, 1e-9)
+    ctx.expect_close("a feather over the cap gets the cap",
+                     cg.mask_blur_sigma(50, 640), 64.0, 1e-9)
+    ctx.expect_close("and the same ask at a render width gets the same "
+                     "FRACTION, which is the point of quoting it as one",
+                     cg.mask_blur_sigma(50, 3840) / 3840.0,
+                     cg.mask_blur_sigma(50, 640) / 640.0, 1e-12)
+    ctx.expect_eq("a negative feather is zero, not a blur the other way",
+                  cg.mask_blur_sigma(-2, 640), 0.0)
+    ctx.expect_eq("zero costs nothing", cg.mask_blur_sigma(0, 640), 0.0)
+
+    # The numpy reference: an absurd feather has to compose EXACTLY as a
+    # feather at the cap, or the clamp is only in the helper and not on the
+    # path mask_matte takes.
+    img = H.render(CLIP, _cfg_plain(), T)
+    capped = _reference(_layer([_win(LEFT, feather=cg.MASK_BLUR_MAX)]), img)
+    absurd = _reference(_layer([_win(LEFT, feather=50.0)]), img)
+    soft = _reference(_layer([_win(LEFT, feather=0.01)]), img)
+    ctx.expect_true("the reference composes an absurd feather exactly as one "
+                    "at the cap", bool(np.array_equal(capped, absurd)),
+                    f"max difference {float(np.abs(capped - absurd).max()):.6f}")
+    ctx.expect_gt("and a feather under the cap is a different matte, so the "
+                  "check above is comparing something",
+                  float(np.abs(capped - soft).max()), 0.01)
+    # The same for the finesse blur, which is a second call site.
+    fin_capped = _reference(_layer([_win(LEFT)],
+                                   mask={"finesse": {"blur": cg.MASK_BLUR_MAX}}),
+                            img)
+    fin_absurd = _reference(_layer([_win(LEFT)],
+                                   mask={"finesse": {"blur": 50.0}}), img)
+    ctx.expect_true("finesse.blur is capped on the same path",
+                    bool(np.array_equal(fin_capped, fin_absurd)),
+                    f"max difference "
+                    f"{float(np.abs(fin_capped - fin_absurd).max()):.6f}")
+
+    # The ffmpeg graph: the sigma it names is the clamped one. This is the
+    # third implementation, and the one that would otherwise hand the number
+    # straight to gblur.
+    segs = cg.mask_stack_segments(_layer([_win(LEFT, feather=50.0)]), 0,
+                                  dict(H.info_for(CLIP), width=640, height=360),
+                                  {})
+    graph = " ".join(str(x) for x in segs)
+    ctx.expect_true("the filter graph asks gblur for the capped sigma, not "
+                    "for the sigma that was typed",
+                    "sigma=64.000" in graph and "sigma=32000" not in graph,
+                    graph[:300])
+
+    # And the door. A value outside [0, 1] is a typo, so it is refused with a
+    # sentence rather than silently clamped: this is the function every
+    # scripted caller comes through (POST /api/stats's `mask`, `cinegrade
+    # stats --mask`).
+    for label, block in (
+            ("a component feather",
+             {"components": [_win(LEFT, feather=50.0)]}),
+            ("finesse.blur",
+             {"components": [_win(LEFT)], "finesse": {"blur": 50.0}}),
+            ("a NEGATIVE feather past the range",
+             {"components": [_win(LEFT, feather=-3.0)]})):
+        raised = ""
+        try:
+            cg.mask_stack_layer(block)
+        except cg.GradeError as exc:
+            raised = str(exc)
+        ctx.expect_true(f"{label} of 50 is refused", bool(raised),
+                        raised[:80] or "nothing raised")
+        ctx.expect_true(f"and the refusal for {label} says what the number "
+                        f"means and what the range is",
+                        "fraction" in raised.lower()
+                        and "between 0 and 1" in raised, raised[:200])
+    ok = ""
+    try:
+        cg.mask_stack_layer({"components": [_win(LEFT, feather=0.5)],
+                             "finesse": {"blur": 1.0}})
+    except cg.GradeError as exc:
+        ok = str(exc)
+    ctx.expect_true("a feather of 0.5 and a blur of 1.0 are still accepted: "
+                    "the refusal is for typos, not for wide blurs", not ok, ok)
+
+    # A disabled component is checked too: somebody who typed 50 into a
+    # switched off component wants to hear about it before enabling it.
+    off = ""
+    try:
+        cg.mask_stack_layer({"components": [_win(LEFT),
+                                            _win(TOP, feather=50.0,
+                                                 enabled=False)]})
+    except cg.GradeError as exc:
+        off = str(exc)
+    ctx.expect_true("a switched off component's feather is checked as well",
+                    bool(off), off[:80] or "nothing raised")
+
 
 def test_key_component_matches_the_qualifier(ctx):
     """A key component selects what the legacy qualifier selects.
@@ -1348,6 +1475,45 @@ def test_matte_resize_lands_where_the_scaler_lands(ctx):
 
 # --------------------------------------------------------------------------
 
+def test_radial_matte_names_carry_the_exact_numbers(ctx):
+    """Round 2 finding 67: `radial_mask` named its cached file
+    `radial_{w}x{h}_{start:.2f}_{end:.2f}.png`.
+
+    `start` and `end` are free floats out of the config, so two radials that
+    differ in the third decimal shared a file name, and the cache is a plain
+    `if not p.exists()`: the second caller silently got the FIRST caller's
+    ramp. That is a wrong picture with no warning anywhere, and gap 22's per
+    run cache makes it more reachable rather than less, because which of the
+    two wins now depends on the order one run happens to bake them in.
+
+    `window_mask` already does this right (it hashes the exact block), so the
+    check is that a radial behaves the same way: different numbers, different
+    file, different pixels; the same numbers, the same file.
+    """
+    w, h = 96, 64
+    a = H.cg.radial_mask(w, h, 0.301, 0.7)
+    b = H.cg.radial_mask(w, h, 0.304, 0.7)
+    again = H.cg.radial_mask(w, h, 0.301, 0.7)
+    ctx.expect_true("0.301 and 0.304 do not share a cache file",
+                    Path(a) != Path(b), f"{Path(a).name} vs {Path(b).name}")
+    ctx.expect_eq("the same numbers still hit the same cache file",
+                  str(again), str(a))
+    for q in (a, b):
+        ctx.expect_true(f"{Path(q).name} was written", Path(q).is_file(),
+                        str(q))
+    ramp_a = read_gray_png(a, w, h).astype(np.int16)
+    ramp_b = read_gray_png(b, w, h).astype(np.int16)
+    diff = int(np.abs(ramp_a - ramp_b).max())
+    ctx.expect_gt("and the two ramps really are different pictures, so the "
+                  "shared name was handing back the wrong one",
+                  float(diff), 0.0)
+    ctx.note(f"max difference between the two ramps: {diff} code values")
+    # The name has to be stable across processes as well, or the cache never
+    # hits: same inputs, same hash, no run counter or object id in it.
+    ctx.expect_true("the name is derived from the numbers, not from the run",
+                    Path(a).name.startswith(f"radial_{w}x{h}_"), Path(a).name)
+
+
 def register(suite):
     g = "mask"
     suite.add(g, "legacy_parity", test_legacy_parity_against_the_pre_change_engine,
@@ -1370,6 +1536,10 @@ def register(suite):
               doc="a component's invert and the mask's invert are different masks")
     suite.add(g, "feather", test_feather_softens_one_component_only,
               doc="feather makes a ramp at the edge and leaves the interior exact")
+    suite.add(g, "blur_cap", test_the_feather_and_blur_cap,
+              doc="feather and finesse.blur are capped at a fraction of frame "
+                  "width in all three implementations, and a value outside "
+                  "[0, 1] is refused")
     suite.add(g, "key_component", test_key_component_matches_the_qualifier,
               doc="a key component selects what the legacy qualifier selects")
     suite.add(g, "luma_component", test_luma_component_is_a_key_with_hue_and_sat_open,
@@ -1426,3 +1596,6 @@ def register(suite):
                   "frames themselves, and quality(compute_iou=True) uses it")
     suite.add(g, "matte_resize", test_matte_resize_lands_where_the_scaler_lands,
               doc="the numpy resample and ffmpeg's bilinear scaler agree")
+    suite.add(g, "radial_cache_name", test_radial_matte_names_carry_the_exact_numbers,
+              doc="two radials three thousandths apart get two cache files, "
+                  "not one shared ramp (round 2 finding 67)")

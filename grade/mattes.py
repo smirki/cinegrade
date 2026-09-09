@@ -151,7 +151,12 @@ def is_under(root, path) -> bool:
 # Mirrored rather than imported because grade/ must run with no studio/ beside
 # it (studio/grades.py opens studio/data/studio.db on import, which a CLI in
 # somebody's footage folder has no business creating). The two are asserted
-# identical on real bytes by studio/tests/py/test_mask_routes.py.
+# identical on real bytes by studio/tests/py/test_projects.py (class
+# ClipKeyMirror): a file under a megabyte, a file over two megabytes so the
+# head and the tail are hashed separately, a file out of this repository, the
+# length going into the digest, and the two constants below. Round 2 finding
+# 63: this line used to name test_mask_routes.py and no such test existed in
+# that file or anywhere else.
 CLIP_KEY_CHUNK = 1024 * 1024
 CLIP_KEY_LEN = 32
 _clip_key_cache: dict = {}

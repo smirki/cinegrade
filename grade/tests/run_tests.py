@@ -61,7 +61,11 @@ import cases_harness          # noqa: E402
 # registering (a rename, a bad merge, a `register()` that returns early), which
 # used to shrink both the numerator and the denominator of the printed total
 # and stay green.
-EXPECTED_TESTS = 341
+# Round 2: 341 -> 345, the exact live count after the three cases the round 2
+# fixes added (cli_render.width_keeps_the_generated_cache for finding 61,
+# mask.radial_cache_name for 67, mask.blur_cap for 52) plus
+# harness.cache_prune_refuses_a_symlinked_cache for 66.
+EXPECTED_TESTS = 345
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,

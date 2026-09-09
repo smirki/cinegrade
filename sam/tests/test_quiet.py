@@ -207,6 +207,45 @@ def test_reading_it_while_it_rests() -> None:
           live.stats()["resting"] is False
           and live.stats()["rest_left_s"] is None)
 
+    # Round 2 finding 78. The worker thread clears _rest_began and _rest_until
+    # in rest()'s finally the instant its sleep ends, and /health is served on
+    # another thread. Reading the field twice (once to test it for None, once
+    # to subtract it) is a torn read: the rest can end in between. `TearingClock`
+    # is that race made deterministic, because it clears both fields exactly
+    # when the clock is read, which is the middle of both expressions.
+    class TearingClock:
+        def __init__(self, duty):
+            self.duty = duty
+            self.now = 1000.0
+
+        def __call__(self):
+            self.duty._rest_began = None
+            self.duty._rest_until = None
+            return self.now
+
+    torn = throttle.DutyCycle(0.5, clock=lambda: 1000.0)
+    torn._clock = TearingClock(torn)
+    torn.idle_s = 4.0
+    torn._rest_began = 990.0
+    torn._rest_until = 1010.0
+    try:
+        idle = torn.idle_now()
+        blew_up = ""
+    except TypeError as exc:
+        idle, blew_up = None, str(exc)
+    check("a rest that finishes while /health is being served does not blow "
+          "the reading up: idle_now snapshots the start of the rest before it "
+          "subtracts it, instead of reading the field a second time",
+          not blew_up and idle == 14.0, blew_up or str(idle))
+
+    torn._rest_began = 990.0
+    torn._rest_until = 1010.0
+    block = torn.stats()
+    check("and the rest block is one consistent read, never 'not resting' with "
+          "ten seconds still left on the clock",
+          (block["resting"] is True) == (block["rest_left_s"] is not None),
+          f"resting {block['resting']} left {block['rest_left_s']}")
+
 
 def test_owe_and_settle() -> None:
     print("\nowe and settle: the last window's rest, after the job is reported")
@@ -436,7 +475,6 @@ def test_health_and_responsiveness() -> None:
         # person or a poller would look at while it sleeps.
         latency = []
         queued_positions = []
-        hundred_percent_running = []
         resting_seen = None
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -445,9 +483,6 @@ def test_health_and_responsiveness() -> None:
             latency.append(time.time() - began)
             block = health["throttle"]
             job = call(base, f"/jobs/{first['job_id']}")
-            if job["state"] == "running" \
-                    and job["done_frames"] >= job["total_frames"]:
-                hundred_percent_running.append(job["done_frames"])
             if block["resting"]:
                 resting_seen = dict(block, job_done=job["done_frames"],
                                     job_state=job["state"])
@@ -493,15 +528,62 @@ def test_health_and_responsiveness() -> None:
         check("its matte kept the frames it did write",
               job["done_frames"] == 6, str(job["done_frames"]))
 
-        second_job = wait_for_job(base, second["job_id"], timeout_s=60)
+        # Round 2 finding 57. `hundred_percent_running` was appended to only
+        # inside the loop above, and that loop BREAKS on the first observed
+        # rest, which is after window 1 of 3 at 6 frames of 18. The condition
+        # it looked for (done_frames >= total_frames) can only happen at the
+        # END of a job, which that loop never reaches: the first job is then
+        # cancelled at 6 frames and the second was drained through
+        # wait_for_job, which records nothing. So the list was empty by the
+        # shape of the harness and not by the behaviour of owe/settle, and the
+        # check could not fail.
+        #
+        # The second job IS sampled to the end now, and the claim is stated as
+        # the thing that would actually be wrong: how long the job sits at
+        # 100 percent of its frames before it is reported done. The last
+        # window's rest is OWED to the service and taken after `_end_job`, so
+        # that gap is a matte flush (milliseconds). If the rest were taken
+        # inside `track()` instead, the gap would be the whole asked rest,
+        # which this run measured above at over a second.
+        first_full = None
+        reported_done = None
+        samples = 0
+        deadline = time.time() + 60
+        second_job = None
+        while time.time() < deadline:
+            job = call(base, f"/jobs/{second['job_id']}")
+            samples += 1
+            total = job.get("total_frames") or 0
+            if total and job["done_frames"] >= total and first_full is None:
+                first_full = time.time()
+                first_full_state = job["state"]
+            if job["state"] in ("done", "failed", "cancelled"):
+                reported_done = time.time()
+                second_job = job
+                break
+            time.sleep(0.02)
         check("the queue drains afterwards: the job behind the cancelled one "
-              "ran to the end", second_job["state"] == "done"
+              "ran to the end", second_job is not None
+              and second_job["state"] == "done"
               and second_job["done_frames"] == 18,
-              f"{second_job['state']} {second_job['done_frames']}")
-        check("no sample ever showed a job at 100 percent of its frames and "
-              "still running, which is what owing the last window's rest to "
-              "the service is for", hundred_percent_running == [],
-              str(hundred_percent_running))
+              f"{second_job and second_job['state']} "
+              f"{second_job and second_job['done_frames']} "
+              f"over {samples} samples")
+        check("and it really was sampled on the way, rather than read once "
+              "after it had already finished", samples > 1, str(samples))
+        check("a sample was taken with every frame written, which is the "
+              "sample the claim below is about",
+              first_full is not None, str(first_full))
+        if first_full is not None and reported_done is not None:
+            gap = reported_done - first_full
+            asked = (resting_seen or {}).get("last", {}).get("asked_rest_s", 0)
+            check("a job at 100 percent of its frames is reported done "
+                  "immediately, not after the last window's rest: that rest "
+                  "is owed to the service and taken afterwards, so a poller "
+                  "never watches a finished job that will not finish",
+                  gap < 0.5 and asked > 1.0,
+                  f"{gap * 1000:.0f} ms at 100 percent, against an asked rest "
+                  f"of {asked}s (state at that sample: {first_full_state})")
 
         block = call(base, "/health")["throttle"]
         check("the run's own numbers are on /health at the end: rests taken, "
@@ -515,6 +597,104 @@ def test_health_and_responsiveness() -> None:
               str(block.get("units")))
         check("one rest was woken early by the cancel, and it is counted",
               block["woken_early"] >= 1, str(block["woken_early"]))
+    finally:
+        stop(proc)
+
+
+def test_a_pick_after_a_cancel_still_rests() -> None:
+    """Round 2 finding 62: after a cancel, picks stopped resting.
+
+    `interrupt()` sets the wake event and the only `wake.clear()` in the tree
+    is `resume()`, which `_run_job` called and `_run_pick` did not. So the
+    event stayed set from a cancel until the next JOB started, and every pick
+    served in between rested on an already-set event: the wait returned at
+    once, `woken_early` went up and the recorded rest was 0.
+
+    In plain words, somebody who cancels a track and then keeps clicking the
+    picture to pick objects gets no throttling at all on those clicks, at the
+    exact moment they are most likely to be doing something else on the
+    machine. Which is the whole point of quiet mode.
+
+    Measured through /health rather than by timing the call, because the rest
+    is taken AFTER the answer is on its way: the pick itself is fast either
+    way, and what moved is the gap the machine gets afterwards.
+    """
+    print("\nover real HTTP: a pick after a cancel still rests (finding 62)")
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="sam-quiet-cancel-"))
+    clip = make_frames(root / "clip", count=18, width=48, height=32)
+    port = free_port()
+    # Duty cycle 0.1: a rest of nine times the work, so one 25 ms pick asks
+    # for about 0.2 s and the difference between resting and not resting is
+    # far outside any timing noise.
+    proc, base = start(port, root / "svc",
+                       ["--stub-delay-ms", "25", "--duty-cycle", "0.1",
+                        "--chunk-frames", "6", "--mask-width-hint", "32"])
+    try:
+        job = call(base, "/track", {"video": str(clip), "fps": 24,
+                                    "prompts": {"text": ["person"]},
+                                    "out_dir": str(root / "m1")})
+        # Cancel it while it is RUNNING, which is the only cancel that
+        # interrupts a rest, and wait until the queue is empty again so the
+        # pick below is served with no job in flight.
+        deadline = time.time() + 30
+        state = ""
+        while time.time() < deadline:
+            state = call(base, f"/jobs/{job['job_id']}")["state"]
+            if state == "running":
+                break
+            time.sleep(0.02)
+        check("the track reached running, so its cancel is the kind that "
+              "interrupts a rest", state == "running", state)
+        call(base, f"/jobs/{job['job_id']}/cancel", {})
+        ended = wait_for_job(base, job["job_id"], timeout_s=20)
+        check("and it ended as cancelled", ended["state"] == "cancelled",
+              ended["state"])
+
+        before = call(base, "/health")["throttle"]
+        picks_before = (before.get("units") or {}).get("pick") or {"count": 0,
+                                                                   "idle_s": 0.0}
+        woken_before = before["woken_early"]
+
+        call(base, "/segment", {"image": str(clip / "0000.png"),
+                                "prompts": {"text": ["person"]}})
+
+        # The rest is taken after the answer, so poll until the pick has been
+        # accounted rather than reading /health once and racing it.
+        picks = picks_before
+        last = None
+        woken_after = woken_before
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            block = call(base, "/health")["throttle"]
+            picks = (block.get("units") or {}).get("pick") or {"count": 0,
+                                                               "idle_s": 0.0}
+            if picks["count"] > picks_before["count"]:
+                woken_after = block["woken_early"]
+                last = block.get("last")
+                break
+            time.sleep(0.02)
+
+        check("the pick was accounted as a pick, not as a window",
+              picks["count"] == picks_before["count"] + 1,
+              f"{picks_before['count']} -> {picks['count']}")
+        rested = picks["idle_s"] - picks_before["idle_s"]
+        check("and it really rested afterwards, rather than the cancel's own "
+              "wake event making its rest return instantly",
+              rested > 0.01, f"{rested:.3f}s of rest after the pick")
+        # The sharp version of the same claim: the pick's own record says it
+        # slept nearly all of what it asked for and was not woken. A stub pick
+        # is a few milliseconds of work, so the asked rest is small; what
+        # matters is that it was taken rather than skipped.
+        check("the pick's own record says it slept what it asked for",
+              isinstance(last, dict) and last.get("unit") == "pick"
+              and last.get("woken") is False
+              and last.get("rest_s", 0) >= 0.8 * last.get("asked_rest_s", 0)
+              and last.get("asked_rest_s", 0) > 0.0, str(last))
+        check("so nothing was counted as woken early by a cancel that had "
+              "already been served", woken_after == woken_before,
+              f"{woken_before} -> {woken_after}")
     finally:
         stop(proc)
 
@@ -566,6 +746,7 @@ def main() -> int:
     test_preset()
     test_stub_really_sleeps()
     test_health_and_responsiveness()
+    test_a_pick_after_a_cancel_still_rests()
     test_quiet_flag_over_http()
     return report("test_quiet")
 

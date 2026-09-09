@@ -152,8 +152,18 @@ def _run(tmp: Path) -> int:
               and not any(a is not None for a in opened["areas"]),
               str(len(opened["areas"])))
         check("the job knows how many frames it will do", job["total_frames"] == 24)
-        check("the matte's directory is under the out_dir the caller gave",
-              str(matte_dir).startswith(str(tmp / "data" / "mattes" / "C015-rot0")))
+        # Compared against the RESOLVED out_dir. Round 2 finding 77: the
+        # service used to validate the resolved path and then return the
+        # caller's spelling of it, so a symlink swapped in between the two
+        # re-homed the whole store; it returns the resolved path now. On this
+        # machine that is visible without any symlink game, because /tmp is
+        # itself a symlink to /private/tmp, and the two spellings name the
+        # same directory.
+        want = (tmp / "data" / "mattes" / "C015-rot0").resolve()
+        check("the matte's directory is under the out_dir the caller gave, "
+              "spelled the way the service resolved it",
+              str(matte_dir).startswith(str(want)),
+              f"{matte_dir} against {want}")
 
         done = wait_for_job(base, job["job_id"], 60)
         check("the job finishes", done["state"] == "done", str(done.get("error")))

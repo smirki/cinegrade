@@ -168,11 +168,17 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     exception on the frame where the sky genuinely left the picture.
 
     Every WEIGHTED answer, empty or not, also carries `coverage` (the mean
-    of the weight over the frame: 1.0 for a weight of all ones, 0.25 for a
-    matte covering a quarter of it solidly, and the same 0.25 for a matte
-    covering half of it at half strength) and `no_coverage` (False on a real
-    measurement). An UNWEIGHTED call is byte for byte what it always was:
-    neither key appears, because neither means anything without a mask.
+    of the weight over THE MEASURED AREA, which is the region when one is
+    given and the whole frame when one is not: 1.0 for a weight of all ones,
+    0.25 for a matte covering a quarter of that area solidly, and the same
+    0.25 for a matte covering half of it at half strength) and `no_coverage`
+    (False on a real measurement). Round 2 finding 81: this used to say "of
+    the frame" and the weight is cropped to `region` before the mean is
+    taken, so the same matte reads higher inside a tight region than it does
+    over the whole frame, and two anchors taken with and without a region are
+    not comparable on this number. An UNWEIGHTED call is byte for byte
+    what it always was: neither key appears, because neither means anything
+    without a mask.
     """
     a = rgb.astype(np.float32) / 255.0
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -263,8 +269,10 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
         "bands": bands(rgb, weight=w),
     }
     if w is not None:
-        # Gap 23 / gap 19: a weighted answer says how much of the frame it
-        # measured, so a number and the mask it came from travel together.
+        # Gap 23 / gap 19: a weighted answer says how much of the MEASURED
+        # AREA it measured (the region when one was given, the whole frame
+        # otherwise: `w` was cropped with the picture above), so a number and
+        # the mask it came from travel together.
         # Absent on an unweighted call on purpose: every envelope written
         # before this change is unchanged there.
         out["coverage"] = round(float(w.mean()), 6)

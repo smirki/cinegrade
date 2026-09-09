@@ -117,12 +117,28 @@ def test_the_forbidden_port_list_is_one_shared_list(ctx):
     py_reader = (H.CONTENT / "studio" / "tests" / "py" / "ports.py").read_text()
     ctx.expect_true("the studio route suites read the same file",
                     "forbidden-ports.json" in py_reader, py_reader[:200])
-    run_mjs = (H.CONTENT / "studio" / "tests" / "run.mjs").read_text()
-    ctx.expect_true("the browser harness reads the same file, instead of "
-                    "picking freely from 20000-60000 as it used to",
-                    "forbidden-ports.json" in run_mjs
-                    and "FORBIDDEN_PORTS" in run_mjs,
-                    run_mjs[:200])
+    # The node side: ONE reader of the file and ONE picker, shared by both
+    # harnesses that start servers. Round 2 finding 58: the parity gate had
+    # its own picker over 20000-60000 with no forbidden list at all, so the
+    # gate could bind the founder's live studio port while run.mjs beside it
+    # could not. The picker moved into lib/util.mjs and both import it, which
+    # is what these four checks pin: the reader is the library, and neither
+    # harness has grown a picker of its own again.
+    util_mjs = (H.CONTENT / "studio" / "tests" / "lib" / "util.mjs").read_text()
+    ctx.expect_true("the node harnesses' shared library reads the same file, "
+                    "instead of picking freely from 20000-60000 as it used to",
+                    "forbidden-ports.json" in util_mjs
+                    and "FORBIDDEN_PORTS" in util_mjs
+                    and "export async function pickPort" in util_mjs,
+                    util_mjs[:200])
+    for name in ("run.mjs", "parity-gate.mjs"):
+        text = (H.CONTENT / "studio" / "tests" / name).read_text()
+        ctx.expect_true(f"{name} takes its ports from that one picker",
+                        'pickPort' in text
+                        and 'from "./lib/util.mjs"' in text, name)
+        ctx.expect_true(f"{name} no longer keeps a picker of its own",
+                        "function pickPort" not in text
+                        and "findFreePort(" not in text, name)
     for name in ("cases_cli_project.py", "cases_cli_agent.py"):
         text = (H.TESTS / name).read_text()
         ctx.expect_true(f"{name} uses the shared picker",
@@ -174,6 +190,94 @@ def test_this_run_has_its_own_generated_cache(ctx):
                     f"{cg.LUT_LAYERS} / {cg.LUT_MASKS}")
 
 
+def test_the_cache_prune_refuses_a_symlinked_cache(ctx):
+    """Round 2 finding 66, exercised through the real node function.
+
+    `pruneHarnessCache()` deletes files. Its containment guard used to be
+    `path.resolve()` plus a string suffix test, and `path.resolve` is
+    LEXICAL: it does not look at the disk at all. So a
+    `studio/tests/.cache` that was itself a symlink to `studio/cache` passed
+    the test, and `readdirSync`/`rmSync` both follow a link, so the prune
+    would have deleted the founder's real frame cache. The
+    `isSymbolicLink()` skip inside the walk only ever sees entries INSIDE the
+    folder, never the folder itself.
+
+    That is not a hypothetical in a worktree: `.venv`, `footage` and `refs`
+    at this tree's root are already symlinks into the sibling checkout, so
+    "link the warm cache across too" is one shortcut away.
+
+    Run through `node -e` against the real file rather than re-implemented
+    here, because a re-implementation would pass while the shipped function
+    stayed broken. Three cases: a symlinked cache is refused by name, a
+    folder whose real path is somewhere else entirely is refused, and an
+    ordinary `studio/tests/.cache` under a temporary root is pruned normally
+    (which is what proves the two refusals are the guard talking and not the
+    function being broken for everything).
+    """
+    import shutil                                            # noqa: PLC0415
+    import subprocess                                        # noqa: PLC0415
+    import tempfile                                          # noqa: PLC0415
+
+    node = shutil.which("node")
+    if not node:
+        ctx.skip("node is not on PATH, so the node harness cannot be exercised")
+        return
+    util = H.CONTENT / "studio" / "tests" / "lib" / "util.mjs"
+    root = Path(tempfile.mkdtemp(prefix="prune-guard-"))
+    try:
+        # A real one, at the right path, with a file in it to prune.
+        real = root / "studio" / "tests" / ".cache"
+        real.mkdir(parents=True)
+        (real / "a.png").write_bytes(b"x" * 16)
+        # The dangerous one: something precious, and a .cache that is a link
+        # to it, at a path that passes any string test.
+        precious = root / "studio" / "cache"
+        precious.mkdir(parents=True)
+        (precious / "keep-me.png").write_bytes(b"y" * 16)
+        linked_parent = root / "linked" / "studio" / "tests"
+        linked_parent.mkdir(parents=True)
+        os.symlink(precious, linked_parent / ".cache")
+        # And one that is an honest folder with a dishonest name.
+        wrong = root / "somewhere" / "else"
+        wrong.mkdir(parents=True)
+
+        script = (
+            'const u = await import(process.argv[1]);\n'
+            'const out = [];\n'
+            'for (const dir of process.argv.slice(2)) {\n'
+            '  try { out.push("OK " + JSON.stringify(u.pruneHarnessCache(dir))); }\n'
+            '  catch (e) { out.push("THREW " + e.message); }\n'
+            '}\n'
+            'console.log(out.join("\\n"));\n')
+        done = subprocess.run(
+            [node, "--input-type=module", "-e", script, str(util),
+             str(linked_parent / ".cache"), str(wrong), str(real)],
+            capture_output=True, text=True, timeout=120)
+        lines = [l for l in done.stdout.splitlines() if l]
+        ctx.expect_eq("the node call answered for all three folders",
+                      len(lines), 3, )
+        if len(lines) != 3:
+            ctx.note(done.stdout + done.stderr)
+            return
+        linked, elsewhere, ordinary = lines
+        ctx.expect_true("a .cache that is a symlink is refused, by name",
+                        linked.startswith("THREW")
+                        and "symlink" in linked, linked[:200])
+        ctx.expect_true("and the folder it pointed at still has its file: the "
+                        "refusal happened before anything was deleted",
+                        (precious / "keep-me.png").is_file(),
+                        sorted(p.name for p in precious.iterdir()))
+        ctx.expect_true("a folder that is not a studio/tests/.cache is refused",
+                        elsewhere.startswith("THREW")
+                        and "only ever prunes" in elsewhere, elsewhere[:200])
+        ctx.expect_true("and an ordinary studio/tests/.cache is pruned, so the "
+                        "two refusals above are the guard and not a function "
+                        "that refuses everything",
+                        ordinary.startswith("OK"), ordinary[:200])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def register(suite):
     g = "harness"
     suite.add(g, "a_skip_cannot_hide_a_failure", test_a_skip_cannot_hide_a_failure,
@@ -182,6 +286,10 @@ def register(suite):
               test_the_forbidden_port_list_is_one_shared_list,
               doc="one JSON list of ports no test may bind, read by the engine "
                   "suite, the studio route suites and run.mjs")
+    suite.add(g, "cache_prune_refuses_a_symlinked_cache",
+              test_the_cache_prune_refuses_a_symlinked_cache,
+              doc="the node harnesses' cache prune refuses a .cache that is a "
+                  "symlink, or whose real path is somewhere else")
     suite.add(g, "run_scoped_generated_cache",
               test_this_run_has_its_own_generated_cache,
               doc="this run's baked cubes and mattes live under its own "

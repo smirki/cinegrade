@@ -364,6 +364,13 @@ class Service:
         refuses outright, is a relative path, a `..` anywhere in it, or a root
         that is really a file. `--allow-out-dir` turns the rest into a hard
         allowlist for a launcher that wants one.
+
+        Returns the RESOLVED path, which is the one every refusal above was
+        checked against (round 2 finding 77). It used to check `resolved` and
+        return `given`, and nothing downstream was pinned to what passed, so a
+        symlink swapped into out_dir's place between the check and the write
+        re-homed the store: `store.under()`'s own anchor is `base.resolve()`,
+        which moves with the link, so it would raise nothing.
         """
         if not raw:
             return default
@@ -382,7 +389,7 @@ class Service:
         inside = any(resolved == root or resolved.is_relative_to(root)
                      for root in self.out_dir_roots)
         if inside:
-            return given
+            return resolved
         if self.confined:
             raise ServiceError(
                 400, f"out_dir {resolved} is outside every allowed root "
@@ -398,7 +405,7 @@ class Service:
         warnings.append(f"out_dir {key} is outside this service's data dir "
                         f"({self.data_dir}); it was accepted because no "
                         f"--allow-out-dir was given")
-        return given
+        return resolved
 
     def paths_report(self) -> dict:
         """The write rules, on /health, so "where can this service write" is
@@ -553,6 +560,24 @@ class Service:
             if pick in self.pending_picks:
                 self.pending_picks.remove(pick)
         self.busy = True
+        if self.backend is not None and self.current is None:
+            # Round 2 finding 62. `interrupt()` sets the wake event and the
+            # only `wake.clear()` in the tree is `resume()`, which _run_job
+            # calls and this did not. So after ANY cancel the event stayed set
+            # until the next JOB started, and every pick served in between
+            # called rest() on an already-set event: the wait returned at
+            # once, `woken_early` went up and `rest_s` was recorded as 0. In
+            # plain words, somebody who cancelled a track and then kept
+            # clicking the picture to pick objects got no throttling at all on
+            # those picks, at the moment they are most likely to be doing
+            # something else on the machine. Same one line _run_job uses, for
+            # the same reason: forget the PREVIOUS piece of work's interrupt.
+            #
+            # `self.current is None` is the same condition the rest below
+            # uses, and it is what keeps this from swallowing a LIVE job's
+            # cancel: a pick served between two frames of a running track must
+            # not clear the event that track's own rest is waiting on.
+            self.backend.throttle.resume()
         token = self.backend.throttle.begin() if self.backend is not None else None
         try:
             pick.result = self._segment(pick.payload)
@@ -1129,8 +1154,33 @@ class Handler(BaseHTTPRequestHandler):
             payload["detail"] = detail
         self._send(status, payload)
 
+    # The most a single request body may be. Round 2 finding 64: this read
+    # whatever Content-Length said, so one request declaring a 4 GB body made
+    # this service try to hold 4 GB on a 16 GB machine, on the same box as the
+    # model, and a NEGATIVE Content-Length became read(-1), which reads until
+    # EOF. The studio has done this correctly since it was written
+    # (studio/server.py's BODY_MAX_BYTES, checked before a byte is read, with
+    # a 413 and close_connection); this is that, with the same number. Every
+    # real body here is a JSON request of prompts and paths, kilobytes at
+    # most.
+    BODY_MAX_BYTES = 8 * 1024 * 1024
+
     def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ServiceError(400, "Content-Length is not a number") from None
+        if length < 0:
+            raise ServiceError(400, "Content-Length may not be negative")
+        if length > self.BODY_MAX_BYTES:
+            # close_connection, because the body is still on the wire and this
+            # server is never going to read it: without it the next request on
+            # this connection would start parsing in the middle of the one
+            # being refused.
+            self.close_connection = True
+            raise ServiceError(
+                413, f"the request body is {length} bytes and this service "
+                     f"reads at most {self.BODY_MAX_BYTES}")
         if not length:
             return {}
         raw = self.rfile.read(length)

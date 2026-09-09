@@ -28,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -2166,6 +2167,39 @@ def _register(job: Job) -> Job:
     return job
 
 
+def _ffmpeg_stderr():
+    """A temp FILE for a progress-reporting ffmpeg's stderr, not a pipe.
+
+    Round 2 finding 70. The three workers below all read `-progress pipe:1`
+    line by line, then `wait()`, then `stderr.read()`. stderr is a pipe that
+    nothing reads until AFTER wait(), so once ffmpeg has written more than the
+    64 KB pipe buffer to it, ffmpeg blocks on that write, stops producing
+    progress lines on stdout, the `for line in proc.stdout` loop blocks
+    forever and wait() is never reached: a render job stuck at whatever
+    percentage it had got to, with no error and no timeout.
+
+    It takes 64 KB of genuine errors to get there, because every command
+    starts `-v error`, so the shape that reaches it is a big component stack
+    emitting a per frame warning. A file has no such limit, and sam/frames.py
+    already does exactly this for the same reason (round 1 finding 45).
+    """
+    return tempfile.TemporaryFile()
+
+
+def _ffmpeg_stderr_text(handle, limit: int = 600) -> str:
+    """The last of whatever ffmpeg said, for a job's failure message.
+
+    Never raises: an unreadable stderr must not replace the real failure.
+    Same shape and same reasoning as sam/frames.py's `_tail`.
+    """
+    try:
+        handle.seek(0)
+        text = handle.read().decode("utf-8", "replace").strip()
+    except Exception:                                          # noqa: BLE001
+        return ""
+    return text[-limit:]
+
+
 def start_render(payload: dict, user_id=None) -> Job:
     # Engine "gpu" is the same render through a headless Chrome running
     # gpu.js instead of ffmpeg's filter graph (studio/render_gpu.py). Every
@@ -2197,7 +2231,12 @@ def start_render(payload: dict, user_id=None) -> Job:
     # clip over this picture and write the file with no warning at all.
     # Unconditional, for both engines, because allow_partial means "I accept an
     # unfinished matte" and never "I accept the wrong clip's matte".
-    _require_render_mattes_match(cfg, clip)
+    # may_read: the refusal names the OTHER clip's file name, and it runs on a
+    # matte id the caller supplied, so on a server with logins on it would tell
+    # an account the name of a file it may not read (round 2 finding 60). It
+    # still refuses; it just does not say whose.
+    _require_render_mattes_match(
+        cfg, clip, may_read=lambda n: _may_read_clip(user_id, n))
     if str(payload.get("engine") or "ffmpeg").lower() == "gpu":
         return RG.start_gpu_render(payload, user_id=user_id)
     scale = payload.get("scale")            # optional preview downscale
@@ -2243,9 +2282,10 @@ def start_render(payload: dict, user_id=None) -> Job:
     job.output = str(out_path)
 
     def worker():
+        errors = _ffmpeg_stderr()          # a FILE, not a pipe: finding 70
         try:
             job.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True)
+                                        stderr=errors, text=True)
             for line in job.proc.stdout:
                 line = line.strip()
                 if line.startswith("out_time_us="):
@@ -2258,7 +2298,7 @@ def start_render(payload: dict, user_id=None) -> Job:
                 elif line.startswith("frame="):
                     job.log.append(line)
             job.proc.wait()
-            err = job.proc.stderr.read()
+            err = _ffmpeg_stderr_text(errors)
             if job.status == "cancelled":
                 Path(out_path).unlink(missing_ok=True)
             elif job.proc.returncode == 0:
@@ -2274,6 +2314,7 @@ def start_render(payload: dict, user_id=None) -> Job:
             job.message = f"{exc}"
         finally:
             job.finished = time.time()
+            errors.close()          # the temp file goes with the job
 
     threading.Thread(target=worker, daemon=True).start()
     return job
@@ -2511,10 +2552,11 @@ def start_proxy(params: dict) -> Job:
         _proxy_jobs[key] = job.id
 
     def worker():
+        errors = _ffmpeg_stderr()          # a FILE, not a pipe: finding 70
         try:
             with FFMPEG_SLOTS:
                 job.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, text=True)
+                                            stderr=errors, text=True)
                 for line in job.proc.stdout:
                     line = line.strip()
                     if line.startswith("out_time_us="):
@@ -2525,7 +2567,7 @@ def start_proxy(params: dict) -> Job:
                         except ValueError:
                             pass
                 job.proc.wait()
-                err = job.proc.stderr.read()
+                err = _ffmpeg_stderr_text(errors)
             ok = job.proc.returncode == 0 and tmp_path.exists() \
                 and tmp_path.stat().st_size > 0
             if job.status == "cancelled" or not ok:
@@ -2548,6 +2590,7 @@ def start_proxy(params: dict) -> Job:
             job.message = f"{exc}"
         finally:
             job.finished = time.time()
+            errors.close()          # the temp file goes with the job
 
     threading.Thread(target=worker, daemon=True).start()
     return job
@@ -2704,16 +2747,23 @@ def start_mask_proxy(params: dict) -> Job:
     args = _mask_proxy_ffmpeg_args(params, tmp_path)
     label = f"mask proxy {params['clip']} {params['width']}px"
     job = _register(Job("mask_proxy", label))
+    # The clip this job is for, so the read guard on GET /api/mask/status can
+    # ask the same question about a proxy job it asks about a track job
+    # (round 2 finding 54, found by the identity test written for it: the
+    # label above IS the clip's file name, and a proxy job with no `extra`
+    # sailed past a guard that reads `extra["clip"]`).
+    job.extra = {"clip": params["clip"]}
     job.output = str(cache_path)
     total = max(0.1, params["duration"])
     with _mask_proxy_lock:
         _mask_proxy_jobs[key] = job.id
 
     def worker():
+        errors = _ffmpeg_stderr()          # a FILE, not a pipe: finding 70
         try:
             with FFMPEG_SLOTS:
                 job.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE, text=True)
+                                            stderr=errors, text=True)
                 for line in job.proc.stdout:
                     line = line.strip()
                     if line.startswith("out_time_us="):
@@ -2724,7 +2774,7 @@ def start_mask_proxy(params: dict) -> Job:
                         except ValueError:
                             pass
                 job.proc.wait()
-                err = job.proc.stderr.read()
+                err = _ffmpeg_stderr_text(errors)
             ok = job.proc.returncode == 0 and tmp_path.exists() \
                 and tmp_path.stat().st_size > 0
             if job.status == "cancelled" or not ok:
@@ -2745,6 +2795,7 @@ def start_mask_proxy(params: dict) -> Job:
             job.message = f"{exc}"
         finally:
             job.finished = time.time()
+            errors.close()          # the temp file goes with the job
 
     threading.Thread(target=worker, daemon=True).start()
     return job
@@ -2820,7 +2871,28 @@ def mask_clip_key(clip: str) -> str:
     return GRADES.clip_key(clip_path(clip))
 
 
+def _safe_wire_id(value) -> str:
+    """An id from the SAM service that is safe to use as a path segment, or "".
+
+    The same question `MT.valid_matte_id` asks about a matte id, asked about
+    the other ids that come back over that wire and end up in a file name
+    (pick_id, an instance id). Round 2 finding 65: round 1 hardened the
+    service's own side of this wire and left the studio trusting whatever came
+    back, while `Path("/a") / "/b"` is `Path("/b")`.
+    """
+    text = str(value or "").strip()
+    return text if MT.valid_matte_id(text) else ""
+
+
 def _matte_dir(clip_key: str, matte_id: str) -> Path:
+    """The directory one matte lives in.
+
+    `matte_id` is checked as an ID by every caller before it gets here (the
+    routes through `_matte_info`, the track through `check_matte_id` on the
+    service's answer), and checked again HERE, because this is the function
+    that turns a string into a path and `Path("/a") / "/b"` is `Path("/b")`.
+    """
+    MT.check_matte_id(matte_id)
     return MT.matte_root() / clip_key / matte_id
 
 
@@ -2908,7 +2980,8 @@ def _require_deletable_matte(info) -> None:
                              f"not a matte this store wrote")
 
 
-def _matte_clip_refusal(info, clip_key: str, clip_name: str = "") -> str | None:
+def _matte_clip_refusal(info, clip_key: str, clip_name: str = "",
+                        may_read=None) -> str | None:
     """The sentence to refuse with when a matte belongs to a different clip.
 
     index.json records the clip and the clip_key the track ran on (C2) and
@@ -2933,8 +3006,53 @@ def _matte_clip_refusal(info, clip_key: str, clip_name: str = "") -> str | None:
     other.
 
     Returns None when there is nothing to refuse.
+
+    `may_read` closes round 2 finding 60. The engine's sentence begins
+    "matte <id> was tracked on <the other clip's file name>", and this
+    refusal runs on a matte id the CALLER named, ahead of any read guard. So
+    the arc's headline safety feature was itself a disclosure channel: name a
+    matte id you cannot read and be told which file it came from, with the
+    ids enumerable through the list routes. When `may_read` is given and says
+    no, the refusal still happens and still names the matte the caller asked
+    for, and simply does not say whose clip it is. With logins off `may_read`
+    is True for everyone, so the local and the agent case read the full
+    sentence they always did.
     """
-    return CG.matte_clip_refusal(info, clip_key, clip_name)
+    message = CG.matte_clip_refusal(info, clip_key, clip_name)
+    if not message:
+        return None
+    if may_read is not None and not may_read(getattr(info, "clip", "")):
+        return (f"matte {info.matte_id} was tracked on a different clip than "
+                f"{clip_name}: a matte is a per clip thing (a frame sequence "
+                f"at that clip's own rate and framing), so using it here "
+                f"would stretch another clip's subject over this picture. "
+                f"Which clip it was tracked on is not named here because this "
+                f"account cannot read it. Track the subject on {clip_name} "
+                f"and use that matte")
+    return message
+
+
+def _may_read_clip(user_id, name) -> bool:
+    """"May this account read this clip?", asked without a request handler.
+
+    The module level twin of the handler's own `_may_read`, which delegates
+    to this so the two cannot drift: `start_render` and the helpers below are
+    plain functions that carry a `user_id` rather than a `self`. True for
+    everyone when logins are off, and for a name this server cannot turn into
+    a path (the route answers "no such clip" for those, as it always did).
+    """
+    if not AUTH.enabled():
+        return True
+    path = ""
+    try:
+        path = str(clip_path(str(name or "")))
+    except Exception:                                         # noqa: BLE001
+        path = ""
+    try:
+        LIB.guard_read(user_id, path)
+        return True
+    except AUTH.AuthError:
+        return False
 
 
 def _matte_infos_for_stack(mask: dict) -> list:
@@ -2960,14 +3078,56 @@ def _matte_infos_for_stack(mask: dict) -> list:
     return out
 
 
-def _require_stats_mattes_match(clip, matte_info, mask_param) -> None:
-    """Refuse a measurement weighted by another clip's matte (400).
+def _config_matte_refusals(cfg: dict, key: str, name: str, may_read) -> list:
+    """One refusal line per layer matte in `cfg` that names a different clip.
 
-    Both ways a measurement can be weighted: `matte: ID`, already resolved by
-    the route, and `mask: {...}`, a component stack whose matte ids are
-    resolved here. `clip` is a clip NAME; the `path` and `ref` forms of
-    POST /api/stats carry no clip this server can key, so they are left alone
-    rather than guessed at.
+    The shared walk behind `_require_render_mattes_match` and the config half
+    of `_require_stats_mattes_match`: same resolution, same comparison, same
+    per component sentence, so a render and a measurement of the same config
+    can never disagree about whose matte it is.
+    """
+    bad = []
+    for entry in CG.mask_inputs(cfg or {}):
+        if entry.get("kind") != "matte":
+            continue
+        matte_id = str((entry.get("matte") or {}).get("id") or "").strip()
+        if not MT.valid_matte_id(matte_id):
+            continue        # no id yet, or an unusable one: the coverage rule's job
+        try:
+            info = MT.resolve(MT.matte_root(), matte_id)
+        except MT.MatteError:
+            continue        # not in the store: the coverage rule's job too
+        message = _matte_clip_refusal(info, key, name, may_read=may_read)
+        if message:
+            bad.append(f"  layer {entry['layer']} component "
+                       f"{entry['component']}: {message}")
+    return bad
+
+
+def _require_stats_mattes_match(clip, matte_info, mask_param,
+                                config=None, may_read=None) -> None:
+    """Refuse a measurement weighted by, or graded through, another clip's
+    matte (400).
+
+    Three ways a matte reaches a measured frame, and all three are asked
+    about here:
+
+      `matte: ID`       the C6 weight, already resolved by the route
+      `mask: {...}`     the gap 19 component stack weight, resolved here
+      `config`          the grade's OWN layer mattes, which is the PICTURE
+                        rather than the weight
+
+    The third is round 2 finding 51 and it is the one round 1 finding 6 named
+    in its own sentence. `resolve_stats_frame` grades the clip through
+    `full_config(payload["config"])`, so a config carrying a person matte
+    tracked on another clip was composited over this clip's frame and every
+    percentile, band and hue family measured off that picture, with no
+    warning and a 200. The engine had the same hole on `cinegrade stats` and
+    `cinegrade sweep`; it is closed there in `_grade_frame_stats`.
+
+    `clip` is a clip NAME; the `path` and `ref` forms of POST /api/stats carry
+    no clip this server can key, so they are left alone rather than guessed
+    at.
     """
     name = str(clip or "").strip()
     if not name:
@@ -2980,12 +3140,17 @@ def _require_stats_mattes_match(clip, matte_info, mask_param) -> None:
     if isinstance(mask_param, dict):
         infos += _matte_infos_for_stack(mask_param)
     for info in infos:
-        message = _matte_clip_refusal(info, key, name)
+        message = _matte_clip_refusal(info, key, name, may_read=may_read)
         if message:
             raise StudioError(message)
+    bad = _config_matte_refusals(config, key, name, may_read)
+    if bad:
+        raise StudioError("this measurement grades the frame through a matte "
+                          "that was tracked on another clip:\n"
+                          + "\n".join(bad))
 
 
-def _require_render_mattes_match(cfg: dict, clip) -> None:
+def _require_render_mattes_match(cfg: dict, clip, may_read=None) -> None:
     """Refuse a render whose mask reaches another clip's matte (400).
 
     Same shape as CG.require_complete_mattes' refusal, deliberately: one line
@@ -2998,21 +3163,7 @@ def _require_render_mattes_match(cfg: dict, clip) -> None:
         key = mask_clip_key(clip)
     except (StudioError, HttpError, OSError):
         return
-    bad = []
-    for entry in CG.mask_inputs(cfg):
-        if entry.get("kind") != "matte":
-            continue
-        matte_id = str((entry.get("matte") or {}).get("id") or "").strip()
-        if not MT.valid_matte_id(matte_id):
-            continue        # no id yet, or an unusable one: the coverage rule's job
-        try:
-            info = MT.resolve(MT.matte_root(), matte_id)
-        except MT.MatteError:
-            continue        # not in the store: the coverage rule's job too
-        message = _matte_clip_refusal(info, key, str(clip))
-        if message:
-            bad.append(f"  layer {entry['layer']} component "
-                       f"{entry['component']}: {message}")
+    bad = _config_matte_refusals(cfg, key, str(clip), may_read)
     if bad:
         raise StudioError("this render's mask reaches a matte that was tracked "
                           "on another clip:\n" + "\n".join(bad))
@@ -3056,8 +3207,8 @@ def _mean_of(values) -> float | None:
     return round(sum(good) / len(good), 6) if good else None
 
 
-def _matte_summary(info, full: bool = True, quality_limit: int | None = 64
-                   ) -> dict:
+def _matte_summary(info, full: bool = True, quality_limit: int | None = 64,
+                   compute_iou: bool | None = None) -> dict:
     """One matte's record for `GET /api/matte/<id>` and the list route.
 
     `full` decides whether the per frame arrays come with it (checkpoint gap
@@ -3090,14 +3241,24 @@ def _matte_summary(info, full: bool = True, quality_limit: int | None = 64
         "coverage": (round(sp["written"] / span_len, 4) if span_len else 0.0),
         "mean_score": _mean_of(info.scores),
         "mean_area": _mean_of(info.areas),
-        # compute_iou=full: the single matte route (`full=True`) reads the
-        # frames off disk when index.json carries no `ious`, so a matte
-        # tracked before the service wrote them reports iou_source "frames"
-        # rather than "none" and the shape rule really runs (round 1 finding
-        # 15). The LIST route leaves it off, which is what `full` already
-        # means here: one matte can pay for a read of its own frames, a clip
-        # with four mattes over 384 frames each cannot.
-        "quality": MT.quality(info, limit=quality_limit, compute_iou=full),
+        # The single matte route reads the frames off disk when index.json
+        # carries no `ious`, so a matte tracked before the service wrote them
+        # reports iou_source "frames" rather than "none" and the shape rule
+        # really runs (round 1 finding 15).
+        #
+        # Round 2 finding 55: that used to be spelled `compute_iou=full`, and
+        # the LIST route passes `full` straight from `?full=1`. So the
+        # comment ("one matte can pay for a read of its own frames, a clip
+        # with four mattes over 384 frames each cannot") described the
+        # default and not the route: `GET /api/matte?full=1` decoded every
+        # PNG of every matte inside the request handler, measured at 0.86 s
+        # for four mattes over 691 frames. It is its OWN parameter now,
+        # defaulting to the per frame arrays' rule only because that is what
+        # the single matte route wants, and forced False by the list route
+        # whatever `full` says.
+        "quality": MT.quality(info, limit=quality_limit,
+                              compute_iou=full if compute_iou is None
+                              else bool(compute_iou)),
         # Not one of MatteInfo's own dataclass fields; index.json carries it
         # straight from the service on a failed matte ("no instance for text
         # 'shirt'"), and a caller (the jobs panel, a UI badge) needs it to
@@ -3112,16 +3273,31 @@ def _matte_summary(info, full: bool = True, quality_limit: int | None = 64
     return out
 
 
+# The widest picture any single request may ask this server to allocate.
+# 4K, which is wider than any preview or matte this tool works at and wide
+# enough that no real caller notices the ceiling. grain_plate has clamped to
+# the same number since it was written; round 2 finding 53 found
+# GET /api/matte/<id>/frame with a floor and no ceiling, so `?width=100000`
+# on a 16:9 matte asked for a 100000 x 56250 float array (of the order of
+# 45 GB) on a 16 GB machine, from a plain GET.
+MAX_REQUEST_WIDTH = 3840
+
+
 def matte_frame_png(matte_id: str, time_s: float, width: int | None
                     ) -> tuple[bytes, dict]:
     """PNG bytes and headers for GET /api/matte/<id>/frame (C4): the matte at
     a moment, with M2's own nearest-written-frame fallback for a still
     running (partial) matte.
+
+    `width` is clamped to MAX_REQUEST_WIDTH rather than refused: a caller
+    asking for something absurd gets the biggest picture this server will
+    make, which is the same thing every other width in this file does
+    (_preview_dims clamps to the clip's own width, grain_plate to 3840).
     """
     info = _matte_info(matte_id)
     size = None
     if width:
-        w = max(1, int(width))
+        w = max(1, min(int(width), MAX_REQUEST_WIDTH))
         h = max(1, round(w * info.height / max(1, info.width)))
         size = (w, h)
     try:
@@ -3354,7 +3530,13 @@ def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
     # the service gave out, not one studio made up itself, or the service
     # has never heard of it. Only a bare `uuid4` fallback for an old or stub
     # response that omits pick_id, so this route still answers something.
-    pick_id = str(resp.get("pick_id") or uuid.uuid4().hex[:12])
+    # Checked as a NAME before it becomes part of a file name, for the same
+    # reason a matte id is (round 2 finding 65): it comes off the wire and is
+    # joined into MASK_PICK_CACHE below, and `Path("/a") / "/b"` is
+    # `Path("/b")`. A service answering with something that is not a name at
+    # all gets this studio's own uuid instead, which costs only the ability to
+    # track that pick by the service's id.
+    pick_id = _safe_wire_id(resp.get("pick_id")) or uuid.uuid4().hex[:12]
     entry = {"clip": clip, "rotation": rot, "time": float(time_s),
              "prompts": norm_prompts, "frame": str(frame_path),
              "created": time.time(), "instances": {}}
@@ -3362,6 +3544,11 @@ def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
     MASK_PICK_CACHE.mkdir(parents=True, exist_ok=True)
     for inst in (resp.get("instances") or []):
         inst_id = str(inst.get("id"))
+        if not _safe_wire_id(inst_id):
+            # Same rule as pick_id, and skipped rather than substituted: an
+            # instance id is how a caller asks for THIS instance back, so a
+            # made up one would name an overlay nothing can fetch.
+            continue
         mask_path = inst.get("mask")
         overlay_url = mask_url = None
         if mask_path and Path(str(mask_path)).is_file():
@@ -3759,6 +3946,21 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     if not matte_ids:
         raise StudioError("the SAM service accepted this track but returned "
                           "no matte ids to watch")
+    # Round 2 finding 65: these ids come off the WIRE and are then used as
+    # filesystem path segments (`_matte_dir` is `matte_root() / clip_key /
+    # matte_id`, and `Path("/a") / "/b"` is `Path("/b")`). Round 1 finding 13
+    # hardened the service's own side of this wire (`safe_id` and `under()`
+    # throughout sam/store.py) and left this side trusting the answer. The
+    # routes already check every id a BROWSER sends; this is the same check on
+    # the ids a SAM service sends back, so an old, buggy or hostile service
+    # cannot name a directory instead of a matte.
+    for mid in matte_ids:
+        try:
+            MT.check_matte_id(mid)
+        except MT.MatteMissing as exc:
+            raise StudioError(
+                f"the SAM service answered with a matte id this studio will "
+                f"not use as a folder name: {exc}") from exc
     label = f"mask track {clip} {','.join(matte_ids)[:60]}"
     job = _register(Job("mask_track", label))
     job.extra = {"matte_ids": matte_ids, "clip": clip, "clip_key": clip_key,
@@ -5014,8 +5216,17 @@ class Handler(BaseHTTPRequestHandler):
         client_gone = False
         with FFMPEG_SLOTS:
             try:
+                # A FILE for stderr, not a pipe. Round 2 finding 70 names
+                # the three progress workers; this fourth reader has the
+                # same shape and the worst version of the consequence. It
+                # drains stdout in a blocking read and never reads stderr at
+                # all, so a segment render noisy enough to fill the 64 KB
+                # pipe buffer stops ffmpeg writing video, blocks this read
+                # forever, and does it while holding one of the FFMPEG_SLOTS
+                # and a live response. The wait(timeout=30) below cannot
+                # help: the loop above it is what is stuck.
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE)
+                                        stderr=_ffmpeg_stderr())
                 with open(tmp_path, "wb") as tmp:
                     while True:
                         chunk = proc.stdout.read(65536)
@@ -6301,8 +6512,15 @@ class Handler(BaseHTTPRequestHandler):
             # to answer with numbers, no warning and exit 0. Once, here,
             # before the first frame is rendered, so a mismatch costs no
             # ffmpeg.
+            # `config` too, since gap 19 (finding 51): the measured PICTURE is
+            # graded through the config's own layer mattes before a weight is
+            # applied to it at all, and nothing asked whose clip those were.
+            # `may_read` keeps the refusal from naming a clip this account
+            # cannot read (finding 60).
             _require_stats_mattes_match(payload.get("clip"), matte_info,
-                                       mask_param)
+                                       mask_param,
+                                       config=full_config(payload.get("config")),
+                                       may_read=self._may_read)
             times = payload.get("times")
             if times:
                 results = []
@@ -6558,6 +6776,13 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(self._body().get("id", ""))
             if not job:
                 raise StudioError("no such job")
+            # Round 2 finding 72, the generic half: the mask cancel route
+            # next door is scoped to a mask track id, this one cancels
+            # anything in the table, and both used to take an id and act.
+            # Same rule, same one line, and `extra` is empty on the jobs
+            # that carry no clip (a plain render carries `clip`), so those
+            # are unchanged. With logins off it is a no-op.
+            self._guard_read(job.extra.get("clip"))
             job.status = "cancelled"
             if job.proc and job.proc.poll() is None:
                 job.proc.send_signal(signal.SIGINT)
@@ -6670,6 +6895,19 @@ class Handler(BaseHTTPRequestHandler):
                 for j in JOBS.values():
                     if j.kind not in ("mask_track", "mask_proxy"):
                         continue
+                    # Round 2 finding 54. `as_dict()` ends with
+                    # `out.update(self.extra)`, so `clip`, `clip_key`,
+                    # `matte_ids` and `mattes` all ship, and `label` is
+                    # "mask track <clip> <matte ids>". That is the same
+                    # disclosure GET /api/matte was given a guard for in
+                    # round 1 (the clip's own file name, and for a text
+                    # prompt the prompt words), on a route that answers with
+                    # every caller's jobs at once. Per job, dropping what
+                    # this account may not read rather than 403ing the whole
+                    # list, for the same reason the matte list does it that
+                    # way. With logins off this is a no-op.
+                    if not self._may_read(j.extra.get("clip")):
+                        continue
                     view = j.as_dict()
                     # The service's own answer for this job, forwarded rather
                     # than re-derived, so this route and the SAM service can
@@ -6768,9 +7006,13 @@ class Handler(BaseHTTPRequestHandler):
             # queued or running (or recently finished, same 30 job cap as
             # every other job list) mask_track job, so a caller reads one
             # shape whether it asks for one job or all of them.
+            # Round 2 finding 54, the same guard the matte list carries and
+            # for the same reason: _mask_job_view returns `clip`, `clip_key`
+            # and a `label` built out of the clip name and the matte ids.
             with JOBS_LOCK:
                 jobs = [_mask_job_view(j) for j in JOBS.values()
-                       if j.kind == "mask_track"]
+                       if j.kind == "mask_track"
+                       and self._may_read(j.extra.get("clip"))]
             self._json({"jobs": jobs})
             return
 
@@ -6779,6 +7021,8 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(job_id)
             if not job or job.kind != "mask_track":
                 raise HttpError(404, f"no mask track job: {job_id}")
+            # One job, so the refusal shape is right here (finding 54).
+            self._guard_read(job.extra.get("clip"))
             self._json(_mask_job_view(job))
             return
 
@@ -6796,6 +7040,13 @@ class Handler(BaseHTTPRequestHandler):
             job = JOBS.get(job_id)
             if not job or job.kind != "mask_track":
                 raise HttpError(404, f"no mask track job: {job_id}")
+            # Round 2 finding 72: this was the only destructive mask route
+            # with no gate at all, where DELETE /api/matte/<id> has three,
+            # and job ids are enumerable through the list routes above. The
+            # rule is the same one every other mask route uses: you may act
+            # on a job whose clip you may read. With logins off it is a
+            # no-op, so the local and the agent case are unchanged.
+            self._guard_read(job.extra.get("clip"))
             job.status = "cancelled"
             self._json(_mask_job_view(job))
             return
@@ -6826,8 +7077,13 @@ class Handler(BaseHTTPRequestHandler):
             # that plots the curve (`mask show --strip`) reads the same
             # bytes it always did.
             full = str(q.get("full", "")).strip().lower() in ("1", "true", "yes")
+            # compute_iou=False unconditionally (finding 55): `?full=1` asks
+            # for the per frame arrays index.json already holds, never for a
+            # decode of every PNG of every matte on the clip. A caller that
+            # wants the measured IoU of one matte asks for that one matte.
             self._json({"mattes": [_matte_summary(i, full=full,
-                                                  quality_limit=8)
+                                                  quality_limit=8,
+                                                  compute_iou=False)
                                    for i in infos],
                         "full": full})
             return
@@ -6996,12 +7252,12 @@ class Handler(BaseHTTPRequestHandler):
         because somebody else's matte is in the store. Same rule, same
         function, so the two cannot drift apart; True for everyone when
         logins are off, since _guard_read returns immediately then.
+
+        The body is `_may_read_clip`, the module level twin, because the
+        matte ownership helpers are plain functions that carry a user id
+        rather than a handler (round 2 finding 60).
         """
-        try:
-            self._guard_read(name)
-            return True
-        except AUTH.AuthError:
-            return False
+        return _may_read_clip(self._uid(), name)
 
     def _guard_read_key(self, key: str) -> None:
         """The same rule for a route that carries only a cache key.

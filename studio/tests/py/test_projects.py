@@ -37,6 +37,7 @@ sys.path.insert(0, str(CONTENT / "grade"))
 import db                 # noqa: E402  (the env var has to be set first)
 import grades             # noqa: E402
 import projects as P      # noqa: E402
+import mattes as MT       # noqa: E402  (the engine's side of the clip key)
 
 db.set_data_dir(TMP)
 grades.USERS_DIR = db.DATA / "users"
@@ -265,6 +266,74 @@ class GradeRowMirror(unittest.TestCase):
 
     def test_the_mirror_is_quiet_about_a_clip_with_no_project(self):
         self.assertIsNone(P.mirror_grade(1, "f" * 32))
+
+
+class ClipKeyMirror(unittest.TestCase):
+    """`grade/mattes.py`'s clip key against `studio/grades.py`'s, on real bytes.
+
+    Round 2 finding 63: `grade/mattes.py` said these two were "asserted
+    identical on real bytes by studio/tests/py/test_mask_routes.py" and no such
+    test existed anywhere. The sibling mirror (the matte id pattern) IS pinned,
+    which is what made the omission look accidental rather than deliberate.
+
+    It matters because of what drift would do, which mattes.py states two lines
+    above the claim: a second definition that drifted would not refuse the
+    wrong matte, it would refuse EVERY matte. index.json records the studio's
+    key and the engine compares its own against it, so the two disagreeing
+    means a bare CLI render refuses every matte the studio ever tracked.
+
+    This file rather than test_mask_routes.py for one practical reason: the
+    studio's clip_key writes its answer into studio.db, and this is the module
+    that already has a temporary database and a guard that refuses to run
+    against the real one. test_mask_routes.py drives the server as a
+    subprocess and never imports grades in process.
+    """
+
+    def _pair(self, path: Path) -> tuple:
+        return MT.clip_key(path), grades.clip_key(path)
+
+    def test_the_two_definitions_agree_on_a_file_smaller_than_one_chunk(self):
+        small = TMP / "small.bin"
+        small.write_bytes(bytes(range(256)) * 40)          # 10240 bytes
+        engine, studio = self._pair(small)
+        self.assertEqual(engine, studio)
+        self.assertTrue(MT.is_clip_key(engine))
+        self.assertTrue(grades.is_key(studio))
+
+    def test_they_agree_on_a_file_bigger_than_two_chunks(self):
+        """The head and the tail are hashed separately above 1 MiB, so this is
+        the case where a mirrored implementation could read the same file and
+        still land somewhere else."""
+        big = TMP / "big.bin"
+        with open(big, "wb") as fh:
+            fh.write(b"HEAD" * (300 * 1024))               # 1.17 MiB
+            fh.write(b"\x00" * (700 * 1024))
+            fh.write(b"TAIL" * (300 * 1024))               # 1.17 MiB
+        self.assertGreater(big.stat().st_size, 2 * MT.CLIP_KEY_CHUNK)
+        engine, studio = self._pair(big)
+        self.assertEqual(engine, studio)
+
+    def test_they_agree_on_a_real_file_out_of_this_repository(self):
+        """A file nobody wrote for this test: whatever is on disk today."""
+        real = STUDIO / "static" / "gpu.js"
+        self.assertTrue(real.is_file(), str(real))
+        engine, studio = self._pair(real)
+        self.assertEqual(engine, studio)
+
+    def test_the_length_goes_into_the_digest_on_both_sides(self):
+        """Two files whose first megabyte matches and whose length does not
+        must not collide, on either side, or a truncated copy would read as
+        the same clip."""
+        a, b = TMP / "len_a.bin", TMP / "len_b.bin"
+        a.write_bytes(b"x" * 4096)
+        b.write_bytes(b"x" * 8192)
+        self.assertNotEqual(MT.clip_key(a), MT.clip_key(b))
+        self.assertEqual(MT.clip_key(a), grades.clip_key(a))
+        self.assertEqual(MT.clip_key(b), grades.clip_key(b))
+
+    def test_the_constants_are_mirrored_too(self):
+        self.assertEqual(MT.CLIP_KEY_CHUNK, grades.CHUNK)
+        self.assertEqual(MT.CLIP_KEY_LEN, grades.KEY_LEN)
 
 
 class Navigation(unittest.TestCase):

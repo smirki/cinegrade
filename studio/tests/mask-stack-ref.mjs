@@ -117,6 +117,52 @@ eq("a grow under the cap is still just round(grow * width)",
 eq("the cap never falls below one pass, however small the frame",
    M.growPasses(1.0, 8), 1);
 
+/* The feather and finesse.blur cap (round 2 finding 52). Same shape as the
+ * grow cap and for a harder reason: sigma is a fraction of frame WIDTH and the
+ * blur pads by 3 sigma on each side, so an uncapped feather of 50 asked for a
+ * pad of 150 frame widths, which is a float64 array of hundreds of megabytes
+ * per component on the reference side and a shader loop of hundreds of
+ * thousands of taps per pixel here. One POST could have done that. This is the
+ * port of cinegrade.MASK_BLUR_MAX and cinegrade.mask_blur_sigma; the engine
+ * suite pins the same numbers on the python side, so the preview clamps
+ * exactly where the render clamps. */
+eq("the blur cap is the engine's 0.10 of frame width", M.BLUR_MAX, 0.10);
+eq("a feather under the cap is granted in full, in pixels of this width",
+   M.blurSigma(0.02, 640), 12.8);
+eq("a feather over the cap gets the cap", M.blurSigma(50, 640), 64);
+eq("and the cap is the same FRACTION at a render width",
+   M.blurSigma(50, 3840), 384);
+eq("a negative feather is zero, not a blur the other way",
+   M.blurSigma(-2, 640), 0);
+eq("zero is zero, so a mask with no feather pays nothing",
+   M.blurSigma(0, 640), 0);
+check("the clamped feather is the same fraction of the frame at 640 and 3840",
+      Math.abs(M.blurSigma(50, 640) / 640 - M.blurSigma(50, 3840) / 3840)
+      < 1e-12,
+      M.blurSigma(50, 640) / 640 + " vs " + M.blurSigma(50, 3840) / 3840);
+/* And the stack really goes through it, not just the exported helper: an
+ * absurd feather composes to the same picture as a feather at the cap. If the
+ * clamp were only in maskBlurSigma and not on the path maskStackCPU takes,
+ * these two would differ. */
+{
+  const one = (f) => M.stack({ components: [{ id: "c", type: "window",
+                                              op: "add", feather: f,
+                                              window: { x0: 0.25, y0: 0.25,
+                                                        x1: 0.75, y1: 0.75,
+                                                        enabled: true } }] },
+                             24, 16, {});
+  const capped = one(M.BLUR_MAX), absurd = one(50);
+  check("an absurd feather composes exactly as a feather at the cap does",
+        Array.from(capped).every((v, i) => v === absurd[i]),
+        Array.from(capped).slice(0, 6).join(",") + " vs "
+        + Array.from(absurd).slice(0, 6).join(","));
+  const soft = one(0.01);
+  check("and a feather under the cap is a DIFFERENT picture, so the check "
+        + "above is not comparing two blurs of everything",
+        !Array.from(capped).every((v, i) => v === soft[i]),
+        Array.from(soft).slice(0, 6).join(","));
+}
+
 eq("usesComponents: absent", M.usesComponents({}), false);
 eq("usesComponents: empty", M.usesComponents({ components: [] }), false);
 eq("usesComponents: one disabled entry still counts",
@@ -442,16 +488,29 @@ eq("clean_white in a stack pushes a high matte to full swing",
         threw.indexOf("gradient") >= 0 && threw.indexOf("is not one of") >= 0,
         threw || "nothing was thrown");
   /* And the stack really uses it: a capitalised matte type used to compose as
-   * a KEY here (the fall-through) while the engine composed a matte. With no
-   * sample function a matte composes as black, so the two spellings have to
-   * give the same picture. */
+   * a KEY here (the fall-through) while the engine composed a matte.
+   *
+   * The two samplers have to DISAGREE for this to mean anything (round 2
+   * finding 59). This check used to pass `{}`, and with no sample function
+   * both branches compose black: the matte branch reads `sample.matte ? ... : 0`
+   * and the key branch reads `sample.key ? ... : 0`, so a "Matte" falling
+   * through to the key branch produced a picture identical to the matte
+   * branch's and the check could only ever catch componentType throwing.
+   * With matte sampling 1 and key sampling 0, a fall through is full black
+   * against full white and there is nowhere for it to hide. */
   const comps = (t) => ({ components: [{ id: "c", type: t, op: "add",
                                          matte: { id: "m_x" } }] });
-  const lower = M.stack(comps("matte"), 8, 4, {});
-  const upper = M.stack(comps("Matte"), 8, 4, {});
+  const tell = { matte: () => 1, key: () => 0 };
+  const lower = M.stack(comps("matte"), 8, 4, tell);
+  const upper = M.stack(comps("Matte"), 8, 4, tell);
   check("a capitalised matte composes as a matte, not as whatever came last",
         Array.from(lower).every((v, i) => v === upper[i]),
         Array.from(lower).join(",") + " vs " + Array.from(upper).join(","));
+  check("and the two branches really do give different pictures here, so the "
+        + "check above is comparing something",
+        Array.from(lower).every((v) => v === 65535)
+        && Array.from(M.stack(comps("key"), 8, 4, tell)).every((v) => v === 0),
+        Array.from(lower).join(",").slice(0, 40));
 }
 
 // ------------------------------------------------------------ morphology
@@ -690,24 +749,30 @@ check("a zero or negative try count is still a real delay", M.retryDelay(0) >= 2
  * evicts the frames another matte is about to need, and the state line sits on
  * "matte lagging" for the rest of the session. */
 {
-  const floor = M.PREFETCH + 2;
-  eq("one matte gets the flat floor of 48", M.cacheCap(1, 0), M.CACHE_MAX);
-  eq("so do four, whose windows still fit inside 48",
-     M.cacheCap(4, 0), M.CACHE_MAX);
-  eq("six mattes get a read ahead window each instead",
-     M.cacheCap(6, 0), 6 * floor);
-  eq("a small frame does not lower the cap",
-     M.cacheCap(6, 64 * 36 * 4), 6 * floor);
-  // An HD matte frame is 8.3 MB on the card, so the byte ceiling bites first.
+  /* Round 2 finding 68: every expected value here used to be re-derived from
+   * the same exported constants the implementation uses (`M.PREFETCH + 2`,
+   * `Math.floor(M.CACHE_BYTES / ...)`), so halving MATTE_CACHE_BYTES moved
+   * both sides together and the block stayed green while the numbers the
+   * comment argues for changed underneath it. The constants are pinned once
+   * against literals, and then every cap is a literal. */
+  eq("the flat cap is 48 frames", M.CACHE_MAX, 48);
+  eq("the per matte read ahead is 8 frames", M.PREFETCH, 8);
+  eq("and the byte ceiling is 256 MB", M.CACHE_BYTES, 256 * 1024 * 1024);
+  eq("one matte gets the flat floor of 48", M.cacheCap(1, 0), 48);
+  eq("so do four, whose windows still fit inside 48", M.cacheCap(4, 0), 48);
+  eq("six mattes get a read ahead window each instead (6 * (8 + 2))",
+     M.cacheCap(6, 0), 60);
+  eq("a small frame does not lower the cap", M.cacheCap(6, 64 * 36 * 4), 60);
+  // An HD matte frame is 8.3 MB on the card, so the byte ceiling bites first:
+  // 256 MB / 8.29 MB is 32 frames.
   eq("an HD frame lowers the cap to what the byte ceiling allows",
-     M.cacheCap(6, 1920 * 1080 * 4),
-     Math.floor(M.CACHE_BYTES / (1920 * 1080 * 4)));
+     M.cacheCap(6, 1920 * 1080 * 4), 32);
   // A 4K frame is 33 MB: the ceiling would allow seven, which is less than one
   // read ahead window, and a cache smaller than the read ahead cannot work at
   // all, so the floor wins and the ceiling is deliberately overshot.
   eq("but the cap never drops below one read ahead window plus two",
-     M.cacheCap(6, 3840 * 2160 * 4), floor);
-  eq("even for an absurd frame size", M.cacheCap(6, M.CACHE_BYTES), floor);
+     M.cacheCap(6, 3840 * 2160 * 4), 10);
+  eq("even for an absurd frame size", M.cacheCap(6, M.CACHE_BYTES), 10);
 }
 
 {

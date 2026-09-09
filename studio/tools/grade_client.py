@@ -385,7 +385,8 @@ class Studio:
         `region` (a stack is written in the whole frame's coordinates: a
         `window` component says any rectangle it needs). A weighted answer,
         either kind, also carries `measured_width` and `coverage` (how much
-        of the frame the mask covers), plus `no_coverage: true` with the
+        of the MEASURED AREA the mask covers: the region when `region` is
+        given, the whole frame when it is not), plus `no_coverage: true` with the
         numbers null on a frame the mask covers nothing of (gap 23), which
         is a row to write down rather than an error to catch.
         """
@@ -779,10 +780,21 @@ def bands(stats: dict) -> list:
     only, never a score: nothing here ranks one band against another.
     Absent on a server that has not shipped it yet, in which case this
     returns a one line note instead of raising, so a caller can print
-    `bands(stats)` unconditionally."""
+    `bands(stats)` unconditionally.
+
+    A gap 23 row (the mask covered nothing at this timestamp) also has no
+    bands, and it is answered FIRST, before the old-server note (round 2
+    finding 80). Both look identical from here (`bands` is None either way)
+    and the old-server sentence sent a reader off hunting for a deploy
+    problem when the real answer was "there was no sky in this frame"."""
     m = _measurement(stats)
     b = m.get("bands")
     if not b:
+        if m.get("no_coverage"):
+            return ["(no bands: the mask covered nothing at this timestamp, "
+                    "so there was nothing to measure. This is a normal row, "
+                    "not a failure, and not an old server: coverage is 0 and "
+                    "every measurement block is null, see contract G3 gap 23)"]
         return ["(no bands block: this server has not shipped per band "
                 "measurements yet, see contract G3)"]
     edges = b.get("edges") or []

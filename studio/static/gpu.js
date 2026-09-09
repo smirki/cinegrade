@@ -943,6 +943,29 @@
   var MASK_GROW_MAX = 32;              // passes, at MASK_GROW_REF_WIDTH
   var MASK_GROW_REF_WIDTH = 1920;
 
+  /* The cap on a component feather and on the finesse blur, as a fraction of
+   * frame width, and the same cap for both because they are the same gaussian
+   * at two points in the chain. cinegrade.MASK_BLUR_MAX is the same number and
+   * cinegrade.mask_blur_sigma is the same two lines; they have to move
+   * together, for the same reason the grow cap does.
+   *
+   * Round 2 finding 52: grow was capped and said why, and these two were not
+   * capped at all, so a feather of 50 asked the engine's numpy reference for a
+   * pad of about 555 MB and a length 192001 convolution per row from a plain
+   * POST /api/stats. On this side it would ask the card for a gblur with a
+   * radius far wider than the picture. 0.10 of frame width is a sigma of 64
+   * pixels at 640 and 384 at 4K, far past any edge softening a person asks
+   * for (the parity fixtures use 0.01 and 0.02). */
+  var MASK_BLUR_MAX = 0.10;
+
+  /* The sigma for a feather or a finesse blur at a width. Negative reads as
+   * zero: these controls have no meaning below zero. */
+  function maskBlurSigma(value, W) {
+    var v = +value || 0;
+    if (v < 0) v = 0;
+    return Math.min(v, MASK_BLUR_MAX) * W;
+  }
+
   /* The pass count for a grow at a width. pyRound on both the cap and the
    * request, because cinegrade rounds both with Python's round(). */
   function maskGrowPasses(grow, W) {
@@ -1340,7 +1363,7 @@
       // interior but not at the frame border, so the order is pinned.
       if (comp.invert) { for (i = 0; i < n; i++) m[i] = 1 - m[i]; }
       var feather = +comp.feather || 0;
-      if (feather > 0) m = gblurCPU(m, W, H, feather * W);
+      if (feather > 0) m = gblurCPU(m, W, H, maskBlurSigma(feather, W));
       for (i = 0; i < n; i++) {
         var a16 = q16r(acc[i]), b16 = q16r(m[i]), v;
         if (comp.op === "intersect") v = mul16(a16, b16);
@@ -1358,7 +1381,7 @@
     var grow = +f.grow || 0;
     var steps = maskGrowPasses(grow, W);
     if (steps >= 1) acc = morphCPU(acc, W, H, steps, grow > 0);
-    if (+f.blur > 0) acc = gblurCPU(acc, W, H, +f.blur * W);
+    if (+f.blur > 0) acc = gblurCPU(acc, W, H, maskBlurSigma(+f.blur, W));
     var out = new Uint16Array(n);
     var inv = !!(mask && mask.invert);
     for (i = 0; i < n; i++) {
@@ -4559,7 +4582,8 @@
       }
       var feather = +c.feather || 0;
       if (feather > 0) {
-        var b = self.gblur(m.tex, W, H, fmt(feather * W, 3), 1, MASK_MAX);
+        var b = self.gblur(m.tex, W, H,
+                           fmt(maskBlurSigma(feather, W), 3), 1, MASK_MAX);
         G.release(m);
         m = b;
       }
@@ -4580,7 +4604,8 @@
     var steps = maskGrowPasses(grow, W);
     if (steps >= 1) acc = this.morphMatte(acc, steps, grow > 0, W, H);
     if (+f.blur > 0) {
-      var fb = this.gblur(acc.tex, W, H, fmt(+f.blur * W, 3), 1, MASK_MAX);
+      var fb = this.gblur(acc.tex, W, H,
+                          fmt(maskBlurSigma(+f.blur, W), 3), 1, MASK_MAX);
       G.release(acc);
       acc = fb;
     }
@@ -5329,6 +5354,8 @@
       GROW_MAX: MASK_GROW_MAX,
       GROW_REF_WIDTH: MASK_GROW_REF_WIDTH,
       growPasses: maskGrowPasses,
+      BLUR_MAX: MASK_BLUR_MAX,
+      blurSigma: maskBlurSigma,
       componentType: componentType,
       TYPES: MASK_TYPES,
       // playback side (design rule 10), no GPU needed to test any of it

@@ -61,7 +61,10 @@ NOTES: list[str] = []
 # never turn a suite red, and more than one lane adds to this file, so the
 # rule is "never fewer". Raise it deliberately when you add checks; lowering
 # it to make a run green is the thing this exists to stop.
-EXPECTED_CHECKS = 257
+# Round 2: 257 -> 272, the exact live count after the ownership cases for
+# findings 51 and 6 (preset and sweep), the hostile pick id block for finding
+# 69, and the readable-key-on-another-clip case for finding 71.
+EXPECTED_CHECKS = 272
 
 
 def ok(label: str, cond: bool, detail: str = "") -> None:
@@ -137,6 +140,39 @@ def test_mask_cli(base: str) -> None:
         ok("segment -o DIR: the mask preview is the PNG the server serves, "
            "under a .png name",
            any(n.endswith("-mask.png") for n in heads), sorted(heads))
+
+    # Round 2 finding 69: the file NAME is built out of two fields that come
+    # straight off the wire, and `--url` lets the caller point the CLI at any
+    # server. A pick_id of "../../x" wrote outside -o entirely. The fake
+    # answers with exactly that shape when a prompt says "escape"; the
+    # preview urls stay honest, so what is under test is the name, not the
+    # download.
+    with tempfile.TemporaryDirectory(prefix="mask_segment_escape_") as d:
+        box = Path(d) / "box"
+        box.mkdir()
+        r_esc = run_cli(["mask", "segment", "C015.mov", "--time", "1.0",
+                        "--text", "escape artist", "--json", "-o", str(box)],
+                        env=env)
+        ok("segment -o DIR with a hostile pick id: still exit 0",
+           r_esc.returncode == 0, r_esc.stderr[-300:])
+        inside = sorted(q.name for q in box.iterdir() if q.is_file())
+        outside = sorted(q.name for q in Path(d).iterdir() if q.is_file())
+        ok("segment -o DIR: every file landed INSIDE the folder that was "
+           "asked for", len(inside) == 4 and not outside,
+           f"inside {inside} / outside {outside}")
+        # A literal ".." INSIDE a longer name is harmless (it is one path
+        # component either way); what must not survive is a separator, a name
+        # that IS a parent, or a leading dot that hides the file.
+        ok("segment -o DIR: and every name is one plain path component",
+           all("/" not in n and "\\" not in n and not n.startswith(".")
+               and Path(n).name == n and n not in ("..", ".")
+               for n in inside), inside)
+        ok("segment -o DIR: the hostile characters became underscores rather "
+           "than being dropped, so two different ids still make two "
+           "different names", len(set(inside)) == len(inside), inside)
+        ok("segment -o DIR: nothing was written above the temporary root "
+           "either", not list(Path(d).parent.glob("escaped-*")),
+           str(Path(d).parent))
 
     r3 = run_cli(["mask", "track", "C015.mov", "--text", "person",
                  "--wait", "--json"], env=env)
@@ -1498,6 +1534,14 @@ def test_matte_belongs_to_this_clip() -> None:
         # than a content key. The guard cannot answer the question for one of
         # these, so it must not pretend the answer is "no".
         _write_matte_fixture(store / "m_legacy", "readable-key", "mine.mp4")
+        # The same unreadable key, but recorded against the OTHER clip. Round
+        # 2 finding 71: the engine used to return "allow" for any key that was
+        # not 32 hex, before it looked at anything else, so this one sailed
+        # through the CLI while the studio refused it. Now both halves fall
+        # back to the recorded file NAME for exactly this case, so both refuse
+        # it and both still allow m_legacy above.
+        _write_matte_fixture(store / "m_legacy_other", "readable-key",
+                             "other.mp4")
 
         env = {"CINEGRADE_MATTE_ROOT": str(store), "STUDIO_URL": ""}
 
@@ -1525,6 +1569,22 @@ def test_matte_belongs_to_this_clip() -> None:
                            "--matte", "m_legacy", "--json"], env=env)
         ok("a matte filed under a readable key is measured, not judged",
            r_legacy.returncode == 0, r_legacy.stderr[-400:])
+
+        r_legacy_other = run_cli(["stats", str(mine), "--time", "0.2",
+                                 "--matte", "m_legacy_other", "--json"],
+                                 env=env)
+        ok("but one whose readable key belongs to another clip's NAME is "
+           "still refused, the way the studio refuses it (finding 71)",
+           r_legacy_other.returncode != 0, r_legacy_other.stdout[:200])
+        ok("... in the same sentence as a key mismatch",
+           "was tracked on" in r_legacy_other.stderr
+           and "other.mp4" in r_legacy_other.stderr,
+           r_legacy_other.stderr[-400:])
+        ok("... and the studio asks the engine the same question rather than "
+           "carrying its own copy of the rule",
+           "CG.matte_clip_refusal(" in (CONTENT / "studio"
+                                       / "server.py").read_text(),
+           "studio/server.py")
 
         # --- stats --mask, the same matte reached through a stack ----------
         stack = json.dumps({"components": [
@@ -1566,7 +1626,51 @@ def test_matte_belongs_to_this_clip() -> None:
            "--allow-partial" not in r_render.stderr, r_render.stderr[-400:])
         ok("... and nothing was written", not out_bad.exists())
 
+        # --- the config's OWN layers (round 2 finding 51) -----------------
+        # No --matte and no --mask: the matte is in the preset the
+        # measurement grades through. `_grade_frame_stats` builds the same
+        # layer graph `render` builds, so this weighted the numbers with
+        # another clip's subject exactly as render would have, and it was the
+        # one path with no guard on it. `sweep` runs through the same
+        # function, so it is pinned here too rather than assumed.
+        r_cfg = run_cli(["stats", str(mine), "--time", "0.2",
+                        "--preset", str(bad_preset), "--json"], env=env)
+        ok("stats through a PRESET carrying another clip's matte: refused",
+           r_cfg.returncode != 0, r_cfg.stdout[:200])
+        ok("... in the same sentence, naming the layer and both clips",
+           "was tracked on" in r_cfg.stderr
+           and "layer 0 component 0" in r_cfg.stderr
+           and "other.mp4" in r_cfg.stderr and "mine.mp4" in r_cfg.stderr,
+           r_cfg.stderr[-400:])
+        ok("... and no numbers came back to be graded to",
+           "coverage" not in r_cfg.stdout and '"luma"' not in r_cfg.stdout,
+           r_cfg.stdout[:200])
+
+        r_sweep = run_cli(["sweep", str(mine), "--time", "0.2",
+                          "--preset", str(bad_preset), "--param", "exposure",
+                          "--values", "0,0.5", "--json"], env=env)
+        ok("sweep through the same preset: refused as well, and before it "
+           "rendered a single variant",
+           r_sweep.returncode != 0, r_sweep.stdout[:200])
+        ok("... in the same words", "was tracked on" in r_sweep.stderr,
+           r_sweep.stderr[-400:])
+
         good_preset = _preset_for("m_mine", root / "preset_mine.json")
+        r_cfg_ok = run_cli(["stats", str(mine), "--time", "0.2",
+                           "--preset", str(good_preset), "--json"], env=env)
+        ok("stats through a preset carrying THIS clip's matte: measures",
+           r_cfg_ok.returncode == 0, r_cfg_ok.stderr[-400:])
+
+        legacy_preset = _preset_for("m_legacy", root / "preset_legacy.json")
+        r_cfg_legacy = run_cli(["stats", str(mine), "--time", "0.2",
+                               "--preset", str(legacy_preset), "--json"],
+                               env=env)
+        ok("and a preset carrying a matte filed under a readable key is "
+           "still measured, not judged: the guard refuses a mismatch it can "
+           "prove, never every matte",
+           r_cfg_legacy.returncode == 0, r_cfg_legacy.stderr[-400:])
+
+
         out_good = root / "right.mov"
         r_good = run_cli(["render", str(mine), "--preset", str(good_preset),
                          "-o", str(out_good), "-t", "0.5"], env=env)

@@ -11,6 +11,7 @@ decoder killing the whole render.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 
@@ -140,6 +141,120 @@ def test_width_scales_the_render(ctx):
                   float(int(st.get("width", 0))), 300.0)
 
 
+def test_width_does_not_move_the_generated_cache(ctx):
+    """Round 2 finding 61: `--width` and `--scale` re-pinned the generated
+    cache root for the rest of the process.
+
+    Those two flags are the only ones that need the studio's own preview
+    scaler, so `cmd_render` does `import server as studio_server`. Importing
+    that file RUNS its module body, and the body ends with
+    `CG.set_cache_root(CACHE)` where CACHE is the studio's own default
+    (studio/cache unless STUDIO_CACHE_DIR or STUDIO_DATA_DIR says otherwise).
+    `cache_root()` checks that pin before the environment, so it beat both
+    CINEGRADE_CACHE_DIR and any pin the calling process had set on purpose.
+
+    Reachability, checked rather than assumed. Running the engine as a
+    script (`python cinegrade.py render ...`) is IMMUNE: that copy of the
+    module is named `__main__`, so `import cinegrade as CG` inside
+    studio/server.py builds a SECOND module object and pins that one, and
+    the running command's own `CACHE_ROOT_OVERRIDE` never moves. What is
+    not immune is every caller that imports the engine under its own name
+    and then calls into it: studio/server.py itself, grade/tests/harness.py
+    (which pins this run's scratch cache with `cg.set_cache_root`), and
+    studio/tools. So the test drives that path: a subprocess that imports
+    `cinegrade`, pins a cache root, runs `main()` on a render with --width,
+    and reports where the cache root ended up.
+
+    The layer bakes a real cube and a real window matte, so the files are
+    checked as well as the pin: it is the files landing somewhere else that
+    a person would eventually notice, in a folder the live studio reads.
+    """
+    scratch = H.WORK / "cachepin"
+    engine_cache = scratch / "engine-cache"
+    studio_data = scratch / "studio-data"
+    for d in (engine_cache, studio_data):
+        d.mkdir(parents=True, exist_ok=True)
+
+    preset = scratch / "preset.json"
+    layer = H.cg.deep_merge(H.cg.LAYER_DEFAULTS, {
+        "enabled": True, "name": "cachepin",
+        "mask": {"window": {"enabled": True, "shape": "rect", "cx": 0.5,
+                            "cy": 0.5, "w": 0.5, "h": 0.5, "softness": 0.2}},
+        "correct": {"exposure": 0.6, "saturation": 1.4, "contrast": 1.2}})
+    preset.write_text(json.dumps(
+        H.cg.deep_merge(H.cg.DEFAULTS, {"layers": [layer]})))
+
+    # The caller: imports the engine as `cinegrade`, pins its own cache root
+    # the way harness.py and the studio server do, then runs the CLI entry
+    # point in process. Everything it reports comes from that one module
+    # object, so a pin moved underneath it shows up as a moved cache root.
+    driver = scratch / "driver.py"
+    driver.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import cinegrade as cg\n"
+        "cg.set_cache_root(sys.argv[2])\n"
+        "before = str(cg.cache_root())\n"
+        "sys.argv = ['cinegrade'] + sys.argv[3:]\n"
+        "cg.main()\n"
+        "print('CACHEPIN ' + json.dumps({\n"
+        "    'before': before, 'after': str(cg.cache_root()),\n"
+        "    'layers': str(cg.LUT_LAYERS), 'masks': str(cg.LUT_MASKS)}))\n")
+
+    studio_cache = H.CONTENT / "studio" / "cache" / "luts"
+    before_live = ({str(q) for q in studio_cache.rglob("*") if q.is_file()}
+                   if studio_cache.is_dir() else set())
+
+    out = scratch / "cache_pin.mp4"
+    env = dict(os.environ)
+    # A throwaway data dir, so importing the studio server cannot touch the
+    # real studio/data, and so its default cache is somewhere this test can
+    # look for stray files.
+    env["STUDIO_DATA_DIR"] = str(studio_data)
+    env.pop("STUDIO_CACHE_DIR", None)
+    r = subprocess.run(
+        [PY, str(driver), str(H.GRADE), str(engine_cache),
+         "render", SRC, "-p", str(preset), "--codec", "libx264",
+         "--width", "320", "-t", "0.12", "--no-audio", "-o", str(out)],
+        capture_output=True, text=True, env=env)
+    ctx.expect_eq("in-process render --width: exit code", r.returncode, 0)
+    line = [ln for ln in r.stdout.splitlines() if ln.startswith("CACHEPIN ")]
+    if r.returncode != 0 or not line:
+        ctx.note(f"stderr: {r.stderr[-800:]}")
+        ctx.expect_true("the driver reported where the cache root ended up",
+                        False, "no CACHEPIN line")
+        return
+    got = json.loads(line[-1][len("CACHEPIN "):])
+
+    ctx.expect_eq("the caller's pin survives the render", got["after"],
+                  got["before"])
+    ctx.expect_eq("and it is the folder the caller asked for", got["after"],
+                  str(engine_cache.resolve()))
+    ctx.expect_true("LUT_LAYERS still points inside it",
+                    got["layers"].startswith(got["after"]), got["layers"])
+    ctx.expect_true("LUT_MASKS still points inside it",
+                    got["masks"].startswith(got["after"]), got["masks"])
+
+    baked = sorted(str(q) for q in (engine_cache / "luts").rglob("*")
+                   if q.is_file())
+    strays = sorted(str(q) for q in (studio_data / "cache").rglob("*")
+                    if q.is_file())
+    after_live = ({str(q) for q in studio_cache.rglob("*") if q.is_file()}
+                  if studio_cache.is_dir() else set())
+    ctx.note(f"baked {len(baked)} file(s) in the caller's cache, "
+             f"{len(strays)} under the studio's default, "
+             f"{len(after_live - before_live)} under studio/cache/luts")
+    ctx.expect_true("the render really baked something, so this is measuring "
+                    "a cache that was used", bool(baked), baked[:3])
+    ctx.expect_true("nothing was baked under the studio's own cache dir",
+                    not strays, strays[:5])
+    ctx.expect_true("and nothing under studio/cache/luts, which is the "
+                    "folder a live studio reads",
+                    not (after_live - before_live),
+                    sorted(after_live - before_live)[:5])
+
+
 def test_scale_fraction_matches_width_math(ctx):
     """--scale 0.5 on a probed source should land on the same width the
     preview path (studio's scale_for_preview) would compute for that
@@ -242,6 +357,11 @@ def register(suite):
                   "start_render does (prores_ks -> .mov, else .mp4)")
     suite.add(g, "width_scales_the_render", test_width_scales_the_render,
               doc="--width actually renders at that width")
+    suite.add(g, "width_keeps_the_generated_cache",
+              test_width_does_not_move_the_generated_cache,
+              doc="--width does not re-home the baked cubes into "
+                  "studio/cache, which importing the studio's scaler used to "
+                  "do silently")
     suite.add(g, "scale_fraction_matches_width_math",
               test_scale_fraction_matches_width_math,
               doc="--scale reuses the preview path's own pixel math")

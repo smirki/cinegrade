@@ -76,6 +76,19 @@ def header(frames_count: int = 4) -> dict:
 def test_lock_ownership(tmp: Path) -> None:
     print("\nfinding 11: a lock nobody took must not be given away")
     real = modellock.LOCK_DIR
+    # Round 2 finding 56: the "the real lock is untouched" check at the end of
+    # this test used to read `not LOCK_DIR.exists() or owner()["pid"] != mine`,
+    # and its FIRST disjunct passes exactly when the real lock has been
+    # DELETED, which is the damage the check is named after. The second passes
+    # whenever anything else owns it. So it could only ever go red in a case
+    # the suite cannot produce. This is the snapshot the check needed: what
+    # was there before the redirect, compared against what is there after.
+    # It matters more than its severity suggests, because the founder's live
+    # grading run is what holds that lock while this suite runs.
+    real_existed = real.exists()
+    # Named for the LOCK, not for the function: `real_owner` further down is
+    # the saved `modellock.owner` function itself, restored after a monkeypatch.
+    real_lock_owner = modellock.owner(real)
     modellock.LOCK_DIR = tmp / "model.lock"
     check("the test is not pointed at the real lock",
           modellock.LOCK_DIR != real and not modellock.LOCK_DIR.exists(),
@@ -180,10 +193,16 @@ def test_lock_ownership(tmp: Path) -> None:
             lock_dir.rmdir()
 
     modellock.LOCK_DIR = real
-    check("the real lock is untouched by this suite",
-          not modellock.LOCK_DIR.exists()
-          or (modellock.owner() or {}).get("pid") != os.getpid(),
-          str(modellock.LOCK_DIR))
+    # The pair, unchanged: it is still there if it was there, still gone if it
+    # was gone, and still owned by whoever owned it. A suite that deleted the
+    # founder's lock now turns this red, which the old form could not.
+    check("the real lock still exists exactly as it did before this suite",
+          real.exists() == real_existed,
+          f"{real}: existed={real_existed} now={real.exists()}")
+    check("and it is still owned by whoever owned it before, not by this pid",
+          modellock.owner(real) == real_lock_owner,
+          f"before={json.dumps(real_lock_owner)} "
+          f"after={json.dumps(modellock.owner(real))}")
 
 
 # ---------------------------------------------------------------------------

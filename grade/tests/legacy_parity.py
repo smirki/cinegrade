@@ -131,6 +131,42 @@ def _norm(cg, text: str, root: Path) -> str:
                 .replace(str(root), "<ROOT>"))
 
 
+# Round 2 finding 67 renamed the radial ramp's cache file. It used to be
+# `radial_320x180_0.55_1.00.png`, two floats rounded to two decimals, which
+# meant two radials three thousandths apart shared a file and the second
+# caller silently got the first caller's ramp; it is now the same sha1 of the
+# exact numbers that `window_mask` has always used. The blessed fingerprint on
+# this disk was produced by the pre-component engine and still carries the old
+# NAME, so a straight comparison reports four cases moved for a rename that
+# changes no pixels.
+#
+# `stable()` folds that one name to a placeholder on BOTH sides. What it does
+# not fold is the ramp's CONTENT: `files` maps the (folded) name to a sha1 of
+# the bytes, so a radial that actually draws something different is still a
+# red gate, and so is a radial that moves to a different input index. This is
+# the only generated name that has been renamed since the blessing; window and
+# layer names are compared as they are, because their hashes are the identity
+# of the settings that produced them.
+RADIAL_NAME = re.compile(r"(radial_\d+x\d+_)[^/\s'\":,\]\[]+(\.png)")
+
+
+def stable(data):
+    """One fingerprint, or a whole dict of them, with the radial ramp's cache
+    file name folded to `radial_WxH_<ID>.png`.
+
+    Applied to the blessed side and the rebuilt side, so the comparison is
+    "same graph, same input order, same bytes" and not "same name for a
+    generated file".
+    """
+    if isinstance(data, str):
+        return RADIAL_NAME.sub(r"\1<ID>\2", data)
+    if isinstance(data, list):
+        return [stable(v) for v in data]
+    if isinstance(data, dict):
+        return {stable(k): stable(v) for k, v in data.items()}
+    return data
+
+
 def fingerprint(cg, cfg: dict, info: dict, root: Path) -> dict:
     """Graph text, input list and the bytes of every file they name."""
     graph = cg.graph_with_mask(cfg, info)

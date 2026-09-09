@@ -31,21 +31,25 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import shutil
-import socket
 import struct
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from ports import free_port as _shared_free_port              # noqa: E402
 CONTENT = HERE.parent.parent.parent
 PYTHON = CONTENT / ".venv" / "bin" / "python"
 SERVER = "studio/server.py"
@@ -62,14 +66,21 @@ STATE: dict = {}
 # --------------------------------------------------------------------------
 
 def free_port() -> int:
+    """A port nothing is on, and nothing on the shared forbidden list.
+
+    This file used to draw from 20000-60000 with a bind test and no list at
+    all, which is round 1 finding 20's exact shape: the two ports that list
+    names because a real server was found squatting on them (22929, 28958)
+    are both inside that range, and a bind test only proves a port is free
+    at this instant. One list, one picker
+    (studio/tests/forbidden-ports.json, studio/tests/py/ports.py), the same
+    one test_mask_routes.py and the node harnesses use.
+    """
     for _ in range(60):
-        port = random.randint(20000, 60000)
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
+        try:
+            return _shared_free_port()
+        except OSError:
+            continue
     raise unittest.SkipTest("no free port")
 
 
@@ -77,6 +88,80 @@ def cli(*args, stdin: str = "") -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(PYTHON), SERVER, "--data-dir", str(STATE["tmp"]), *args],
         cwd=str(CONTENT), input=stdin, capture_output=True, text=True)
+
+
+class _FakeSam(BaseHTTPRequestHandler):
+    """The smallest SAM service that lets a mask track job EXIST.
+
+    Round 2 findings 54 and 72 are about who may read and cancel a mask track
+    job, and a job only exists once POST /api/mask/track has been answered by
+    a service. This one accepts a track, keeps it running for ever and never
+    writes a matte frame: nothing here is about tracking, only about there
+    being a job with a clip name attached to it. The real service's own
+    behaviour is covered by test_mask_routes.py against a much fuller fake.
+    """
+
+    cancels: list = []
+
+    def log_message(self, fmt, *args):                 # noqa: D401  (quiet)
+        pass
+
+    def _json(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):                                    # noqa: N802
+        if self.path == "/health":
+            self._json(200, {"ok": True, "backend": "fake", "model": "none",
+                             "loaded": True, "busy": False, "queue": 0})
+            return
+        if self.path.startswith("/jobs/"):
+            self._json(200, {"state": "running", "done_frames": 0,
+                             "total_frames": 4, "fps": 10.0,
+                             "elapsed_s": 0.1, "matte_ids": ["m_identity"],
+                             "mattes": [{"matte_id": "m_identity",
+                                         "state": "running"}]})
+            return
+        self._json(404, {"error": self.path})
+
+    def do_POST(self):                                   # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        if self.path == "/track":
+            self._json(200, {
+                "job_id": "sam_identity_job", "state": "queued",
+                "total_frames": 4, "fps": 10.0,
+                "mattes": [{"matte_id": "m_identity", "object_id": "0",
+                            "label": "a private subject", "kind": "text"}],
+                "matte_ids": ["m_identity"]})
+            return
+        if self.path.endswith("/cancel"):
+            _FakeSam.cancels.append(self.path)
+            self._json(200, {"ok": True, "state": "cancelled"})
+            return
+        self._json(404, {"error": self.path})
+
+
+def start_fake_sam() -> str:
+    port = free_port()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), _FakeSam)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    STATE["sam"] = {"server": srv, "thread": thread, "port": port}
+    return f"http://127.0.0.1:{port}"
+
+
+def stop_fake_sam() -> None:
+    entry = STATE.get("sam")
+    if not entry:
+        return
+    entry["server"].shutdown()
+    entry["server"].server_close()
 
 
 def start_server(name: str, *extra) -> None:
@@ -161,8 +246,13 @@ def setUpModule() -> None:
             raise unittest.SkipTest(f"could not create the {who} test "
                                     f"account: {made.stderr}")
 
+    sam_url = start_fake_sam()
     start_server("primary")
-    start_server("gated", "--auth")
+    # The gated server is the one every permission case runs against, so it is
+    # the one that needs a SAM service to have mask track jobs at all
+    # (findings 54 and 72). Nothing else in this file calls a mask route that
+    # reaches the service, so pointing it at the fake changes no other test.
+    start_server("gated", "--auth", "--sam-url", sam_url)
     STATE["ada"] = login("ada")
     STATE["ida"] = login("ida")
 
@@ -170,6 +260,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     stop_server("primary")
     stop_server("gated")
+    stop_fake_sam()
     if STATE.get("tmp"):
         shutil.rmtree(STATE["tmp"], ignore_errors=True)
 
@@ -711,6 +802,128 @@ class Identity(unittest.TestCase):
         self.assertEqual(done.get("status"), 200, done)
         self.assertEqual(done.get("deleted"), "m_deleteme")
         self.assertFalse(matte.exists(), "an admin DELETE left it on disk")
+
+
+    def test_24_the_mask_job_routes_show_only_what_an_account_may_read(self):
+        """Round 2 findings 54 and 72: `GET /api/mask/status`, `GET
+        /api/mask/jobs`, `GET /api/mask/jobs/<id>` and `POST
+        /api/mask/jobs/<id>/cancel`.
+
+        Round 1 gave `GET /api/matte` this guard and wrote out why: a matte
+        summary carries the clip's own file name and, for a text prompt, the
+        prompt words. A mask JOB carries the same two things (`clip`,
+        `clip_key`, and a label built as "mask track <clip> <matte ids>") and
+        the three list routes answer with every caller's jobs at once, so on
+        a studio with logins on any signed in account could read back the
+        file name of every clip anybody had tracked, including clips in
+        other people's private library folders. The cancel route had no gate
+        at all, and job ids are enumerable through the list routes, so any
+        account could stop anybody's track.
+
+        With logins off, which is the default and how every agent runs this,
+        all four are no-ops: `test_the_matte_list_with_no_clip_still_answers_
+        with_logins_off` in test_mask_routes.py is the other half of that.
+        """
+        private = private_library_clip("ida")
+        if private is None:
+            self.skipTest("could not put a clip in ida's library")
+        started = call("/api/mask/track",
+                       {"clip": private, "prompts": {"text": ["a private "
+                                                              "subject"]}},
+                       headers=as_user("ida"), server="gated")
+        if started.get("status") != 200:
+            self.skipTest(f"the track could not be queued: {started}")
+        job_id = started.get("job_id")
+        self.assertTrue(job_id, started)
+
+        # ada may not read ida's library clip, so she sees no such job at all.
+        listed = call("/api/mask/jobs", headers=as_user("ada"), server="gated")
+        self.assertEqual(listed.get("status"), 200, listed)
+        self.assertNotIn(job_id, [j.get("id") for j in listed.get("jobs", [])],
+                         "the jobs list handed out a job on somebody else's "
+                         "private clip")
+        status = call("/api/mask/status", headers=as_user("ada"),
+                      server="gated")
+        self.assertEqual(status.get("status"), 200, status)
+        blob = json.dumps(status.get("jobs", []))
+        self.assertNotIn(job_id, blob)
+        self.assertNotIn(private, blob,
+                         "mask/status named a clip this account may not read")
+
+        one = call(f"/api/mask/jobs/{job_id}", headers=as_user("ada"),
+                   server="gated")
+        self.assertEqual(one.get("status"), 403, one)
+
+        cancelled = call(f"/api/mask/jobs/{job_id}/cancel", method="POST",
+                         headers=as_user("ada"), server="gated")
+        self.assertEqual(cancelled.get("status"), 403, cancelled)
+
+        # The owner still sees it and can still stop it, so this is a
+        # permission filter and not a route that stopped working.
+        mine = call("/api/mask/jobs", headers=as_user("ida"), server="gated")
+        self.assertIn(job_id, [j.get("id") for j in mine.get("jobs", [])])
+        mine_one = call(f"/api/mask/jobs/{job_id}", headers=as_user("ida"),
+                        server="gated")
+        self.assertEqual(mine_one.get("status"), 200, mine_one)
+        self.assertEqual(mine_one.get("clip"), private)
+        stop = call(f"/api/mask/jobs/{job_id}/cancel", method="POST",
+                    headers=as_user("ida"), server="gated")
+        self.assertEqual(stop.get("status"), 200, stop)
+        self.assertEqual(stop.get("state"), "cancelled", stop)
+
+        # And the generic cancel route, which has the identical hole and the
+        # identical one line fix.
+        again = call("/api/mask/track",
+                     {"clip": private, "prompts": {"text": ["a second "
+                                                            "private subject"]}},
+                     headers=as_user("ida"), server="gated")
+        if again.get("status") == 200 and again.get("job_id"):
+            generic = call("/api/job/cancel", {"id": again["job_id"]},
+                           headers=as_user("ada"), server="gated")
+            self.assertEqual(generic.get("status"), 403, generic)
+
+
+    def test_25_a_refusal_does_not_name_a_clip_this_account_cannot_read(self):
+        """Round 2 finding 60: the arc's own safety feature was a disclosure
+        channel.
+
+        The clip ownership refusal begins "matte <id> was tracked on <the
+        other clip's file name>", and it runs on a matte id the CALLER named,
+        ahead of any read guard. So naming a matte id you may not read told
+        you which file it came from, and finding 54 made the ids enumerable.
+
+        Both halves are pinned: the refusal still happens for ada (it is a
+        real mismatch, and silently measuring it is the bug the whole guard
+        exists to stop), and it still names the matte she asked for, but it
+        does not name ida's file. For ida, who may read that clip, the full
+        sentence comes back, so this is a redaction and not a route that
+        stopped explaining itself.
+        """
+        private = private_library_clip("ida")
+        if private is None:
+            self.skipTest("could not put a clip in ida's library")
+        write_matte("m_secretclip", private)
+        shared = STATE["clips"][0]
+        body = {"clip": shared, "time": 0.1, "width": 64, "config": {},
+                "mask": {"components": [{"id": "c1", "type": "matte",
+                                         "op": "add",
+                                         "matte": {"id": "m_secretclip"}}]}}
+
+        as_ada = call("/api/stats", body, headers=as_user("ada"),
+                      server="gated")
+        self.assertEqual(as_ada.get("status"), 400, as_ada)
+        said = as_ada.get("error", "")
+        self.assertIn("m_secretclip", said)
+        self.assertNotIn(private, said,
+                         "the refusal named a clip this account may not read")
+        self.assertIn("cannot read", said)
+
+        as_ida = call("/api/stats", body, headers=as_user("ida"),
+                      server="gated")
+        self.assertEqual(as_ida.get("status"), 400, as_ida)
+        self.assertIn(private, as_ida.get("error", ""),
+                      "the owner should still be told which clip it was "
+                      "tracked on")
 
 
 if __name__ == "__main__":
