@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { pruneHarnessCache } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));   // studio/tests
 const ROOT = path.resolve(HERE, "..", "..");                  // the studio repo root
@@ -91,8 +92,13 @@ if (!dataDirIsOwn) fs.mkdirSync(dataDir, { recursive: true });
 // default cache <data dir>/cache, so every run would re-decode frames it
 // already measured. This is the harness's own stable cache folder, shared
 // with run.mjs, gitignored, and never the founder's studio/cache.
+// ... but not unbounded either: pruned by age and then by size before the
+// server starts, the same call run.mjs makes, so whichever harness runs first
+// pays it and neither leaves a folder that grows for ever (it had reached
+// 3.4 GB). lib/util.mjs carries the two numbers and the reasoning.
 const cacheDir = path.join(ROOT, "studio", "tests", ".cache");
 fs.mkdirSync(cacheDir, { recursive: true });
+console.log(pruneHarnessCache(cacheDir).line);
 
 console.log("root:", ROOT);
 console.log("python:", PYTHON);
@@ -312,8 +318,20 @@ const MASK_FIXTURES = [
                          correct: LCORR }] } },
 
   /* Grow past the cap. 0.5 of the frame width is 100+ passes at any working
-   * width and both sides clamp to 32, so this row fails loudly if one of them
-   * forgot the cap rather than quietly taking minutes to render. */
+   * width, so both sides clamp, and this row fails loudly if one of them
+   * forgot the cap rather than quietly taking minutes to render.
+   *
+   * It also fails if they clamp DIFFERENTLY, which is the half round 1 minor
+   * 31 was about: the cap used to be a flat 32 passes at whatever width each
+   * side happened to run at (the browser previews at 640, the render runs at
+   * the output width), so the same grade grew the matte by 5% of the frame in
+   * the preview and 1.7% in the render. The cap is now 32 passes at 1920 and
+   * scales with the width, so it is the same FRACTION of the picture
+   * everywhere. Every fixture here runs at 640 and at 1280, so this row is
+   * the paired half of that change: two widths, two different pass counts
+   * (11 and 21), and the shader and the engine still agreeing at each. That
+   * the two counts are the same fraction of their own width is pinned in
+   * studio/tests/mask-stack-ref.mjs, which can read growPasses directly. */
   { id: "maskv2_finesse_grow_capped", stage: "mask",
     config: { layers: [{ mask: { components: [comp({ id: "c1", window: WIN_A })],
                                  finesse: { grow: 0.5 } }, correct: LCORR }] } },

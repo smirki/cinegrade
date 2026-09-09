@@ -68,6 +68,21 @@ reason: a test run must not write into it.
   stay warm instead of re-rendering from cold every time; it is gitignored,
   and the founder's own `studio/cache` is never touched by a test run either
   way. Delete `studio/tests/.cache` to force the next harness run cold.
+- **`studio/tests/.cache` is bounded, since round 1.** It is the harness's
+  scratch copy of everything a run decoded: whole decoded frames, source
+  stages, proxies, segments, LUTs, thumbnails and mask stills, each one named
+  after a hash of the clip and the settings that made it. Nothing used to
+  remove anything from it and it had reached 3.4 GB. Both harnesses now prune
+  it before they start their server, oldest first: anything untouched for more
+  than `CACHE_MAX_AGE_DAYS` (7) goes, and if what is left is still over
+  `CACHE_MAX_BYTES` (2 GiB) the oldest files go until it fits. Both numbers
+  live in `studio/tests/lib/util.mjs` and each run prints one line saying what
+  it removed. A pruned entry costs a regeneration on the next run that wants
+  it and can never cost a wrong answer, because the name IS the inputs. To
+  clear it by hand, `rm -rf studio/tests/.cache` (the next run recreates it);
+  the prune itself refuses to touch any folder that is not a
+  `studio/tests/.cache` and never follows a symlink out of it, so it cannot
+  reach `studio/cache`, `studio/data` or `footage/`.
 
 ## Logins and accounts
 
@@ -2764,13 +2779,20 @@ discovered by measuring a frozen mask at 20 seconds and believing the number.
 hole in the middle reads below 1.0.
 
 `quality` is the per frame flag block: `{"thresholds": {"area_jump",
-"min_iou"}, "checked", "iou_source", "suspect_count", "suspect_frames":
+"area_recover", "min_iou"}, "checked", "iou_source", "suspect_count",
+"suspect_frames":
 [{"index", "time", "reasons", "area", "prev_area", "jump", "iou"}, ...],
 "truncated", "first_suspect_index", "first_suspect_time", "reasons":
-{"zero_area", "area_jump", "low_iou"}}`. A written frame is **suspect** when
-its area is zero inside the span, when its area moved by more than
-`area_jump` of the previous written frame's area, or when its IoU with the
-previous written frame is below `min_iou`. Defaults are `0.5` and `0.3`,
+{"zero_area", "area_jump", "area_recover", "low_iou"}}`. A written frame is
+**suspect** when its area is zero inside the span, when its area moved by more
+than `area_jump` of the previous written frame's area, when it holds something
+and the frame before it held nothing (`area_recover`: the tracker found an
+object again, and the area rule is blind to that frame because it divides by
+the previous area), or when its IoU with the previous written frame is below
+`min_iou`. `area_recover` is a pointer rather than a verdict, since a track
+that recovers correctly trips it too, and it is the frame to look at first:
+it is where a tracker most often comes back on the wrong object.
+Defaults are `0.5` and `0.3`,
 measured on the arc's own bakeoff mattes (a matte that lost its subject and
 latched onto a tree flags 45 of 144 frames; a clean sky matte flags none),
 and are overridable per call and by `CINEGRADE_MATTE_AREA_JUMP` /

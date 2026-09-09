@@ -1140,12 +1140,13 @@ class MaskRoutesTest(unittest.TestCase):
         # + 0 + 0 - 0 was what it checked before the arrays were real.
         self.assertEqual(q["suspect_count"], 0, q["suspect_frames"])
         self.assertEqual(q["reasons"], {"zero_area": 0, "area_jump": 0,
-                                        "low_iou": 0})
+                                        "area_recover": 0, "low_iou": 0})
         self.assertIsNone(q["first_suspect_index"])
         self.assertEqual(set(q["reasons"]),
-                         {"zero_area", "area_jump", "low_iou"})
+                         {"zero_area", "area_jump", "area_recover", "low_iou"})
         self.assertEqual(q["suspect_count"],
                          q["reasons"]["zero_area"] + q["reasons"]["area_jump"]
+                         + q["reasons"]["area_recover"]
                          + q["reasons"]["low_iou"]
                          - self._overlapping_reasons(q))
         # and the thresholds in force are readable without computing them
@@ -1169,9 +1170,12 @@ class MaskRoutesTest(unittest.TestCase):
           frame 2  nothing written    area 0 (zero_area), the whole of the
                                       previous area lost (area_jump 1.0) and
                                       no overlap at all (low_iou 0.0)
-          frame 3  steady again       flagged for the shape only: it overlaps
-                                      an empty frame, so low_iou, and the jump
-                                      rule cannot divide by an area of 0
+          frame 3  steady again       the subject is back after an empty
+                                      frame, which is area_recover (round 1
+                                      finding 22: the jump rule cannot divide
+                                      by an area of 0, so this frame used to
+                                      be flagged for its shape alone), and it
+                                      overlaps that empty frame, so low_iou
           frame 4  the other rows     7 rows of 15, so no jump worth flagging
                                       (0.22), one row of overlap out of 15
                                       (low_iou 0.0667)
@@ -1181,7 +1185,7 @@ class MaskRoutesTest(unittest.TestCase):
                                       area_jump alone
 
         Losing a subject trips three rules at once and coming back from it
-        trips one: that is the real behaviour of the shipped rules, not a
+        trips two: that is the real behaviour of the shipped rules, not a
         rounding of it, and writing it down means a change to any one rule
         fails here instead of quietly changing what the studio reports.
         """
@@ -1193,18 +1197,26 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertEqual(q["iou_source"], "index",
                          "the fake writes ious the way sam/store.py does, so "
                          "the rule has to run off the index")
-        self.assertEqual(q["thresholds"], {"area_jump": 0.5, "min_iou": 0.3})
+        self.assertEqual(q["thresholds"], {"area_jump": 0.5, "min_iou": 0.3,
+                                           "area_recover": 0.0})
         by_index = {f["index"]: f["reasons"] for f in q["suspect_frames"]}
         self.assertEqual(by_index, {
             DRIFT_LOST: ["zero_area", "area_jump", "low_iou"],
-            DRIFT_LOST + 1: ["low_iou"],
+            DRIFT_LOST + 1: ["area_recover", "low_iou"],
             DRIFT_ELSEWHERE: ["low_iou"],
             DRIFT_ELSEWHERE + 1: ["low_iou"],
             DRIFT_LATCH: ["area_jump"],
         })
         self.assertEqual(q["suspect_count"], 5)
         self.assertEqual(q["reasons"], {"zero_area": 1, "area_jump": 2,
-                                        "low_iou": 4})
+                                        "area_recover": 1, "low_iou": 4})
+        # The recovery frame is the one the area rule is blind to: it carries
+        # no `jump` at all, because there is no previous area to divide by.
+        came_back = next(f for f in q["suspect_frames"]
+                         if f["index"] == DRIFT_LOST + 1)
+        self.assertIsNone(came_back["jump"])
+        self.assertEqual(came_back["prev_area"], 0.0)
+        self.assertGreater(came_back["area"], 0.0)
         self.assertEqual(q["first_suspect_index"], DRIFT_LOST)
         self.assertAlmostEqual(q["first_suspect_time"],
                               DRIFT_LOST / info["fps"], places=3)
@@ -1232,6 +1244,58 @@ class MaskRoutesTest(unittest.TestCase):
         row = next(m for m in listing["mattes"] if m["matte_id"] == matte_id)
         self.assertEqual(row["quality"]["suspect_count"], 5)
         self.assertEqual(row["quality"]["first_suspect_index"], DRIFT_LOST)
+
+    def test_a_matte_with_no_ious_has_them_read_off_its_own_frames(self):
+        """Round 1 finding 15's deferred line: `compute_iou=full`.
+
+        `frame_ious()` (grade/mattes.py) is the only way to judge the SHAPE
+        half of drift on a matte tracked before the SAM service started
+        writing `ious` into index.json, and nothing in the product called it,
+        so on such a matte `low_iou` was 0 for want of a rule rather than for
+        want of drift and only `iou_source` said so.
+
+        The single matte route reads the frames off disk for it now, and the
+        LIST route deliberately still does not: `full` already means "this is
+        one matte, send its per frame arrays", and a clip with four mattes of
+        384 frames cannot pay for four disk walks to answer "what state are
+        these in".
+
+        The fixture is a real tracked matte with its `ious` taken back out of
+        index.json, which is exactly what an older matte looks like on disk.
+        """
+        result = self._track(prompts={"text": ["iou fallback subject"]},
+                             start=0, end=0.25)
+        matte_id = result["mattes"][0]["matte_id"]
+        self._wait_matte_state(matte_id, ("done",))
+        self.assertEqual(
+            _get(self.base + f"/matte/{matte_id}")["quality"]["iou_source"],
+            "index", "the control: with ious in the index they are used")
+
+        matches = sorted(self._matte_root().rglob(f"{matte_id}/{MT.INDEX_NAME}"))
+        self.assertEqual(len(matches), 1, f"expected one {matte_id} on disk")
+        index_path = matches[0]
+        raw = json.loads(index_path.read_text())
+        self.assertTrue(raw.get("ious"),
+                        "this test removes the ious, so they have to be there "
+                        "to start with")
+        raw.pop("ious")
+        index_path.write_text(json.dumps(raw))
+
+        one = _get(self.base + f"/matte/{matte_id}")
+        self.assertIsNone(one.get("ious"),
+                          "the arrays on the wire are the index's own; only "
+                          "the judgement falls back")
+        self.assertEqual(one["quality"]["iou_source"], "frames",
+                         "with no ious in the index the single matte route "
+                         "reads the shapes off disk; 'none' is the pre-fix "
+                         "answer and means the shape rule did not run at all")
+        self.assertGreater(one["quality"]["checked"], 0)
+
+        listing = _get(self.base + f"/matte?clip={self.clip}")
+        row = next(m for m in listing["mattes"] if m["matte_id"] == matte_id)
+        self.assertEqual(row["quality"]["iou_source"], "none",
+                         "the list route must not read every frame of every "
+                         "matte to answer what state they are in")
 
     def test_a_partial_matte_freezes_past_its_span_and_says_which_frame(self):
         """Round 1 finding 39: `assertTrue(info["frozen_outside_span"])` is a

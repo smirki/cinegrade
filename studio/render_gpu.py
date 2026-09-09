@@ -749,6 +749,15 @@ def start_gpu_render(payload: dict, base_url: str = "", user_id=None):
         "out_bytes": W * H * cut["bytes"],   # cut["format"], back out of it
         "out_format": cut["format"],
         "expected": expected,
+        # The render's own timebase, which is the only way the browser can
+        # say WHEN a frame is. X-Frame-Index counts from 0 at the start of
+        # the range, so frame i is at start + i/fps on the CLIP's timeline,
+        # and that is the number a matte is indexed by (C2). Without these
+        # two keys render.js refuses a config that holds a tracked matte,
+        # rather than grading every frame of the file against matte frame 0
+        # (round 1 finding 2).
+        "fps": fps,
+        "start": float(start or 0.0),
         "pixel_scale": W / float(info["width"]),
         "config": gpu_cfg,
         "defaults": SRV.CG.DEFAULTS,
@@ -803,6 +812,10 @@ def handle(handler, method: str, route: str, query: dict) -> bool:
             "outBytes": plan["out_bytes"],
             "outFormat": plan["out_format"],
             "expected": plan["expected"],
+            # The timebase, so the worker can work out each frame's clip
+            # time and bind the matte frame that belongs to it.
+            "fps": plan["fps"],
+            "start": plan["start"],
             "pixelScale": plan["pixel_scale"],
             "config": plan["config"],
             "defaults": plan["defaults"],

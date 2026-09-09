@@ -930,8 +930,25 @@
    */
 
   // The matte's full swing, and the cap on grow. Both mirror cinegrade.
+  //
+  // The grow cap is quoted at a reference width, exactly as
+  // LAYER_BLUR_REF_WIDTH quotes the layer blur, because grow is a fraction of
+  // frame width and a cap in raw pixels is not: at a flat 32 the same grow
+  // clamped to 2.0 percent of the width on a 640 preview and 0.83 percent on
+  // a 3840 render, so the preview showed a grow about 2.4x wider than the
+  // delivered file (round 1 finding 31). cinegrade.mask_grow_passes is the
+  // same three lines; they have to move together, because parity renders both
+  // engines at the same width and maskv2_finesse_grow_capped measures it.
   var MASK_MAX = 65535;
-  var MASK_GROW_MAX = 32;
+  var MASK_GROW_MAX = 32;              // passes, at MASK_GROW_REF_WIDTH
+  var MASK_GROW_REF_WIDTH = 1920;
+
+  /* The pass count for a grow at a width. pyRound on both the cap and the
+   * request, because cinegrade rounds both with Python's round(). */
+  function maskGrowPasses(grow, W) {
+    var cap = Math.max(1, pyRound(MASK_GROW_MAX * W / MASK_GROW_REF_WIDTH));
+    return Math.min(cap, pyRound(Math.abs(+grow || 0) * W));
+  }
 
   // An 8 bit code, floor(255*v + 0.5) clamped. The window matte's PNG.
   function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
@@ -1014,6 +1031,32 @@
 
   function maskUsesComponents(mask) {
     return !!(mask && mask.components && mask.components.length);
+  }
+
+  /* A component's type, decided ONCE, the way cinegrade.component_type
+   * decides it: lowercased, absent means `window`, `luma` folds into `key`,
+   * and anything else is an error rather than a shrug.
+   *
+   * Round 1 finding 30: this question used to be asked three times with three
+   * different fall-throughs. `maskMatte` tested key/luma, then matte, and
+   * fell through to WINDOW; `maskStackCPU` tested window, then matte, and
+   * fell through to KEY; the engine lowercases and raises. So `type: "Matte"`
+   * (a capital M, which is all it takes) rendered as a matte in the engine,
+   * as a window in the shader and as a key in the CPU reference: three
+   * different pictures from one config, and the two browser answers did not
+   * even agree with each other. Throwing here is deliberate and matches the
+   * engine: a component type this file does not know is a broken config, and
+   * a broken config that draws SOMETHING is how the three answers survived
+   * this long. */
+  var MASK_TYPES = ["matte", "key", "luma", "window"];
+
+  function componentType(comp) {
+    var t = String((comp && comp.type) || "window").toLowerCase();
+    if (MASK_TYPES.indexOf(t) < 0) {
+      throw new Error("mask component type " + JSON.stringify(t)
+        + " is not one of " + MASK_TYPES.join(", "));
+    }
+    return t === "luma" ? "key" : t;
   }
 
   function maskFinesse(mask) {
@@ -1261,10 +1304,11 @@
     var i, x, y, n = W * H;
     for (var c = 0; c < comps.length; c++) {
       var comp = comps[c].comp;
+      var kind = componentType(comp);
       var m;
-      if (comp.type === "window") {
+      if (kind === "window") {
         m = windowMatteCPU(comp.window, W, H);
-      } else if (comp.type === "matte") {
+      } else if (kind === "matte") {
         /* A matte frame is an 8 BIT grey PNG that gray16le lifts by 257, the
          * same hop a window PNG takes, so it lands on the 8 bit lattice and
          * NOT on an arbitrary 16 bit value. Truncating a k/255 float at
@@ -1312,7 +1356,7 @@
       for (i = 0; i < n; i++) acc[i] = q16f(softKnee(acc[i], cb, cw)) / MASK_MAX;
     }
     var grow = +f.grow || 0;
-    var steps = Math.min(MASK_GROW_MAX, pyRound(Math.abs(grow) * W));
+    var steps = maskGrowPasses(grow, W);
     if (steps >= 1) acc = morphCPU(acc, W, H, steps, grow > 0);
     if (+f.blur > 0) acc = gblurCPU(acc, W, H, +f.blur * W);
     var out = new Uint16Array(n);
@@ -3221,7 +3265,7 @@
       if (maskUsesComponents(L.mask)) {
         stackComponents(L.mask).forEach(function (e) {
           var c = e.comp;
-          if (c.type !== "key" && c.type !== "luma") return;
+          if (componentType(c) !== "key") return;
           var kl = keyMatteLayer(componentKey(c));
           reqs.push({ slot: "layer" + i + ":comp" + e.index,
                       key: "keymatte:" + stableJson(kl.mask.key),
@@ -4505,9 +4549,10 @@
     var acc = this.matteConst(0, W, H);
     comps.forEach(function (e) {
       var c = e.comp, m;
-      if (c.type === "key" || c.type === "luma") {
+      var kind = componentType(c);
+      if (kind === "key") {
         m = self.matteKeyPass(c, slots[idx + ":comp" + e.index], srcTex, W, H);
-      } else if (c.type === "matte") {
+      } else if (kind === "matte") {
         m = self.matteTexPass(c, W, H);
       } else {
         m = self.matteWindowPass(c, W, H);
@@ -4532,7 +4577,7 @@
     var cb = clamp01(+f.clean_black || 0), cw = clamp01(+f.clean_white || 0);
     if (cb > 0 || cw > 0) acc = this.cleanMatte(acc, cb, cw, W, H);
     var grow = +f.grow || 0;
-    var steps = Math.min(MASK_GROW_MAX, pyRound(Math.abs(grow) * W));
+    var steps = maskGrowPasses(grow, W);
     if (steps >= 1) acc = this.morphMatte(acc, steps, grow > 0, W, H);
     if (+f.blur > 0) {
       var fb = this.gblur(acc.tex, W, H, fmt(+f.blur * W, 3), 1, MASK_MAX);
@@ -5282,6 +5327,10 @@
       pyRound: pyRound,
       MAX: MASK_MAX,
       GROW_MAX: MASK_GROW_MAX,
+      GROW_REF_WIDTH: MASK_GROW_REF_WIDTH,
+      growPasses: maskGrowPasses,
+      componentType: componentType,
+      TYPES: MASK_TYPES,
       // playback side (design rule 10), no GPU needed to test any of it
       frameIndex: matteFrameIndexOf,
       frameKey: matteFrameKey,

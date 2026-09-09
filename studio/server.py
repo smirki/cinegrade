@@ -2925,18 +2925,16 @@ def _matte_clip_refusal(info, clip_key: str, clip_name: str = "") -> str | None:
     be checked and is allowed through: this can only ever refuse a matte that
     positively names a different clip.
 
+    The sentence itself lives in the engine (`CG.matte_clip_refusal`), which
+    asks the same question for a bare `cinegrade render` and a bare
+    `cinegrade stats` outside this server. One sentence, in one place: a
+    caller who hits the refusal through the CLI and through this route reads
+    the same words, and neither copy can drift into being kinder than the
+    other.
+
     Returns None when there is nothing to refuse.
     """
-    have = str(getattr(info, "clip_key", "") or "").strip()
-    want = str(clip_key or "").strip()
-    if not have or not want or have == want:
-        return None
-    return (f"matte {info.matte_id} was tracked on "
-            f"{info.clip or have} and this is {clip_name or want}: a matte is "
-            f"a per clip thing (a frame sequence at that clip's own rate and "
-            f"framing), so using it here would stretch another clip's subject "
-            f"over this picture. Track the subject on "
-            f"{clip_name or want} and use that matte")
+    return CG.matte_clip_refusal(info, clip_key, clip_name)
 
 
 def _matte_infos_for_stack(mask: dict) -> list:
@@ -3092,7 +3090,14 @@ def _matte_summary(info, full: bool = True, quality_limit: int | None = 64
         "coverage": (round(sp["written"] / span_len, 4) if span_len else 0.0),
         "mean_score": _mean_of(info.scores),
         "mean_area": _mean_of(info.areas),
-        "quality": MT.quality(info, limit=quality_limit),
+        # compute_iou=full: the single matte route (`full=True`) reads the
+        # frames off disk when index.json carries no `ious`, so a matte
+        # tracked before the service wrote them reports iou_source "frames"
+        # rather than "none" and the shape rule really runs (round 1 finding
+        # 15). The LIST route leaves it off, which is what `full` already
+        # means here: one matte can pay for a read of its own frames, a clip
+        # with four mattes over 384 frames each cannot.
+        "quality": MT.quality(info, limit=quality_limit, compute_iou=full),
         # Not one of MatteInfo's own dataclass fields; index.json carries it
         # straight from the service on a failed matte ("no instance for text
         # 'shirt'"), and a caller (the jobs panel, a UI badge) needs it to

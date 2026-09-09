@@ -61,7 +61,7 @@ NOTES: list[str] = []
 # never turn a suite red, and more than one lane adds to this file, so the
 # rule is "never fewer". Raise it deliberately when you add checks; lowering
 # it to make a run green is the thing this exists to stop.
-EXPECTED_CHECKS = 227
+EXPECTED_CHECKS = 257
 
 
 def ok(label: str, cond: bool, detail: str = "") -> None:
@@ -110,28 +110,33 @@ def test_mask_cli(base: str) -> None:
         r2 = run_cli(["mask", "segment", "C015.mov", "--time", "1.0",
                      "--text", "person", "--json", "-o", d], env=env)
         ok("segment -o DIR: exit 0", r2.returncode == 0, r2.stderr[-300:])
-        # A `*` glob, not `*.png` (round 1 finding 16): the CLI takes the
-        # extension from the preview URL, and the real server's preview URLs
-        # (/api/mask/pick/<pick>/<inst>/overlay) have none, so every file is
-        # named .png whatever the bytes are. Counting only *.png hid that.
+        # A `*` glob, not `*.png` (round 1 finding 16): the CLI used to take
+        # the extension from the preview URL, and the real server's preview
+        # URLs (/api/mask/pick/<pick>/<inst>/overlay) have none, so every file
+        # was named .png whatever the bytes were. Counting only *.png hid it.
         files = sorted(q for q in Path(d).iterdir() if q.is_file())
         ok("segment -o DIR: downloaded one overlay and one mask per instance",
            len(files) == 4, f"found {len(files)}: {[f.name for f in files]}")
-        heads = {q.name: q.read_bytes()[:4] for q in files}
+        heads = {q.name: q.read_bytes()[:8] for q in files}
         ok("segment -o DIR: every downloaded preview is real image bytes",
            all(v.startswith(b"\x89PNG") or v.startswith(b"\xff\xd8\xff")
                for v in heads.values()), heads)
-        jpegs = sorted(name for name, v in heads.items()
-                       if v.startswith(b"\xff\xd8\xff"))
-        if jpegs:
-            # Recorded, not asserted as correct: the mislabel is in
-            # `_cmd_mask_segment` (grade/cinegrade.py), which this lane does
-            # not own. See ROUND1-FIXES-tests.md, finding 16.
-            note(f"the overlay preview arrives as image/jpeg (the real "
-                 f"server's own content type for an overlay) and is written "
-                 f"into a .png name, because the extension comes from a URL "
-                 f"that has none: {jpegs}. CLI lane's to fix in "
-                 f"_cmd_mask_segment")
+        # Every file says what it IS. The overlay arrives as image/jpeg (the
+        # server's own content type for an overlay) and the mask preview as
+        # image/png, and the name each is written under now comes from the
+        # bytes rather than from a URL that carries no extension at all.
+        magic = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff"}
+        for name, head in sorted(heads.items()):
+            suffix = Path(name).suffix
+            ok(f"segment -o DIR: {name} really is a {suffix.lstrip('.')} file",
+               suffix in magic and head.startswith(magic[suffix]),
+               f"{name}: {head!r}")
+        ok("segment -o DIR: the overlay is the JPEG the server serves, under "
+           "a .jpg name",
+           any(n.endswith("-overlay.jpg") for n in heads), sorted(heads))
+        ok("segment -o DIR: the mask preview is the PNG the server serves, "
+           "under a .png name",
+           any(n.endswith("-mask.png") for n in heads), sorted(heads))
 
     r3 = run_cli(["mask", "track", "C015.mov", "--text", "person",
                  "--wait", "--json"], env=env)
@@ -943,6 +948,9 @@ def test_mask_gaps(base: str) -> None:
         ok("show: the reason is the area going to zero",
            "zero_area" in (q.get("reasons") or {}) and
            q["reasons"]["zero_area"] >= 1, q)
+        ok("show: while only the first three frames are written, nothing "
+           "claims the subject came back yet (frame 3 is not written)",
+           (q.get("reasons") or {}).get("area_recover") == 0, q.get("reasons"))
 
         r8 = run_cli(["mask", "show", bad_matte], env=env)
         ok("show (text): prints the span", "span      " in r8.stdout,
@@ -984,8 +992,34 @@ def test_mask_gaps(base: str) -> None:
        and float(jumped[0]["iou"]) < 0.3,
        jumped)
     ok("show: a clean stretch of the same matte is not flagged",
-       all(f["index"] in (2, 4) for f in (q_all.get("suspect_frames") or [])),
+       all(f["index"] in (2, 3, 4) for f in (q_all.get("suspect_frames") or [])),
        q_all.get("suspect_frames"))
+
+    # -- finding 22: the frame the area rule is blind to -------------------
+    # Frame 3 is the subject coming back after the empty frame 2. `area_jump`
+    # divides by the previous area, and that area is 0, so this frame was the
+    # one frame of the three that nothing could ever flag, which is the frame
+    # a tracker most often comes back on the WRONG object at.
+    ok("show: the frame after the empty one is flagged as a recovery",
+       (q_all.get("reasons") or {}).get("area_recover") == 1,
+       q_all.get("reasons"))
+    back = [f for f in (q_all.get("suspect_frames") or [])
+            if "area_recover" in (f.get("reasons") or [])]
+    ok("show: it is the frame right after the empty one, and it carries no "
+       "jump number because there is nothing to divide by",
+       len(back) == 1 and back[0]["index"] == 3 and back[0].get("jump") is None,
+       back)
+    ok("show: the recovery floor is reported beside the other thresholds, so "
+       "a count of 0 can be read against what judged it",
+       "area_recover" in (q_all.get("thresholds") or {}),
+       q_all.get("thresholds"))
+    r_back = run_cli(["mask", "show", bad_matte], env=env)
+    ok("show (text): names the frame where the subject came back, rather than "
+       "counting it in a list",
+       "the subject comes back after an empty frame at frame 3" in r_back.stdout,
+       r_back.stdout[:900])
+    ok("show (text): and says why that frame is worth looking at first",
+       "comes back on the wrong object" in r_back.stdout, r_back.stdout[:900])
 
     # -- gap 6: the list is a summary; --full is the old payload -----------
     r10 = run_cli(["mask", "list", "SUSPECT_CLIP", "--json"], env=env)
@@ -1390,6 +1424,158 @@ def test_matte_id_is_never_a_path(base: str) -> None:
                    str(exc)[:160])
 
 
+# --------------------------------------------------------------------------
+# 9. a matte belongs to the clip it was tracked on (round 1 finding 6, the
+#    engine half the security lane deferred to this one)
+#
+#    The studio's routes have refused a cross clip matte since round 1, but
+#    the engine run bare, with no server anywhere, did not: `stats --matte`
+#    weighted the measurement with another clip's subject and returned
+#    numbers with exit 0 (an anchor somebody then grades to), and `render`
+#    stretched that subject over the picture and wrote the file. Both now ask
+#    the same question the route asks, comparing the matte's recorded
+#    clip_key (C2) against the content key of the file in front of them, and
+#    refuse in the same sentence.
+# --------------------------------------------------------------------------
+
+def _make_other_clip(path: Path) -> None:
+    """A second clip whose BYTES differ, so its content key differs too.
+
+    clip_key hashes the size and the first and last mebibyte, so two renders
+    of the same testsrc would share a key and prove nothing.
+    """
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "smptebars=size=64x48:rate=10:duration=3",
+         "-pix_fmt", "yuv420p", str(path)],
+        check=True, timeout=30)
+
+
+def _write_matte_fixture(matte_dir: Path, clip_key: str, clip_name: str,
+                         frames: int = 30, fps: float = 10.0) -> None:
+    import mattes as MT
+    import numpy as np
+
+    matte_dir.mkdir(parents=True, exist_ok=True)
+    mw, mh = 32, 24
+    for i in range(frames):
+        arr = np.zeros((mh, mw), dtype=np.uint8)
+        arr[:, :mw // 2] = 255
+        MT.write_gray_png(matte_dir / MT.frame_name(i), arr)
+    (matte_dir / "index.json").write_text(json.dumps({
+        "matte_id": matte_dir.name, "clip": clip_name, "clip_key": clip_key,
+        "rotation": "auto", "fps": fps, "frames": frames,
+        "width": mw, "height": mh, "recipe": {"prompts": {"text": ["x"]}},
+        "state": "done", "done_frames": frames,
+        "areas": [0.5] * frames, "scores": [0.9] * frames,
+        "created": time.time(), "model": "stub", "backend": "stub",
+    }))
+
+
+def test_matte_belongs_to_this_clip() -> None:
+    print("\n== a matte belongs to the clip it was tracked on ==")
+    import cinegrade as cg
+    import mattes as MT
+    from copy import deepcopy
+
+    with tempfile.TemporaryDirectory(prefix="mask_matte_owner_") as root_s:
+        root = Path(root_s)
+        mine, other = root / "mine.mp4", root / "other.mp4"
+        _make_synthetic_clip(mine)
+        _make_other_clip(other)
+
+        mine_key, other_key = MT.clip_key(mine), MT.clip_key(other)
+        ok("two different clips have two different content keys",
+           mine_key != other_key, f"{mine_key} vs {other_key}")
+        ok("and the engine's key is the studio's 32 hex shape",
+           MT.is_clip_key(mine_key) and MT.is_clip_key(other_key),
+           f"{mine_key} / {other_key}")
+
+        store = root / "mattes"
+        _write_matte_fixture(store / "m_mine", mine_key, "mine.mp4")
+        _write_matte_fixture(store / "m_other", other_key, "other.mp4")
+        # A hand built or pre-C2 matte, filed under a readable name rather
+        # than a content key. The guard cannot answer the question for one of
+        # these, so it must not pretend the answer is "no".
+        _write_matte_fixture(store / "m_legacy", "readable-key", "mine.mp4")
+
+        env = {"CINEGRADE_MATTE_ROOT": str(store), "STUDIO_URL": ""}
+
+        # --- stats --matte -------------------------------------------------
+        r_bad = run_cli(["stats", str(mine), "--time", "0.2",
+                        "--matte", "m_other", "--json"], env=env)
+        ok("stats --matte <another clip's matte>: refused",
+           r_bad.returncode != 0, r_bad.stdout[:200])
+        ok("... in the route's own sentence, naming both clips",
+           "was tracked on" in r_bad.stderr and "other.mp4" in r_bad.stderr
+           and "mine.mp4" in r_bad.stderr, r_bad.stderr[-400:])
+        ok("... and it says why, not just that it will not",
+           "per clip thing" in r_bad.stderr, r_bad.stderr[-400:])
+        ok("... and no numbers came back to be graded to",
+           "coverage" not in r_bad.stdout, r_bad.stdout[:200])
+
+        r_ok = run_cli(["stats", str(mine), "--time", "0.2",
+                       "--matte", "m_mine", "--json"], env=env)
+        ok("stats --matte <this clip's own matte>: measures",
+           r_ok.returncode == 0, r_ok.stderr[-400:])
+        ok("... and reports the coverage it measured through",
+           '"coverage"' in r_ok.stdout, r_ok.stdout[:200])
+
+        r_legacy = run_cli(["stats", str(mine), "--time", "0.2",
+                           "--matte", "m_legacy", "--json"], env=env)
+        ok("a matte filed under a readable key is measured, not judged",
+           r_legacy.returncode == 0, r_legacy.stderr[-400:])
+
+        # --- stats --mask, the same matte reached through a stack ----------
+        stack = json.dumps({"components": [
+            {"id": "c1", "type": "matte", "op": "add", "enabled": True,
+             "invert": False, "feather": 0.0, "matte": {"id": "m_other"}}]})
+        r_stack = run_cli(["stats", str(mine), "--time", "0.2",
+                          "--mask", stack, "--json"], env=env)
+        ok("stats --mask through a stack that reaches it: refused as well",
+           r_stack.returncode != 0, r_stack.stdout[:200])
+        ok("... in the same words", "was tracked on" in r_stack.stderr,
+           r_stack.stderr[-400:])
+
+        # --- render --------------------------------------------------------
+        def _preset_for(matte_id: str, path: Path) -> Path:
+            layer = deepcopy(cg.LAYER_DEFAULTS)
+            layer["mask"] = cg.deep_merge(layer["mask"], {"components": [
+                {"id": "c1", "type": "matte", "op": "add", "enabled": True,
+                 "invert": False, "feather": 0.0,
+                 "matte": {"id": matte_id}}]})
+            layer["correct"] = cg.deep_merge(layer["correct"],
+                                             {"exposure": 0.5})
+            path.write_text(json.dumps(
+                cg.deep_merge(cg.DEFAULTS, {"layers": [layer]})))
+            return path
+
+        bad_preset = _preset_for("m_other", root / "preset_other.json")
+        out_bad = root / "wrong.mov"
+        r_render = run_cli(["render", str(mine), "--preset", str(bad_preset),
+                           "-o", str(out_bad), "-t", "0.5",
+                           "--allow-partial"], env=env)
+        ok("render with another clip's matte: refused",
+           r_render.returncode != 0, r_render.stderr[-400:])
+        ok("... naming the layer and the component that reaches it",
+           "layer 0 component 0" in r_render.stderr, r_render.stderr[-400:])
+        ok("... in the same sentence the route and stats use",
+           "was tracked on" in r_render.stderr, r_render.stderr[-400:])
+        ok("... and --allow-partial did not buy it (that flag means an "
+           "unfinished matte, never the wrong clip's)",
+           "--allow-partial" not in r_render.stderr, r_render.stderr[-400:])
+        ok("... and nothing was written", not out_bad.exists())
+
+        good_preset = _preset_for("m_mine", root / "preset_mine.json")
+        out_good = root / "right.mov"
+        r_good = run_cli(["render", str(mine), "--preset", str(good_preset),
+                         "-o", str(out_good), "-t", "0.5"], env=env)
+        ok("render with this clip's own matte: renders",
+           r_good.returncode == 0, r_good.stderr[-400:])
+        ok("... and writes an output file",
+           out_good.is_file() and out_good.stat().st_size > 0)
+
+
 def main() -> int:
     print("starting the fake studio server...")
     srv, th, port = FAKE.start(0)
@@ -1405,6 +1591,7 @@ def main() -> int:
         test_stats_matte()
         test_render_allow_partial()
         test_matte_id_is_never_a_path(base)
+        test_matte_belongs_to_this_clip()
     finally:
         srv.shutdown()
 

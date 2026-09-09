@@ -96,6 +96,26 @@ eq("pyRound breaks a half to even, down", M.pyRound(2.5), 2);
 eq("pyRound breaks a half to even, up", M.pyRound(3.5), 4);
 eq("pyRound is ordinary elsewhere", M.pyRound(2.6), 3);
 eq("the grow cap is the engine's 32", M.GROW_MAX, 32);
+/* ... and 32 is quoted AT a width, not at whatever width each side happens to
+ * run (round 1 finding 31). The cap has to travel with the reference width or
+ * the number means nothing, so they are asserted together. */
+eq("the cap's reference width is the engine's 1920", M.GROW_REF_WIDTH, 1920);
+eq("at the reference width the cap is the flat 32 it always was",
+   M.growPasses(1.0, 1920), 32);
+eq("a 640 preview clamps at 11 passes", M.growPasses(1.0, 640), 11);
+eq("a 3840 render clamps at 64 passes", M.growPasses(1.0, 3840), 64);
+/* The point of the whole change, as a number: the clamped grow is the same
+ * FRACTION of the frame at every width, to within the one pass the integer
+ * cap has to round to. Before it, 640 clamped at 1.72 percent of width and
+ * 3840 at 0.83 percent, a factor of 2.1. */
+check("the clamped grow is the same fraction of the frame at 640 and 3840",
+      Math.abs(M.growPasses(1.0, 640) / 640
+               - M.growPasses(1.0, 3840) / 3840) < 0.002,
+      M.growPasses(1.0, 640) / 640 + " vs " + M.growPasses(1.0, 3840) / 3840);
+eq("a grow under the cap is still just round(grow * width)",
+   M.growPasses(0.01, 640), 6);
+eq("the cap never falls below one pass, however small the frame",
+   M.growPasses(1.0, 8), 1);
 
 eq("usesComponents: absent", M.usesComponents({}), false);
 eq("usesComponents: empty", M.usesComponents({ components: [] }), false);
@@ -275,8 +295,9 @@ eq("clean_white in a stack pushes a high matte to full swing",
     return o;
   }
   function grow(a) {
-    const steps = Math.min(M.GROW_MAX, M.pyRound(Math.abs(fin.grow) * W));
-    return M.morph(a, W, H, steps, fin.grow > 0);
+    // The cap is a fraction of the width now (finding 31), so the hand
+    // composition asks for the pass count the same way the stack does.
+    return M.morph(a, W, H, M.growPasses(fin.grow, W), fin.grow > 0);
   }
   function blur(a) { return M.gblur(a, W, H, fin.blur * W); }
   function codes(a) {
@@ -311,16 +332,22 @@ eq("clean_white in a stack pushes a high matte to full swing",
 }
 
 /* The grow step in COMPOSITION: the pass count is Python's round() of
- * grow * width, and it is capped at 32 passes.
+ * grow * width, capped at 32 passes AT 1920 WIDE (so 17 at the 1000 this
+ * block composes at).
  *
  * pyRound is unit tested above, but the number that reaches morph is the one
  * that matters, and nothing tested THAT: the old block only checked the cap,
  * so a stack using JavaScript's Math.round (which rounds a half away from
  * zero, where Python rounds it to even) would have passed. A rect window with
  * no softness makes the pass count directly measurable: a dilate of n passes
- * widens the run of fully selected pixels by exactly n on each side. */
+ * widens the run of fully selected pixels by exactly n on each side.
+ *
+ * 1000 wide rather than the 200 this used to compose at: with the cap now a
+ * fraction of the width, 200 wide clamps at 3 passes and the rounding checks
+ * below (2.5 -> 2, 3.5 -> 4) would be measuring the cap instead of the
+ * rounding. The widths are the only thing that changed here. */
 {
-  const W = 200, H = 8;
+  const W = 1000, H = 8;
   const comps = [{ id: "w", type: "window", op: "add",
                    window: { shape: "rect", cx: 0.5, cy: 0.5, w: 0.2, h: 0.9,
                              rotation: 0, softness: 0, invert: false } }];
@@ -337,27 +364,32 @@ eq("clean_white in a stack pushes a high matte to full swing",
   }
   const flat = widthOf(stackWith(0));
   check("the un-grown rect is a measurable run of selected pixels", flat > 8, "run " + flat);
-  // 0.02 * 200 = 4 exactly: four passes, four pixels each side.
+  // 0.004 * 1000 = 4 exactly: four passes, four pixels each side.
   eq("a grow of 4 passes widens the selection by 4 pixels each side",
-     widthOf(stackWith(0.02)), flat + 8);
-  /* 0.0125 * 200 = 2.5, which Python rounds DOWN to 2 (round half to even)
+     widthOf(stackWith(0.004)), flat + 8);
+  /* 0.0025 * 1000 = 2.5, which Python rounds DOWN to 2 (round half to even)
    * and JavaScript rounds UP to 3. Two passes, so four pixels, not six: this
    * is the assertion that fails if the pass count ever stops going through
    * pyRound. */
   eq("a grow of exactly two and a half passes rounds to two, Python's way",
-     widthOf(stackWith(0.0125)), flat + 4);
-  // 0.0175 * 200 = 3.5, which rounds to 4 both ways: the half-to-even rule
+     widthOf(stackWith(0.0025)), flat + 4);
+  // 0.0035 * 1000 = 3.5, which rounds to 4 both ways: the half-to-even rule
   // only shows up on an odd half, and this pins the other side of it.
   eq("a grow of three and a half passes rounds to four",
-     widthOf(stackWith(0.0175)), flat + 8);
+     widthOf(stackWith(0.0035)), flat + 8);
 
+  // The cap at THIS width: 32 passes at 1920 is 17 passes at 1000.
+  const cap = M.growPasses(1.0, W);
+  eq("the cap at 1000 wide is 32 scaled to it", cap, 17);
   const big = stackWith(0.5);
-  const capped = stackWith(0.16);
-  // 0.5 * 200 = 100 passes, 0.16 * 200 = 32: both clamp to 32, so the two
-  // mattes are the same picture and a grow past the cap does nothing more.
-  check("grow is capped at 32 passes, so a bigger grow does not grow further",
+  const capped = stackWith(cap / W);
+  // 0.5 * 1000 = 500 passes and 0.017 * 1000 = 17: both clamp to 17, so the
+  // two mattes are the same picture and a grow past the cap does nothing more.
+  check("grow is capped, so a bigger grow does not grow further",
         Array.from(big).every((v, i) => v === capped[i]));
-  eq("and the cap is 32", M.GROW_MAX, 32);
+  eq("the capped grow really is the cap's worth of passes, measured",
+     widthOf(big), flat + 2 * cap);
+  eq("and the cap is 32 at the reference width", M.GROW_MAX, 32);
 }
 
 // ------------------------------------------------- the key and luma cubes
@@ -387,6 +419,39 @@ eq("clean_white in a stack pushes a high matte to full swing",
   eq("the key cube layer carries no window stack", L.mask.components.length, 0);
   eq("the key cube layer is not inverted", L.mask.invert, false);
   eq("the key cube layer carries the widened key", L.mask.key.hue_width, 360);
+}
+
+/* One answer to "what type is this component" (round 1 finding 30).
+ *
+ * The three places that asked it used to disagree, and the disagreement only
+ * showed on a type that was not spelled exactly right: `type: "Matte"` was a
+ * matte to the engine, a window to the shader and a key to this reference. So
+ * the checks below are about the AWKWARD spellings, not the ordinary ones. */
+{
+  eq("a type is lowercased, the way the engine lowercases it",
+     M.componentType({ type: "Matte" }), "matte");
+  eq("luma folds into key, so nothing downstream carries a fourth branch",
+     M.componentType({ type: "LUMA" }), "key");
+  eq("no type at all is a window, the engine's own default",
+     M.componentType({}), "window");
+  eq("the four spellings the engine knows are the four this file knows",
+     M.TYPES.join(","), "matte,key,luma,window");
+  let threw = "";
+  try { M.componentType({ type: "gradient" }); } catch (e) { threw = e.message; }
+  check("a type outside those four is an error, not a silent window",
+        threw.indexOf("gradient") >= 0 && threw.indexOf("is not one of") >= 0,
+        threw || "nothing was thrown");
+  /* And the stack really uses it: a capitalised matte type used to compose as
+   * a KEY here (the fall-through) while the engine composed a matte. With no
+   * sample function a matte composes as black, so the two spellings have to
+   * give the same picture. */
+  const comps = (t) => ({ components: [{ id: "c", type: t, op: "add",
+                                         matte: { id: "m_x" } }] });
+  const lower = M.stack(comps("matte"), 8, 4, {});
+  const upper = M.stack(comps("Matte"), 8, 4, {});
+  check("a capitalised matte composes as a matte, not as whatever came last",
+        Array.from(lower).every((v, i) => v === upper[i]),
+        Array.from(lower).join(",") + " vs " + Array.from(upper).join(","));
 }
 
 // ------------------------------------------------------------ morphology

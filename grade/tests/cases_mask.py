@@ -647,12 +647,20 @@ def test_finesse_defaults_add_no_filters(ctx):
 
 
 def test_finesse_grow_and_shrink_move_the_edge(ctx):
-    """grow dilates the matte, a negative grow erodes it, in frame widths."""
+    """grow dilates the matte, a negative grow erodes it, in frame widths.
+
+    Two claims, because there are two regimes (round 1 minor 31). Under the
+    cap a grow moves the edge by exactly the fraction of the width it asked
+    for. Over the cap the cap decides, and since the cap became a fraction of
+    the width rather than a flat 32 passes at whatever width each side happens
+    to run at, "over the cap" now means the same ASK at every width, which is
+    what makes the browser preview and this engine agree.
+    """
     base = _layer([_win(LEFT)])
     img = H.render(CLIP, _cfg(base), T)
     h, w, _ = img.shape
     areas = {}
-    for grow in (-0.05, 0.0, 0.05):
+    for grow in (-0.05, 0.0, 0.01, 0.05):
         layer = _layer([_win(LEFT)], mask={"finesse": {"grow": grow}})
         ref = _reference(layer, img)
         areas[grow] = float(ref.mean())
@@ -664,9 +672,23 @@ def test_finesse_grow_and_shrink_move_the_edge(ctx):
                  f"the render moves {rendered.mean() * 100:.2f}% of pixels")
     ctx.expect_gt("a positive grow selects more", areas[0.05], areas[0.0])
     ctx.expect_lt("a negative grow selects less", areas[-0.05], areas[0.0])
-    px = int(round(0.05 * w))
+    cap = cg.mask_grow_passes(1.0, w)          # the most this width allows
+    small, big = cg.mask_grow_passes(0.01, w), cg.mask_grow_passes(0.05, w)
+    ctx.note(f"width {w}: cap {cap} passes, 1% asks {int(round(0.01 * w))} "
+             f"and gets {small}, 5% asks {int(round(0.05 * w))} and gets {big}")
+    ctx.expect_eq("a 1% grow at this width is under the cap and is granted "
+                  "in full", small, int(round(0.01 * w)))
     ctx.expect_close("and it moves the edge by the pixels it asked for",
-                     (areas[0.05] - areas[0.0]) * w, float(px), 1.5)
+                     (areas[0.01] - areas[0.0]) * w, float(small), 1.5)
+    ctx.expect_lt("a 5% grow at this width is over the cap", big,
+                  int(round(0.05 * w)))
+    ctx.expect_close("and then the edge moves by the cap, not by the ask",
+                     (areas[0.05] - areas[0.0]) * w, float(big), 1.5)
+    ctx.expect_close("the cap is the same fraction of the frame at any width "
+                     "(that is the whole point of it: preview and render run "
+                     "at different widths)",
+                     cg.mask_grow_passes(1.0, 1920) / 1920.0, cap / float(w),
+                     0.002)
 
 
 def test_finesse_clean_black_and_white_are_the_identity_at_zero(ctx):
@@ -1094,23 +1116,27 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
       2      0.00   lost:            zero_area, and area_jump too, because a
                                      drop to nothing is a 100% change and 1.0
                                      is over the 0.5 threshold
-      3      0.05   back:            not flagged, because the jump rule needs
-                                     a non zero frame BEFORE it to divide by
+      3      0.05   back:            area_recover, and only that: the jump
+                                     rule needs a non zero frame BEFORE it to
+                                     divide by, so it cannot see this frame
       4      0.65   the tree:        area_jump (12.0 against 0.5) and
                                      low_iou (0.05 against 0.3)
       5      0.66   steady on it
 
-    Two suspect FRAMES (2 and 4) and four suspect REASONS across them: the
-    difference between those two numbers is the thing the route test's
+    Three suspect FRAMES (2, 3 and 4) and five suspect REASONS across them:
+    the difference between those two numbers is the thing the route test's
     `suspect_count == zero + jump + iou - overlap` arithmetic was standing in
     for, and here both are stated outright.
 
     Frames 2 and 3 are the pair worth reading twice. Losing the subject is
-    counted under two reasons at once, and coming back is counted under none,
-    because the rule divides by the previous area and 0 is not a base to
-    measure a change against. That asymmetry is the real behaviour of the
-    shipped function; it is written down here so that a future change to it
-    fails this test instead of quietly changing what the studio reports.
+    counted under two reasons at once, and coming back under one reason of its
+    own (`area_recover`, round 1 finding 22) rather than under none: the area
+    rule divides by the previous area and 0 is not a base to measure a change
+    against, so before that reason existed the single frame most worth looking
+    at, the one where a tracker comes back on the wrong object, was the one
+    frame nothing flagged. That asymmetry is the real behaviour of the shipped
+    function; it is written down here so that a future change to it fails this
+    test instead of quietly changing what the studio reports.
     """
     frames = {i: band(64, 36, 0, 8 + i) for i in range(6)}
     areas = [0.05, 0.05, 0.0, 0.05, 0.65, 0.66]
@@ -1124,22 +1150,27 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
     ctx.expect_eq("every written frame is judged", q["checked"], 6)
     ctx.expect_eq("the ious came from the index the service wrote",
                   q["iou_source"], "index")
-    ctx.expect_eq("two frames are suspect, not none and not all six",
-                  q["suspect_count"], 2)
-    ctx.expect_eq("and they are the two that went wrong",
-                  [f["index"] for f in q["suspect_frames"]], [2, 4])
+    ctx.expect_eq("three frames are suspect, not none and not all six",
+                  q["suspect_count"], 3)
+    ctx.expect_eq("and they are the three that went wrong",
+                  [f["index"] for f in q["suspect_frames"]], [2, 3, 4])
     ctx.expect_eq("the reason counts name what went wrong on each",
-                  q["reasons"], {"zero_area": 1, "area_jump": 2, "low_iou": 1})
-    lost, tree = q["suspect_frames"]
+                  q["reasons"], {"zero_area": 1, "area_jump": 2,
+                                 "area_recover": 1, "low_iou": 1})
+    lost, back, tree = q["suspect_frames"]
     ctx.expect_eq("the lost frame is flagged for its area being zero, and for "
                   "the drop that got it there", lost["reasons"],
                   ["zero_area", "area_jump"])
     ctx.expect_close("that drop being the whole of the previous area",
                      float(lost["jump"]), 1.0, 1e-6)
-    ctx.expect_eq("and the frame the subject comes back on is not flagged, "
-                  "because there is no non zero area before it to compare "
-                  "against", [f["index"] for f in q["suspect_frames"]
-                              if f["index"] == 3], [])
+    ctx.expect_eq("the frame the subject comes back on is flagged as a "
+                  "recovery, which is the frame the area rule is blind to",
+                  back["reasons"], ["area_recover"])
+    ctx.expect_true("with no jump reported on it, because there is no non "
+                    "zero area before it to divide by",
+                    back["jump"] is None, back["jump"])
+    ctx.expect_close("and the area it came back at", float(back["area"]),
+                     0.05, 1e-6)
     ctx.expect_eq("the latch is flagged for BOTH the size change and the "
                   "shape moving", tree["reasons"], ["area_jump", "low_iou"])
     ctx.expect_close("and the jump is reported as a fraction of the frame "
@@ -1154,15 +1185,17 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
     # The thresholds really are the thresholds: each rule can be turned off
     # by moving its own number past the data, and nothing else moves.
     loose = MT.quality(info, area_jump=20.0, min_iou=0.001)
-    ctx.expect_eq("with both thresholds moved past the data, only the zero "
-                  "area frame is left", [f["index"] for f in
-                                         loose["suspect_frames"]], [2])
-    ctx.expect_eq("and it is left for the one reason a threshold cannot turn "
-                  "off: an empty matte is empty at any threshold",
+    ctx.expect_eq("with both thresholds moved past the data, the empty frame "
+                  "and the frame after it are what is left",
+                  [f["index"] for f in loose["suspect_frames"]], [2, 3])
+    ctx.expect_eq("and they are left for the two reasons a threshold cannot "
+                  "turn off: an empty matte is empty at any threshold, and a "
+                  "subject that comes back came back",
                   loose["reasons"], {"zero_area": 1, "area_jump": 0,
-                                     "low_iou": 0})
+                                     "area_recover": 1, "low_iou": 0})
     ctx.expect_eq("and the thresholds in force come back with the report",
-                  loose["thresholds"], {"area_jump": 20.0, "min_iou": 0.001})
+                  loose["thresholds"], {"area_jump": 20.0, "area_recover": 0.0,
+                                        "min_iou": 0.001})
     tight = MT.quality(info, area_jump=0.005, min_iou=0.95)
     ctx.expect_eq("and with both tightened past every frame, every frame "
                   "after the first is suspect",
@@ -1173,7 +1206,7 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
     # this, and "truncated" is how a reader knows not to trust the list length.
     capped = MT.quality(info, limit=1)
     ctx.expect_eq("limit caps the list", len(capped["suspect_frames"]), 1)
-    ctx.expect_eq("but not the count", capped["suspect_count"], 2)
+    ctx.expect_eq("but not the count", capped["suspect_count"], 3)
     ctx.expect_true("and says it was capped", capped["truncated"], "truncated")
 
     # A clean matte reports zero, so the flags mean something when they are
@@ -1184,7 +1217,8 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
     qc = MT.quality(MT.resolve(MT.matte_root(), clean))
     ctx.expect_eq("a clean track reports nothing suspect", qc["suspect_count"], 0)
     ctx.expect_eq("with every reason at zero", qc["reasons"],
-                  {"zero_area": 0, "area_jump": 0, "low_iou": 0})
+                  {"zero_area": 0, "area_jump": 0, "area_recover": 0,
+                   "low_iou": 0})
     ctx.expect_eq("and it still says where its ious came from",
                   qc["iou_source"], "index")
 
@@ -1201,7 +1235,7 @@ def test_quality_flags_the_frames_that_went_wrong(ctx):
                   qn["suspect_frames"][-1]["reasons"], ["area_jump"])
     ctx.expect_eq("and the report says so rather than implying a clean shape",
                   qn["iou_source"], "none")
-    ctx.expect_eq("the area rules still run", qn["suspect_count"], 2)
+    ctx.expect_eq("the area rules still run", qn["suspect_count"], 3)
 
 
 def test_frame_ious_reads_the_shapes_off_disk(ctx):
@@ -1245,7 +1279,8 @@ def test_frame_ious_reads_the_shapes_off_disk(ctx):
     ctx.expect_eq("the frame that moved away is flagged, and only it",
                   [f["index"] for f in q["suspect_frames"]], [2])
     ctx.expect_eq("for the shape, not for its size", q["reasons"],
-                  {"zero_area": 0, "area_jump": 0, "low_iou": 1})
+                  {"zero_area": 0, "area_jump": 0, "area_recover": 0,
+                   "low_iou": 1})
     ctx.expect_eq("and with the fallback switched off (the default), the rule "
                   "does not run at all",
                   MT.quality(info)["iou_source"], "none")

@@ -131,7 +131,9 @@ def _areas_for(done: int, total: int, suspect: bool = False) -> list:
     `suspect` writes a track that went wrong the way the grader's "face"
     matte did (checkpoint gap 18): it holds a small area, loses the subject
     entirely at frame 2, then latches onto something several times bigger.
-    Frame 2 trips the zero-area rule and frame 4 trips the area-jump rule.
+    Frame 2 trips the zero-area rule, frame 3 trips the recovery rule (the
+    subject is back after an empty frame, round 1 finding 22) and frame 4
+    trips the area-jump rule.
     """
     def area(i: int) -> float:
         if not suspect:
@@ -201,7 +203,7 @@ def _matte_summary(mid: str, m: dict, full: bool = True) -> dict:
     first = written[0] if written else 0
     end = (written[-1] + 1) if written else 0
     span_len = max(0, end - first)
-    thresholds = {"area_jump": 0.5, "min_iou": 0.3}
+    thresholds = {"area_jump": 0.5, "area_recover": 0.0, "min_iou": 0.3}
     ious = list(m.get("ious") or [])
     flagged = []
     prev = None
@@ -213,6 +215,13 @@ def _matte_summary(mid: str, m: dict, full: bool = True) -> dict:
             reasons.append("zero_area")
         if prev is not None and prev > 0 and abs(v - prev) / prev > thresholds["area_jump"]:
             reasons.append("area_jump")
+        elif prev is not None and prev <= 0 and v > 0:
+            # The subject came back after an empty frame (round 1 finding
+            # 22). The jump rule above cannot see this frame at all: it
+            # divides by the previous area and that area is 0. Mirrored here
+            # because this file pins the WIRE shape the CLI parses, and the
+            # CLI prints a sentence about these frames.
+            reasons.append("area_recover")
         # The third rule (round 1 finding 15): overlap with the previous
         # written frame, from the array the store writes. Read here rather
         # than hardcoded to 0, so a track that jumps to a different object
@@ -252,6 +261,8 @@ def _matte_summary(mid: str, m: dict, full: bool = True) -> dict:
                                      if "zero_area" in f["reasons"]),
                     "area_jump": sum(1 for f in flagged
                                      if "area_jump" in f["reasons"]),
+                    "area_recover": sum(1 for f in flagged
+                                        if "area_recover" in f["reasons"]),
                     "low_iou": sum(1 for f in flagged
                                    if "low_iou" in f["reasons"])},
     }

@@ -141,6 +141,69 @@ def is_under(root, path) -> bool:
     return p == r or r in p.parents
 
 
+# The content key a matte, a project and a saved grade all file a clip under.
+# This is studio/grades.py's key, and it has to be BYTE for byte the same one:
+# index.json records the studio's `clip_key`, and the engine compares against
+# it (cinegrade.matte_clip_refusal) when a bare CLI render or a bare CLI stats
+# is about to use a matte. A second definition that drifted would not refuse
+# the wrong matte, it would refuse every matte.
+#
+# Mirrored rather than imported because grade/ must run with no studio/ beside
+# it (studio/grades.py opens studio/data/studio.db on import, which a CLI in
+# somebody's footage folder has no business creating). The two are asserted
+# identical on real bytes by studio/tests/py/test_mask_routes.py.
+CLIP_KEY_CHUNK = 1024 * 1024
+CLIP_KEY_LEN = 32
+_clip_key_cache: dict = {}
+
+
+def clip_key(path) -> str:
+    """The content key for a clip file: sha256 of its length, its first
+    megabyte and its last megabyte, truncated to 32 hex characters.
+
+    The length goes in first and as a fixed width field, so two files whose
+    first megabyte matches cannot collide just because the rest of them is a
+    different length. Cached in this process by (realpath, size, mtime), the
+    way studio/grades.py caches it, so a `stats` run over ten timestamps reads
+    the file once.
+    """
+    import hashlib                                          # noqa: PLC0415
+
+    rp = os.path.realpath(str(path))
+    st = os.stat(rp)
+    ck = (rp, st.st_size, st.st_mtime_ns)
+    hit = _clip_key_cache.get(ck)
+    if hit:
+        return hit
+    size = st.st_size
+    h = hashlib.sha256()
+    h.update(size.to_bytes(8, "big"))
+    with open(rp, "rb") as fh:
+        h.update(fh.read(min(CLIP_KEY_CHUNK, size)))
+        if size > CLIP_KEY_CHUNK:
+            fh.seek(max(0, size - CLIP_KEY_CHUNK))
+            h.update(fh.read(CLIP_KEY_CHUNK))
+    key = h.hexdigest()[:CLIP_KEY_LEN]
+    _clip_key_cache[ck] = key
+    return key
+
+
+def is_clip_key(value) -> bool:
+    """Whether this string is a content key at all: 32 lowercase hex digits.
+
+    The question matters because a matte's recorded `clip_key` is only
+    comparable when it IS one. Hand built fixtures in this repo (and any older
+    service) file mattes under readable names like `clipA` or `guardkey`, and
+    a comparison against those would refuse every one of them. So the engine's
+    ownership check asks this first and says nothing about a matte whose key
+    it cannot compute an answer for, exactly as the studio route says nothing
+    about a matte with no clip_key at all.
+    """
+    v = str(value or "").strip()
+    return (len(v) == CLIP_KEY_LEN
+            and all(c in "0123456789abcdef" for c in v))
+
+
 # --------------------------------------------------------------------------
 # where the store lives
 # --------------------------------------------------------------------------
@@ -671,6 +734,16 @@ def span(info: MatteInfo) -> dict:
 #   area_jump   the area changed by more than `area_jump` as a FRACTION of
 #               the previous frame's area: a face becoming a whole person
 #               is a jump of about 1.1, a tree grab is a jump of 13.
+#   area_recover  the previous frame held NOTHING and this one holds
+#               something: the tracker found an object again after losing
+#               it. The area rule cannot see this frame at all, because it
+#               divides by the previous area and 0 is not a base to measure
+#               a change against, so the frame worth looking at hardest (the
+#               one where a tracker most often comes back on the wrong
+#               object: the tree, not the face) was the one frame nothing
+#               flagged. Round 1 finding 22. It is a POINTER, not a verdict:
+#               a track that recovers correctly trips it too, which is why
+#               it is a reason of its own rather than another area_jump.
 #   low_iou     the mask's overlap with the previous frame fell under
 #               `min_iou`: the shape moved somewhere else entirely, which
 #               an area test alone misses when the new thing happens to be
@@ -695,9 +768,13 @@ def span(info: MatteInfo) -> dict:
 
 SUSPECT_AREA_JUMP = 0.5
 SUSPECT_MIN_IOU = 0.3
+# The floor both `zero_area` and `area_recover` judge against: an area at or
+# under it is "the matte holds nothing". Not configurable, because it is not a
+# taste question the way the other two are: 0 is 0.
+SUSPECT_AREA_FLOOR = 0.0
 
 # Reasons, spelled once so a caller can switch on them rather than on prose.
-SUSPECT_REASONS = ("zero_area", "area_jump", "low_iou")
+SUSPECT_REASONS = ("zero_area", "area_jump", "area_recover", "low_iou")
 
 
 def quality_thresholds(area_jump=None, min_iou=None) -> dict:
@@ -720,6 +797,11 @@ def quality_thresholds(area_jump=None, min_iou=None) -> dict:
 
     return {"area_jump": pick(area_jump, "CINEGRADE_MATTE_AREA_JUMP",
                               SUSPECT_AREA_JUMP),
+            # The recovery rule's own number, reported for the same reason the
+            # other two are: so a count of 0 can be read against what it was
+            # judged by. A frame whose area is over this floor, straight after
+            # one at or under it, is a recovery.
+            "area_recover": SUSPECT_AREA_FLOOR,
             "min_iou": pick(min_iou, "CINEGRADE_MATTE_MIN_IOU",
                             SUSPECT_MIN_IOU)}
 
@@ -739,18 +821,14 @@ def frame_ious(info: MatteInfo, width: int = 128) -> dict:
     as it tracks, and `quality()` prefers those whenever they are there.
 
     Round 1 finding 15: this docstring used to say the caller was "`mask show`
-    and the strip, one matte at a time". It is not, and never was. Nothing in
-    the product passes `compute_iou=True`, so this function only runs from the
-    tests that cover it directly (`grade/tests/cases_mask.py`, group `mask`:
-    frame_ious_reads_the_shapes_off_disk). It is kept rather than deleted
-    because it is the ONLY way to judge drift on a matte tracked before the
-    service started writing `ious`, and the wiring it needs is one argument on
-    one line: `MT.quality(info, limit=..., compute_iou=full)` in
-    studio/server.py's `_matte_summary`, where `full` is already the "this is
-    one matte, send the per frame arrays" flag. That line belongs to the matte
-    route lane, is written down in
-    plan/2026-09-08-studio-masks/review/ROUND1-FIXES-tests.md, and is not
-    changed here rather than being changed quietly from a test lane.
+    and the strip, one matte at a time", which was not true of any code path
+    at the time: nothing in the product passed `compute_iou=True`, so this
+    function only ran from the tests covering it directly. It is true now.
+    `studio/server.py`'s `_matte_summary` passes `compute_iou=full`, so
+    `GET /api/matte/<id>` (and therefore `mask show` and its strip) reads the
+    frames off disk when index.json carries no `ious`, and the LIST route
+    still does not: one matte can pay for a read of its own frames, a clip
+    with four mattes over 384 frames each cannot.
     """
     idx = info.written_indices()
     out: dict[int, float] = {}
@@ -782,7 +860,8 @@ def quality(info: MatteInfo, area_jump=None, min_iou=None,
          "checked": 144, "iou_source": "index"|"frames"|"none",
          "suspect_count": 45, "suspect_frames": [...],
          "first_suspect_index": 4, "first_suspect_time": 0.1667,
-         "reasons": {"zero_area": 44, "area_jump": 1, "low_iou": 0},
+         "reasons": {"zero_area": 44, "area_jump": 1, "area_recover": 1,
+                     "low_iou": 0},
          "truncated": false}
 
     Each entry in `suspect_frames` is `{"index", "time", "reasons": [...],
@@ -836,12 +915,17 @@ def quality(info: MatteInfo, area_jump=None, min_iou=None,
         reasons = []
         jump = None
         if area is not None:
-            if float(area) <= 0.0:
+            if float(area) <= th["area_recover"]:
                 reasons.append("zero_area")
-            if prev_area is not None and prev_area > 0 and area is not None:
+            if prev_area is not None and prev_area > th["area_recover"]:
                 jump = abs(float(area) - prev_area) / prev_area
                 if jump > th["area_jump"]:
                     reasons.append("area_jump")
+            elif prev_area is not None and float(area) > th["area_recover"]:
+                # The subject came back. `jump` stays None on purpose: there
+                # is no previous area to divide by, which is exactly why the
+                # area rule above cannot see this frame (finding 22).
+                reasons.append("area_recover")
         iou = iou_by_index.get(i)
         if iou is not None and iou < th["min_iou"]:
             reasons.append("low_iou")

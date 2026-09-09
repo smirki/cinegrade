@@ -2466,7 +2466,31 @@ MASK_TYPES = ("matte", "key", "luma", "window")
 # minutes. 32 pixels of grow at any sane working width is already a very
 # large move; past it the value clamps, which is a cap on the CONTROL and
 # not on the matte (a grow that big is a different tool: use a blur).
-MASK_GROW_MAX = 32
+#
+# Quoted at a reference width, the way LAYER_BLUR_REF_WIDTH quotes the layer
+# blur sigma, because grow itself is a FRACTION of frame width (C1) and a cap
+# in raw pixels is not: at 32 pixels flat, grow 0.02 was 13 passes on a 640
+# preview and 32 on a 3840 render, so the preview showed a grow about 2.4x
+# wider than the delivered file (round 1 finding 31). The cap is still a whole
+# number of passes, so the two sides differ by a rounding of one pass rather
+# than by a factor.
+MASK_GROW_MAX = 32          # passes, at MASK_GROW_REF_WIDTH
+MASK_GROW_REF_WIDTH = 1920.0
+
+
+def mask_grow_passes(grow: float, width: float) -> int:
+    """The dilation/erosion pass count for a grow at this width.
+
+    One definition, used by the filter graph and by the numpy reference here,
+    and ported character for character into studio/static/gpu.js (maskMatte
+    and maskStackCPU) so the preview and the render clamp at the same
+    FRACTION of the frame. mask-stack-ref.mjs pins the arithmetic on the
+    browser side; the parity row maskv2_finesse_grow_capped renders both
+    engines at two widths and is what proves they still agree.
+    """
+    w = float(width)
+    cap = max(1, int(round(MASK_GROW_MAX * w / MASK_GROW_REF_WIDTH)))
+    return min(cap, int(round(abs(float(grow)) * w)))
 
 # The full swing of the matte chain. Written out rather than taken from
 # ffmpeg's `maxval`, because ffmpeg's lut filter reports maxval as 65280 on
@@ -2612,16 +2636,85 @@ def _mattes():
     return mattes
 
 
-def resolve_matte(ref, root=None):
+def matte_clip_refusal(info, clip_key: str, clip_name: str = ""):
+    """The sentence to refuse with when a matte belongs to a different clip.
+
+    index.json records the clip and the clip_key the track ran on (C2). The
+    studio's own routes compare them (studio/server.py imports this function
+    for its `_matte_clip_refusal`, so there is one sentence and not two), and
+    this engine compares them too for the two commands that run with no
+    server at all: `cinegrade render` and `cinegrade stats`. Before round 1
+    finding 6 was closed on both sides, a bare CLI measurement returned
+    numbers with no warning and exit 0, and a bare CLI render stretched
+    another clip's subject over the picture and wrote the file.
+
+    Compared on clip_key, the content key a matte, a project and a saved grade
+    already share, so a rename or a move does not read as a mismatch. A matte
+    with no clip_key recorded cannot be checked and is allowed through: this
+    can only ever refuse a matte that positively names a different clip.
+
+    Returns None when there is nothing to refuse.
+    """
+    have = str(getattr(info, "clip_key", "") or "").strip()
+    want = str(clip_key or "").strip()
+    if not have or not want or have == want:
+        return None
+    return (f"matte {info.matte_id} was tracked on "
+            f"{info.clip or have} and this is {clip_name or want}: a matte is "
+            f"a per clip thing (a frame sequence at that clip's own rate and "
+            f"framing), so using it here would stretch another clip's subject "
+            f"over this picture. Track the subject on "
+            f"{clip_name or want} and use that matte")
+
+
+def matte_belongs_to(info, src):
+    """The refusal for using this matte on the file `src`, or None.
+
+    Two exemptions, both of them "this engine cannot answer the question"
+    rather than "the answer is yes":
+
+    * a source whose key cannot be computed (a file that vanished between the
+      probe and here) is not judged, and
+    * a matte whose recorded clip_key is not a CONTENT key at all is not
+      judged. Hand built fixtures in this repo and any pre-C2 service file a
+      matte under a readable key (`clipA`, `guardkey`), and comparing a
+      readable name against a sha digest refuses every matte rather than the
+      wrong one. The studio makes the same kind of exemption for a matte with
+      no clip_key at all; this is that exemption with one more shape in it,
+      and it is why the guard can only refuse a matte that positively names a
+      different clip.
+
+    The SAM service is always handed the studio's own content key (C2), so
+    every matte a real track wrote is judged.
+    """
+    MT = _mattes()
+    if not src:
+        return None
+    have = str(getattr(info, "clip_key", "") or "").strip()
+    if not MT.is_clip_key(have):
+        return None
+    try:
+        key = MT.clip_key(src)
+    except (OSError, ValueError):
+        return None
+    return matte_clip_refusal(info, key, Path(src).name)
+
+
+def resolve_matte(ref, root=None, src=None):
     """A component's matte reference to a MatteInfo, or None when it is not there.
 
     Returns (info, reason). `reason` is None when the matte resolved, and a
     sentence for the warnings list when it did not: no id yet (the component
-    is waiting for a pick), or an id that names nothing in the store.
+    is waiting for a pick), an id that names nothing in the store, or, when
+    the caller passed `src`, a matte that belongs to a different clip
+    (matte_belongs_to). `src` is the file being rendered or measured; without
+    it the ownership question is not asked at all, which is what keeps the
+    preview, stills and scopes paths drawing whatever exists.
 
     Never raises for a missing matte. A preview of a grade whose track is
     still queued has to draw something, and the policy about whether that is
-    good enough to RENDER lives in require_complete_mattes().
+    good enough to RENDER lives in require_complete_mattes() and
+    require_matte_clip().
     """
     MT = _mattes()
     matte_id = str((ref or {}).get("id") or "").strip()
@@ -2630,12 +2723,42 @@ def resolve_matte(ref, root=None):
     if root is None:
         ensure_matte_root_from_server()          # checkpoint gap 5
     try:
-        return MT.resolve(root if root is not None else MT.matte_root(),
-                          matte_id), None
+        info = MT.resolve(root if root is not None else MT.matte_root(),
+                          matte_id)
     except MT.MatteMissing:
         return None, f"matte {matte_id} is not in the store"
     except MT.MatteError as exc:
         return None, f"matte {matte_id}: {exc}"
+    wrong_clip = matte_belongs_to(info, src)
+    if wrong_clip:
+        return None, wrong_clip
+    return info, None
+
+
+def require_matte_clip(cfg, src, root=None) -> None:
+    """Refuse a render whose mask reaches another clip's matte.
+
+    The engine's half of round 1 finding 6, and the counterpart of
+    studio/server.py's `_require_render_mattes_match`: same comparison, same
+    sentence, one line per bad component naming the layer and the component,
+    so the two paths refuse a bare `cinegrade render` and a render posted to
+    the studio in the same words.
+
+    Called by the render verb regardless of `--allow-partial`, because
+    allow_partial means "I accept an unfinished matte" and never "I accept the
+    wrong clip's matte".
+    """
+    bad = []
+    for entry in mask_inputs(cfg):
+        if entry.get("kind") != "matte":
+            continue
+        _info, reason = resolve_matte(entry["matte"], root, src=src)
+        if reason and "was tracked on" in reason:
+            bad.append(f"  layer {entry['layer']} component "
+                       f"{entry['component']}: {reason}")
+    if bad:
+        raise GradeError("this render's mask reaches a matte that was tracked "
+                         "on another clip:\n" + "\n".join(bad))
 
 
 def flat_mask(value: int, w: int, h: int):
@@ -2971,7 +3094,7 @@ def finesse_filters(finesse: dict, info: dict) -> list[str]:
     if cb > 0 or cw > 0:
         out.append(f"geq=lum='{clean_geq(cb, cw)}'")
     grow = float(f.get("grow", 0.0) or 0.0)
-    passes = min(MASK_GROW_MAX, int(round(abs(grow) * width)))
+    passes = mask_grow_passes(grow, width)
     if passes > 0:
         out += ["dilation" if grow > 0 else "erosion"] * passes
     blur = float(f.get("blur", 0.0) or 0.0)
@@ -3153,7 +3276,7 @@ def mask_matte(layer: dict, info: dict, rgb=None, time_s: float = 0.0,
     if cb > 0 or cw > 0:
         acc = clean_curve(acc, cb, cw)
     grow = float(f.get("grow", 0.0) or 0.0)
-    passes = min(MASK_GROW_MAX, int(round(abs(grow) * w)))
+    passes = mask_grow_passes(grow, w)
     if passes > 0:
         acc = morph2d(acc, passes, grow > 0)
     blur = float(f.get("blur", 0.0) or 0.0)
@@ -4296,6 +4419,12 @@ def cmd_render(a):
         src = "studiosrc"
     graph = graph_with_mask(rcfg, rinfo, src_label=src, head_extra=head)
     o = dict(cfg["output"], codec=codec)
+    # Whose mattes are these (round 1 finding 6, engine half)? Before the
+    # coverage rule and before a frame is decoded, and NOT under
+    # --allow-partial, which means "I accept an unfinished matte" and never
+    # "I accept the wrong clip's matte". The studio's own render route asks
+    # the same question in the same words.
+    require_matte_clip(cfg, a.input)
     args = ffmpeg_inputs(a.input, rcfg, rinfo, a.start, a.duration,
                          strict_mattes=not a.allow_partial)
     # Non blocking mask notices. An `unfinished` matte covers every frame this
@@ -4440,7 +4569,8 @@ def _measure_region_size(region, info, width=None) -> tuple[int, int]:
     return tw, th
 
 
-def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict):
+def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict,
+                            src=None):
     """The HxW weight array `stats --matte ID` measures through, and any
     warnings about the frame it actually used.
 
@@ -4472,6 +4602,17 @@ def _matte_weight_for_frame(matte_id: str, t: float, region, info: dict):
     ensure_matte_root_from_server()
     try:
         minfo = MT.resolve(MT.matte_root(), matte_id)
+    except MT.MatteMissing as exc:
+        raise GradeError(f"--matte {matte_id}: {exc}") from exc
+    # Whose matte is this (round 1 finding 6, engine half)? A measurement
+    # weighted by another clip's matte came back as numbers with no warning
+    # and exit 0, which is worse than an error: it is an anchor somebody
+    # grades to. Refused before the frame is even read, in the studio's own
+    # words.
+    wrong_clip = matte_belongs_to(minfo, src)
+    if wrong_clip:
+        raise GradeError(f"--matte {matte_id}: {wrong_clip}")
+    try:
         full, _served, warn = MT.load_time(
             minfo, t, size=(int(info["width"]), int(info["height"])))
     except MT.MatteMissing as exc:
@@ -4550,7 +4691,7 @@ def mask_stack_matte_ids(layer: dict) -> list[str]:
     return out
 
 
-def _mask_weight_for_frame(mask: dict, t: float, rgb, size: tuple):
+def _mask_weight_for_frame(mask: dict, t: float, rgb, size: tuple, src=None):
     """The HxW weight array for `stats --mask`, and its warnings (gap 19).
 
     `rgb` is the frame being measured, uint8 (h, w, 3), display referred: the
@@ -4578,6 +4719,13 @@ def _mask_weight_for_frame(mask: dict, t: float, rgb, size: tuple):
             _served, warn = MT.served_frame(minfo, t)
         except MT.MatteMissing as exc:
             raise GradeError(f"--mask: {exc}") from exc
+        # Same ownership question as `--matte`, asked of every matte the
+        # stack reaches (finding 6): a stack is the form the round 4 skin
+        # anchor was measured through, so it is the form most likely to be
+        # scripted at the wrong clip.
+        wrong_clip = matte_belongs_to(minfo, src)
+        if wrong_clip:
+            raise GradeError(f"--mask: {wrong_clip}")
         if warn:
             warns.append(warn)
         elif getattr(minfo, "state", "done") != "done":
@@ -4693,7 +4841,8 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
             "--mask '{\"components\": [{\"type\": \"matte\", \"op\": \"add\", "
             "\"matte\": {\"id\": \"ID\"}}]}'")
     if matte:
-        weight, warns = _matte_weight_for_frame(matte, t, region, info)
+        weight, warns = _matte_weight_for_frame(matte, t, region, info,
+                                                src=src)
         if weight.shape != (h, w):
             from PIL import Image                            # noqa: PLC0415
             weight = np.asarray(
@@ -4703,7 +4852,7 @@ def _grade_frame_stats(a, cfg, info, t: float, region=None, path=None,
     elif mask is not None:
         # Composed at the measured frame's own size (gap 19), so no resample
         # sits between the weight and the picture it weights.
-        weight, warns = _mask_weight_for_frame(mask, t, rgb, (w, h))
+        weight, warns = _mask_weight_for_frame(mask, t, rgb, (w, h), src=src)
     row = {"time": t, "key": f"{Path(src).name}@{t:g}s",
           "size": [w, h], "measured_width": int(w),
           "stats": frame_stats(rgb, weight=weight)}
@@ -6099,6 +6248,33 @@ def _fetch_bytes(base: str, url: str, headers: dict | None = None) -> bytes:
         raise GradeError(f"could not fetch {full}: {exc.reason}") from exc
 
 
+def _image_ext(data: bytes, fallback: str = "") -> str:
+    """The file extension these BYTES deserve, by their own magic number.
+
+    `mask segment -o DIR` used to take the extension from the preview URL,
+    and the studio's preview URLs (`/api/mask/pick/<pick>/<inst>/<kind>`)
+    carry none, so everything it downloaded was written as `.png` whatever it
+    was: an overlay is served as `image/jpeg` (studio/server.py picks the
+    content type per kind), so every overlay on disk was JPEG bytes under a
+    PNG name. Anything reading those files by extension (Preview's Quick Look
+    is forgiving, `PIL.Image.open` sniffs, a build step that trusts the name
+    is not) had a file that lied about itself.
+
+    Sniffed rather than taken from the Content-Type header because these
+    bytes are what is being written: the header is a second opinion about
+    them. `fallback` is used only when the bytes are nothing this knows.
+    """
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    return fallback or ".bin"
+
+
 def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
     prompts = _mask_prompts(a)
     if not prompts:
@@ -6117,7 +6293,8 @@ def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
                 if not url:
                     continue
                 data = _fetch_bytes(base, url, headers=hdr)
-                ext = Path(str(url).split("?")[0]).suffix or ".png"
+                # The bytes name the file, not the URL: see _image_ext.
+                ext = _image_ext(data, Path(str(url).split("?")[0]).suffix)
                 dest = outdir / f"{out.get('pick_id', 'pick')}-{iid}-{field}{ext}"
                 dest.write_bytes(data)
                 inst[f"{field}_file"] = str(dest)
@@ -6330,13 +6507,28 @@ def _quality_line(q: dict) -> str:
     if not n:
         return (f"quality   no suspect frames of {q.get('checked')} checked "
                 f"(area jump > {th.get('area_jump')}, iou < {th.get('min_iou')}"
-                f", iou from {src})")
+                f", iou from {src}, and no frame where the subject came back "
+                f"after an empty one)")
     reasons = ", ".join(f"{k} {v}" for k, v in (q.get("reasons") or {}).items()
                         if v)
-    return (f"quality   {n} SUSPECT frames of {q.get('checked')} checked "
+    line = (f"quality   {n} SUSPECT frames of {q.get('checked')} checked "
             f"({reasons}); first at {q.get('first_suspect_time')}s "
             f"(frame {q.get('first_suspect_index')}). Thresholds: area jump > "
             f"{th.get('area_jump')}, iou < {th.get('min_iou')} (iou from {src})")
+    # The recovery rule in words rather than as a key name (round 1 finding
+    # 22). It is the frame the area rule is blind to and the one a tracker
+    # most often comes back on the wrong object at, so it gets its own
+    # sentence naming the frames to look at instead of a count in a list.
+    back = [f for f in (q.get("suspect_frames") or [])
+            if "area_recover" in (f.get("reasons") or [])]
+    if back:
+        where = ", ".join(f"{f.get('index')} ({f.get('time')}s)"
+                          for f in back[:5])
+        more = "" if len(back) <= 5 else f" and {len(back) - 5} more"
+        line += (f"\n          the subject comes back after an empty frame at "
+                 f"frame {where}{more}: look at those first, that is where a "
+                 f"track most often comes back on the wrong object")
+    return line
 
 
 def _print_matte_index(idx: dict) -> None:
@@ -6549,6 +6741,13 @@ def _build_matte_strip(base: str, hdr: dict, matte_id: str, index: dict,
     if quality.get("suspect_count"):
         note += (f"  |  {quality['suspect_count']} suspect frames, first at "
                  f"{quality.get('first_suspect_time')}s")
+        # Named on the strip too, because the strip is the thing a person
+        # looks at before grading and "the subject came back here" is the
+        # panel to look hardest at (round 1 finding 22).
+        back = int((quality.get("reasons") or {}).get("area_recover") or 0)
+        if back:
+            note += (f", {back} where the subject comes back after an empty "
+                     f"frame")
     ImageDraw.Draw(out_img).text((4, row_h + curve.height + 4), note,
                                  fill=(210, 210, 210), font=font)
     out_img.save(out_path)

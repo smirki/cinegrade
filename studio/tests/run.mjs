@@ -16,7 +16,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findFreePort, waitForHttp200, sleep, renderTable } from "./lib/util.mjs";
+import { findFreePort, waitForHttp200, sleep, renderTable, pruneHarnessCache } from "./lib/util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONTENT_DIR = path.resolve(HERE, "..", ".."); // studio/tests -> studio -> content
@@ -111,6 +111,10 @@ const SPEC_FILES = [
    * nothing numbered after it needs the stub alive. */
   "30-gpu-matte-time.mjs",
   "31-mask-stack-ref.mjs",
+  /* 32 is A1's other half: the FILE a GPU final render writes. It runs last
+   * because it is the most expensive spec here (a real render through the
+   * headless worker) and because it needs nothing any later spec sets up. */
+  "32-gpu-render-matte-frame.mjs",
 ];
 
 /* Chasing one failing spec through a whole run costs minutes of GPU work, so
@@ -304,9 +308,15 @@ async function main() {
   // specs read their answer before it arrived. This is a stable folder that
   // belongs to the harness alone (gitignored), so repeat runs are warm again
   // and the founder's studio/cache is still never touched.
+  // Kept between runs, but not for ever: pruneHarnessCache() bounds it by age
+  // and then by size before the server starts (lib/util.mjs documents both
+  // numbers, studio/README.md says what the folder is and how to empty it by
+  // hand). Nothing else on the disk is touched, and a pruned entry costs a
+  // regeneration, never a wrong answer, because every name in there is a hash
+  // of the clip plus the settings that made it.
   const cacheDir = path.join(HERE, ".cache");
   fs.mkdirSync(cacheDir, { recursive: true });
-  console.log("[run] harness cache dir " + cacheDir + " (kept between runs on purpose)");
+  console.log("[run] " + pruneHarnessCache(cacheDir).line);
 
   const serverLog = { stdout: [], stderr: [] };
   const server = spawn(PYTHON, ["studio/server.py", "--port", String(port),
