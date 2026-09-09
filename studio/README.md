@@ -402,6 +402,22 @@ covers nothing of" below. The list below describes what lives inside
 `stats`:
 
 - luma percentiles at 5, 25, 50, 75 and 95, as 0 to 1
+- `luma.std` and `luma.p5_p95`: how spread out the luma of what was
+  measured is, beside `luma.mean` and on the same basis as it, so a
+  masked row reports the spread INSIDE the mask. `std` is the standard
+  deviation over the measured pixels (weighted by the matte when there
+  is one), `p5_p95` is `p95 - p5`. A contrast reduction pulls every
+  pixel toward the pivot, so with the pivot at the mask's own mean the
+  mean does not move while both of these fall: on a synthetic region
+  measured through its matte, contrast 0.1 about a pivot at the mean
+  left `mean` at 0.5000 and took `std` from 0.3000 to 0.0294 and
+  `p5_p95` from 0.6000 to 0.0588. Neither figure is a target; they say
+  how much internal variation the measurement found, nothing about
+  whether that is the right amount
+- `luma.min` and `luma.max`: the extremes of the measured pixels, which
+  under a matte are the mask's own and not the frame's (they were the
+  frame's until the two spread figures above went in, so a mask on a
+  face in a letterboxed frame reported min 0.0)
 - mean saturation, computed as `(max - min) / max` per pixel. This falls
   under ANY toe lift, `primaries.black_lift` included (measured under
   "Which way is which" below: 0.1843 to 0.1716 to 0.1502 as `black_lift`
@@ -616,8 +632,8 @@ which is a human's own live studio.
 | `match REF CLIP` | `--time`; `-p/--preset` (a preset name or JSON file, sent as this call's config); `--method {reinhard,histogram}` (default `reinhard`); `--rotate {auto,0,90,180,270}` (sent as this call's own `rotation` field; falls back to `--preset`'s own config `rotation`, then `auto`, same order every other subcommand's `--rotate` falls back through; `match` previously had no rotation handling at all); `--strength N` (default 1.0); `--luma-preserve`/`--no-luma-preserve` (default on); `--ref-crop X0 Y0 X1 Y1`, `--frame-crop X0 Y0 X1 Y1` (whole frame, `[0,0,1,1]`, when neither is given, never a browser tab's saved rectangle, see "Match Reference" above); `--name`, `--out-dir`; `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/match`: no local equivalent exists, so this is a thin wrapper, the one place the server is the primary surface and the CLI mirrors it, not the other way round |
 | `preset {save,load} NAME` | `save NAME -p grade.json --comment TEXT`; `load NAME [--expand] [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `POST`/`GET /api/preset`: the shared, named grade store, read and written by every account and agent alike |
 | `grade {save,load} CLIP` | `save CLIP -p grade.json --message TEXT`; `load CLIP [-o file.json]`; both take `--json`, `--port`/`--url`/`--agent`/`--attach` | `PUT`/`GET /api/grade` (contract C3): one clip's own per clip grade, distinct from the shared `preset` above and from `session patch` (the live config a browser tab is watching; `grade save` never wakes it) |
-| `mask segment CLIP` | `--time` (default 0); `--text "PROMPT"` (repeatable); `--point X,Y[,neg]` (repeatable, fraction of the frame, trailing `,neg` for a negative point); `--box X0,Y0,X1,Y1` (repeatable); `--rotate`; `-o DIR` (downloads every instance's `overlay`/`mask` preview image); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/segment` (contract C4): SAM's synchronous pick on one frame, `{"pick_id", "instances": [{"id", "score", "box", "area", "overlay", "mask"}, ...], "candidates": N}`, nothing tracked or saved yet, look at the previews before choosing an id to track. A prompt the model matches nothing for is NOT a silent empty list: the response carries `"candidates": 0` and a `message` (`no match for "shirt" at 3s: 0 candidates from the model. Try another word ...`), and the CLI raises that sentence, so `mask segment` exits 1. With `--json` the payload still prints first, then the command exits 1, so a JSON caller loses nothing and a shell caller gets a real failure |
-| `mask track CLIP` | `--text "PROMPT"` (repeatable) or `--pick PICK --select IDS` (comma separated ids, or `all`), not both; `--start`, `--end` (seconds); `--steady N` (temporal smoothing frames); `--rotate`; `--wait` (blocks, prints progress to stderr the way `render` does, exits non zero on a `failed` job; a cache hit has no job to wait on and says so on stderr rather than failing); `--force` (redo a matte this recipe already has, frames deleted first); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/track`: starts a background SAM track, returns `{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...], "cached": false, "start_frame", "end_frame"}` immediately unless `--wait`. Cached by clip identity, rotation and recipe, and the cache is a hit only while its answer is still usable: a live job for this recipe, or every frame of the window already written, is free (`{"job_id", "cached": true, "mattes": [...]}`); a HOLE in the window resumes from the first missing frame; a `failed`/`stale`/`cancelled` matte restarts the window; `force` restarts it after deleting the frames. A resume or a restart answers with `resumed`, `restarted`, `resumed_from` and a `message`, writes back into the SAME matte id, and moves the state to `queued`/`running` again. Before this, an identical retry of a dead track handed back the same dead matte and `job_id: null`, and the only way to get another attempt was to change the words |
+| `mask segment CLIP` | `--time` (default 0); `--text "PROMPT"` (repeatable); `--point X,Y[,neg]` (repeatable, fraction of the frame, trailing `,neg` for a negative point); `--box X0,Y0,X1,Y1` (repeatable); `--rotate`; `-o DIR` (downloads every instance's `overlay`/`mask` preview image); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/segment` (contract C4): SAM's synchronous pick on one frame, `{"pick_id", "instances": [{"id", "score", "box", "area", "overlay", "mask"}, ...], "candidates": N, "frame_width", "frame_height"}`, nothing tracked or saved yet, look at the previews before choosing an id to track. `frame_width`/`frame_height` are the frame the model was actually shown, measured off that frame: the studio renders it at its own working width (`--mask-width` / `STUDIO_MASK_WIDTH`, default 1280) and a model's candidate scores depend on that width, so two sessions comparing which instance came back for the same words are comparing like with like only when the widths match. A prompt the model matches nothing for is NOT a silent empty list: the response carries `"candidates": 0` and a `message` (`no match for "shirt" at 3s: 0 candidates from the model on a 1280px frame. Try another word ...`, naming the width so a width mismatch is tellable from a model that looked and found nothing), and the CLI raises that sentence, so `mask segment` exits 1. With `--json` the payload still prints first, then the command exits 1, so a JSON caller loses nothing and a shell caller gets a real failure |
+| `mask track CLIP` | `--text "PROMPT"` (repeatable) or `--pick PICK --select IDS` (comma separated ids, or `all`), not both; `--start`, `--end` (seconds); `--steady N` (temporal smoothing frames); `--rotate`; `--wait` (blocks, prints progress to stderr the way `render` does, exits non zero on a `failed` job; a cache hit has no job to wait on and says so on stderr rather than failing); `--force` (clear the frames this request asks for and track them again: a window inside what the matte already covers clears only those frames, a window over its whole span clears the matte); `--json`; `--port`/`--url`/`--agent`/`--attach` | `POST /api/mask/track`: starts a background SAM track, returns `{"job_id", "mattes": [{"matte_id", "recipe", "state"}, ...], "cached": false, "start_frame", "end_frame"}` immediately unless `--wait`. Cached by clip identity, rotation and recipe, and the cache is a hit only while its answer is still usable: a live job for this recipe, or every frame of the window already written, is free (`{"job_id", "cached": true, "mattes": [...]}`); a HOLE in the window resumes from the first missing frame; a `failed`/`stale`/`cancelled` matte restarts the window; `force` clears the frames the request names and tracks them again, and answers with `cleared_start`, `cleared_end` and `cleared_whole_matte`, so a repair of one second inside a longer matte is tellable from a redo of the whole thing (a narrow force keeps every frame outside its own window). A resume or a restart answers with `resumed`, `restarted`, `resumed_from` and a `message`, writes back into the SAME matte id, and moves the state to `queued`/`running` again. Before this, an identical retry of a dead track handed back the same dead matte and `job_id: null`, and the only way to get another attempt was to change the words |
 | `mask jobs` | `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/mask/jobs`: every queued or running track job, visible to every caller |
 | `mask list CLIP` | `--full` (the per frame arrays as well as the summary); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte?clip=`: that clip's mattes, a SUMMARY per matte by default (`matte_id`, `state`, `done_frames`/`frames`, `span`, `coverage` of that span, `mean_score`, `mean_area`, `quality`, `recipe`), not the per frame arrays: four mattes over 384 frames used to be thousands of mostly-null numbers just to read four states. `--full` (`?full=1` on the route) adds `areas`, `scores` and `ious` back; `GET /api/matte/<id>` always carries them. The printed line also flags suspect frames (`SUSPECT 3 frames from 4.25s`) and closes with the reminder that every matte is frozen outside its span. Mattes belong to the clip, shared by every caller |
 | `mask show ID` | `--strip` (one panel per second of the frames the matte really wrote, matte tinted over the picture, with the tracked area curve underneath, needs `-o` and Pillow); `-o/--output OUT.jpg` (required with `--strip`); `--width N` (default 220, panel width for `--strip`); `--json`; `--port`/`--url`/`--agent`/`--attach` | `GET /api/matte/<id>`: one matte's index (state, frame count, recipe), plus its `span`, `coverage` and `quality`. Works on a matte that is still running or only partly written: the printed block names the span in seconds, says "frozen outside span" out loud, and lists the suspect frames; the strip walks only the written span, labels a panel `held <frame>` when the server served a frozen one, marks suspect frames in red on the curve, and refuses with a sentence (naming the state and the count) when nothing has been written yet. A matte with nothing written used to be drawn as if the whole requested length existed, and the `None` tail raised a `TypeError`, so the mattes most in need of a look over time were the ones that could not be looked at. With `--strip`, the verification pass to run before grading on a matte, see the Masks section of `.claude/skills/studio-grading/SKILL.md` |
@@ -1436,7 +1452,11 @@ window and resident memory from `/api/mask/status`, and a `Cancel`. While the
 matte is not finished the badge reads **static until tracked**: the engines
 hold the nearest written frame, so the correction still works, it just stops
 moving past the tip of the track. A cancelled track leaves a partial matte and
-the row says how far it got (`tracked to 26 of 120 frames, held past there`).
+the row says how far it got (`tracked to 26 of 120 frames, held past there`). Cancelled
+before it wrote anything, the matte reads `cancelled` with 0 of the frames
+asked for, not `failed`: nothing about the track was tried and found
+impossible, so a reader is not sent looking for a tracking failure that
+never happened.
 When a job finishes, the matte id on the component has not changed, so the
 layer swaps to the tracked matte with no click. `steady` is the temporal
 smoothing width on the track, centred on the frame so the matte does not lag
@@ -1444,7 +1464,9 @@ the picture; 1 is off.
 
 **The states the panel shows**, all from the server, never guessed:
 `queued`, `running`, `done`, `failed` (with the service's own reason on the
-row), `partial`, `stale`, `needs_pick`, and the service being down at all. A
+row), `cancelled` (somebody stopped it; the reason on the row is the
+service's own, and `failed` is kept for a track that ran and could not
+finish), `partial`, `stale`, `needs_pick`, and the service being down at all. A
 matte is stale when it was tracked at a different rotation or for a different
 clip, and the row says which; the fix is `Track again`. "auto" is not a
 rotation but "honour the file's own tag", so it is resolved to that tag before
@@ -2731,9 +2753,11 @@ way footage does).
 `span`, `frozen_outside_span`, `coverage`, `mean_score`, `mean_area` and
 `quality`), **`DELETE /api/matte/<id>`** (admin only, with logins on): a
 matte's own record, `state` one of `queued`, `running`, `done`, `failed`,
-`stale` (its recipe no longer matches anything live) alongside
-`queued`/`running`'s own `partial` reading (servable by its nearest already
-written frame, never empty).
+`cancelled` (the job was stopped; `done_frames` of `total_frames` says how
+much of the window it had written when it was, which is 0 for a job stopped
+before it started), `stale` (its recipe no longer matches anything live)
+alongside `queued`/`running`'s own `partial` reading (servable by its nearest
+already written frame, never empty).
 
 The LIST route answers a summary per matte and leaves the per frame arrays
 out (`{"mattes": [...], "full": false}`); `?full=1` puts `areas`, `scores`

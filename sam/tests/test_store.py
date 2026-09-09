@@ -275,6 +275,61 @@ def main() -> int:
           resumed_late.index["start_frame"] == 48,
           str(resumed_late.index["start_frame"]))
 
+    print("\nan interior re-track keeps the matte's declared span (gap 24)")
+    # The shape a narrow `mask track --force` makes: the studio clears the
+    # frames of one window and re-queues only that window, naming the same
+    # matte id. The header for that run declares the WINDOW, not the matte,
+    # so a store that read the shorter length as "a different track" blanked
+    # the arrays and reported 0 done with 7 files sitting in the folder, and
+    # the matte's own span shrank to the repair window.
+    whole = MatteWriter(root, "m_interior", header(10), steady=1)
+    for i in range(10):
+        whole.push(i, ramp(0.5), 0.9)
+    whole.finish("done")
+    for i in (4, 5, 6):
+        (whole.dir / frame_name(i)).unlink()
+    inner = MatteWriter(root, "m_interior",
+                        dict(header(7), start_frame=4, end_frame=7), steady=1)
+    check("the matte still declares the ten frames it was tracked over, not "
+          "the three the repair asked for",
+          inner.index["frames"] == 10 and inner.index["end_frame"] == 10
+          and inner.index["start_frame"] == 0,
+          f"{inner.index['frames']} frames, "
+          f"{inner.index['start_frame']}..{inner.index['end_frame']}")
+    check("its arrays are still ten long, so every index a caller already "
+          "holds still means the same frame",
+          len(inner.index["areas"]) == 10 and len(inner.index["ious"]) == 10,
+          f"{len(inner.index['areas'])} areas")
+    check("the frames outside the repair window are counted, not forgotten",
+          inner.done == 7, str(inner.done))
+    check("and their numbers survive",
+          inner.index["areas"][0] is not None
+          and inner.index["areas"][9] is not None,
+          str(inner.index["areas"]))
+    inner.set_state("running")
+    for i in (4, 5, 6):
+        inner.push(i, ramp(0.8), 0.7)
+    inner.finish("done")
+    repaired = read_index(inner.dir)
+    check("after the repair the matte is whole again and says so",
+          repaired["done_frames"] == 10 and repaired["state"] == "done"
+          and repaired["frames"] == 10,
+          f"{repaired['state']}, {repaired['done_frames']}/{repaired['frames']}")
+    def _near(value, want: float) -> bool:
+        # A red run of this block reads None here, so the comparison has to
+        # answer False rather than raise: a failed check names itself, a
+        # traceback takes the rest of the suite with it (round 1 finding 39).
+        return isinstance(value, (int, float)) and abs(value - want) < 0.01
+
+    check("the repaired frames carry the new run's numbers and the rest carry "
+          "the first run's",
+          _near(repaired["areas"][5], 0.8) and _near(repaired["areas"][0], 0.5),
+          f"{repaired['areas'][5]} inside, {repaired['areas'][0]} outside")
+    files = sorted(p.name for p in inner.dir.glob("*.png"))
+    check("and every frame file is back on disk, the kept ones untouched",
+          len(files) == 10 and files[0] == "000000.png"
+          and files[-1] == "000009.png", str(len(files)))
+
     print("\nindex.json is never seen half written")
     writer = MatteWriter(root, "m_atomic", header(4), steady=1)
     # The outcome is checked, not merely reached: this used to be a bare

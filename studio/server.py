@@ -3510,6 +3510,68 @@ def _matte_reaches_past(info, w_start: int, w_end: int) -> bool:
     return w_start < m_start or w_end > m_end
 
 
+def _clear_matte_window(info, w_start: int, w_end: int) -> int:
+    """Delete `[w_start, w_end)` from one matte and leave the rest alone.
+
+    The narrow half of `force` (tooling gap 24). The wide half is an `rmtree`
+    of the whole directory, which is what force always did and still does when
+    the request covers everything the matte declares; this is for the repair
+    of one second of a twelve second matte, where throwing the other eleven
+    away is the bug rather than the feature.
+
+    Two things go, and only for frames inside the window: the frame files, and
+    the per frame numbers in index.json (`areas`, `scores`, `ious`), so the
+    area curve and the quality flags cannot go on reporting a frame that is no
+    longer on disk if the re-track never lands. The matte's own declared span,
+    every frame outside the window and everything else in the index stay
+    exactly as they are; `sam/store.py`'s `_carry_forward` then reads that
+    index, keeps the longer span and writes the window again.
+
+    Studio writing this file at all is the same exception `_write_matte_index`
+    already names: the frames being cleared are ones the service is not
+    touching, and the alternative (asking the service to clear a window) is a
+    wire change for a case only studio knows about, because only studio knows
+    what `force` means. Returns how many frame files were removed.
+    """
+    removed = 0
+    for index in list(info.written_indices(refresh=True)):
+        if not (int(w_start) <= int(index) < int(w_end)):
+            continue
+        p = info.path / MT.frame_name(int(index))
+        try:
+            p.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+    d = info.path
+    lock = _matte_index_locks.setdefault(str(d), threading.Lock())
+    with lock:
+        p = d / MT.INDEX_NAME
+        try:
+            raw = json.loads(p.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = None
+        if raw is not None:
+            for key in ("areas", "scores", "ious"):
+                values = raw.get(key)
+                if not isinstance(values, list):
+                    continue
+                for i in range(int(w_start), min(int(w_end), len(values))):
+                    values[i] = None
+            written = len([q for q in d.glob("*.png") if q.stem.isdigit()])
+            raw["done_frames"] = written
+            # `partial` for the moment between the clear and the service's own
+            # first write: the matte really is missing frames it declares, and
+            # a reader catching it here should see that rather than `done`.
+            if raw.get("state") == "done":
+                raw["state"] = "partial"
+            tmp = d / f".{MT.INDEX_NAME}.{uuid.uuid4().hex[:8]}.tmp"
+            tmp.write_text(json.dumps(raw, allow_nan=False))
+            tmp.replace(p)
+    MT.forget_cache()
+    return removed
+
+
 def _matte_first_missing(info, w_start: int, w_end: int) -> int | None:
     """The first frame of `[w_start, w_end)` this matte has not written, or
     None when every frame of it is on disk.
@@ -3657,6 +3719,17 @@ def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
                 PICKS.pop(pid, None)
     out = {"pick_id": pick_id, "instances": instances_out,
            "candidates": len(instances_out),
+           # Tooling gap 27: the width of the frame SAM was actually shown,
+           # read off that frame rather than from the setting, so it cannot
+           # drift from what was served. The pick is run at this studio's
+           # working width (--mask-width / STUDIO_MASK_WIDTH), and a model's
+           # candidate scores depend on it: the same words at 720 and at 1280
+           # are two different asks, and one investigation spent a day on a
+           # "0 candidates" that was a 720 wide frame rather than a miss.
+           # Reported on every answer, not only the empty ones, so two
+           # sessions comparing picks can compare widths.
+           "frame_width": int(rgb.shape[1]),
+           "frame_height": int(rgb.shape[0]),
            "elapsed_s": resp.get("elapsed_s")}
     # Checkpoint gap 3: an empty list said nothing about WHY it was empty,
     # so "the model looked and found nothing" and "this phrase meant
@@ -3673,8 +3746,9 @@ def mask_segment(clip: str, time_s: float, rotation, prompts: dict,
             asked = " + ".join(kinds) or "these prompts"
         out["message"] = (
             f"no match for {asked} at {float(time_s):g}s: 0 candidates from "
-            f"the model. Try another word for the same thing, a different "
-            f"--time, or a --point/--box prompt on the pixels themselves.")
+            f"the model on a {int(rgb.shape[1])}px frame. Try another word "
+            f"for the same thing, a different --time, or a --point/--box "
+            f"prompt on the pixels themselves.")
     return out
 
 
@@ -3751,7 +3825,14 @@ def _poll_sam_job(job: Job, clip_key: str, sam_job_id) -> None:
         if state.get("mattes"):
             job.extra["mattes"] = state["mattes"]
         if st in ("done", "failed", "cancelled"):
-            job.status = "done" if st == "done" else "failed"
+            # Tooling gap 26: this used to read `"done" if st == "done" else
+            # "failed"`, so a job the service reports as CANCELLED settled on
+            # this studio as failed, one poll after the cancel was accepted.
+            # A caller then read a tracking failure that never happened, and
+            # `_mask_job_view` put the service's message in `error` for it.
+            # The service's own three terminal words come through as they are.
+            job.status = "cancelled" if st == "cancelled" else \
+                "done" if st == "done" else "failed"
             if st == "done":
                 job.progress = 1.0
             job.finished = time.time()
@@ -3882,6 +3963,8 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     resume_kind = ""       # "resume", "widen", "restart" or "force"
     restart_reason = ""
     resume_ids: dict[str, str] = {}
+    cleared_window = (req_start, req_end)   # gap 24, force only
+    cleared_whole = False
     if cached_infos and not force:
         live = JOBS.get(_matte_jobs.get(rhash) or "")
         live_now = live is not None and live.status in ("queued", "running")
@@ -3949,16 +4032,44 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
             restart_reason = (f"resuming from frame {resume_from}: "
                               f"{', '.join(sorted({i.state for i in cached_infos}))}")
     elif cached_infos and force:
-        # A full redo. The service derives the same matte id for the same
-        # recipe and window, so without clearing the frames first a shorter
-        # re-track would leave the old attempt's tail sitting on disk and
-        # reading as tracked. The index goes with them; the track call below
-        # writes a fresh one.
-        for i in cached_infos:
-            shutil.rmtree(i.path, ignore_errors=True)
-        MT.forget_cache()
+        # A redo of what was asked for. Tooling gap 24: until this split,
+        # every force deleted the matte's whole directory whatever window the
+        # request named, so a repair of one second of a twelve second matte
+        # cost the other eleven seconds and a full re-track, while the answer
+        # named the repair window and read as though only that had gone.
+        #
+        # Which of the two it is comes from the matte's own declared span, not
+        # from the request alone: a request covering everything the matte
+        # declares is "this matte is wrong, do it again", the documented use,
+        # and still takes the directory with it. Anything narrower clears only
+        # its own frames. The service derives the same matte id for the same
+        # recipe, so in both cases the new frames land back in this matte;
+        # what differs is how much of it is standing when they do.
+        span_start = min(_matte_declared_window(i)[0] for i in cached_infos)
+        span_end = max(_matte_declared_window(i)[1] for i in cached_infos)
+        cleared_whole = req_start <= span_start and req_end >= span_end
+        if cleared_whole:
+            for i in cached_infos:
+                shutil.rmtree(i.path, ignore_errors=True)
+            MT.forget_cache()
+            cleared_window = (span_start, span_end)
+            restart_reason = (
+                f"force: frames {span_start} to {span_end} cleared, the whole "
+                f"matte, tracking again")
+        else:
+            for i in cached_infos:
+                _clear_matte_window(i, req_start, req_end)
+            cleared_window = (req_start, req_end)
+            kept = []
+            if span_start < req_start:
+                kept.append(f"{span_start} to {req_start}")
+            if req_end < span_end:
+                kept.append(f"{req_end} to {span_end}")
+            restart_reason = (
+                f"force: frames {req_start} to {req_end} cleared, frames "
+                f"{' and '.join(kept)} kept, tracking the cleared window "
+                f"again")
         resume_kind = "force"
-        restart_reason = "force: previous frames cleared, tracking again"
 
     if cached_infos:
         for i in cached_infos:
@@ -4087,6 +4198,13 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         out["restarted"] = resume_kind in ("restart", "force")
         out["resumed_from"] = resume_from
         out["message"] = restart_reason
+        if resume_kind == "force":
+            # Gap 24: which frames force actually threw away, as a range, and
+            # whether that was all of them. A caller reading only `restarted`
+            # cannot tell a repair of one second from a redo of the matte.
+            out["cleared_start"] = cleared_window[0]
+            out["cleared_end"] = cleared_window[1]
+            out["cleared_whole_matte"] = cleared_whole
     return out
 
 

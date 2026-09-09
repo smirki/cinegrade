@@ -677,6 +677,17 @@ class Service:
                 if state == "done":
                     matte.finish("failed", f"the model found nothing for "
                                            f"{matte.index.get('label') or matte.index.get('object_id')}")
+                elif state == "cancelled":
+                    # Tooling gap 26. This used to be `failed` as well, so a
+                    # matte whose job somebody stopped was indistinguishable
+                    # from one the tracker could not do, and a reader chased a
+                    # tracking failure that never happened. The job already
+                    # ends as `cancelled` here; the matte now says the same
+                    # word, with the job's own reason and 0 of the frames it
+                    # was asked for. `failed` keeps its meaning: it tried and
+                    # could not. A cancel that DID write frames is still
+                    # `partial` below, because there is a usable matte there.
+                    matte.finish("cancelled", error or state)
                 else:
                     matte.finish("failed", error or state)
             else:

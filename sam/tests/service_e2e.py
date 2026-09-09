@@ -483,8 +483,23 @@ def _run(tmp: Path) -> int:
               final["state"] == "cancelled" and final["done_frames"] == 0,
               f"{final['state']}, {final['done_frames']} frames")
         second_index = json.loads((Path(second["mattes"][0]["path"]) / "index.json").read_text())
-        check("and its matte is failed rather than pretending to be partial",
-              second_index["state"] == "failed", second_index["state"])
+        # Tooling gap 26: this used to require `failed`, which is what the
+        # service really wrote, and a grader reading `failed 0/N frames` on
+        # `mask list` went hunting for a tracking failure that never happened.
+        # A matte whose job was cancelled says `cancelled`; `failed` stays for
+        # a track that tried and could not, which is the distinction the whole
+        # row exists to carry. It is still not `partial`: nothing was written.
+        check("and its matte says cancelled, not failed and not partial",
+              second_index["state"] == "cancelled", second_index["state"])
+        check("with the job's own stated reason on it, and no frames written",
+              second_index["error"] == final.get("error")
+              and "cancelled" in str(second_index["error"])
+              and second_index["done_frames"] == 0,
+              f"{second_index['error']!r} against the job's "
+              f"{final.get('error')!r}, {second_index['done_frames']} frames")
+        check("and the frames it was asked for are still readable beside the "
+              "frames it managed, so a reader can say 0 of N",
+              int(second_index["frames"]) > 0, str(second_index.get("frames")))
 
         call(base, f"/jobs/{first_track['job_id']}/cancel", {}, method="POST")
         wait_for_job(base, first_track["job_id"], 30)

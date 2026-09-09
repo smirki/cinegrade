@@ -5149,9 +5149,19 @@ def _print_stats_block(label: str, row: dict) -> None:
         return
     lu, sa, ch, fam = s["luma"], s["saturation"], s["channels"], s["families"]
     cl, bd = s["clipped"], s["bands"]
-    print(f"  luma     p5 {lu['p5']:.4f}  p25 {lu['p25']:.4f}  p50 {lu['p50']:.4f}  "
-          f"p75 {lu['p75']:.4f}  p95 {lu['p95']:.4f}  mean {lu['mean']:.4f} "
-          f"({lu['mean8']:.1f}/255)")
+    luma_line = (
+        f"  luma     p5 {lu['p5']:.4f}  p25 {lu['p25']:.4f}  "
+        f"p50 {lu['p50']:.4f}  p75 {lu['p75']:.4f}  p95 {lu['p95']:.4f}  "
+        f"mean {lu['mean']:.4f} ({lu['mean8']:.1f}/255)")
+    if lu.get("std") is not None and lu.get("p5_p95") is not None:
+        # Tooling gap 25: how spread out the measured luma is, printed beside
+        # the mean and on the same basis as it, so a change that moves the
+        # detail without moving the mean is visible on this row instead of
+        # only in a picture. Guarded because an older studio's /api/stats
+        # answer does not carry them, and then this prints the line it always
+        # printed rather than dying on a missing key.
+        luma_line += f"  sd {lu['std']:.4f}  p5..p95 {lu['p5_p95']:.4f}"
+    print(luma_line)
     print(f"  sat      mean {sa['mean']:.4f}  mean(coloured) {sa['mean_coloured']:.4f}  "
           f"p95 {sa['p95']:.4f}")
     print(f"  rgb      r {ch['r']:.4f}  g {ch['g']:.4f}  b {ch['b']:.4f}")
@@ -6592,13 +6602,23 @@ def _cmd_mask_segment(a, base: str, hdr: dict) -> None:
         # read the same, and the command exited 0 either way, so a scripted
         # retry loop could not tell "found nothing" from "worked". The
         # server's own sentence is raised here, which exits 1.
+        width = out.get("frame_width")
         raise GradeError(out.get("message") or (
             f"no match for these prompts on {a.clip} at {a.time:g}s: "
-            f"0 candidates from the model"))
+            f"0 candidates from the model"
+            + (f" on a {int(width)}px frame" if width else "")))
     if a.json:
         return
-    print(f"pick {out.get('pick_id')}  "
-         f"{len(instances)} instance(s)")
+    # Tooling gap 27: the width of the frame the model was shown, on every
+    # answer. It is the studio's own working width (--mask-width /
+    # STUDIO_MASK_WIDTH), a model's scores depend on it, and two sessions
+    # comparing which candidate came back have to be comparing the same
+    # width. An older studio that does not report it prints the line it
+    # always printed.
+    head = f"pick {out.get('pick_id')}  {len(instances)} instance(s)"
+    if out.get("frame_width"):
+        head += f"  on a {int(out['frame_width'])}px frame"
+    print(head)
     for inst in out.get("instances") or []:
         box = inst.get("box")
         box_s = " ".join(f"{v:.3f}" for v in box) if box else "?"
@@ -6689,6 +6709,16 @@ def _cmd_mask_track(a, base: str, hdr: dict) -> None:
                 "cached" if queued.get("cached") else "queued")
         print(f"  frames    {queued['start_frame']} to "
              f"{queued.get('end_frame')}  ({kind})")
+    if queued.get("cleared_start") is not None:
+        # Tooling gap 24: what `--force` threw away, which is no longer
+        # always the whole matte. The two numbers on the `frames` line above
+        # are the window being tracked now; these are the frames that were
+        # deleted to make room for it, and the words say whether anything
+        # outside them survived.
+        scope = ("the whole matte" if queued.get("cleared_whole_matte")
+                 else "inside the matte, frames outside this range kept")
+        print(f"  cleared   frames {queued['cleared_start']} to "
+             f"{queued['cleared_end']}  ({scope})")
     for m in queued.get("mattes") or out.get("mattes") or []:
         print(f"  matte {m.get('matte_id')}  state={m.get('state')}")
 
@@ -7837,8 +7867,13 @@ def main():
                           "progress lines to stderr the way render does, "
                           "and exit non zero if the job fails")
     mtr.add_argument("--force", action="store_true",
-                     help="throw the cached matte away and track this "
-                          "recipe from scratch. Without it an identical "
+                     help="clear the frames this request asks for and track "
+                          "them again. With --start/--end inside what the "
+                          "matte already covers only those frames are "
+                          "cleared and the rest are kept; over the matte's "
+                          "whole span it clears the matte. The answer names "
+                          "the range that was cleared either way. Without it "
+                          "an identical "
                           "repeat request is free while the cached matte "
                           "still covers the window asked for, RESUMES "
                           "(re-queues only the missing frames, keeping the "

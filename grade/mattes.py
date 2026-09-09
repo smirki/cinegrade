@@ -61,7 +61,12 @@ INDEX_NAME = "index.json"
 
 # The states a matte can be in (C2 / section 2 rule 3 of the plan). Kept as a
 # tuple so a caller can validate rather than guess at spellings.
-STATES = ("queued", "running", "done", "failed", "stale", "partial")
+# `cancelled` is a matte whose job somebody stopped before it wrote anything
+# (tooling gap 26): distinct from `failed`, which is a track that tried and
+# could not, and from `partial`, which is a cancel that did leave usable
+# frames behind. The service writes it (`sam/server.py`, `_end_job`).
+STATES = ("queued", "running", "done", "failed", "stale", "partial",
+          "cancelled")
 
 # What a matte id may look like, stated ONCE, for every place an id enters a
 # process: a URL segment on the studio's matte routes, a --matte argument on
@@ -339,8 +344,12 @@ class MatteInfo:
         the service knows it is not finished, and a short frame list says so
         whatever the state field claims (a job killed between the last frame
         and the index rewrite leaves `running` on disk forever).
+
+        `cancelled` is in the list for the same reason `failed` is: whatever
+        it has on disk, nothing is coming to finish it (tooling gap 26).
         """
-        if self.state in ("queued", "running", "partial", "failed", "stale"):
+        if self.state in ("queued", "running", "partial", "failed", "stale",
+                          "cancelled"):
             return True
         total = self.total_frames
         return total > 0 and self.written_count < total

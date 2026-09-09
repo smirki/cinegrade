@@ -493,6 +493,16 @@ class Studio:
         `overlay`/`mask` yourself (`self.request("GET", url, want_json=False)`,
         joining onto `self.base` if the url is server relative) if you want
         the actual images, the same way `mask segment -o DIR` does.
+
+        The answer also carries `frame_width` and `frame_height`: the frame
+        the model was actually shown, which is the studio's own working width
+        (`--mask-width` / `STUDIO_MASK_WIDTH`, default 1280) and not something
+        this call chooses. Candidate scores depend on it, so two sessions
+        comparing which instance came back for the same words are only
+        comparing like with like when the widths match, and `candidates: 0`
+        with an unexpected width there is a different thing from a model that
+        looked and found nothing (tooling gap 27). `--quiet` on the service
+        hints a width; it does not set this one.
         """
         p = dict(prompts) if prompts is not None else {}
         if text is not None:
@@ -754,9 +764,14 @@ def _measurement(stats: dict) -> dict:
 
 
 def brief(stats: dict, clip: str | None = None) -> str:
-    """The one line p5 p25 p50 p75 p95 sat r g b [clip] summary: what an
-    agent prints after every measurement instead of dumping the whole
-    dict."""
+    """The one line p5 p25 p50 p75 p95 sd p5..p95 sat r g b [clip] summary:
+    what an agent prints after every measurement instead of dumping the whole
+    dict.
+
+    `sd` and `p5_p95` are the luma spread of whatever was measured, the mask
+    when the call carried one (tooling gap 25). A server too old to send them
+    prints `n/a` in their place, the same as every other missing figure
+    here."""
     m = _measurement(stats)
     luma = m.get("luma") or {}
     sat = m.get("saturation") or {}
@@ -767,7 +782,9 @@ def brief(stats: dict, clip: str | None = None) -> str:
         return f"{v:.4f}" if isinstance(v, (int, float)) else "n/a"
 
     line = (f"p5={g(luma, 'p5')} p25={g(luma, 'p25')} p50={g(luma, 'p50')} "
-            f"p75={g(luma, 'p75')} p95={g(luma, 'p95')} sat={g(sat, 'mean')} "
+            f"p75={g(luma, 'p75')} p95={g(luma, 'p95')} "
+            f"sd={g(luma, 'std')} p5_p95={g(luma, 'p5_p95')} "
+            f"sat={g(sat, 'mean')} "
             f"r={g(ch, 'r')} g={g(ch, 'g')} b={g(ch, 'b')}")
     if clip:
         line += f" clip={clip}"

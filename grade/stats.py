@@ -130,6 +130,28 @@ def _wmean(values: np.ndarray, weight: np.ndarray | None) -> float:
     return float(np.sum(values.astype(np.float64) * weight) / total)
 
 
+def _wstd(values: np.ndarray, weight: np.ndarray | None, mean: float) -> float:
+    """The standard deviation of `values` about `mean`, weighted by `weight`.
+
+    Population form (divided by the total weight, not by one less than it),
+    which is what `np.std` returns on an unweighted array, so an all-ones
+    weight and no weight at all report the same number instead of two that
+    differ by a factor nobody can see. Zero total weight reads as 0.0, the
+    same "empty selection reads as zero" rule `_wmean` follows; a caller
+    measuring through a matte that covers nothing never reaches here anyway
+    (`frame_stats` answers that with `no_coverage`, gap 23).
+    """
+    if values.size == 0:
+        return 0.0
+    if weight is None:
+        return float(values.std())
+    total = float(weight.sum())
+    if total <= 0:
+        return 0.0
+    d = values.astype(np.float64) - float(mean)
+    return float(np.sqrt(float(np.sum(weight * d * d)) / total))
+
+
 def _wsum_pct(selected: np.ndarray, weight: np.ndarray | None, total) -> float:
     """The share of `total` (pixel count, or total weight) that falls in a
     boolean selection, as a percentage: `sum(weight[selected]) / total * 100`
@@ -179,6 +201,13 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     not comparable on this number. An UNWEIGHTED call is byte for byte
     what it always was: neither key appears, because neither means anything
     without a mask.
+
+    `luma` carries two spread figures beside its mean (tooling gap 25):
+    `std`, the standard deviation of the measured luma, and `p5_p95`, the
+    distance from `p5` to `p95`. Both are on the same basis as the mean, so
+    a weighted call reports the spread INSIDE the mask and an unweighted one
+    the spread of the frame. `min` and `max` are the extremes of the measured
+    pixels as well; weighted, they used to be the whole frame's.
     """
     a = rgb.astype(np.float32) / 255.0
     r, g, b = a[..., 0], a[..., 1], a[..., 2]
@@ -235,13 +264,33 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     clipped_black = _wsum_pct(raw.max(-1) <= CLIP_BLACK, w, total)
     clipped_white = _wsum_pct(raw.min(-1) >= CLIP_WHITE, w, total)
 
+    y_mean = _wmean(y, w)
+    # The extremes of what was MEASURED, which under a weight is the pixels
+    # the weight selects and not the whole frame: a mask on a face in a frame
+    # with black bars used to report min 0.0, a number from outside the mask,
+    # in a block where every other figure was weighted. Found while adding
+    # the two spread figures below, which would otherwise disagree with the
+    # min and max sitting next to them.
+    y_sel = y if w is None else y[w > 0]
+    if y_sel.size == 0:                     # w.sum() > 0 with every w <= 0
+        y_sel = y
     out = {
         "luma": {
             "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),
             "p75": round(p75, 4), "p95": round(p95, 4),
-            "mean": round(_wmean(y, w), 4),
-            "mean8": round(_wmean(y, w) * 255.0, 1),
-            "min": round(float(y.min()), 4), "max": round(float(y.max()), 4),
+            "mean": round(y_mean, 4),
+            "mean8": round(y_mean * 255.0, 1),
+            # Tooling gap 25. Two figures for how spread out the luma inside
+            # the measurement is, on the same basis as the mean beside them:
+            # `std` over every measured pixel, `p5_p95` the distance between
+            # the two percentiles already in this block. A mean can sit still
+            # while both of these collapse (a contrast reduction pulls every
+            # pixel toward the pivot), which is the case that read as "no
+            # change" on a stats row that carried the mean alone.
+            "std": round(_wstd(y, w, y_mean), 4),
+            "p5_p95": round(p95 - p5, 4),
+            "min": round(float(y_sel.min()), 4),
+            "max": round(float(y_sel.max()), 4),
         },
         "saturation": {
             "mean": round(_wmean(sat, w), 4),

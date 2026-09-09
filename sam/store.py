@@ -224,9 +224,13 @@ class MatteWriter:
     def _carry_forward(self, previous: dict, frames: int) -> None:
         """A resume keeps what the earlier attempt already produced.
 
-        Only when the earlier index agrees about how long the matte is
-        (`frames`): a different length means a different track, and merging
-        two of those by index would put one attempt's numbers at another's
+        Two shapes count as the same track. The earlier index agrees about
+        how long the matte is (`frames`), which is a re-queue of the same
+        window; or the window THIS run was asked for sits inside the window
+        the earlier index declares (`_inside_previous`), which is a re-track
+        of one part of a longer matte, and then the matte keeps the LONGER
+        declaration. Any other length is a different track, and merging two
+        of those by index would put one attempt's numbers at another's
         timestamps. `done_frames` is recounted off the directory, because
         that is the only number that survives a process dying.
         """
@@ -235,12 +239,32 @@ class MatteWriter:
         # really there and a resumed range that overwrites a frame does not
         # count it twice.
         self._written: set[int] = set()
-        if not previous or int(previous.get("frames") or 0) != int(frames):
+        if not previous:
             return
+        length = int(frames)
+        declared = int(previous.get("frames") or 0)
+        if declared != length:
+            # Tooling gap 24: a repair of one second of a twelve second matte
+            # arrives here declaring the repair window, and this used to read
+            # as "a different track": the arrays were blanked, `done` restarted
+            # at 0 with every kept frame still on disk, and the matte's own
+            # span shrank to the repair. It keeps its own span instead, and
+            # this run writes into the middle of it. Only INSIDE, never wider:
+            # a longer window is a widen, whose own re-track covers everything
+            # from the first missing frame to the new end anyway.
+            if not self._inside_previous(previous):
+                return
+            length = declared
+            self.index["frames"] = declared
+            self.index["end_frame"] = max(
+                int(self.index.get("end_frame") or 0),
+                int(previous.get("end_frame") or declared))
+            for key in ("areas", "scores", "ious"):
+                self.index[key] = [None] * declared
         for key in ("areas", "scores", "ious"):
             old = previous.get(key)
-            if isinstance(old, list) and len(old) == frames:
-                merged = list(self.index.get(key) or [None] * frames)
+            if isinstance(old, list) and len(old) == length:
+                merged = list(self.index.get(key) or [None] * length)
                 for i, value in enumerate(old):
                     if value is not None and merged[i] is None:
                         merged[i] = value
@@ -255,6 +279,35 @@ class MatteWriter:
         except OSError:
             self._written = set()
         self.done = len(self._written)
+
+    def _inside_previous(self, previous: dict) -> bool:
+        """True when this run's window sits inside the window `previous`
+        declares, so the two are the same matte and this run is a repair of
+        part of it (tooling gap 24).
+
+        Read off the two indexes' own `start_frame`/`end_frame`, plus the
+        three fields that say which PICTURE a matte is of: a matte tracked for
+        another clip, another rotation or another working width is not this
+        one whatever its frame numbers say, and merging its numbers in by
+        index would be the worst kind of wrong answer. The equal length case
+        above does not ask (it never did), because an id is only re-opened by
+        a caller naming it, and the studio judges a mismatched recipe as
+        `stale` and re-tracks it before this store is asked at all.
+        """
+        for key in ("clip_key", "rotation", "width"):
+            if key in previous and str(previous.get(key)) != \
+                    str(self.index.get(key)):
+                return False
+        try:
+            prev_start = int(previous.get("start_frame") or 0)
+            prev_end = int(previous.get("end_frame")
+                           or previous.get("frames") or 0)
+            start = int(self.index.get("start_frame") or 0)
+            end = int(self.index.get("end_frame")
+                      or self.index.get("frames") or 0)
+        except (TypeError, ValueError):
+            return False
+        return prev_end > prev_start and prev_start <= start and end <= prev_end
 
     # -- state -------------------------------------------------------------
 

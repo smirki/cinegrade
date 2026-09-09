@@ -64,7 +64,10 @@ NOTES: list[str] = []
 # Round 2: 257 -> 272, the exact live count after the ownership cases for
 # findings 51 and 6 (preset and sweep), the hostile pick id block for finding
 # 69, and the readable-key-on-another-clip case for finding 71.
-EXPECTED_CHECKS = 272
+# Round 4 tooling: 272 -> 289, the live count after the cancelled-not-failed
+# rows for gap 26, the cleared-window checks for gap 24 and the frame width
+# checks for gap 27.
+EXPECTED_CHECKS = 289
 
 
 def ok(label: str, cond: bool, detail: str = "") -> None:
@@ -875,6 +878,28 @@ def test_mask_gaps(base: str) -> None:
     ok("segment with no matches: --json still exits non zero",
        r_j.returncode != 0)
 
+    # -- gap 27: which frame the model was shown ---------------------------
+    # A grader's 0 candidates for words another session had picked with was
+    # not the words: that studio ran at --mask-width 720 and the other at the
+    # 1280 default, and the model's confidence for those words fell under its
+    # own cutoff at the smaller size. Nothing printed said which frame the
+    # model saw, so the two sessions had no number to compare. Now both the
+    # empty answer and a successful pick name it.
+    ok("segment with no matches: the sentence names the frame width, so a "
+       "width mismatch is tellable from a model miss",
+       f"0 candidates from the model on a {FAKE.MASK_FRAME_WIDTH}px frame"
+       in r.stderr, r.stderr[:400])
+    ok("segment with no matches: --json carries the width as a field",
+       json.loads(r_j.stdout or "{}").get("frame_width")
+       == FAKE.MASK_FRAME_WIDTH, r_j.stdout[:200])
+    r_w = run_cli(["mask", "segment", "C015.mov", "--time", "1.0",
+                  "--text", "person"], env=env)
+    ok("segment that found something: exit 0", r_w.returncode == 0,
+       r_w.stderr[-300:])
+    ok("segment that found something: names the frame width too, so two "
+       "sessions comparing picks can compare widths",
+       f"on a {FAKE.MASK_FRAME_WIDTH}px frame" in r_w.stdout, r_w.stdout[:300])
+
     # -- gap 12: the same request again ------------------------------------
     r1 = run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
                  "--wait", "--json"], env=env)
@@ -909,6 +934,42 @@ def test_mask_gaps(base: str) -> None:
     ok("track --force: keeps the same matte id (same recipe, redone)",
        (forced.get("mattes") or [{}])[0].get("matte_id") == cached_matte,
        forced)
+
+    # -- tooling gap 24: what --force cleared ------------------------------
+    # The grader forced frames 173 to 197 of a matte done over 0 to 288 to
+    # repair one second of it, and got back "force: previous frames cleared,
+    # tracking again" beside the numbers 173 and 197. That reads as "those
+    # frames were cleared"; what had happened was the whole matte going, and
+    # the 264 verified frames outside the repair window with it. The answer
+    # now names the range that went and whether it was all of it, on both the
+    # JSON path and the printed one.
+    ok("track --force over the whole clip: says it cleared the whole matte",
+       forced.get("cleared_whole_matte") is True, forced)
+    ok("track --force over the whole clip: names the range it cleared",
+       (forced.get("cleared_start"), forced.get("cleared_end"))
+       == (0, FAKE.CLIP_FRAMES), forced)
+    lo_t, hi_t = 2 / FAKE.MATTE_FPS, 4 / FAKE.MATTE_FPS
+    r_nf = run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
+                   "--start", f"{lo_t:.6f}", "--end", f"{hi_t:.6f}",
+                   "--force", "--json"], env=env)
+    narrow = json.loads(r_nf.stdout) if r_nf.returncode == 0 else {}
+    ok("track --force on a window inside the matte: exit 0",
+       r_nf.returncode == 0, r_nf.stderr[-300:])
+    ok("track --force on a window inside the matte: clears that window only",
+       (narrow.get("cleared_start"), narrow.get("cleared_end"),
+        narrow.get("cleared_whole_matte")) == (2, 4, False), narrow)
+    ok("and it queues that window only, so the frames outside it are kept "
+       "rather than tracked again",
+       (narrow.get("start_frame"), narrow.get("end_frame")) == (2, 4), narrow)
+    ok("and the message says which frames went and which stayed",
+       "frames 2 to 4 cleared" in str(narrow.get("message"))
+       and "kept" in str(narrow.get("message")), narrow.get("message"))
+    r_nfp = run_cli(["mask", "track", "C015.mov", "--text", "cache-probe",
+                    "--start", f"{lo_t:.6f}", "--end", f"{hi_t:.6f}",
+                    "--force"], env=env)
+    ok("and the printed answer names the cleared range too, not just --json",
+       "cleared" in r_nfp.stdout and "frames 2 to 4" in r_nfp.stdout,
+       r_nfp.stdout[:400])
 
     # -- round 1 finding 40: rotation is part of the cache key -------------
     # Design rule 5 keys a track by clip identity, rotation, working width and
@@ -1083,6 +1144,35 @@ def test_mask_gaps(base: str) -> None:
        r12.stdout[:400])
     ok("list (text): says every matte is frozen outside its span",
        "frozen outside its span" in r12.stdout, r12.stdout[-300:])
+
+    # -- gap 26: a cancelled matte is not a failed one ---------------------
+    # The grader cancelled a track before it started and read
+    # `state=failed 0/N frames` off this command, then went looking for a
+    # tracking failure that had never happened. `CANCELLED_CLIP` is the fake's
+    # hook for the row the real service now writes for that case; FAIL_CLIP
+    # beside it is the row that really did fail, so the two are compared
+    # rather than one being read on its own.
+    run_cli(["mask", "track", "CANCELLED_CLIP", "--text", "stopped-early"],
+            env=env)
+    for flag in ([], ["--full"]):
+        r_c = run_cli(["mask", "list", "CANCELLED_CLIP"] + flag, env=env)
+        label = "list --full" if flag else "list"
+        ok(f"{label} (text): a cancelled matte says cancelled, not failed",
+           "state=cancelled" in r_c.stdout and "state=failed" not in r_c.stdout,
+           r_c.stdout[:400])
+        ok(f"{label} (text): with the frames it managed out of the frames it "
+           f"was asked for",
+           f"0/{FAKE.CLIP_FRAMES} frames" in r_c.stdout, r_c.stdout[:400])
+    r_cj = run_cli(["mask", "list", "CANCELLED_CLIP", "--json"], env=env)
+    c_row = (json.loads(r_cj.stdout or "{}").get("mattes") or [{}])[0]
+    ok("list --json: the state on the wire is cancelled too",
+       c_row.get("state") == "cancelled", c_row.get("state"))
+    run_cli(["mask", "track", "FAIL_CLIP", "--text", "really-failed"], env=env)
+    r_f = run_cli(["mask", "list", "FAIL_CLIP"], env=env)
+    ok("list (text): a matte that really failed still says failed, so the two "
+       "outcomes are told apart",
+       "state=failed" in r_f.stdout and "state=cancelled" not in r_f.stdout,
+       r_f.stdout[:400])
 
 
 # --------------------------------------------------------------------------

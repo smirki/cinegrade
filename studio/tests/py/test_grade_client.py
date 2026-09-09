@@ -177,6 +177,25 @@ class BriefBandsDiff(unittest.TestCase):
                      "g=", "b="):
             self.assertIn(token, line)
 
+    def test_brief_carries_the_luma_spread_beside_the_percentiles(self):
+        """Tooling gap 25: the detail figures, on the row every agent prints.
+
+        A contrast reduction pulls every pixel toward the pivot, so the mean
+        can sit still while the spread collapses. Before this the line carried
+        the percentiles and the mean, and a reader comparing before with after
+        had no number for how much internal variation was left.
+        """
+        s = dict(self.STATS)
+        s["luma"] = dict(self.STATS["luma"], std=0.1837, p5_p95=0.83)
+        line = brief(s)
+        self.assertIn("sd=0.1837", line)
+        self.assertIn("p5_p95=0.8300", line)
+        self.assertNotIn("\n", line)
+        # A server too old to send them says so in the same words every other
+        # missing figure uses, rather than making this call raise.
+        self.assertIn("sd=n/a", brief(self.STATS))
+        self.assertIn("p5_p95=n/a", brief(self.STATS))
+
     def test_brief_appends_the_clip_name_when_given(self):
         self.assertIn("clip=A001.MOV", brief(self.STATS, clip="A001.MOV"))
         self.assertNotIn("clip=", brief(self.STATS))

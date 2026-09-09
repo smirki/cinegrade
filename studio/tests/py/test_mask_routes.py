@@ -200,6 +200,14 @@ class _FakeSamState:
         # at all, let alone in the key.
         self.last_track_width = None
         self.last_track_rotation = None
+        # The frame window the last /track asked for, so a test can prove what
+        # was actually re-queued rather than inferring it from what landed
+        # (tooling gap 24: a narrow `--force` must ask for the narrow window).
+        self.last_track_window = None
+        # The frame file the last /segment was handed, so a test can measure
+        # what the model was really shown rather than trusting the number the
+        # answer reports about itself (tooling gap 27).
+        self.last_segment_image = None
 
     def release_gates(self) -> None:
         """Let every held track run to the end (called from the test)."""
@@ -264,6 +272,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             with self.state.lock:
                 self.state.segment_calls += 1
+                self.state.last_segment_image = body.get("image")
             prompts = body.get("prompts") or {}
             texts = prompts.get("text") or []
             if any(str(t).startswith("__none__") for t in texts):
@@ -386,6 +395,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                 self.state.last_matte_ids = dict(resume_ids)
                 self.state.last_track_width = body.get("width")
                 self.state.last_track_rotation = body.get("rotation")
+                self.state.last_track_window = (start, end)
             for m in mattes:
                 override = resume_ids.get(str(m.get("object_id")))
                 if override:
@@ -413,7 +423,10 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                 if any(str(t).startswith(f"__{mark}__") for t in texts):
                     kind = mark
                     break
-            hold = "hold" in texts
+            # "hold" waits after HOLD_AFTER frames; "hold0" waits before the
+            # first one, so a cancel can land on a track with nothing written.
+            hold_at_zero = "hold0" in texts
+            hold = "hold" in texts or hold_at_zero
             job_id = f"job{len(self.state.jobs) + 1}"
             for m in mattes:
                 m["path"] = str(out_dir / m["matte_id"])
@@ -439,7 +452,8 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                         self.state.gates[job_id] = gate
                 threading.Thread(target=_run_slow_track, args=(
                     self.state, job_id, out_dir, mattes, total, common, start,
-                    kind, gate), daemon=True).start()
+                    kind, gate, HOLD_AT_ZERO if hold_at_zero else HOLD_AFTER),
+                    daemon=True).start()
             else:
                 for m in mattes:
                     mid = m["matte_id"]
@@ -498,10 +512,16 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                                               state="partial",
                                               done_frames=job["done_frames"])
                         else:
-                            job["matte_state"][mid] = "failed"
+                            # Tooling gap 26, and this is the C3 shape the
+                            # real service writes (sam/server.py `_end_job`):
+                            # a cancel with nothing on disk is `cancelled`,
+                            # which is not `failed` (it tried and could not)
+                            # and not `partial` (there is something usable).
+                            job["matte_state"][mid] = "cancelled"
                             job["matte_error"][mid] = "cancelled"
                             _fake_index_write(Path(m["path"]), matte_id=mid,
-                                              state="failed", error="cancelled")
+                                              state="cancelled",
+                                              error="cancelled")
             # A held writer is waiting on its gate; wake it so it notices the
             # cancel now rather than at the end of its bounded wait.
             if gate is not None:
@@ -517,6 +537,34 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
 DRIFT_LOST = 2                 # the subject is gone: nothing tracked at all
 DRIFT_ELSEWHERE = 4            # the same size, somewhere else entirely
 DRIFT_LATCH = 6                # the whole frame: latched onto the background
+
+
+def _jpeg_size(path) -> tuple:
+    """(width, height) read from a JPEG's own SOF marker.
+
+    Tooling gap 27 needs the size of the frame the SAM service was actually
+    handed, and this venv has no image decoder guaranteed to be importable
+    here, so the two numbers come off the file's own header: 0xFFC0..0xFFCF
+    (bar the four that are not start of frame markers) carries height then
+    width as big endian 16 bit values after a one byte precision field.
+    """
+    data = Path(str(path)).read_bytes()
+    i = 2                                        # past the SOI marker
+    while i < len(data) - 9:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9,
+                      0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            h = int.from_bytes(data[i + 5:i + 7], "big")
+            w = int.from_bytes(data[i + 7:i + 9], "big")
+            return w, h
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            i += 2                               # markers with no payload
+            continue
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    raise AssertionError(f"no start of frame marker in {path}")
 
 
 def _fake_mask(w: int, h: int, index: int, kind: str = "normal"):
@@ -684,6 +732,14 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
         raw = json.loads(p.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         raw = {}
+    declared = raw.get("frames")
+    incoming = fields.get("frames")
+    if declared is not None and incoming is not None \
+            and int(declared) > int(incoming):
+        # sam/store.py's tooling gap 24 rule, mirrored: a re-track of a window
+        # INSIDE a longer matte keeps the matte's own declared length, so the
+        # span a caller already read does not shrink to the repair window.
+        fields = dict(fields, frames=int(declared))
     raw.update({k: v for k, v in fields.items() if v is not None})
     raw.setdefault("created", time.time())
     tmp = p.with_suffix(".tmp")
@@ -693,19 +749,26 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
 
 HOLD_AFTER = 2                 # frames a held track writes before it waits
 HOLD_TIMEOUT = 30.0            # and how long it waits before giving up
+# A track whose prompts carry "hold0" waits before writing ANY frame, so a
+# test can cancel a track that has not started without racing the writer
+# (tooling gap 26: a cancel with nothing on disk is its own outcome).
+HOLD_AT_ZERO = 0
 
 
 def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
                     mattes: list, total: int, common: dict,
                     start: int = 0, kind: str = "normal",
-                    gate: threading.Event | None = None) -> None:
+                    gate: threading.Event | None = None,
+                    hold_after: int = HOLD_AFTER) -> None:
     """The timed writer: one frame every half second, cancellable.
 
     `gate` (a track whose prompts carry the word "hold") stops after
-    `HOLD_AFTER` frames and waits, so a test can cancel a track at a KNOWN
+    `hold_after` frames and waits, so a test can cancel a track at a KNOWN
     number of written frames instead of racing it. The wait is bounded and a
     gate that is never released ends the thread rather than leaving it writing
-    into a matte a later test reads.
+    into a matte a later test reads. `hold_after` is `HOLD_AT_ZERO` for a
+    track that must hold before its first frame ("hold0"), which is the only
+    way to cancel a track that has written nothing without racing it.
     """
     for m in mattes:
         _fake_index_write(Path(m["path"]), matte_id=m["matte_id"], state="running")
@@ -714,6 +777,16 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
             job = state.jobs.get(job_id)
             if job is None or job["state"] == "cancelled":
                 return
+        # Read BEFORE this frame is written, so `hold_after` frames are on
+        # disk when the wait starts whichever number it is, zero included.
+        if gate is not None and i >= hold_after:
+            if not gate.wait(timeout=HOLD_TIMEOUT):
+                return                      # nobody released it: write no more
+            gate = None                     # released: normal pace from here
+            with state.lock:
+                job = state.jobs.get(job_id)
+                if job is None or job["state"] == "cancelled":
+                    return
         for m in mattes:
             d = Path(m["path"])
             _write_frame(state, d, start + i,
@@ -726,11 +799,6 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
             if job is None:
                 return
             job["done_frames"] = i + 1
-        if gate is not None and (i + 1) >= HOLD_AFTER:
-            if not gate.wait(timeout=HOLD_TIMEOUT):
-                return                      # nobody released it: write no more
-            gate = None                     # released: normal pace from here
-            continue
         time.sleep(0.5)
     with state.lock:
         job = state.jobs.get(job_id)
@@ -889,6 +957,41 @@ class MaskRoutesTest(unittest.TestCase):
     def _get_raw(self, url):
         with urllib.request.urlopen(url, timeout=30) as r:
             return r.read(), dict(r.headers)
+
+    def test_segment_names_the_width_of_the_frame_it_showed_the_model(self):
+        """Tooling gap 27: the same words, two widths, two different asks.
+
+        A grader's `mask segment` returned 0 candidates for a phrase a
+        previous session had picked with, and the phrase was not the
+        difference: that studio was started with `--mask-width 720` and the
+        other ran the 1280 default, and the model's own confidence for those
+        words fell below its internal cutoff at the smaller size. Nothing in
+        the answer said which frame the model had been shown, so the two
+        sessions had no number to compare and the investigation took a day.
+
+        The answer now carries the width and height of the frame that was
+        actually served, read off the frame rather than off the setting, so
+        the two cannot disagree. This measures the JPEG the fake service was
+        handed: the number in the response has to be the number in the file.
+        """
+        out = self._segment(prompts={"text": ["two"]})
+        served = self.sam_state.last_segment_image
+        self.assertTrue(served and Path(served).is_file(),
+                        f"the fake service was handed no frame: {served!r}")
+        width, height = _jpeg_size(served)
+        self.assertEqual((out["frame_width"], out["frame_height"]),
+                         (width, height),
+                         "the reported size is not the served frame's size")
+        # Reported on a normal answer too, not only an empty one: comparing
+        # two sessions' picks means comparing the widths they picked at, and
+        # a session that found something still has to be comparable.
+        self.assertGreater(out["candidates"], 0)
+        # And it is the width this studio runs masks at, which is what
+        # /api/mask/status reports as `mask_width` (the same setting
+        # --mask-width and STUDIO_MASK_WIDTH carry), unless the source itself
+        # is narrower than that, in which case the frame is what there was.
+        status = _get(self.base + "/mask/status")
+        self.assertLessEqual(out["frame_width"], int(status["mask_width"]))
 
     def test_segment_with_no_prompt_is_refused(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
@@ -1075,6 +1178,14 @@ class MaskRoutesTest(unittest.TestCase):
         self.assertEqual(out["candidates"], 0)
         self.assertIn("no match for", out["message"])
         self.assertIn("__none__ghost", out["message"])
+        # Tooling gap 27: and which frame the model was looking at when it
+        # found nothing, so "the words meant nothing to the model" can be
+        # told apart from "the model was shown a smaller frame than the
+        # session this is being compared with".
+        width, _height = _jpeg_size(self.sam_state.last_segment_image)
+        self.assertEqual(out["frame_width"], width)
+        self.assertIn(f"0 candidates from the model on a {width}px frame",
+                      out["message"])
         # the service's own warning is passed through, not swallowed
         self.assertTrue(any("matched nothing" in w
                             for w in out.get("warnings") or []))
@@ -1661,6 +1772,197 @@ class MaskRoutesTest(unittest.TestCase):
                              "curve for the head of the clip")
         self.assertIsNotNone(full["areas"][declared_end - 1])
         self.assertEqual(full["quality"]["iou_source"], "index")
+
+    def _matte_dir(self, matte_id: str) -> Path:
+        """The one directory on disk this matte's frames live in."""
+        matches = sorted(self._matte_root().rglob(f"{matte_id}/{MT.INDEX_NAME}"))
+        self.assertEqual(len(matches), 1, f"expected one {matte_id} on disk")
+        return matches[0].parent
+
+    def _frame_mtimes(self, matte_id: str) -> dict:
+        return {p.name: p.stat().st_mtime_ns
+                for p in self._matte_dir(matte_id).glob("*.png")}
+
+    def test_force_on_a_window_inside_the_matte_clears_only_that_window(self):
+        """Tooling gap 24: `--force` narrower than the matte deleted all of it.
+
+        The grader had a matte done over frames 0 to 288 and forced frames 173
+        to 197 to repair one second of it. The answer named 173 and 197, which
+        reads as "that window was cleared", and afterwards the matte declared
+        197 frames over 7.21s to 8.21s with 24 PNGs in its folder: the other
+        264 verified frames were gone, and the repair cost a full re-track.
+
+        A force whose window covers the whole matte still throws it all away
+        (the test below this one), because that is what it is for. This one is
+        the narrower ask: clear the window, keep everything outside it, and
+        say which frames went.
+        """
+        prompts = {"text": ["narrow force subject"]}
+        first = self._track(prompts=prompts, start=0, end=0.5)
+        matte_id = first["mattes"][0]["matte_id"]
+        declared_end = first["end_frame"]
+        done = self._wait_written(matte_id, declared_end)
+        self.assertEqual(done["written_count"], declared_end)
+        self.assertEqual(done["state"], "done")
+        fps = float(done["fps"])
+        self.assertGreater(declared_end, 5,
+                           "the window has to be longer than the repair, or "
+                           "this is the whole matte force test")
+        lo, hi = 2, 4                      # the repair window, in frames
+        before = self._frame_mtimes(matte_id)
+        self.assertEqual(len(before), declared_end)
+        calls = self.sam_state.track_calls
+
+        forced = self._track(prompts=prompts, start=lo / fps, end=hi / fps,
+                            force=True)
+        self.assertFalse(forced["cached"])
+        self.assertTrue(forced["restarted"])
+        self.assertEqual(self.sam_state.track_calls, calls + 1)
+        self.assertEqual(forced["mattes"][0]["matte_id"], matte_id,
+                         "a force writes back into the same matte")
+        # What was cleared, as a frame range, which is the thing the old
+        # message did not say: "previous frames cleared" was true of the whole
+        # matte while the two numbers beside it named the window.
+        self.assertEqual((forced["cleared_start"], forced["cleared_end"]),
+                         (lo, hi))
+        self.assertFalse(forced["cleared_whole_matte"])
+        self.assertIn(f"frames {lo} to {hi} cleared", forced["message"])
+        self.assertEqual((forced["start_frame"], forced["end_frame"]), (lo, hi))
+        # And the wire call asked for that window and nothing else: this is
+        # the difference between "the rest survived" and "the rest was tracked
+        # again", which cost the grader the whole span.
+        self.assertEqual(self.sam_state.last_track_window, (lo, hi))
+        self.assertEqual(self.sam_state.last_matte_ids.get("0"), matte_id)
+
+        after_info = self._wait_written(matte_id, declared_end)
+        self.assertEqual(after_info["total_frames"], declared_end,
+                         "the matte still declares the span it was tracked "
+                         "over: this is the number that read 197 of 288")
+        self.assertEqual(after_info["written_count"], declared_end,
+                         "and every frame is on disk again")
+        self.assertEqual(after_info["span"],
+                         dict(after_info["span"], start_frame=0,
+                              end_frame=declared_end, contiguous=True))
+        after = self._frame_mtimes(matte_id)
+        self.assertEqual(sorted(after), sorted(before))
+        for name, was in before.items():
+            index = int(Path(name).stem)
+            if lo <= index < hi:
+                self.assertNotEqual(after[name], was,
+                                    f"frame {index} is inside the forced "
+                                    f"window and was not written again")
+            else:
+                self.assertEqual(after[name], was,
+                                 f"frame {index} is outside the forced window "
+                                 f"and must not have been touched")
+        full = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(len(full["areas"]), declared_end)
+        self.assertTrue(all(a is not None for a in full["areas"]),
+                        f"every frame has a number again: {full['areas']}")
+
+    def test_force_over_the_whole_matte_still_throws_all_of_it_away(self):
+        """The other half of gap 24: today's behaviour, kept.
+
+        `--force` over the span the matte already covers is the documented
+        escape hatch for "this matte is wrong, do it again". It deletes the
+        frames, which is why every frame file is newer afterwards, and it says
+        so with the same frame range the narrow case reports.
+        """
+        prompts = {"text": ["whole force subject"]}
+        first = self._track(prompts=prompts, start=0, end=0.5)
+        matte_id = first["mattes"][0]["matte_id"]
+        declared_end = first["end_frame"]
+        self._wait_written(matte_id, declared_end)
+        before = self._frame_mtimes(matte_id)
+
+        forced = self._track(prompts=prompts, start=0, end=0.5, force=True)
+        self.assertTrue(forced["restarted"])
+        self.assertTrue(forced["cleared_whole_matte"])
+        self.assertEqual((forced["cleared_start"], forced["cleared_end"]),
+                         (0, declared_end))
+        self.assertIn("the whole matte", forced["message"])
+        self.assertEqual((forced["start_frame"], forced["end_frame"]),
+                         (0, declared_end))
+        after_info = self._wait_written(matte_id, declared_end)
+        self.assertEqual(after_info["total_frames"], declared_end)
+        after = self._frame_mtimes(matte_id)
+        self.assertEqual(sorted(after), sorted(before))
+        for name, was in before.items():
+            self.assertNotEqual(after[name], was,
+                                f"{name} survived a force over the whole span")
+
+    def test_a_job_cancelled_before_it_wrote_anything_reads_cancelled(self):
+        """Tooling gap 26: a cancelled track used to read as a failed one.
+
+        The grader cancelled a track before it started and `mask list` showed
+        `state=failed 0/N frames`, so the next reader went looking for a
+        tracking failure that had never happened. Two halves, and both are
+        here because either one alone still prints `failed`:
+
+        * the service ends such a matte as `cancelled` (its own suite pins
+          that: `sam/tests/service_e2e.py`, "and its matte says cancelled";
+          the fake here writes the same C3 shape), and
+        * this studio must not flatten it on the way through. Its poller
+          mapped every non `done` service state onto `job.status = "failed"`,
+          so the job the panel and `mask jobs` show went from `cancelled` to
+          `failed` one poll after the cancel was accepted.
+
+        The prompts carry "hold0", the fake's own gate before the FIRST frame,
+        so "nothing written" is arithmetic rather than a race against a writer.
+        """
+        prompts = {"text": ["slow", "hold0", "cancel before it starts"]}
+        first = self._track(prompts=prompts, start=0, end=0.5)
+        job_id = first["job_id"]
+        matte_id = first["mattes"][0]["matte_id"]
+        requested = first["end_frame"]
+        self.assertGreater(requested, 0)
+        # Nothing on disk, and nothing about to be: the gate holds the writer
+        # before frame 0. Read it rather than assume it.
+        early = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(early["written_count"], 0,
+                         "this test is about a track that wrote nothing")
+
+        _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+        stopped = self._wait_matte_state(matte_id, ("cancelled", "failed"),
+                                        timeout=25.0)
+        self.assertEqual(stopped["state"], "cancelled",
+                         "a cancelled matte that wrote nothing is cancelled, "
+                         "not failed: failed means the tracker tried and "
+                         "could not")
+        self.assertEqual(stopped["done_frames"], 0)
+        self.assertEqual(stopped["total_frames"], requested,
+                         "and the frames it was ASKED for are still there to "
+                         "read, so a row can say 0 of N")
+
+        # The list route, plain and --full, which is what the grader read.
+        for query in (f"/matte?clip={self.clip}",
+                      f"/matte?clip={self.clip}&full=1"):
+            listing = _get(self.base + query)
+            row = next(m for m in listing["mattes"]
+                       if m["matte_id"] == matte_id)
+            self.assertEqual(row["state"], "cancelled", query)
+            self.assertEqual(row["done_frames"], 0, query)
+            self.assertEqual(row["total_frames"], requested, query)
+
+        # And the job itself keeps saying cancelled AFTER the poller has seen
+        # the service settle. `finished` is set by the poller's own return, so
+        # waiting for it is waiting for exactly the write that used to turn
+        # this row into "failed".
+        deadline = time.time() + 20.0
+        view = None
+        while time.time() < deadline:
+            view = _get(self.base + f"/mask/jobs/{job_id}")
+            if view.get("finished"):
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(view)
+        self.assertTrue(view.get("finished"),
+                        "the poller never finished, so this proves nothing "
+                        "about what it wrote")
+        self.assertEqual(view["state"], "cancelled")
+        self.assertIsNone(view["error"],
+                          "a cancel is not an error to report; the reason "
+                          "lives on the matte")
 
     def test_the_track_cache_key_includes_rotation_and_the_working_width(self):
         """Round 1 finding 40. Design rule 5 keys a track by clip identity,

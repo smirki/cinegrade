@@ -67,7 +67,9 @@ import cases_harness          # noqa: E402
 # harness.cache_prune_refuses_a_symlinked_cache for 66.
 # Round 3: 345 -> 347, the exact live count after mask.component_cap (finding
 # 82) and mask.legacy_fold_collision (finding 87).
-EXPECTED_TESTS = 347
+# Round 4 tooling: 347 -> 348, stats.luma_spread_reports_detail_the_mean_cannot_see
+# (gap 25).
+EXPECTED_TESTS = 348
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,

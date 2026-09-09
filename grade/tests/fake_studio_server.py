@@ -71,6 +71,16 @@ STATE_LOCK = threading.Lock()
 CLIP_FRAMES = 9
 MATTE_FPS = 24.0
 
+# The frame size this fake claims it showed the model on /api/mask/segment
+# (tooling gap 27). The real studio renders the frame at its own working width
+# (--mask-width / STUDIO_MASK_WIDTH, default 1280) and reports the size of what
+# it served; nothing is rendered here, so the answer carries a fixed pair the
+# CLI tests can read back. What is being tested is that the CLI prints the
+# width the server reported and that the empty answer's sentence names it, not
+# what the number is.
+MASK_FRAME_WIDTH = 1280
+MASK_FRAME_HEIGHT = 720
+
 
 class FakeState:
     def __init__(self):
@@ -483,10 +493,13 @@ class Handler(BaseHTTPRequestHandler):
                     asked = ", ".join(f'"{t}"' for t in texts)
                     self._json({
                         "pick_id": pick_id, "instances": [], "candidates": 0,
+                        "frame_width": MASK_FRAME_WIDTH,
+                        "frame_height": MASK_FRAME_HEIGHT,
                         "warnings": ["the model found nothing for these prompts"],
                         "message": (f"no match for {asked} at "
                                     f"{float(body.get('time', 0)):g}s: 0 "
-                                    f"candidates from the model. Try another "
+                                    f"candidates from the model on a "
+                                    f"{MASK_FRAME_WIDTH}px frame. Try another "
                                     f"word for the same thing, a different "
                                     f"--time, or a --point/--box prompt on the "
                                     f"pixels themselves.")})
@@ -519,11 +532,20 @@ class Handler(BaseHTTPRequestHandler):
                     instances = [dict(inst, id=reported_ids[i])
                                  for i, inst in enumerate(instances)]
                 self._json({"pick_id": reported_pick, "instances": instances,
-                            "candidates": len(instances)})
+                            "candidates": len(instances),
+                            "frame_width": MASK_FRAME_WIDTH,
+                            "frame_height": MASK_FRAME_HEIGHT})
                 return
             if path == "/api/mask/track":
                 clip = body.get("clip")
                 fail = clip == "FAIL_CLIP"
+                # A clip name hook, the same shape FAIL_CLIP and SUSPECT_CLIP
+                # already are: the matte a track on this clip leaves behind is
+                # the one a cancel with nothing written leaves behind on the
+                # real service, `cancelled` with 0 frames done of the frames
+                # asked for (tooling gap 26). `mask cancel` is not a CLI verb,
+                # so a hook is the only way the CLI can read that row.
+                cancelled = clip == "CANCELLED_CLIP"
                 force = bool(body.get("force"))
                 prompts = body.get("prompts")
                 pick_id = body.get("pick_id")
@@ -561,6 +583,8 @@ class Handler(BaseHTTPRequestHandler):
                 resume_kind = ""            # resume | widen | restart | force
                 resume_from = start_frame
                 message = ""
+                cleared = None              # (start, end), force only, gap 24
+                cleared_whole = False
                 if known and not force:
                     # studio/server.py's order, and the order matters: `stale`
                     # is read BEFORE coverage (round 1 finding 21, a stale
@@ -617,8 +641,33 @@ class Handler(BaseHTTPRequestHandler):
                                    + ", ".join(sorted({_m(mid)["state"]
                                                        for mid in known})))
                 elif known and force:
+                    # studio/server.py's tooling gap 24 split, mirrored: a
+                    # force whose window covers everything the matte declares
+                    # clears the whole matte, which is what force always did;
+                    # anything narrower clears only its own window and the
+                    # frames outside it stay where they are.
                     resume_kind, resume_from = "force", start_frame
-                    message = "force: previous frames cleared, tracking again"
+                    span_start = min(int(STATE.mattes[mid].get("start_frame") or 0)
+                                     for mid in known)
+                    span_end = max(int(STATE.mattes[mid].get("frames") or 0)
+                                   for mid in known)
+                    cleared_whole = (start_frame <= span_start
+                                     and end_frame >= span_end)
+                    if cleared_whole:
+                        cleared = (span_start, span_end)
+                        message = (f"force: frames {span_start} to {span_end} "
+                                   f"cleared, the whole matte, tracking again")
+                    else:
+                        cleared = (start_frame, end_frame)
+                        kept = []
+                        if span_start < start_frame:
+                            kept.append(f"{span_start} to {start_frame}")
+                        if end_frame < span_end:
+                            kept.append(f"{end_frame} to {span_end}")
+                        message = (f"force: frames {start_frame} to "
+                                   f"{end_frame} cleared, frames "
+                                   f"{' and '.join(kept)} kept, tracking the "
+                                   f"cleared window again")
                 job_id = STATE.new_id("job")
                 if known:
                     matte_ids = known
@@ -633,7 +682,9 @@ class Handler(BaseHTTPRequestHandler):
                         m["end_frame"] = m["frames"]
                         m["start_frame"] = min(int(m.get("start_frame") or 0),
                                                start_frame)
-                        if resume_kind in ("force", "restart"):
+                        if resume_kind in ("force", "restart") \
+                                and not (resume_kind == "force"
+                                         and not cleared_whole):
                             # A dead or stale matte is re-tracked, not resumed:
                             # its frames go, and `resumed_from` is the start of
                             # the window, not whatever the old attempt reached.
@@ -644,6 +695,17 @@ class Handler(BaseHTTPRequestHandler):
                             m["done_frames"] = 0
                             m["areas"] = _areas_for(0, int(m["frames"]))
                             m["ious"] = _ious_for(0, int(m["frames"]))
+                        elif resume_kind == "force":
+                            # A force narrower than the matte (gap 24): only
+                            # the cleared window goes. This file's coverage
+                            # model is a prefix count (frames 0 to done-1 on
+                            # disk), so it cannot hold the hole in the middle
+                            # the real store holds; it says what it can, that
+                            # the frames before the window survived, and the
+                            # frame level truth is pinned against the real
+                            # server in studio/tests/py/test_mask_routes.py.
+                            m["done_frames"] = min(int(m["done_frames"]),
+                                                   int(cleared[0]))
                 else:
                     matte_ids = [STATE.new_id("m_")]
                     STATE.mattes[matte_ids[0]] = {
@@ -657,18 +719,22 @@ class Handler(BaseHTTPRequestHandler):
                         "fps": MATTE_FPS, "frames": end_frame,
                         "start_frame": start_frame, "end_frame": end_frame,
                         "width": 240, "height": 135,
-                        "recipe": body, "state": "failed" if fail else "queued",
+                        "recipe": body,
+                        "state": ("failed" if fail else
+                                  "cancelled" if cancelled else "queued"),
                         "done_frames": 0, "areas": _areas_for(0, end_frame),
                         "ious": _ious_for(0, end_frame),
                         "scores": [], "created": time.time(),
                         "model": "stub", "backend": "stub",
-                        "error": ("synthetic failure for FAIL_CLIP"
-                                  if fail else None),
+                        "error": ("synthetic failure for FAIL_CLIP" if fail
+                                  else "cancelled" if cancelled else None),
                     }
                 STATE.recipes[key] = matte_ids
                 first = STATE.mattes[matte_ids[0]]
                 STATE.jobs[job_id] = {
-                    "clip": clip, "state": "failed" if fail else "queued",
+                    "clip": clip,
+                    "state": ("failed" if fail else
+                              "cancelled" if cancelled else "queued"),
                     "done_frames": first["done_frames"],
                     "total_frames": int(first["frames"]),
                     "fps": 3.5, "matte_ids": matte_ids, "started": time.time(),
@@ -690,6 +756,10 @@ class Handler(BaseHTTPRequestHandler):
                     out["restarted"] = resume_kind in ("restart", "force")
                     out["resumed_from"] = resume_from
                     out["message"] = message
+                    if cleared is not None:
+                        out["cleared_start"] = cleared[0]
+                        out["cleared_end"] = cleared[1]
+                        out["cleared_whole_matte"] = cleared_whole
                 self._json(out)
                 return
             if path == "/api/frame":

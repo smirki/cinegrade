@@ -218,6 +218,99 @@ def test_a_weighted_measurement_says_how_much_it_covered(ctx):
                     (half["luma"]["mean"], faint["luma"]["mean"]))
 
 
+def _detail_fixture() -> tuple[np.ndarray, np.ndarray]:
+    """A 16x16 grey frame with an 8x8 checkerboard region, and its mask.
+
+    Inside the region every pixel is either 0.2 or 0.8 and none is near the
+    middle, so the region's mean sits at 0.5 with nothing at 0.5. Outside it
+    the frame is flat 0.5 apart from one black and one white pixel, which are
+    there to prove the masked figures come from the mask: the extremes of the
+    frame are 0.0 and 1.0 and the extremes of the region are 0.2 and 0.8.
+    """
+    h = w = 16
+    y = np.full((h, w), 0.5)
+    y[0, 0] = 0.0
+    y[0, 1] = 1.0
+    tile = np.indices((8, 8)).sum(axis=0) % 2
+    y[4:12, 4:12] = np.where(tile == 0, 0.2, 0.8)
+    mask = np.zeros((h, w))
+    mask[4:12, 4:12] = 1.0
+    return y, mask
+
+
+def _to_rgb(y: np.ndarray) -> np.ndarray:
+    """A grey frame as rgb24. Grey means the luma weights sum onto the same
+    value, so the luma of each pixel is exactly the number written here."""
+    return np.round(np.clip(y, 0.0, 1.0) * 255.0).astype(np.uint8)[..., None] \
+        .repeat(3, axis=-1)
+
+
+def test_luma_spread_reports_detail_the_mean_cannot_see(ctx):
+    """Tooling gap 25: a strong contrast reduction with the mean standing still.
+
+    A per layer contrast below 1 pulls every pixel toward the pivot
+    (`cor' = pivot + (cor - pivot) * contrast`, the arithmetic in
+    cinegrade.py's layer stage), so with the pivot at the region's own mean
+    the mean does not move at all and the internal variation goes. Measured
+    through the matte, the row a grader read carried percentiles and a mean,
+    and the mean was identical before and after: the number that changed was
+    not on the row. `std` and `p5_p95` are that number, on the same basis the
+    mean already had.
+
+    Measurement only: nothing here says a spread of 0.06 is too little or
+    that 0.6 was right, only that the two readings differ and by how much.
+    """
+    y, mask = _detail_fixture()
+    pivot = 0.5
+    flat = pivot + (y - pivot) * 0.1
+    before = ST.frame_stats(_to_rgb(y), weight=mask)
+    after = ST.frame_stats(_to_rgb(flat), weight=mask)
+
+    ctx.expect_close("the masked mean before the reduction",
+                     before["luma"]["mean"], 0.5, 1e-3)
+    ctx.expect_close("the masked mean after it: the same number, which is "
+                     "why this change was invisible on the old row",
+                     after["luma"]["mean"], before["luma"]["mean"], 2e-3)
+    ctx.expect_close("the masked standard deviation before", before["luma"]["std"],
+                     0.3, 1e-3)
+    ctx.expect_lt("and after: the detail inside the mask is gone",
+                  after["luma"]["std"], before["luma"]["std"] / 5.0)
+    ctx.expect_close("the masked p5 to p95 spread before",
+                     before["luma"]["p5_p95"], 0.6, 1e-3)
+    ctx.expect_lt("and after", after["luma"]["p5_p95"],
+                  before["luma"]["p5_p95"] / 5.0)
+    ctx.note(f"masked luma: mean {before['luma']['mean']} -> "
+             f"{after['luma']['mean']}, sd {before['luma']['std']} -> "
+             f"{after['luma']['std']}, p5_p95 {before['luma']['p5_p95']} -> "
+             f"{after['luma']['p5_p95']}")
+
+    # The two figures are on the mask's basis, not the frame's, the same as
+    # every other number in a weighted answer.
+    whole = ST.frame_stats(_to_rgb(y))
+    ctx.expect_true("an unweighted call carries them too",
+                    whole["luma"]["std"] is not None
+                    and whole["luma"]["p5_p95"] is not None, whole["luma"])
+    ctx.expect_true("and reads a different spread, because it measured "
+                    "different pixels",
+                    whole["luma"]["std"] != before["luma"]["std"],
+                    (whole["luma"]["std"], before["luma"]["std"]))
+    solid = ST.frame_stats(_to_rgb(y), weight=np.ones(y.shape))
+    ctx.expect_close("a weight of all ones reports the unweighted standard "
+                     "deviation (one formula, two paths, same number)",
+                     solid["luma"]["std"], whole["luma"]["std"], 1e-4)
+
+    # Found while adding the above: min and max were the whole frame's under
+    # a weight, in a block where every other figure was the mask's.
+    ctx.expect_close("the masked min is the region's darkest pixel, not the "
+                     "frame's", before["luma"]["min"], 0.2, 1e-3)
+    ctx.expect_close("the masked max is the region's brightest, not the "
+                     "frame's", before["luma"]["max"], 0.8, 1e-3)
+    ctx.expect_close("and the unweighted min is still the frame's own",
+                     whole["luma"]["min"], 0.0, 1e-6)
+    ctx.expect_close("and the unweighted max likewise",
+                     whole["luma"]["max"], 1.0, 1e-6)
+
+
 def test_a_bad_weight_shape_is_still_an_error(ctx):
     """Gap 23 turned an empty matte into a row, not every weight problem into
     one: a weight that is not the frame's size is a caller bug, and nothing a
@@ -666,6 +759,10 @@ def register(suite):
     suite.add(g, "a_weighted_measurement_says_how_much_it_covered",
               test_a_weighted_measurement_says_how_much_it_covered,
               doc="coverage is the mean weight; absent on an unweighted call")
+    suite.add(g, "luma_spread_reports_detail_the_mean_cannot_see",
+              test_luma_spread_reports_detail_the_mean_cannot_see,
+              doc="std and p5_p95 move when a contrast reduction leaves the "
+                  "mean where it was (gap 25)")
     suite.add(g, "a_bad_weight_shape_is_still_an_error",
               test_a_bad_weight_shape_is_still_an_error,
               doc="a wrong sized weight is a caller bug and still raises")
