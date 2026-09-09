@@ -426,6 +426,41 @@ def test_a_bad_weight_shape_is_still_an_error(ctx):
                         "does not match the frame" in str(exc), str(exc))
 
 
+def test_a_weight_that_is_not_a_number_is_refused_by_name(ctx):
+    """Round 5 finding 103: a NaN in the weight used to raise out of the middle
+    of the luma block.
+
+    `w.sum()` is NaN and `NaN <= 0.0` is False, so the no-coverage answer is
+    skipped; `w.max()` is NaN and every comparison against NaN is False, so the
+    core selection is empty and `min` over nothing raises `zero-size array to
+    reduction operation minimum`, which names nothing a caller can act on. A
+    weight that is not a number is a caller bug like a wrong shape, and is
+    refused the same way, before any figure is computed: every percentage in
+    the row would have a NaN total under it, not only the two extremes that
+    happened to raise.
+    """
+    arr = _band_fixture()
+    w = np.ones(arr.shape[:2], dtype=np.float64)
+    w[0, 0] = np.nan
+    try:
+        ST.frame_stats(arr, weight=w)
+        ctx.check(False, "a weight holding a NaN was accepted")
+    except ST.StatsError as exc:
+        ctx.expect_true("the message says the weight is not a finite number",
+                        "not a finite number" in str(exc), str(exc))
+        ctx.expect_true("and separates it from the mask that selects nothing, "
+                        "which is a row rather than an error",
+                        "no_coverage" in str(exc), str(exc))
+    except Exception as exc:                                   # noqa: BLE001
+        ctx.check(False, f"{type(exc).__name__} rather than a StatsError: "
+                         f"{exc}")
+    # And the neighbouring case still answers with a row: a weight of zeros
+    # selects nothing, which is something a frame can honestly be.
+    empty = ST.frame_stats(arr, weight=np.zeros(arr.shape[:2]))
+    ctx.expect_true("a weight of zeros is still no_coverage, not an error",
+                    empty.get("no_coverage") is True, str(empty)[:120])
+
+
 def test_bands_neutral_rows_are_exactly_zero(ctx):
     """The six untouched rows are grey: warm and tint read exactly 0.0, not
     merely small, proving the neutral case is not just "close" by luck."""
@@ -872,6 +907,10 @@ def register(suite):
     suite.add(g, "a_bad_weight_shape_is_still_an_error",
               test_a_bad_weight_shape_is_still_an_error,
               doc="a wrong sized weight is a caller bug and still raises")
+    suite.add(g, "a_weight_that_is_not_a_number_is_refused_by_name",
+              test_a_weight_that_is_not_a_number_is_refused_by_name,
+              doc="a NaN weight is a named refusal, not a ValueError out of "
+                  "the luma block (round 5 finding 103)")
     suite.add(g, "bands_neutral_rows_are_exactly_zero",
               test_bands_neutral_rows_are_exactly_zero,
               doc="a grey row reads exactly 0.0 warm and tint")

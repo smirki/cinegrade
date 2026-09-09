@@ -70,6 +70,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -184,10 +185,21 @@ class _FakeSamState:
         # prove studio asked for a RESUME rather than a fresh matte
         # (checkpoint gap 12).
         self.last_matte_ids: dict = {}
-        # Per matte directory, per frame: area, score, IoU and the mask that
-        # produced them, so index.json can carry the real arrays the service
-        # writes (contract C2) instead of nothing at all.
-        self.frame_stats: dict[str, dict] = {}
+        # Per TRACK (job id, matte directory), per frame: area, score, IoU and
+        # the mask that produced them, so index.json can carry the real arrays
+        # the service writes (contract C2) instead of nothing at all.
+        #
+        # Per track, not per directory, since round 5 finding 99. Keeping it
+        # per directory gave this fake a memory of every frame any run had ever
+        # written into that matte, which the real store does not have: it
+        # rebuilds the arrays from the index on disk and carries them forward
+        # only where its own rule says the two runs are the same matte. So a
+        # re-track that dropped every earlier frame's numbers in the real store
+        # could not drop one here, and the widen that lost them was invisible
+        # to every test in this file. Now a run knows only what it wrote, and
+        # what survives from earlier runs survives through `_fake_index_write`
+        # mirroring the store's carry forward, which is where the real rule is.
+        self.frame_stats: dict[tuple, dict] = {}
         # job_id to an Event a timed track waits on before writing past
         # `HOLD_AFTER` frames. Round 1 finding 34: without this the cancel
         # test raced the writer, so it accepted "resumed OR restarted" and
@@ -342,10 +354,21 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             # window it was tracked over, so the shape round 4 finding 89 is
             # about (a force that hangs off one end of a matte that does not
             # start at 0) could not be reached through this route at all.
+            # `width` is the working width this call was given, which is what
+            # the real service records (`"width": source.width`, and its
+            # `FrameSource` takes its width from the body). Round 5 finding
+            # 100: the studio predicts this field to decide whether the store
+            # will carry a matte forward before it clears anything, so a fake
+            # that wrote a fixed 20 here made every matte look like it was
+            # tracked at another width. The frames themselves stay 20x15 and
+            # `height` keeps their aspect, which is all the frame route reads
+            # the pair for.
+            asked_width = int(body.get("width") or 20)
             common = {"clip": body.get("clip"), "clip_key": body.get("clip_key"),
                      "rotation": body.get("rotation"), "fps": fps,
                      "frames": end, "start_frame": start, "end_frame": end,
-                     "width": 20, "height": 15,
+                     "width": asked_width,
+                     "height": max(2, int(round(asked_width * 15 / 20))),
                      "recipe": body.get("recipe") or {}}
             if pick:
                 with self.state.lock:
@@ -476,7 +499,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                                           error=err, **common)
                         continue
                     for i in range(start, end):
-                        _write_frame(self.state, d, i,
+                        _write_frame(self.state, job_id, d, i,
                                      _fake_mask(20, 15, i, kind=kind))
                     with self.state.lock:
                         self.state.jobs[job_id]["matte_state"][mid] = "done"
@@ -488,7 +511,7 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
                     on_disk = len([q for q in d.glob("*.png") if q.stem.isdigit()])
                     _fake_index_write(d, matte_id=mid, state="done",
                                       done_frames=on_disk, **common,
-                                      **_frame_arrays(self.state, d,
+                                      **_frame_arrays(self.state, job_id, d,
                                                       common.get("frames")))
                 with self.state.lock:
                     j = self.state.jobs[job_id]
@@ -631,8 +654,8 @@ def _fake_mask(w: int, h: int, index: int, kind: str = "normal"):
     return a
 
 
-def _write_frame(state: "_FakeSamState", dir_path: Path, index: int, arr,
-                 score: float = 0.9) -> None:
+def _write_frame(state: "_FakeSamState", job_id: str, dir_path: Path,
+                 index: int, arr, score: float = 0.9) -> None:
     """Write one matte frame AND the per frame numbers that go with it.
 
     A mirror of sam/store.py's `MatteWriter._write`: the area is the mean of
@@ -644,18 +667,17 @@ def _write_frame(state: "_FakeSamState", dir_path: Path, index: int, arr,
     frames held. Every quality assertion in this file was written against
     that.
 
-    One deliberate difference from the store: the store keeps the previous
-    mask on the writer object, so the first frame of a resumed tail has no
-    predecessor and gets no IoU. This keeps the numbers per matte DIRECTORY
-    and compares against the previous frame index, so a resumed tail's first
-    frame is compared with the frame before it on disk. That is the same
-    answer on a track that runs straight through, and a better one on a
-    resume, and it means a widen cannot silently drop a matte's IoU curve.
+    Kept per TRACK, the way the store keeps its previous mask on the writer
+    object: the first frame a resumed or widened run writes has no predecessor
+    in memory and gets no IoU, exactly as the real store reports it. This used
+    to be kept per matte DIRECTORY and compared against whatever any earlier
+    run had written, which reads as a denser IoU curve and is a fake that
+    cannot lose a number the real store loses (round 5 finding 99).
     """
     MT.write_gray_png(dir_path / MT.frame_name(index), arr)
     cur = np.asarray(arr) >= 0.5
     with state.lock:
-        rec = state.frame_stats.setdefault(str(dir_path), {})
+        rec = state.frame_stats.setdefault((str(job_id), str(dir_path)), {})
         earlier = [i for i in rec if i < index]
         iou = None
         if earlier:
@@ -669,16 +691,21 @@ def _write_frame(state: "_FakeSamState", dir_path: Path, index: int, arr,
                       "mask": cur}
 
 
-def _frame_arrays(state: "_FakeSamState", dir_path: Path, frames) -> dict:
-    """`areas`, `scores` and `ious` for index.json (contract C2).
+def _frame_arrays(state: "_FakeSamState", job_id: str, dir_path: Path,
+                  frames) -> dict:
+    """`areas`, `scores` and `ious` for index.json (contract C2), for the
+    frames THIS track wrote.
 
     Indexed by ABSOLUTE frame index and padded with None to the declared
     frame count, which is what makes a partial matte obvious in the response
-    and what `quality()` reads.
+    and what `quality()` reads. What an earlier track measured is not in here:
+    it is on disk, and it survives only where `_fake_index_write` carries it
+    forward, which is the store's rule and not this fake's memory (round 5
+    finding 99).
     """
     with state.lock:
         rec = {i: dict(v) for i, v in
-               state.frame_stats.get(str(dir_path), {}).items()}
+               state.frame_stats.get((str(job_id), str(dir_path)), {}).items()}
     n = max(int(frames or 0), (max(rec) + 1) if rec else 0)
     out = {"areas": [None] * n, "scores": [None] * n, "ious": [None] * n}
     for i, entry in rec.items():
@@ -726,29 +753,23 @@ def _recipe_tag(prompts, select=None, steady=None, clip_key=None,
     return hashlib.sha1(raw.encode()).hexdigest()[:8]
 
 
-def _inside_declared(raw: dict, fields: dict) -> bool:
-    """sam/store.py's `_inside_previous`, mirrored: is the window this write
-    declares INSIDE the window the index on disk already declares, and is it a
-    picture of the same thing?
+def _same_picture(raw: dict, fields: dict) -> bool:
+    """sam/store.py's `same_picture`, mirrored: are the index on disk and the
+    header this write carries pictures of the same thing?
 
-    The store keeps the matte's own longer declaration only for this case, and
-    reads anything else as a different track. Mirroring the whole condition
-    (not just "shorter than what is there") is round 4 finding 89: the looser
-    version here made a force window that only partly overlaps the matte look
-    survivable through this route while the real store threw the kept frames'
-    numbers away.
+    The store carries an earlier run's per frame numbers forward for any window
+    of the same picture and for nothing else, so this is the whole of its rule
+    (round 5 finding 99; round 4 finding 89 mirrored the window half of the
+    older rule here, which is what the store no longer asks). Same three
+    fields, same "a key the older index does not carry is not a difference",
+    same string comparison. The real one is pinned against the real store in
+    `sam/tests/test_store.py`; this exists so a re-track through this route
+    keeps and loses exactly what a re-track through the service would.
     """
     for key in ("clip_key", "rotation", "width"):
         if key in raw and str(raw.get(key)) != str(fields.get(key)):
             return False
-    try:
-        prev_start = int(raw.get("start_frame") or 0)
-        prev_end = int(raw.get("end_frame") or raw.get("frames") or 0)
-        start = int(fields.get("start_frame") or 0)
-        end = int(fields.get("end_frame") or fields.get("frames") or 0)
-    except (TypeError, ValueError):
-        return False
-    return prev_end > prev_start and prev_start <= start and end <= prev_end
+    return True
 
 
 def _fake_index_write(dir_path: Path, **fields) -> None:
@@ -759,6 +780,15 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
     frames with no index.json at all, which is a real but different state:
     "a hand made matte a test built" per its own docstring, not "the service
     that owns this file hasn't written it yet").
+
+    A write that carries a window (`frames`, `start_frame`, `end_frame`) goes
+    through sam/store.py's `_carry_forward`, mirrored: for the same picture the
+    matte spans the UNION of the two windows and every number the earlier run
+    measured stays in its own absolute slot; for a different picture nothing is
+    carried and this run's own window and arrays stand. That mirror is the
+    point of this function since round 5 finding 99: `_frame_arrays` above now
+    reports only what THIS track wrote, so what an earlier track measured
+    survives here or nowhere, exactly as it does in the store.
     """
     dir_path.mkdir(parents=True, exist_ok=True)
     p = dir_path / MT.INDEX_NAME
@@ -766,34 +796,38 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
         raw = json.loads(p.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         raw = {}
+    same = bool(raw) and _same_picture(raw, fields)
     declared = raw.get("frames")
     incoming = fields.get("frames")
-    if declared is not None and incoming is not None \
-            and int(declared) > int(incoming) \
-            and _inside_declared(raw, fields):
-        # sam/store.py's tooling gap 24 rule, mirrored: a re-track of a window
-        # INSIDE a longer matte keeps the matte's own declared length, so the
-        # span a caller already read does not shrink to the repair window.
-        # ONLY inside, the way the store only carries forward for that case
-        # (round 4 finding 89): a shorter window that is not inside this one is
-        # a different track to the store, and the declared length moves to it.
-        fields = dict(fields, frames=int(declared))
-    if raw.get("start_frame") is not None and fields.get("start_frame") is not None:
-        # The earliest start and the furthest end survive a re-track, which is
-        # what the store's `_carry_forward` does on the two paths the studio can
-        # ask for (an equal window and an interior one). On a window that is
-        # NEITHER the real store instead adopts the incoming window and drops
-        # what it was carrying; this fake does not mirror that, because the
-        # studio refuses that request now (finding 89) and the store's own
-        # behaviour there is pinned against the real store in
-        # sam/tests/test_store.py rather than imagined here.
+    length = int(incoming) if incoming is not None else 0
+    if same and declared is not None and incoming is not None:
+        # The longer of the two declarations, whichever way this window hangs:
+        # a repair inside a longer matte keeps the matte's length (tooling gap
+        # 24) and a widen past its end keeps the frames it already measured
+        # (round 5 finding 99).
+        length = max(int(declared), int(incoming))
+        fields = dict(fields, frames=length)
+    if same and raw.get("start_frame") is not None \
+            and fields.get("start_frame") is not None:
         fields = dict(fields,
                       start_frame=min(int(raw["start_frame"]),
                                       int(fields["start_frame"])))
-    if raw.get("end_frame") is not None and fields.get("end_frame") is not None:
+    if same and raw.get("end_frame") is not None \
+            and fields.get("end_frame") is not None:
         fields = dict(fields,
                       end_frame=max(int(raw["end_frame"]),
                                     int(fields["end_frame"])))
+    if same:
+        for key in ("areas", "scores", "ious"):
+            new = fields.get(key)
+            if not isinstance(new, list):
+                continue          # this write carries no arrays: leave disk
+            old = raw.get(key)
+            merged = list(new) + [None] * max(0, length - len(new))
+            for i, value in enumerate(list(old or [])[:len(merged)]):
+                if value is not None and merged[i] is None:
+                    merged[i] = value
+            fields = dict(fields, **{key: merged})
     raw.update({k: v for k, v in fields.items() if v is not None})
     raw.setdefault("created", time.time())
     tmp = p.with_suffix(".tmp")
@@ -843,11 +877,12 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
                     return
         for m in mattes:
             d = Path(m["path"])
-            _write_frame(state, d, start + i,
+            _write_frame(state, job_id, d, start + i,
                          _fake_mask(20, 15, start + i, kind=kind))
             _fake_index_write(d, matte_id=m["matte_id"], done_frames=i + 1,
                               **common,
-                              **_frame_arrays(state, d, common.get("frames")))
+                              **_frame_arrays(state, job_id, d,
+                                              common.get("frames")))
         with state.lock:
             job = state.jobs.get(job_id)
             if job is None:
@@ -872,7 +907,8 @@ def _run_slow_track(state: _FakeSamState, job_id: str, out_dir: Path,
             on_disk = len([q for q in d.glob("*.png") if q.stem.isdigit()])
             _fake_index_write(d, matte_id=m["matte_id"], state="done",
                               done_frames=on_disk, **common,
-                              **_frame_arrays(state, d, common.get("frames")))
+                              **_frame_arrays(state, job_id, d,
+                                              common.get("frames")))
 
 
 def _start_fake_sam() -> tuple[ThreadingHTTPServer, threading.Thread, _FakeSamState]:
@@ -2124,13 +2160,173 @@ class MaskRoutesTest(unittest.TestCase):
                          areas_before)
 
         # The widen the sentence points at: every frame already tracked stays
-        # on disk, and the new ones land in the same matte.
+        # on disk WITH the numbers measured for it, and the new ones land in
+        # the same matte. Round 5 finding 99: the files half of this was
+        # asserted here and the numbers half was not, and the numbers were what
+        # the widen threw away, against a fake that kept its own memory of
+        # every area and so could not lose one. The fake now reports only the
+        # frames each track wrote and carries the rest forward by the store's
+        # own rule (`_same_picture`), which is the rule
+        # `sam/tests/test_store.py` drives against the real store.
         wider = self._track(prompts=prompts, start=0, end=past / fps)
         self.assertTrue(wider["widened"])
         self.assertEqual(wider["mattes"][0]["matte_id"], matte_id)
         after = self._wait_written(matte_id, past)
         self.assertEqual(after["written_count"], past)
         self._wait_job_finished(wider["job_id"])
+        grown = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(self._declared_window(matte_id), (0, past),
+                         "the widened matte declares the union of the two "
+                         "windows")
+        self.assertEqual(len(grown["areas"]), past)
+        self.assertTrue(all(a is not None for a in grown["areas"]),
+                        f"a widen keeps every frame's area, not only its "
+                        f"file: {grown['areas']}")
+        self.assertEqual(grown["areas"][:end], areas_before,
+                         "and the frames tracked before it keep the numbers "
+                         "they already had")
+        self.assertEqual(grown["done_frames"], past,
+                         "and done_frames counts the matte, not this run")
+        quality = grown["quality"]
+        self.assertEqual(quality["checked"], past,
+                         "so the quality pass judges every frame it claims to "
+                         "have checked")
+
+    def test_force_that_does_not_overlap_the_matte_at_all_says_so(self):
+        """Round 5 finding 101: the refusal for a partly overlapping force was
+        being used for windows that do not overlap the matte at all.
+
+        It then asserted something false ("so it overlaps part of the matte and
+        hangs off it") and named a repair computed as the intersection, which
+        for these shapes is an empty range ("ask for frames 200 to 200"), an
+        inverted one ("frames 100 to 50"), or the request itself. Forcing the
+        frames after a matte's end is an ordinary ask, and following advice
+        that cannot be typed is a loop.
+
+        Four shapes, which is all of them: touching the low edge, touching the
+        high edge, disjoint before, disjoint after. Every range the sentence
+        names has to be a real range, whichever shape it is, and the two asks
+        that do work for a window with nothing of this matte in it are the
+        widen and the whole-span redo.
+        """
+        prompts = {"text": ["no overlap subject"]}
+        made = self._track(prompts=prompts, start=0.25, end=0.6)
+        matte_id = made["mattes"][0]["matte_id"]
+        lo, hi = made["start_frame"], made["end_frame"]
+        self.assertGreaterEqual(lo, 5, "the window has to start above frame 0")
+        info = self._wait_written(matte_id, hi - lo)
+        fps = float(info["fps"])
+        self._wait_job_finished(made["job_id"])
+        before = self._frame_mtimes(matte_id)
+        calls = self.sam_state.track_calls
+
+        for name, (req_lo, req_hi) in (
+                ("touching the low edge", (lo - 4, lo)),
+                ("touching the high edge", (hi, hi + 4)),
+                ("disjoint before", (0, lo - 3)),
+                ("disjoint after", (hi + 2, hi + 6))):
+            sentence = self._force_refusal(prompts, req_lo / fps, req_hi / fps)
+            self.assertIn("does not overlap the matte at all", sentence,
+                          f"{name}: {sentence}")
+            self.assertNotIn("overlaps part of the matte", sentence,
+                             f"{name}: {sentence}")
+            self.assertNotIn("To repair part of it", sentence,
+                             f"{name}: there is nothing of this matte inside "
+                             f"the window, so no repair can be named: "
+                             f"{sentence}")
+            self.assertIn(f"frames {req_lo} to {req_hi}", sentence,
+                          f"{name}: the refusal names what was asked for: "
+                          f"{sentence}")
+            self.assertIn(f"frames {lo} to {hi}", sentence,
+                          f"{name}: and what the matte declares: {sentence}")
+            self.assertIn(f"frames {min(req_lo, lo)} to {max(req_hi, hi)}",
+                          sentence,
+                          f"{name}: and the redo that would work: {sentence}")
+            self.assertIn("without force", sentence.lower(),
+                          f"{name}: and the widen, which is the request that "
+                          f"tracks these frames as well: {sentence}")
+            # The finding itself, as a rule rather than as four literals: every
+            # range this sentence names has to be a range somebody can type.
+            named = re.findall(r"frames (\d+) to (\d+)", sentence)
+            self.assertTrue(named, sentence)
+            for a, b in named:
+                self.assertLess(int(a), int(b),
+                                f"{name}: the refusal names the empty or "
+                                f"inverted range {a} to {b}: {sentence}")
+            self.assertEqual(self.sam_state.track_calls, calls,
+                             f"{name}: a refused force must not reach the SAM "
+                             f"service")
+            self.assertEqual(self._frame_mtimes(matte_id), before,
+                             f"{name}: a refused force must not touch a frame")
+            self.assertEqual(self._declared_window(matte_id), (lo, hi),
+                             f"{name}: or move the declared window")
+
+    def test_force_on_a_matte_recorded_at_another_working_width_is_refused(self):
+        """Round 5 finding 100: the studio decided whether a force was an
+        interior repair from the frame window alone, while sam/store.py also
+        asks whether the two runs are the same PICTURE (clip key, rotation,
+        working width) before it carries any number forward.
+
+        A matte whose recorded width is not the width this track will send
+        passes a window-only gate, has its window cleared, and is then read by
+        the store as a different track: the frames the studio kept lose their
+        area, their score and their IoU, which is round 4 finding 89's own loss
+        through a door the frame numbers cannot see. The studio asks the
+        store's own rule now (`picture_differences`, imported from
+        sam/store.py), so this refuses instead.
+
+        The recorded width is edited on disk here rather than reached through a
+        second server, because the recipe hash keys this cache entry by the
+        working width the studio ASKED for: two studios at different widths do
+        not share a cache entry at all, which is that layer of the defence and
+        is pinned by
+        `test_the_track_cache_key_includes_rotation_and_the_working_width`.
+        What is edited is what the SERVICE recorded, which is the field the
+        store compares.
+        """
+        prompts = {"text": ["picture gap subject"]}
+        made = self._track(prompts=prompts, start=0, end=0.5)
+        matte_id = made["mattes"][0]["matte_id"]
+        lo, hi = made["start_frame"], made["end_frame"]
+        info = self._wait_written(matte_id, hi - lo)
+        fps = float(info["fps"])
+        self._wait_job_finished(made["job_id"])
+        self.assertGreaterEqual(hi - lo, 4, "the matte needs an interior")
+        raw = self._matte_index(matte_id)
+        self.assertEqual(int(raw["width"]), MASK_WIDTH,
+                         "the service records the working width it was sent, "
+                         "which is the field the store compares")
+        index_path = self._matte_dir(matte_id) / MT.INDEX_NAME
+
+        # The same matte, recorded at another working width.
+        index_path.write_text(json.dumps(dict(raw, width=MASK_WIDTH * 2)))
+        before = self._frame_mtimes(matte_id)
+        calls = self.sam_state.track_calls
+        inner = (lo + 1, hi - 1)
+        sentence = self._force_refusal(prompts, inner[0] / fps, inner[1] / fps)
+        self.assertIn("width", sentence, sentence)
+        self.assertIn(str(MASK_WIDTH * 2), sentence,
+                      f"the refusal names the width the matte was tracked at: "
+                      f"{sentence}")
+        self.assertIn(str(MASK_WIDTH), sentence,
+                      f"and the width this track works at: {sentence}")
+        self.assertIn(f"frames {lo} to {hi}", sentence,
+                      f"and the redo that would work: {sentence}")
+        self.assertEqual(self.sam_state.track_calls, calls,
+                         "a refused force must not reach the SAM service")
+        self.assertEqual(self._frame_mtimes(matte_id), before,
+                         "a refused force must not touch one frame file")
+
+        # And it is the width that refused it, not the window: put the
+        # recorded width back and the same interior force is accepted.
+        index_path.write_text(json.dumps(raw))
+        repair = self._track(prompts=prompts, start=inner[0] / fps,
+                             end=inner[1] / fps, force=True)
+        self.assertEqual((repair["cleared_start"], repair["cleared_end"]),
+                         inner)
+        self.assertFalse(repair["cleared_whole_matte"])
+        self.assertEqual(repair["mattes"][0]["matte_id"], matte_id)
+        self._wait_job_finished(repair["job_id"])
 
     def test_force_while_a_track_for_that_recipe_is_running_is_refused(self):
         """Round 4 finding 91: `_clear_matte_window`'s docstring said the

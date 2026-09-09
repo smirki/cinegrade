@@ -19,6 +19,7 @@ import argparse
 import email.utils
 import getpass
 import hashlib
+import importlib.util
 import json
 import math
 import mimetypes
@@ -3514,6 +3515,76 @@ def _matte_reaches_past(info, w_start: int, w_end: int) -> bool:
     return w_start < m_start or w_end > m_end
 
 
+# sam/store.py's own rule for "is this the same matte", read out of that file
+# rather than paraphrased here (round 5 finding 100). The studio has to know
+# whether the store will carry a matte's per frame numbers forward BEFORE it
+# deletes any of that matte's frames, and a second copy of a rule that lives in
+# another program is a copy that drifts: the force gate asked about the frame
+# window alone while the store also compares the clip key, the rotation and the
+# working width, so a repair this server called interior could still land on a
+# store that read it as a different track.
+#
+# Loaded lazily and by path, never as a plain import: the studio talks to the
+# SAM service over HTTP precisely so it can run without it, so a missing sam/
+# has to be a studio that still starts. By path also keeps that folder's own
+# module names (`server`, `ports`) off sys.path, where studio/ and its tests
+# already have files of both names.
+_SAM_STORE = None
+_SAM_STORE_LOADED = False
+
+
+def _sam_store():
+    """`sam/store.py` as a module, or None when it cannot be read."""
+    global _SAM_STORE, _SAM_STORE_LOADED
+    if not _SAM_STORE_LOADED:
+        _SAM_STORE_LOADED = True
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_sam_store", str(CONTENT / "sam" / "store.py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _SAM_STORE = module
+        except Exception as exc:                               # noqa: BLE001
+            print(f"warning: sam/store.py could not be read ({exc}), so a "
+                  f"force that repairs part of a matte will be refused rather "
+                  f"than guessed at", file=sys.stderr)
+            _SAM_STORE = None
+    return _SAM_STORE
+
+
+def _matte_picture_gap(info, clip_key: str, rotation, width) -> list[str]:
+    """Which of the store's three picture fields this matte disagrees with,
+    for the track this request is about to queue. Empty means the store will
+    carry this matte's per frame numbers forward; `["width"]` means it will not.
+
+    What is compared is what the header the SERVICE will write carries, which
+    this server knows for two of the three: it sends `clip_key` and `width`
+    itself and the service records exactly what it was sent (sam/server.py's
+    track route writes `"clip_key": clip_key` and `"width": source.width`, and
+    `FrameSource` takes its width from the body). Rotation is compared only
+    when this request names a concrete one: the studio's own default is "auto",
+    which the SERVICE resolves from the clip's own display matrix, so comparing
+    the literal "auto" against the number it resolved would refuse a repair the
+    store carries forward happily. Nothing is lost by that, because the recipe
+    hash keys this cache entry by the rotation STRING and by the clip's own
+    content key, so a matte reached through it was queued at the same rotation
+    on the same bytes and resolves to the same number now.
+
+    A studio that cannot read the store's rule answers with one difference,
+    which every caller here reads as "not the same picture": refusing a repair
+    is the safe direction, and the whole-span redo the refusal names still
+    works.
+    """
+    store = _sam_store()
+    if store is None:
+        return ["sam/store.py could not be read"]
+    raw = info.raw or {}
+    current = {"clip_key": clip_key, "width": width,
+               "rotation": raw.get("rotation") if str(rotation) == "auto"
+               else rotation}
+    return store.picture_differences(raw, current)
+
+
 def _clear_matte_window(info, w_start: int, w_end: int) -> int:
     """Delete `[w_start, w_end)` from one matte and leave the rest alone.
 
@@ -3536,12 +3607,24 @@ def _clear_matte_window(info, w_start: int, w_end: int) -> int:
     touching, and the alternative (asking the service to clear a window) is a
     wire change for a case only studio knows about, because only studio knows
     what `force` means. That first clause is a PRECONDITION, and its one caller
-    is what enforces it (round 4 finding 91): the force branch refuses while a
-    job for this recipe is queued or running, because `MatteWriter` is built in
-    the service's own track route and rewrites its whole in-memory index at
-    least once a second while it works, so a clear under a live writer restores
-    `areas`, `scores` and `ious` for frames whose files have just gone. Returns
-    how many frame files were removed.
+    is what mostly enforces it (round 4 finding 91): the force branch refuses
+    while a job for this recipe is queued or running, because `MatteWriter` is
+    built in the service's own track route and rewrites its whole in-memory
+    index at least once a second while it works, so a clear under a live writer
+    restores `areas`, `scores` and `ious` for frames whose files have just gone.
+
+    What that check does NOT cover, said plainly rather than left to be found
+    (round 5 finding 102): the service builds its `MatteWriter` inside its own
+    track route, so a writer for this recipe exists from the moment another
+    caller's `SAMC.client().track()` reaches the service, while this server only
+    records that job in `_matte_jobs` when the call returns. `StudioServer` is a
+    `ThreadingHTTPServer`, so a force arriving in that interval reads no live
+    job and clears frames under a writer that has just started. The exposure is
+    one HTTP round trip rather than a whole tracking pass, and it needs two
+    callers on one studio at once; closing it outright means holding a per
+    recipe lock across the cache decision, the clear and the track call, which
+    is a restructure of `queue_mask_track` rather than a check, and it has not
+    been done. Returns how many frame files were removed.
     """
     removed = 0
     for index in list(info.written_indices(refresh=True)):
@@ -4062,26 +4145,23 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         # what differs is how much of it is standing when they do.
         #
         # There are THREE shapes, not two (round 4 finding 89). A window that
-        # only PARTLY overlaps the declared span is neither, and taking the
-        # narrow branch for it loses the frames it says it keeps: the studio
-        # keeps their files, but the window it then asks the service to track
-        # is neither equal to the matte's declared length nor inside it, so
-        # sam/store.py's `_inside_previous` reads it as a different track
-        # (correctly, by its own rule), `_carry_forward` returns early, and the
-        # kept frames end up either past the end of the new arrays (orphaned
-        # files the index cannot describe) or inside them with no area, score
-        # or IoU, while the matte still reads `done` and `quality` reports no
-        # suspect frames over frames nothing looked at. Measured both ways in
-        # sam/tests/test_store.py's own non-interior block.
+        # only PARTLY overlaps the declared span is neither: it clears frames
+        # the matte has and asks the service for frames it does not, so which
+        # of the two things the caller meant (repair the part this matte holds,
+        # or redo the matte over the wider range) is a guess. It is REFUSED
+        # before anything is deleted, and the sentence names both of those
+        # ranges by number. Refused rather than clamped to the overlap (which
+        # would silently track less than was asked for) or widened to the union
+        # (which would re-track frames the answer calls kept): both answer a
+        # question the caller did not ask, and each of the two they might have
+        # meant is one request that behaves correctly.
         #
-        # So it is REFUSED, before anything is deleted, and the sentence names
-        # both ranges and the two asks that do work. Refused rather than
-        # clamped to the overlap (which would silently track less than was
-        # asked for) or widened to the union (which would re-track the frames
-        # the answer calls kept): both of those answer a question the caller
-        # did not ask, and the two things a caller wants next, a repair inside
-        # the span and a widen outside it, are each one request that already
-        # behaves correctly.
+        # Round 5 finding 99: this refusal used to give a second, stronger
+        # reason, that sam/store.py could not carry the kept frames' numbers
+        # across such a window. That is no longer true of any window of the same
+        # picture (the store merges the union of the two declarations now), so
+        # what is left is the ambiguity above, which is a choice about answers
+        # rather than a guard against losing data.
         spans = [_matte_declared_window(i) for i in cached_infos]
         span_start = min(s for s, _e in spans)
         span_end = max(e for _s, e in spans)
@@ -4091,29 +4171,79 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         # force takes the directory whatever window was asked for. Without this
         # the refusal below would fire on the one matte force is most needed
         # for, and the narrow branch used to report frames kept out of an empty
-        # span (round 4 finding 94).
+        # span (round 4 finding 94). It has nothing to keep from an INTERIOR
+        # force either, so it does not block one beside a matte that does
+        # declare frames: a recipe with two text slots where one is still a
+        # bootstrap index used to refuse every interior force with advice
+        # identical to the request, which is a loop (round 5 finding 101).
         declares_nothing = all(e <= s for s, e in spans)
         cleared_whole = all(e <= s or (req_start <= s and req_end >= e)
                             for s, e in spans)
-        inside = all(e > s and s <= req_start and req_end <= e
-                     for s, e in spans)
+        # The other half of "is this a repair of this matte": the store asks
+        # whether the two are the same PICTURE before it carries any number
+        # forward, so this asks the store rather than keeping a second copy of
+        # that rule (round 5 finding 100). A matte recorded at another working
+        # width passes the window test and then lands on a store that reads it
+        # as a different track, which is finding 89's own loss through a door
+        # the frame numbers cannot see.
+        picture_gaps = [(i, _matte_picture_gap(i, clip_key, rot,
+                                               req_params["width"]))
+                        for i in cached_infos]
+        wrong_picture = [(i, gap) for i, gap in picture_gaps if gap]
+        inside = all(e <= s or (s <= req_start and req_end <= e)
+                     for s, e in spans) and not wrong_picture
         if not cleared_whole and not inside:
             covers = "; ".join(
                 f"{i.matte_id} covers frames {s} to {e}"
                 for i, (s, e) in zip(cached_infos, spans))
+            # The redo is the union, which is always a real range whatever
+            # shape the request is; the repair is the intersection, which is
+            # not, so it is named only where there is one (round 5 finding
+            # 101). Per matte, because with several mattes in one recipe the
+            # outer hull is a range no single matte covers.
+            redo = (f"to redo it ask for frames "
+                    f"{min(req_start, span_start)} to "
+                    f"{max(req_end, span_end)}")
+            widen = ("The same request WITHOUT force widens the matte instead "
+                     "and keeps every frame already tracked, with its area, "
+                     "score and IoU.")
+            if wrong_picture:
+                made = "; ".join(
+                    f"{i.matte_id} was tracked at "
+                    + ", ".join(f"{k} {(i.raw or {}).get(k)!r}" for k in gap)
+                    for i, gap in wrong_picture)
+                raise StudioError(
+                    f"force: this request asks for frames {req_start} to "
+                    f"{req_end} and {covers}, but {made}, while this track "
+                    f"works at clip_key {clip_key!r}, rotation {rot!r} and "
+                    f"width {req_params['width']}. Clearing part of a matte "
+                    f"made of another picture would leave every frame it keeps "
+                    f"with no area, score or IoU, because the matte store "
+                    f"reads it as a different track and carries nothing "
+                    f"forward. Redo the whole matte instead: {redo}.")
+            overlaps = [(i, s, e) for i, (s, e) in zip(cached_infos, spans)
+                        if e > s and max(req_start, s) < min(req_end, e)]
+            if overlaps:
+                repair = "; ".join(
+                    (f"{i.matte_id} " if len(cached_infos) > 1 else "")
+                    + f"frames {max(req_start, s)} to {min(req_end, e)}"
+                    for i, s, e in overlaps)
+                raise StudioError(
+                    f"force: this request asks for frames {req_start} to "
+                    f"{req_end} and {covers}, so it overlaps part of the matte "
+                    f"and hangs off it. force clears either a window INSIDE "
+                    f"what the matte covers, keeping every frame outside it, "
+                    f"or the whole span, taking the matte with it; a window "
+                    f"that is neither leaves which of those two you meant to "
+                    f"this server to guess. To repair part of it ask for "
+                    f"{repair}; {redo}. {widen}")
             raise StudioError(
                 f"force: this request asks for frames {req_start} to "
-                f"{req_end} and {covers}, so it overlaps part of the matte "
-                f"and hangs off it. force clears either a window INSIDE what "
-                f"the matte covers, keeping every frame outside it, or the "
-                f"whole span, taking the matte with it; a window that is "
-                f"neither would leave frames on disk that the matte's own "
-                f"index cannot describe. To repair part of it ask for frames "
-                f"{max(req_start, span_start)} to {min(req_end, span_end)}; "
-                f"to redo it ask for frames {min(req_start, span_start)} to "
-                f"{max(req_end, span_end)}. The same request WITHOUT force "
-                f"widens the matte instead and keeps every frame already "
-                f"tracked.")
+                f"{req_end} and {covers}, so it does not overlap the matte at "
+                f"all: not one frame this matte holds is inside the window "
+                f"you asked for, so there is nothing here for force to clear "
+                f"and nothing to repair. {widen} To throw this matte away and "
+                f"track the whole range again, {redo}.")
         # The frames being cleared have to be frames nothing is writing, which
         # is what `_clear_matte_window`'s own docstring asserts and what only
         # this check makes true (round 4 finding 91). The non-force branch
@@ -4282,7 +4412,11 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         # widened (a window bigger than the one it declares) or restarted (the
         # matte was unusable, or `force`). They are three separate flags rather
         # than "not resumed means restarted" because a caller has to be able to
-        # tell a widen from a redo: a widen keeps every frame already tracked.
+        # tell a widen from a redo: a widen keeps every frame already tracked,
+        # with the area, the score and the IoU measured for it (round 5 finding
+        # 99: it kept the files and lost those three until sam/store.py's carry
+        # forward learned that a longer window of the same picture is this
+        # matte, not another one).
         out["resumed"] = resume_kind == "resume"
         out["widened"] = resume_kind == "widen"
         out["restarted"] = resume_kind in ("restart", "force")

@@ -2668,11 +2668,19 @@ def check_mask_components(cfg=None, mask=None) -> None:
     total = sum(n for _what, n in mask_fold_counts(cfg, mask))
     if total > MASK_REQUEST_MAX_FOLDS:
         raise GradeError(
+            # Word for word the rule `mask_fold_counts` counts and the sentence
+            # studio/README.md gives for it (round 5 finding 104): a zero
+            # feather or finesse blur is not charged, and the extra fold is
+            # charged to a mask that carries no COMPONENTS rather than to one
+            # "made of neither", which read as though a legacy window with a
+            # blur on it cost one fold when it costs two.
             f"mask: this request asks for {total} mask folds across its "
-            f"layers (one per component, one per feather or finesse blur, and "
-            f"one for a mask made of neither), and one request may ask for at "
-            f"most {MASK_REQUEST_MAX_FOLDS}. No stack on its own is over the "
-            f"limit; the total is. A whole real grade here carries six.")
+            f"layers (one per component, one per non zero feather or finesse "
+            f"blur, and one for a mask that carries no components and still "
+            f"produces a matte, which is the legacy window and key form), and "
+            f"one request may ask for at most {MASK_REQUEST_MAX_FOLDS}. No "
+            f"stack on its own is over the limit; the total is. A whole real "
+            f"grade here carries six.")
 
 
 def mask_grow_passes(grow: float, width: float) -> int:
@@ -7959,7 +7967,12 @@ def main():
                           "cleared and the rest are kept; over the matte's "
                           "whole span it clears the matte; a window that only "
                           "partly overlaps its span is refused, naming both "
-                          "ranges, without clearing anything. The answer "
+                          "ranges, without clearing anything; a window that "
+                          "does not overlap it at all is refused in its own "
+                          "words, since there is nothing there to clear and "
+                          "nothing to repair; and a matte tracked for another "
+                          "clip, rotation or working width is refused rather "
+                          "than half cleared. The answer "
                           "names the range that was cleared either way, and "
                           "an empty range when there was nothing cached to "
                           "clear. Without it "
@@ -7967,7 +7980,9 @@ def main():
                           "repeat request is free while the cached matte "
                           "still covers the window asked for, RESUMES "
                           "(re-queues only the missing frames, keeping the "
-                          "ones already written) when it does not, and "
+                          "ones already written with their area, score and "
+                          "IoU) when it does not, WIDENS the same way when the "
+                          "window runs past the end of the matte, and "
                           "RESTARTS the whole window when the earlier "
                           "attempt ended failed, cancelled or stale")
     mtr.add_argument("--json", action="store_true")

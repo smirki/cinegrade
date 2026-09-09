@@ -648,15 +648,21 @@ class Handler(BaseHTTPRequestHandler):
                     # force whose window covers everything the matte declares
                     # clears the whole matte, which is what force always did;
                     # a window INSIDE the declared span clears only itself and
-                    # the frames outside it stay where they are; and a window
-                    # that overlaps part of the span and hangs off it is
-                    # refused before anything is deleted (round 4 finding 89),
-                    # because the store cannot carry the kept frames' numbers
-                    # forward across it. The refusal is mirrored here so the
-                    # CLI's own message is checked against the same 400 the
-                    # real server sends; the live job refusal beside it in
-                    # server.py is NOT mirrored, because this file's jobs never
-                    # leave `queued` on their own and it has no writer to race.
+                    # the frames outside it stay where they are; a window that
+                    # overlaps part of the span and hangs off it is refused
+                    # before anything is deleted (round 4 finding 89), because
+                    # which of those two the caller meant would otherwise be a
+                    # guess; and a window that does not touch the span at all
+                    # gets its own sentence (round 5 finding 101), because the
+                    # repair the overlap sentence names is an empty or an
+                    # inverted range for that shape. The refusals are mirrored
+                    # here so the CLI's own message is checked against the same
+                    # 400 the real server sends; the live job refusal beside
+                    # them in server.py is NOT mirrored, because this file's
+                    # jobs never leave `queued` on their own and it has no
+                    # writer to race, and neither is the picture refusal (round
+                    # 5 finding 100), because this file's mattes carry no clip
+                    # key, rotation or width for it to disagree with.
                     resume_kind, resume_from = "force", start_frame
                     spans = [(int(STATE.mattes[mid].get("start_frame") or 0),
                               int(STATE.mattes[mid].get("frames") or 0))
@@ -666,28 +672,50 @@ class Handler(BaseHTTPRequestHandler):
                     cleared_whole = all(e <= s or (start_frame <= s
                                                    and end_frame >= e)
                                         for s, e in spans)
-                    inside = all(e > s and s <= start_frame and end_frame <= e
+                    inside = all(e <= s or (s <= start_frame
+                                            and end_frame <= e)
                                  for s, e in spans)
                     if not cleared_whole and not inside:
                         covers = "; ".join(
                             f"{mid} covers frames {s} to {e}"
                             for mid, (s, e) in zip(known, spans))
+                        redo = (f"to redo it ask for frames "
+                                f"{min(start_frame, span_start)} to "
+                                f"{max(end_frame, span_end)}")
+                        widen = ("The same request WITHOUT force widens the "
+                                 "matte instead and keeps every frame already "
+                                 "tracked, with its area, score and IoU.")
+                        overlaps = [(mid, s, e)
+                                    for mid, (s, e) in zip(known, spans)
+                                    if e > s and max(start_frame, s)
+                                    < min(end_frame, e)]
+                        if overlaps:
+                            repair = "; ".join(
+                                (f"{mid} " if len(known) > 1 else "")
+                                + f"frames {max(start_frame, s)} to "
+                                  f"{min(end_frame, e)}"
+                                for mid, s, e in overlaps)
+                            self._json({"error":
+                                f"force: this request asks for frames "
+                                f"{start_frame} to {end_frame} and {covers}, "
+                                f"so it overlaps part of the matte and hangs "
+                                f"off it. force clears either a window INSIDE "
+                                f"what the matte covers, keeping every frame "
+                                f"outside it, or the whole span, taking the "
+                                f"matte with it; a window that is neither "
+                                f"leaves which of those two you meant to this "
+                                f"server to guess. To repair part of it ask "
+                                f"for {repair}; {redo}. {widen}"}, 400)
+                            return
                         self._json({"error":
                             f"force: this request asks for frames "
                             f"{start_frame} to {end_frame} and {covers}, so it "
-                            f"overlaps part of the matte and hangs off it. "
-                            f"force clears either a window INSIDE what the "
-                            f"matte covers, keeping every frame outside it, or "
-                            f"the whole span, taking the matte with it; a "
-                            f"window that is neither would leave frames on "
-                            f"disk that the matte's own index cannot describe. "
-                            f"To repair part of it ask for frames "
-                            f"{max(start_frame, span_start)} to "
-                            f"{min(end_frame, span_end)}; to redo it ask for "
-                            f"frames {min(start_frame, span_start)} to "
-                            f"{max(end_frame, span_end)}. The same request "
-                            f"WITHOUT force widens the matte instead and keeps "
-                            f"every frame already tracked."}, 400)
+                            f"does not overlap the matte at all: not one frame "
+                            f"this matte holds is inside the window you asked "
+                            f"for, so there is nothing here for force to clear "
+                            f"and nothing to repair. {widen} To throw this "
+                            f"matte away and track the whole range again, "
+                            f"{redo}."}, 400)
                         return
                     if cleared_whole:
                         cleared = (span_start, span_end)

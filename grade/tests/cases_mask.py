@@ -790,6 +790,34 @@ def test_the_component_count_cap(ctx):
                     "130" in legacy_total and "at most 128" in legacy_total
                     and "fold" in legacy_total, legacy_total[:240])
 
+    # Round 5 finding 104: the rule, the refusal and the README are one
+    # sentence, not three paraphrases. The counter charges a fold for a NON
+    # ZERO feather or blur and an extra fold to a mask with no COMPONENTS; the
+    # refusal used to say "one per feather or finesse blur, and one for a mask
+    # made of neither", which charged a zero feather and read as though the
+    # legacy window and key form cost one fold when it costs two.
+    for phrase in ("one per component",
+                   "one per non zero feather or finesse blur",
+                   "one for a mask that carries no components"):
+        ctx.expect_true(f"the refusal states the rule it counts: {phrase!r}",
+                        phrase in legacy_total, legacy_total[:240])
+    ctx.expect_true("and no longer says a mask is charged for being made of "
+                    "neither, which named the wrong thing",
+                    "made of neither" not in legacy_total, legacy_total[:240])
+    # The README wraps its lines, so compare on collapsed whitespace rather
+    # than on where the paragraph happens to break.
+    readme = " ".join((H.CONTENT / "studio" / "README.md").read_text().split())
+    for phrase in ("one per component",
+                   "one per non zero feather or finesse blur",
+                   "one for a mask that carries no components"):
+        ctx.expect_true(f"and studio/README.md gives the same rule: {phrase!r}",
+                        phrase in readme, "not found in studio/README.md")
+    # The two shapes the wording is about, proved rather than described.
+    zero_feather = _layer([_win(LEFT, feather=0.0), _win(TOP, op="intersect")])
+    ctx.expect_eq("a feather of zero is charged nothing, as the words say",
+                  [n for _what, n in
+                   cg.mask_fold_counts({"layers": [zero_feather]})], [2])
+
 
 def test_key_component_matches_the_qualifier(ctx):
     """A key component selects what the legacy qualifier selects.

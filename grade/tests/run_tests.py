@@ -71,7 +71,9 @@ import cases_harness          # noqa: E402
 # (gap 25).
 # Round 4 fixes: 348 -> 349,
 # stats.feathered_min_and_max_read_the_mask_not_its_outer_tail (finding 90).
-EXPECTED_TESTS = 349
+# Round 5 fixes: 349 -> 350,
+# stats.a_weight_that_is_not_a_number_is_refused_by_name (finding 103).
+EXPECTED_TESTS = 350
 
 MODULES = [cases_color, cases_golden, cases_params, cases_look,
            cases_range, cases_output, cases_window, cases_radial,

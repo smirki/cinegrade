@@ -168,16 +168,59 @@ class _Steady:
         return out
 
 
+# The three fields of an index.json that say which PICTURE a matte is of.
+# Everything else about a matte (its window, its length, its state) can change
+# between two runs that belong together; these cannot. A matte tracked for
+# another clip, at another rotation or at another working width is not this
+# one whatever its frame numbers say.
+PICTURE_FIELDS = ("clip_key", "rotation", "width")
+
+
+def picture_differences(previous: dict, current: dict) -> list[str]:
+    """Which of `PICTURE_FIELDS` disagree between an index already on disk and
+    the header a new run would write. Empty means the two are the same picture,
+    so one may carry the other's per frame numbers forward.
+
+    A field the older index does not carry at all is not a difference: an index
+    written before that field existed says nothing about it, and refusing to
+    resume such a matte would throw away numbers over a missing key rather than
+    over a disagreement. Compared as strings, because the same rotation reaches
+    this file as the integer 0 from the service's own route and as "0" from a
+    caller that read it back out of JSON.
+
+    Module level and public so the one caller outside this file (the studio's
+    force branch, which has to know whether the store will carry a matte
+    forward BEFORE it deletes anything) asks this rule instead of keeping a
+    second copy of it that can drift (round 5 finding 100).
+    """
+    out = []
+    for key in PICTURE_FIELDS:
+        if key in previous and str(previous.get(key)) != str(current.get(key)):
+            out.append(key)
+    return out
+
+
+def same_picture(previous: dict, current: dict) -> bool:
+    """True when two index headers describe the same picture, so a re-track
+    may carry the earlier run's per frame numbers forward."""
+    return not picture_differences(previous, current)
+
+
 class MatteWriter:
     """One matte: its frames, its index.json, its state.
 
     Opening a matte id that already has a directory is a RESUME (checkpoint
     gap 12): the frames already on disk stay, the per frame arrays are
     carried forward instead of blanked, `start_frame` keeps the earliest of
-    the two ranges, and `done_frames` counts what is really there rather
-    than only what this run writes. Without that, re-queueing the missing
-    tail of a cancelled track would report 125 of 384 while 384 files sat in
-    the folder, and the area curve would lose every point before the tail.
+    the two ranges, `end_frame` the furthest, and `done_frames` counts what is
+    really there rather than only what this run writes. Without that,
+    re-queueing the missing tail of a cancelled track would report 125 of 384
+    while 384 files sat in the folder, and the area curve would lose every
+    point before the tail.
+
+    That is true of every window of the same picture: the same window again, a
+    repair inside it, and a widen past its end all keep what the earlier run
+    measured (round 5 finding 99). Only a different picture starts clean.
     """
 
     def __init__(self, root: Path, matte_id: str, header: dict, steady: int = 1):
@@ -224,15 +267,32 @@ class MatteWriter:
     def _carry_forward(self, previous: dict, frames: int) -> None:
         """A resume keeps what the earlier attempt already produced.
 
-        Two shapes count as the same track. The earlier index agrees about
-        how long the matte is (`frames`), which is a re-queue of the same
-        window; or the window THIS run was asked for sits inside the window
-        the earlier index declares (`_inside_previous`), which is a re-track
-        of one part of a longer matte, and then the matte keeps the LONGER
-        declaration. Any other length is a different track, and merging two
-        of those by index would put one attempt's numbers at another's
-        timestamps. `done_frames` is recounted off the directory, because
-        that is the only number that survives a process dying.
+        Two indexes are the same matte when they are of the same PICTURE
+        (`same_picture` above: clip key, rotation, working width). Then the
+        matte spans the UNION of the two windows: the arrays are as long as
+        the longer declaration, and every number the earlier attempt measured
+        stays in its own slot, because C2 indexes `areas`, `scores` and
+        `ious` by absolute frame index and a re-track of the same picture
+        cannot move a frame number. A different picture is a different track,
+        and merging two of those by index would put one attempt's numbers at
+        another's timestamps, so nothing is carried and the arrays are this
+        run's own window, blank.
+
+        `done_frames` is recounted off the directory, because that is the
+        only number that survives a process dying.
+
+        Round 5 finding 99: the rule used to be about LENGTH, not picture. An
+        equal declaration was a re-queue and a window INSIDE the declared one
+        was a repair (tooling gap 24); anything else, including a WIDEN, read
+        as a different track and returned here without carrying anything. A
+        widen is what the studio asks for whenever a request runs past the end
+        of a matte (`start_frame` = the first missing frame, `end_frame` = the
+        new, longer end), and it is the request the force refusal points a
+        caller at. Every frame already tracked kept its PNG and lost its area,
+        its score and its IoU, under a matte that then read `done` with every
+        frame on disk, `is_partial` false, and a quality pass reporting nothing
+        suspect over frames that had no numbers to judge. A longer window of
+        the same picture is the safe direction, not a suspicious one.
         """
         self.done = 0
         # Frames this matte has on disk, so `done_frames` counts what is
@@ -241,31 +301,35 @@ class MatteWriter:
         self._written: set[int] = set()
         if not previous:
             return
+        if not same_picture(previous, self.index):
+            return
         length = int(frames)
         declared = int(previous.get("frames") or 0)
         if declared != length:
-            # Tooling gap 24: a repair of one second of a twelve second matte
-            # arrives here declaring the repair window, and this used to read
-            # as "a different track": the arrays were blanked, `done` restarted
-            # at 0 with every kept frame still on disk, and the matte's own
-            # span shrank to the repair. It keeps its own span instead, and
-            # this run writes into the middle of it. Only INSIDE, never wider:
-            # a longer window is a widen, whose own re-track covers everything
-            # from the first missing frame to the new end anyway.
-            if not self._inside_previous(previous):
-                return
-            length = declared
-            self.index["frames"] = declared
-            self.index["end_frame"] = max(
-                int(self.index.get("end_frame") or 0),
-                int(previous.get("end_frame") or declared))
+            # The matte is as long as the longer of the two declarations, and
+            # its window is the union of the two: a repair of one second of a
+            # twelve second matte keeps the twelve (tooling gap 24), and a
+            # widen from six seconds to twelve keeps the six it already
+            # measured (round 5 finding 99). Either way the arrays are rebuilt
+            # at that length and the loop below puts the old numbers back in
+            # their own absolute slots.
+            length = max(declared, length)
+            self.index["frames"] = length
             for key in ("areas", "scores", "ious"):
-                self.index[key] = [None] * declared
+                self.index[key] = [None] * length
+        end = max(
+            int(self.index.get("end_frame") or self.index.get("frames") or 0),
+            int(previous.get("end_frame") or declared or 0))
+        if end:
+            self.index["end_frame"] = end
         for key in ("areas", "scores", "ious"):
             old = previous.get(key)
-            if isinstance(old, list) and len(old) == length:
+            if isinstance(old, list):
                 merged = list(self.index.get(key) or [None] * length)
-                for i, value in enumerate(old):
+                # `old[:length]` rather than a length test: an index written
+                # for a shorter window is exactly the widen case, and its
+                # numbers are still this matte's own frames 0..len(old).
+                for i, value in enumerate(old[:length]):
                     if value is not None and merged[i] is None:
                         merged[i] = value
                 self.index[key] = merged
@@ -279,35 +343,6 @@ class MatteWriter:
         except OSError:
             self._written = set()
         self.done = len(self._written)
-
-    def _inside_previous(self, previous: dict) -> bool:
-        """True when this run's window sits inside the window `previous`
-        declares, so the two are the same matte and this run is a repair of
-        part of it (tooling gap 24).
-
-        Read off the two indexes' own `start_frame`/`end_frame`, plus the
-        three fields that say which PICTURE a matte is of: a matte tracked for
-        another clip, another rotation or another working width is not this
-        one whatever its frame numbers say, and merging its numbers in by
-        index would be the worst kind of wrong answer. The equal length case
-        above does not ask (it never did), because an id is only re-opened by
-        a caller naming it, and the studio judges a mismatched recipe as
-        `stale` and re-tracks it before this store is asked at all.
-        """
-        for key in ("clip_key", "rotation", "width"):
-            if key in previous and str(previous.get(key)) != \
-                    str(self.index.get(key)):
-                return False
-        try:
-            prev_start = int(previous.get("start_frame") or 0)
-            prev_end = int(previous.get("end_frame")
-                           or previous.get("frames") or 0)
-            start = int(self.index.get("start_frame") or 0)
-            end = int(self.index.get("end_frame")
-                      or self.index.get("frames") or 0)
-        except (TypeError, ValueError):
-            return False
-        return prev_end > prev_start and prev_start <= start and end <= prev_end
 
     # -- state -------------------------------------------------------------
 

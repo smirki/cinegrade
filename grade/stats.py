@@ -255,6 +255,24 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
             raise StatsError(
                 f"weight shape {w.shape} does not match the frame {y.shape} "
                 f"(contract C6: weight is HxW at the picture's own size)")
+        if not bool(np.isfinite(w).all()):
+            # Round 5 finding 103. A weight with a NaN or an inf in it passes
+            # every test below by accident rather than on purpose: `w.sum()` is
+            # NaN, and `NaN <= 0.0` is False, so the no-coverage answer is
+            # skipped; `w.max()` is NaN, and every comparison against NaN is
+            # False, so the core selection below is empty and the luma block
+            # used to raise `zero-size array to reduction operation minimum`
+            # out of its middle. It is refused in one place instead, like the
+            # mismatched shape above and for the same reason: a weight that is
+            # not a number is a caller bug, and a row built from it would have
+            # a NaN total under every percentage in it, not just the two
+            # extremes that happened to raise.
+            raise StatsError(
+                "weight holds a value that is not a finite number (a NaN or an "
+                "inf), so every figure in this row would be one too (contract "
+                "C6: weight is HxW of finite numbers at the picture's own "
+                "size). A mask that selects nothing is a weight of zeros, "
+                "which is answered with no_coverage rather than an error.")
         if float(w.sum()) <= 0.0:
             # Gap 23: an expected outcome, reported, not an exception. The
             # mismatched SHAPE above stays an error, because that is a caller
@@ -307,6 +325,16 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
             # empty.
             core = w >= float(w.max())
         y_sel = y[core]
+        if y_sel.size == 0:
+            # Belt and braces, and it was here before round 4 finding 90's
+            # fix replaced it with the fallback above: an empty selection here
+            # would take `min` and `max` of nothing, which raises out of the
+            # middle of this block rather than answering. Nothing reaches it
+            # today (a weight that sums above zero and is all finite has a
+            # highest value some pixel carries), which is what makes it worth
+            # one line rather than an exception a caller has to read
+            # (round 5 finding 103).
+            y_sel = y
     out = {
         "luma": {
             "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),

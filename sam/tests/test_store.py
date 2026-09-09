@@ -254,13 +254,34 @@ def main() -> int:
     check("an overwritten frame takes the new run's value",
           abs(index["areas"][2] - 0.6) < 0.01, str(index["areas"][2]))
 
-    print("\na different length is a different track, not a resume")
+    print("\na different PICTURE is a different track; another length of the "
+          "same picture is not (round 5 finding 99)")
+    # This block used to read "a different length is a different track, not a
+    # resume", and it was the rule finding 99 is about: a longer declaration of
+    # the SAME clip at the same rotation and working width is a widen, and
+    # blanking the arrays for it threw away every number the earlier run
+    # measured while keeping every frame file it wrote. Length is not what
+    # makes two runs different pictures; `PICTURE_FIELDS` is.
     other = MatteWriter(root, "m_resume", header(20), steady=1)
-    check("re-opening the same id with another frame count starts clean",
-          other.done == 0, str(other.done))
+    check("re-opening the same id at a longer length keeps the frames already "
+          "written, because a longer window of the same picture is a widen",
+          other.done == 10, str(other.done))
     fresh = read_index(other.dir)
-    check("and its arrays are the new length, all empty",
-          len(fresh["areas"]) == 20 and all(a is None for a in fresh["areas"]))
+    check("and its arrays are the new length with the earlier run's numbers "
+          "still in their own slots",
+          len(fresh["areas"]) == 20
+          and sum(a is not None for a in fresh["areas"]) == 10
+          and all(a is None for a in fresh["areas"][10:]),
+          f"{sum(a is not None for a in fresh['areas'])} of "
+          f"{len(fresh['areas'])} areas set")
+    elsewhere = MatteWriter(root, "m_resume", dict(header(20), width=16),
+                            steady=1)
+    check("but a matte recorded at another working width IS a different "
+          "picture, so nothing is carried into it",
+          elsewhere.done == 0
+          and all(a is None for a in elsewhere.index["areas"]),
+          f"{elsewhere.done} done, "
+          f"{sum(a is not None for a in elsewhere.index['areas'])} areas set")
 
     print("\na matte that starts part way through keeps the earlier start")
     late = MatteWriter(root, "m_startkeep",
@@ -330,17 +351,20 @@ def main() -> int:
           len(files) == 10 and files[0] == "000000.png"
           and files[-1] == "000009.png", str(len(files)))
 
-    print("\na window that only PARTLY overlaps the matte is a different "
-          "track (gap 24, round 4 finding 89)")
-    # The third shape of `mask track --force`, and the reason the studio refuses
-    # it instead of clearing anything: the two above are an equal window (a
-    # resume) and an interior one (a repair), and BOTH carry the matte forward.
-    # A window that hangs off one end carries nothing forward, by this store's
-    # own blessed rule ("a different length is a different track"), so the
-    # frames the studio kept on disk for it end up either past the end of the
-    # new arrays or inside them with no numbers. Neither is wrong here; both
-    # are wrong to ask for, which is what studio/server.py's force branch now
-    # says in words (studio/tests/py/test_mask_routes.py's two refusal tests).
+    print("\na window that only PARTLY overlaps the matte keeps what the "
+          "earlier run measured too (gap 24, round 4 finding 89, round 5 "
+          "finding 99)")
+    # The third shape of `mask track --force`, and the shape the studio refuses
+    # rather than clears: the two above are an equal window (a resume) and an
+    # interior one (a repair). A window that hangs off one end used to carry
+    # nothing forward, by this store's old rule ("a different length is a
+    # different track"), so the frames the studio kept on disk for it ended up
+    # either past the end of the new arrays or inside them with no numbers.
+    # Both of those are fixed here (finding 99): a window of the same picture
+    # carries forward whichever way it hangs. The studio still refuses this
+    # request, because the two asks it names (a repair inside the span, a widen
+    # past it) say what the caller meant; what changed is that the store no
+    # longer loses numbers when something else asks for this shape.
     # Reproduction one, with the round 4 verdict's own frame numbers: a matte
     # tracked over frames 173 to 197, forced at 144 to 192. The force clears
     # the overlap (173 to 191), keeps 192 to 196, and re-queues 144 to 192.
@@ -363,18 +387,21 @@ def main() -> int:
     hangs_low = MatteWriter(root, "m_lowend",
                             dict(header(192), start_frame=144, end_frame=192),
                             steady=1)
-    check("a window that starts before the matte carries nothing forward: the "
-          "declared window moves to the request",
-          hangs_low.index["frames"] == 192
+    check("a window that starts before the matte spans the union of the two, "
+          "so the five frames past its end (192 to 196) keep their slots",
+          hangs_low.index["frames"] == 197
           and hangs_low.index["start_frame"] == 144
-          and hangs_low.index["end_frame"] == 192,
+          and hangs_low.index["end_frame"] == 197,
           f"{hangs_low.index['frames']} frames, "
           f"{hangs_low.index['start_frame']}..{hangs_low.index['end_frame']}")
-    check("its arrays are the request's length, so the five frames the force "
-          "kept (192 to 196) have no slot in them at all, and the numbers the "
-          "first run measured are gone",
-          len(hangs_low.index["areas"]) == 192
-          and all(a is None for a in hangs_low.index["areas"]),
+    check("its arrays are 197 long and still carry the first run's 24 numbers, "
+          "including the ones for frames whose files were deleted: clearing a "
+          "window has to null those itself, which is what the studio's own "
+          "`_clear_matte_window` does",
+          len(hangs_low.index["areas"]) == 197
+          and sum(a is not None for a in hangs_low.index["areas"]) == 24
+          and _near(hangs_low.index["areas"][196], 0.5)
+          and _near(hangs_low.index["areas"][180], 0.5),
           f"{len(hangs_low.index['areas'])} areas, "
           f"{sum(a is not None for a in hangs_low.index['areas'])} of them set")
     hangs_low.set_state("running")
@@ -383,23 +410,26 @@ def main() -> int:
     hangs_low.finish("done")
     low_final = read_index(hangs_low.dir)
     low_files = sorted(p.name for p in hangs_low.dir.glob("*.png"))
-    check("so after the re-track the matte reads done over a window it cannot "
-          "describe: 53 files on disk, 192 declared frames, 48 done",
+    check("so after the re-track the matte describes what it holds: 53 files "
+          "on disk, 197 declared frames, 53 done",
           low_final["state"] == "done" and len(low_files) == 53
-          and low_final["frames"] == 192 and low_final["done_frames"] == 48,
+          and low_final["frames"] == 197 and low_final["done_frames"] == 53,
           f"{low_final['state']}, {len(low_files)} files, "
           f"{low_final['done_frames']}/{low_final['frames']}")
-    check("and the five kept frames are orphaned: their PNGs sit past the end "
-          "of every array, so no reader can reach them",
-          len(low_final["areas"]) == 192
+    check("and nothing is orphaned: every file has a slot in the arrays, the "
+          "five kept frames carry the first run's numbers and the re-tracked "
+          "ones the second run's",
+          len(low_final["areas"]) == 197
           and low_files[-1] == "000196.png"
-          and [n for n in low_files if int(n[:6]) >= 192]
-          == ["%06d.png" % i for i in range(192, 197)],
-          f"{len(low_final['areas'])} areas, last file {low_files[-1]}")
+          and sum(a is not None for a in low_final["areas"]) == 53
+          and _near(low_final["areas"][196], 0.5)
+          and _near(low_final["areas"][144], 0.8),
+          f"{sum(a is not None for a in low_final['areas'])} areas set, "
+          f"last file {low_files[-1]}")
 
-    # Reproduction two, the mirror image, which orphans nothing and is quieter
-    # for it: a matte over frames 0 to 288 forced at 173 to 400. Every kept
-    # frame lands inside the new arrays, with no number in them.
+    # Reproduction two, the mirror image: a matte over frames 0 to 288 forced
+    # at 173 to 400. Every kept frame lands inside the new arrays, and now with
+    # its own number in them.
     over = MatteWriter(root, "m_highend", header(288), steady=1)
     over.set_state("running")
     for i in range(288):
@@ -422,20 +452,94 @@ def main() -> int:
           and high_final["frames"] == 400,
           f"{high_final['state']}, {len(high_files)} files, "
           f"{high_final['frames']} declared")
-    check("and the 173 frames it kept have a PNG each and no area, score or "
-          "IoU: nothing measured them, and done_frames counts only this run",
-          all(high_final["areas"][i] is None for i in range(173))
-          and all(high_final["scores"][i] is None for i in range(173))
-          and all(high_final["ious"][i] is None for i in range(173))
-          and high_final["done_frames"] == 227,
+    check("and the 173 frames it kept have a PNG each AND an area, a score "
+          "and an IoU, so done_frames counts the matte rather than this run",
+          all(high_final["areas"][i] is not None for i in range(173))
+          and all(high_final["scores"][i] is not None for i in range(173))
+          and all(high_final["ious"][i] is not None for i in range(1, 173))
+          and high_final["done_frames"] == 400,
           f"areas[0:3] {high_final['areas'][:3]}, "
           f"{high_final['done_frames']}/{high_final['frames']}")
-    check("so the matte's own declared start moved past frames it still has "
-          "on disk: it says it starts at 173 with 173 files before that",
-          high_final["start_frame"] == 173
-          and len([n for n in high_files if int(n[:6]) < 173]) == 173,
+    check("and the matte's own declared start stays behind the frames it "
+          "holds: it says it starts at 0 with a file at 0",
+          high_final["start_frame"] == 0 and high_files[0] == "000000.png",
           f"start_frame {high_final['start_frame']}, "
-          f"{len([n for n in high_files if int(n[:6]) < 173])} files before it")
+          f"first file {high_files[0]}")
+
+    print("\na widen keeps every frame already tracked, numbers and all "
+          "(round 5 finding 99)")
+    # The request the force refusal points a caller at: "the same request
+    # WITHOUT force widens the matte instead and keeps every frame already
+    # tracked". The studio sends a widen as start_frame = the first MISSING
+    # frame and end_frame = the new, longer end, so the incoming window is
+    # neither the same length as the matte nor inside it, which is the one
+    # shape this store used to read as a different track. It kept every PNG
+    # and threw every area, score and IoU away, under a matte that then read
+    # `done` with 400 of 400 frames on disk and nothing flagged: round 4
+    # finding 89's own defect on a path that needs no --force at all.
+    # The round 5 verdict's numbers: 288 frames tracked, widened to 400.
+    grew = MatteWriter(root, "m_widen", header(288), steady=1)
+    grew.set_state("running")
+    for i in range(288):
+        grew.push(i, ramp(0.5), 0.9)
+    grew.finish("done")
+    check("a matte tracked over frames 0 to 288 has 288 frames of numbers",
+          read_index(grew.dir)["done_frames"] == 288
+          and sum(a is not None for a in read_index(grew.dir)["areas"]) == 288,
+          str(read_index(grew.dir)["done_frames"]))
+    widened = MatteWriter(root, "m_widen",
+                          dict(header(400), start_frame=288, end_frame=400),
+                          steady=1)
+    check("the widened matte declares the union of the two windows, so its "
+          "own start does not move past frames it still holds",
+          widened.index["frames"] == 400
+          and widened.index["start_frame"] == 0
+          and widened.index["end_frame"] == 400,
+          f"{widened.index['frames']} frames, "
+          f"{widened.index['start_frame']}..{widened.index['end_frame']}")
+    check("its arrays are the new length with the first run's numbers still "
+          "in their own slots, not blanked",
+          len(widened.index["areas"]) == 400
+          and sum(a is not None for a in widened.index["areas"]) == 288
+          and _near(widened.index["areas"][0], 0.5)
+          and _near(widened.index["areas"][287], 0.5),
+          f"{sum(a is not None for a in widened.index['areas'])} of "
+          f"{len(widened.index['areas'])} areas set")
+    check("and the frames already on disk are counted at the open, so a widen "
+          "does not report a matte that lost its head",
+          widened.done == 288, str(widened.done))
+    widened.set_state("running")
+    for i in range(288, 400):
+        widened.push(i, ramp(0.8), 0.7)
+    widened.finish("done")
+    grown = read_index(widened.dir)
+    grown_files = sorted(p.name for p in widened.dir.glob("*.png"))
+    check("after the widen the matte is 400 frames of files and 400 of "
+          "done_frames",
+          grown["state"] == "done" and len(grown_files) == 400
+          and grown["frames"] == 400 and grown["done_frames"] == 400,
+          f"{grown['state']}, {len(grown_files)} files, "
+          f"{grown['done_frames']}/{grown['frames']}")
+    check("every one of the 400 frames has an area and a score, so a quality "
+          "pass over this matte reads numbers rather than 288 blanks",
+          all(a is not None for a in grown["areas"])
+          and all(s is not None for s in grown["scores"]),
+          f"{sum(a is None for a in grown['areas'])} areas missing, "
+          f"{sum(s is None for s in grown['scores'])} scores missing")
+    check("the head keeps the first run's numbers and the tail carries the "
+          "new run's",
+          _near(grown["areas"][0], 0.5) and _near(grown["areas"][287], 0.5)
+          and _near(grown["areas"][288], 0.8)
+          and _near(grown["areas"][399], 0.8),
+          f"{grown['areas'][287]} then {grown['areas'][288]}")
+    check("the IoU curve survives too, with one gap at the seam: the frame a "
+          "resumed run writes first has no predecessor in memory to compare "
+          "against, which is what every resume has always reported",
+          sum(v is not None for v in grown["ious"]) == 398
+          and grown["ious"][0] is None and grown["ious"][288] is None
+          and grown["ious"][287] is not None
+          and grown["ious"][289] is not None,
+          f"{sum(v is not None for v in grown['ious'])} of 400 ious set")
 
     print("\nindex.json is never seen half written")
     writer = MatteWriter(root, "m_atomic", header(4), steady=1)
