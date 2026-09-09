@@ -283,7 +283,11 @@ The honest version, so nobody debugs a machine that is behaving correctly:
   and still reached 13 GB, and the second had the windows and the cap and
   still spiked to 13 GB inside every frame.
 * **Cancel takes effect within one frame**, and the matte it leaves behind is
-  marked `partial` with the frames it actually wrote, not thrown away.
+  marked `partial` with the frames it actually wrote, not thrown away. A cancel
+  that landed before the first frame was written has nothing to call partial:
+  that matte is marked `cancelled`, with the job's own reason on it and 0 of
+  the frames it was asked for, so a reader can tell a track somebody stopped
+  from one that tried and `failed`.
 * **A failed job does not take the service down.** It is marked `failed` with
   the reason, the next job runs, and `/health` counts both.
 

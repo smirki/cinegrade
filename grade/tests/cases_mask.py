@@ -646,7 +646,11 @@ def test_the_component_count_cap(ctx):
     component was individually inside the round 2 limits.
 
     Two caps, because there are two ways to ask: one enormous stack, and a
-    config full of legal stacks. Both are refused rather than truncated: no
+    config full of legal stacks. They count different things (round 4 finding
+    92): the per stack cap counts components, because that is what a stack
+    carries, and the per request budget counts FOLDS, because that is what
+    costs. A gaussian and a legacy window and key mask were free under a count
+    of components. Both are refused rather than truncated: no
     real grade is anywhere near them (the biggest stack in bakeoff/ is two
     components, the biggest whole grade six), so a request that reaches one
     is a mistake and silently measuring a truncated version of it would be a
@@ -654,11 +658,11 @@ def test_the_component_count_cap(ctx):
     """
     ctx.expect_eq("a stack may carry at most 32 components",
                   cg.MASK_STACK_MAX_COMPONENTS, 32)
-    ctx.expect_eq("and one request at most 128 across its layers",
-                  cg.MASK_REQUEST_MAX_COMPONENTS, 128)
+    ctx.expect_eq("and one request at most 128 folds across its layers",
+                  cg.MASK_REQUEST_MAX_FOLDS, 128)
     ctx.expect_gt("the request budget is the wider of the two, or a single "
                   "legal stack could not be measured at all",
-                  cg.MASK_REQUEST_MAX_COMPONENTS, cg.MASK_STACK_MAX_COMPONENTS)
+                  cg.MASK_REQUEST_MAX_FOLDS, cg.MASK_STACK_MAX_COMPONENTS)
 
     # The door every scripted caller comes through: `cinegrade stats --mask`
     # and POST /api/stats {"mask": ...} both build their layer here.
@@ -725,6 +729,66 @@ def test_the_component_count_cap(ctx):
     counts = cg.mask_component_counts(real, {"components": [_win(LEFT)]})
     ctx.expect_eq("and the counter sees every stack in the request",
                   [n for _what, n in counts], [2, 2, 2, 1])
+
+    # Round 4 finding 92: the per stack cap counts components, and the request
+    # budget counts what a request actually asks a machine to fold. Those are
+    # not the same number, and counting components for both left two shapes
+    # free: a gaussian, which is the expensive fold, and the legacy window and
+    # key pair, which has no components to count at all.
+    plain = _layer([_win(LEFT), _win(TOP, op="intersect")])
+    blurred = _layer([_win(LEFT, feather=cg.MASK_BLUR_MAX),
+                      _win(TOP, op="intersect")],
+                     mask={"finesse": {"blur": cg.MASK_BLUR_MAX}})
+    ctx.expect_eq("two components and no gaussian costs two folds",
+                  [n for _what, n in cg.mask_fold_counts({"layers": [plain]})],
+                  [2])
+    ctx.expect_eq("the same stack with a feather and a finesse blur costs "
+                  "four, because each gaussian is its own whole frame pass",
+                  [n for _what, n in cg.mask_fold_counts({"layers": [blurred]})],
+                  [4])
+    ctx.expect_eq("while the per stack count still sees the two components it "
+                  "is about",
+                  [n for _what, n in
+                   cg.mask_component_counts({"layers": [blurred]})], [2])
+
+    legacy = deepcopy(cg.LAYER_DEFAULTS)
+    legacy["mask"]["window"]["enabled"] = True
+    legacy["mask"]["key"]["enabled"] = True
+    legacy["mask"]["finesse"]["blur"] = cg.MASK_BLUR_MAX
+    ctx.expect_eq("a legacy window and key mask carries no components at all",
+                  [n for _what, n in
+                   cg.mask_component_counts({"layers": [legacy]})], [0])
+    ctx.expect_eq("and costs two folds: one matte out of the pair however "
+                  "many halves are on, plus its blur",
+                  [n for _what, n in cg.mask_fold_counts({"layers": [legacy]})],
+                  [2])
+    idle = _layer([])
+    ctx.expect_eq("a mask that asks for nothing is absent from the folds, not "
+                  "counted as zero",
+                  cg.mask_fold_counts({"layers": [idle]}), [])
+
+    at_budget = {"layers": [deepcopy(legacy)
+                            for _ in range(cg.MASK_REQUEST_MAX_FOLDS // 2)]}
+    edge = ""
+    try:
+        cg.check_mask_components(at_budget)
+    except cg.GradeError as exc:
+        edge = str(exc)
+    ctx.expect_true("64 of them is exactly the budget and passes", not edge,
+                    edge[:200])
+    over_budget = {"layers": at_budget["layers"] + [deepcopy(legacy)]}
+    legacy_total = ""
+    try:
+        cg.check_mask_components(over_budget)
+    except cg.GradeError as exc:
+        legacy_total = str(exc)
+    ctx.expect_true("65 is refused, where a count of components saw zero of "
+                    "them and let the whole body through",
+                    bool(legacy_total),
+                    legacy_total[:80] or "nothing raised")
+    ctx.expect_true("and the refusal names the total in the unit it counted",
+                    "130" in legacy_total and "at most 128" in legacy_total
+                    and "fold" in legacy_total, legacy_total[:240])
 
 
 def test_key_component_matches_the_qualifier(ctx):
@@ -1682,8 +1746,9 @@ def register(suite):
                   "[0, 1] is refused")
     suite.add(g, "component_cap", test_the_component_count_cap,
               doc="a mask stack may carry at most 32 components and one "
-                  "request at most 128 across its layers, both refused with "
-                  "a sentence rather than truncated")
+                  "request at most 128 folds (components plus gaussians, and "
+                  "a legacy mask is not free), both refused with a sentence "
+                  "rather than truncated")
     suite.add(g, "key_component", test_key_component_matches_the_qualifier,
               doc="a key component selects what the legacy qualifier selects")
     suite.add(g, "luma_component", test_luma_component_is_a_key_with_hue_and_sat_open,

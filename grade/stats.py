@@ -50,6 +50,26 @@ SAT_FLOOR = 0.10          # below this a pixel counts as neutral, not coloured
 CLIP_BLACK = 2            # 8-bit code at or under which a pixel reads as crushed
 CLIP_WHITE = 253
 
+# Where "the mask selects this pixel" starts for `luma.min` and `luma.max`
+# under a weight (round 4 finding 90).
+#
+# Every other figure in the luma block is weight proportional: a pixel at
+# weight 5e-08 moves the mean, the standard deviation and the percentiles by
+# essentially nothing. A min and a max are one pixel each, so on a hard `w > 0`
+# support the outermost tail of a feather counts exactly as much as the middle
+# of the mask, and a feather is a gaussian whose kernel reaches three sigma
+# (`gaussian_blur2d`): a mask feathered at 0.05 of frame width has a support
+# some 60 pixels wider than itself on a 400 pixel frame. So the letterboxed
+# case these two were narrowed for (a mask on a face reporting min 0.0 from a
+# black bar it does not cover) came straight back as soon as the mask was
+# feathered, which for a grading mask is the ordinary case.
+#
+# 0.5 because that is the weight a gaussian leaves at the edge of the shape it
+# blurred, so the core of a feathered mask is the shape that was feathered.
+# It is a different basis from the weighted figures beside it, which is why
+# the printed row and studio/README.md both say so.
+MASK_CORE_WEIGHT = 0.5
+
 # Nine edges, eight equal luma bands over 0 to 1, the default `bands()` uses
 # when a caller does not hand it its own edges.
 DEFAULT_BAND_EDGES = [i / 8.0 for i in range(9)]
@@ -271,9 +291,22 @@ def frame_stats(rgb: np.ndarray, weight: np.ndarray | None = None) -> dict:
     # in a block where every other figure was weighted. Found while adding
     # the two spread figures below, which would otherwise disagree with the
     # min and max sitting next to them.
-    y_sel = y if w is None else y[w > 0]
-    if y_sel.size == 0:                     # w.sum() > 0 with every w <= 0
+    #
+    # "Selects" is MASK_CORE_WEIGHT and above, not any weight above zero
+    # (round 4 finding 90): a feather's outer tail weighs nothing in every
+    # other figure here and would weigh everything in these two.
+    if w is None:
         y_sel = y
+    else:
+        core = w >= MASK_CORE_WEIGHT
+        if not core.any():
+            # A mask that never reaches the core (a very soft key, a feather
+            # wider than the shape it feathers) still has pixels it selects
+            # more than any other, and they are still the mask's own rather
+            # than the frame's. `w.sum() > 0` above guarantees this is not
+            # empty.
+            core = w >= float(w.max())
+        y_sel = y[core]
     out = {
         "luma": {
             "p5": round(p5, 4), "p25": round(p25, 4), "p50": round(p50, 4),

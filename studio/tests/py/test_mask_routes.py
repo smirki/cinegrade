@@ -334,9 +334,18 @@ class _FakeSamHandler(BaseHTTPRequestHandler):
             select = body.get("select")
             pick = body.get("pick")
             prompts = body.get("prompts")
+            # `start_frame`/`end_frame` are the window THIS call was asked for,
+            # which the real service writes into index.json from the same place
+            # (C2) and which the studio's cache decision, its widen test and
+            # its force split all read as "the window this matte declares".
+            # Without them every fake matte declared from frame 0 whatever
+            # window it was tracked over, so the shape round 4 finding 89 is
+            # about (a force that hangs off one end of a matte that does not
+            # start at 0) could not be reached through this route at all.
             common = {"clip": body.get("clip"), "clip_key": body.get("clip_key"),
                      "rotation": body.get("rotation"), "fps": fps,
-                     "frames": end, "width": 20, "height": 15,
+                     "frames": end, "start_frame": start, "end_frame": end,
+                     "width": 20, "height": 15,
                      "recipe": body.get("recipe") or {}}
             if pick:
                 with self.state.lock:
@@ -717,6 +726,31 @@ def _recipe_tag(prompts, select=None, steady=None, clip_key=None,
     return hashlib.sha1(raw.encode()).hexdigest()[:8]
 
 
+def _inside_declared(raw: dict, fields: dict) -> bool:
+    """sam/store.py's `_inside_previous`, mirrored: is the window this write
+    declares INSIDE the window the index on disk already declares, and is it a
+    picture of the same thing?
+
+    The store keeps the matte's own longer declaration only for this case, and
+    reads anything else as a different track. Mirroring the whole condition
+    (not just "shorter than what is there") is round 4 finding 89: the looser
+    version here made a force window that only partly overlaps the matte look
+    survivable through this route while the real store threw the kept frames'
+    numbers away.
+    """
+    for key in ("clip_key", "rotation", "width"):
+        if key in raw and str(raw.get(key)) != str(fields.get(key)):
+            return False
+    try:
+        prev_start = int(raw.get("start_frame") or 0)
+        prev_end = int(raw.get("end_frame") or raw.get("frames") or 0)
+        start = int(fields.get("start_frame") or 0)
+        end = int(fields.get("end_frame") or fields.get("frames") or 0)
+    except (TypeError, ValueError):
+        return False
+    return prev_end > prev_start and prev_start <= start and end <= prev_end
+
+
 def _fake_index_write(dir_path: Path, **fields) -> None:
     """A minimal stand-in for the real SAM service's own index.json writer
     (C2): merge-write under a lock, atomic rename, so a matte directory this
@@ -735,11 +769,31 @@ def _fake_index_write(dir_path: Path, **fields) -> None:
     declared = raw.get("frames")
     incoming = fields.get("frames")
     if declared is not None and incoming is not None \
-            and int(declared) > int(incoming):
+            and int(declared) > int(incoming) \
+            and _inside_declared(raw, fields):
         # sam/store.py's tooling gap 24 rule, mirrored: a re-track of a window
         # INSIDE a longer matte keeps the matte's own declared length, so the
         # span a caller already read does not shrink to the repair window.
+        # ONLY inside, the way the store only carries forward for that case
+        # (round 4 finding 89): a shorter window that is not inside this one is
+        # a different track to the store, and the declared length moves to it.
         fields = dict(fields, frames=int(declared))
+    if raw.get("start_frame") is not None and fields.get("start_frame") is not None:
+        # The earliest start and the furthest end survive a re-track, which is
+        # what the store's `_carry_forward` does on the two paths the studio can
+        # ask for (an equal window and an interior one). On a window that is
+        # NEITHER the real store instead adopts the incoming window and drops
+        # what it was carrying; this fake does not mirror that, because the
+        # studio refuses that request now (finding 89) and the store's own
+        # behaviour there is pinned against the real store in
+        # sam/tests/test_store.py rather than imagined here.
+        fields = dict(fields,
+                      start_frame=min(int(raw["start_frame"]),
+                                      int(fields["start_frame"])))
+    if raw.get("end_frame") is not None and fields.get("end_frame") is not None:
+        fields = dict(fields,
+                      end_frame=max(int(raw["end_frame"]),
+                                    int(fields["end_frame"])))
     raw.update({k: v for k, v in fields.items() if v is not None})
     raw.setdefault("created", time.time())
     tmp = p.with_suffix(".tmp")
@@ -1783,6 +1837,40 @@ class MaskRoutesTest(unittest.TestCase):
         return {p.name: p.stat().st_mtime_ns
                 for p in self._matte_dir(matte_id).glob("*.png")}
 
+    def _matte_index(self, matte_id: str) -> dict:
+        """One matte's index.json as it is on disk.
+
+        The declared window (`start_frame`, `end_frame`) is not on the route's
+        summary, which reports the span read off the FILES, and the difference
+        between those two is what round 4 finding 89 is about.
+        """
+        return json.loads((self._matte_dir(matte_id) / MT.INDEX_NAME).read_text())
+
+    def _declared_window(self, matte_id: str) -> tuple:
+        raw = self._matte_index(matte_id)
+        return int(raw.get("start_frame") or 0), int(
+            raw.get("end_frame") or raw.get("frames") or 0)
+
+    def _wait_job_finished(self, job_id, timeout: float = 20.0) -> dict:
+        """Poll GET /api/mask/jobs/<id> until the poller has settled it.
+
+        A force refuses while a job for the same recipe is live (round 4
+        finding 91), and the studio's own job status lags the frames on disk by
+        up to one poll: the fake service finishes inside the POST while
+        `_poll_sam_job` is still sleeping. So a test that means "the track is
+        over" has to wait for the JOB, not only for the frames, or it is racing
+        a refusal that is doing its job.
+        """
+        deadline = time.time() + timeout
+        view = None
+        while time.time() < deadline:
+            view = _get(self.base + f"/mask/jobs/{job_id}")
+            if view.get("finished") or view["state"] in (
+                    "done", "failed", "cancelled"):
+                return view
+            time.sleep(0.2)
+        raise AssertionError(f"mask job {job_id} never finished: {view}")
+
     def test_force_on_a_window_inside_the_matte_clears_only_that_window(self):
         """Tooling gap 24: `--force` narrower than the matte deleted all of it.
 
@@ -1804,6 +1892,7 @@ class MaskRoutesTest(unittest.TestCase):
         done = self._wait_written(matte_id, declared_end)
         self.assertEqual(done["written_count"], declared_end)
         self.assertEqual(done["state"], "done")
+        self._wait_job_finished(first["job_id"])
         fps = float(done["fps"])
         self.assertGreater(declared_end, 5,
                            "the window has to be longer than the repair, or "
@@ -1873,6 +1962,7 @@ class MaskRoutesTest(unittest.TestCase):
         matte_id = first["mattes"][0]["matte_id"]
         declared_end = first["end_frame"]
         self._wait_written(matte_id, declared_end)
+        self._wait_job_finished(first["job_id"])
         before = self._frame_mtimes(matte_id)
 
         forced = self._track(prompts=prompts, start=0, end=0.5, force=True)
@@ -1890,6 +1980,282 @@ class MaskRoutesTest(unittest.TestCase):
         for name, was in before.items():
             self.assertNotEqual(after[name], was,
                                 f"{name} survived a force over the whole span")
+
+    def _force_refusal(self, prompts, start, end):
+        """POST a force and return the 400's own sentence."""
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self._track(prompts=prompts, start=start, end=end, force=True)
+        self.assertEqual(caught.exception.code, 400)
+        return json.loads(caught.exception.read()).get("error", "")
+
+    def test_force_that_only_partly_overlaps_the_matte_is_refused(self):
+        """Round 4 finding 89, the first of its two shapes: a force window that
+        hangs off the LOW end of what the matte declares.
+
+        The grader's matte was tracked over frames 173 to 197 (a `mask track
+        --start 7.2 --end 8.2`, which is the normal way to make a matte that
+        does not start at frame 0), and forcing frames 144 to 192 on it is the
+        obvious next move. That is neither of the two shapes force had: not
+        inside the declared span, not a superset of it. It took the narrow
+        branch, so the studio kept the frames outside the window on disk and
+        then asked the service for a window the store reads as a different
+        track (`_inside_previous` refuses it, `_carry_forward` returns early),
+        and the kept frames ended up past the end of the new arrays: five files
+        the index could not describe at all, `done_frames` 48 against 53 files,
+        `span` reporting end_frame 197 against declared_frames 192, and the
+        answer on screen saying those frames were kept. Measured against the
+        real store in `sam/tests/test_store.py`'s non-interior block.
+
+        So it is refused, before a file is deleted, and the sentence names both
+        ranges and the two asks that do work. This test proves the refusal AND
+        that nothing moved, because a refusal after the delete would be worse
+        than the bug.
+        """
+        prompts = {"text": ["partial overlap low subject"]}
+        # The matte the grader had: the FIRST track for this recipe is a window
+        # in the middle of the clip, so its declared span starts above zero.
+        # The frame numbers come from the answer rather than from an fps this
+        # test assumes, and the seconds below are computed back through the
+        # matte's own fps, which is the proxy's.
+        late = self._track(prompts=prompts, start=0.25, end=0.6)
+        matte_id = late["mattes"][0]["matte_id"]
+        lo, hi = late["start_frame"], late["end_frame"]
+        self.assertGreaterEqual(lo, 5, "the window has to start above frame 0")
+        self.assertGreaterEqual(hi - lo, 5,
+                                "the window has to be long enough to have a "
+                                "repair strictly inside it")
+        info = self._wait_written(matte_id, hi - lo)
+        fps = float(info["fps"])
+        self._wait_job_finished(late["job_id"])
+        self.assertEqual(self._declared_window(matte_id), (lo, hi),
+                         "this test needs a matte that declares a window "
+                         "starting above frame 0, or there is no low end to "
+                         "hang off")
+        before = self._frame_mtimes(matte_id)
+        areas_before = _get(self.base + f"/matte/{matte_id}")["areas"]
+        calls = self.sam_state.track_calls
+
+        # It overlaps the first four frames of the matte and hangs off the front
+        # by four, which is the grader's 144 to 192 against a 173 to 197 matte.
+        req_lo, req_hi = lo - 4, lo + 4
+        sentence = self._force_refusal(prompts, req_lo / fps, req_hi / fps)
+        self.assertIn(f"frames {req_lo} to {req_hi}", sentence,
+                      f"the refusal has to name what was asked for: {sentence}")
+        self.assertIn(f"frames {lo} to {hi}", sentence,
+                      f"and what the matte declares: {sentence}")
+        self.assertIn(f"frames {lo} to {req_hi}", sentence,
+                      f"and the repair that would work: {sentence}")
+        self.assertIn(f"frames {req_lo} to {hi}", sentence,
+                      f"and the redo that would work: {sentence}")
+        self.assertEqual(self.sam_state.track_calls, calls,
+                         "a refused force must not reach the SAM service")
+        self.assertEqual(self._frame_mtimes(matte_id), before,
+                         "a refused force must not touch one frame file")
+        self.assertEqual(self._declared_window(matte_id), (lo, hi),
+                         "and must not move the matte's declared window")
+        after = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(after["areas"], areas_before)
+        self.assertEqual(after["state"], "done")
+
+        # And the repair the sentence names really does work: the intersection
+        # is inside the declared span, so it clears its own window only.
+        repair = self._track(prompts=prompts, start=lo / fps, end=req_hi / fps,
+                            force=True)
+        self.assertEqual((repair["cleared_start"], repair["cleared_end"]),
+                         (lo, req_hi))
+        self.assertFalse(repair["cleared_whole_matte"])
+        self.assertEqual(repair["mattes"][0]["matte_id"], matte_id)
+        self._wait_written(matte_id, hi - lo)
+        self._wait_job_finished(repair["job_id"])
+        repaired = _get(self.base + f"/matte/{matte_id}")
+        self.assertEqual(self._declared_window(matte_id), (lo, hi),
+                         "the repair kept the matte's own declared window")
+        after_repair = self._frame_mtimes(matte_id)
+        self.assertEqual(sorted(after_repair), sorted(before))
+        for name, was in before.items():
+            index = int(Path(name).stem)
+            if index >= req_hi:
+                self.assertEqual(after_repair[name], was,
+                                 f"frame {index} is outside the repair and "
+                                 f"must not have been touched")
+            else:
+                self.assertNotEqual(after_repair[name], was,
+                                    f"frame {index} is inside the repair and "
+                                    f"was not written again")
+        self.assertTrue(all(a is not None for a in repaired["areas"][lo:hi]),
+                        f"every frame of the span has a number: "
+                        f"{repaired['areas']}")
+
+    def test_force_that_runs_past_the_end_of_the_matte_is_refused(self):
+        """Round 4 finding 89's mirror image, which is the quieter one.
+
+        The grader's other matte was done over frames 0 to 288 of a 400 frame
+        clip, and a force from 173 to past the end orphans nothing: the studio
+        keeps frames 0 to 172 and their numbers, the store then rebuilds the
+        arrays at length 400, and those 173 frames end up with a PNG each and
+        no area, no score and no IoU. The matte reads `done`, 400 of 400 on
+        disk, and `quality` reports zero suspect frames over frames nothing
+        ever looked at: a clean bill of health on an unmeasured matte, which is
+        worse than an obvious loss.
+
+        Refused, with the widen named as the request that does what was meant.
+        """
+        prompts = {"text": ["partial overlap high subject"]}
+        first = self._track(prompts=prompts, start=0, end=0.25)
+        matte_id = first["mattes"][0]["matte_id"]
+        end = first["end_frame"]
+        info = self._wait_written(matte_id, end)
+        fps = float(info["fps"])
+        self._wait_job_finished(first["job_id"])
+        before = self._frame_mtimes(matte_id)
+        areas_before = _get(self.base + f"/matte/{matte_id}")["areas"]
+        calls = self.sam_state.track_calls
+
+        past = end + 6
+        sentence = self._force_refusal(prompts, (end - 2) / fps, past / fps)
+        self.assertIn(f"frames {end - 2} to {past}", sentence, sentence)
+        self.assertIn(f"frames 0 to {end}", sentence, sentence)
+        self.assertIn("without force", sentence.lower(),
+                      f"the refusal names the widen, which is the request "
+                      f"that keeps every frame already tracked: {sentence}")
+        self.assertEqual(self.sam_state.track_calls, calls)
+        self.assertEqual(self._frame_mtimes(matte_id), before)
+        self.assertEqual(_get(self.base + f"/matte/{matte_id}")["areas"],
+                         areas_before)
+
+        # The widen the sentence points at: every frame already tracked stays
+        # on disk, and the new ones land in the same matte.
+        wider = self._track(prompts=prompts, start=0, end=past / fps)
+        self.assertTrue(wider["widened"])
+        self.assertEqual(wider["mattes"][0]["matte_id"], matte_id)
+        after = self._wait_written(matte_id, past)
+        self.assertEqual(after["written_count"], past)
+        self._wait_job_finished(wider["job_id"])
+
+    def test_force_while_a_track_for_that_recipe_is_running_is_refused(self):
+        """Round 4 finding 91: `_clear_matte_window`'s docstring said the
+        frames it deletes are ones the service is not touching, and nothing
+        checked it.
+
+        The service's `MatteWriter` is built in its own track route, before the
+        job is queued, and rewrites its whole in-memory index at least once a
+        second while it runs, so a force landing mid track gives one matte
+        directory two writers: the running one puts `areas`, `scores` and
+        `ious` back for frames whose PNGs the studio has just deleted. The
+        non-force branch already asks whether a live job covers the request;
+        force deletes files, so it refuses on any live job for the recipe.
+
+        "slow" plus "hold" holds the fake's writer after two frames, so the job
+        here is provably still running rather than probably, and the frame count
+        the force lands on is arithmetic.
+        """
+        prompts = {"text": ["slow", "hold", "live force subject"]}
+        first = self._track(prompts=prompts, start=0, end=1.0)
+        matte_id = first["mattes"][0]["matte_id"]
+        job_id = first["job_id"]
+        held = self._wait_written(matte_id, HOLD_AFTER)
+        self.assertEqual(held["written_count"], HOLD_AFTER,
+                         "the gate holds the writer here, so the force below "
+                         "is not a race")
+        live = _get(self.base + f"/mask/jobs/{job_id}")
+        self.assertIn(live["state"], ("queued", "running"),
+                      "this test needs a live job to force against")
+        before = self._frame_mtimes(matte_id)
+        calls = self.sam_state.track_calls
+
+        sentence = self._force_refusal(prompts, 0, 1.0)
+        self.assertIn(job_id, sentence,
+                      f"the refusal names the job to cancel: {sentence}")
+        self.assertIn("cancel", sentence.lower(), sentence)
+        self.assertEqual(self.sam_state.track_calls, calls)
+        for name, was in before.items():
+            self.assertEqual(self._frame_mtimes(matte_id).get(name), was,
+                             f"{name} was cleared under a running writer")
+
+        # Cancelled, the way the sentence says, and then the force is allowed.
+        _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+        self._wait_job_finished(job_id)
+        forced = self._track(prompts=prompts, start=0, end=1.0, force=True)
+        self.assertTrue(forced["restarted"])
+        self.assertEqual(forced["mattes"][0]["matte_id"], matte_id)
+        self._post_cancel_if_live(forced["job_id"])
+
+    def _post_cancel_if_live(self, job_id) -> None:
+        """Stop a track this test started, so it is not still writing while the
+        next test runs. Its own job id, never a pattern, never anything else's.
+        """
+        view = _get(self.base + f"/mask/jobs/{job_id}")
+        if view["state"] in ("queued", "running"):
+            _post(self.base + f"/mask/jobs/{job_id}/cancel", {})
+        self._wait_job_finished(job_id)
+
+    def test_force_with_nothing_cached_names_an_empty_cleared_range(self):
+        """Round 4 finding 94: `--force`'s help says the answer names the range
+        that was cleared either way, and a force with nothing in the recipe
+        cache never entered the force branch at all, so `cleared_whole_matte`
+        was a MISSING key rather than `false` for a scripted caller.
+
+        Nothing was cleared, so the range is empty (`cleared_end` equals
+        `cleared_start`), which is the same arithmetic a caller already does to
+        see how much went.
+        """
+        prompts = {"text": ["first force with no cache"]}
+        out = self._track(prompts=prompts, start=0, end=0.25, force=True)
+        self.assertFalse(out["cached"])
+        self.assertIn("cleared_whole_matte", out,
+                      "a documented field cannot be absent on one of the two "
+                      "paths that documents it")
+        self.assertFalse(out["cleared_whole_matte"])
+        self.assertEqual(out["cleared_start"], out["cleared_end"],
+                         "nothing was cached, so nothing was cleared")
+        self.assertEqual(out["cleared_start"], out["start_frame"])
+        self._wait_job_finished(out["job_id"])
+
+    def test_force_on_a_matte_that_declares_no_frames_keeps_nothing_back(self):
+        """Round 4 finding 94's second half: the `kept` clause was built from
+        the declared span without asking whether the span holds anything.
+
+        A matte whose index was bootstrapped by this studio for an older or
+        `--stub` service has no `frames` and no `end_frame`, and nothing has
+        been written yet, so `_matte_declared_window` answers `(0, 0)` (its
+        fallback is the highest written frame plus one, and there is none).
+        Forcing frames 100 to 200 on it used to take the narrow branch and
+        report "frames 0 to 100 kept" while zero files were removed and zero
+        frames existed. An empty declaration has nothing to keep, so force
+        takes the directory, which is also what makes it usable on the one
+        matte it is most needed for.
+
+        Built by tracking and then reducing what is on disk to that state,
+        because this studio has no route that writes a bootstrap index: the
+        three keys go and so do the frames, which is the shape a service that
+        died before writing its first frame leaves behind.
+        """
+        prompts = {"text": ["a matte that declares nothing"]}
+        first = self._track(prompts=prompts, start=0, end=0.25)
+        matte_id = first["mattes"][0]["matte_id"]
+        self._wait_job_finished(first["job_id"])
+        folder = self._matte_dir(matte_id)
+        path = folder / MT.INDEX_NAME
+        raw = json.loads(path.read_text())
+        for key in ("frames", "start_frame", "end_frame"):
+            raw.pop(key, None)
+        path.write_text(json.dumps(raw))
+        for png in folder.glob("*.png"):
+            png.unlink()
+        MT.forget_cache()
+        self.assertEqual(self._declared_window(matte_id), (0, 0),
+                         "this test needs an index that declares no window")
+
+        out = self._track(prompts=prompts, start=0.1, end=0.2, force=True)
+        self.assertTrue(out["cleared_whole_matte"],
+                        f"an empty declaration has nothing to keep: {out}")
+        self.assertEqual((out["cleared_start"], out["cleared_end"]), (0, 0),
+                         f"and nothing to name as cleared either: {out}")
+        self.assertNotIn("kept", out["message"],
+                         f"nothing was kept, so nothing may claim it: "
+                         f"{out['message']}")
+        self.assertIn("declares no frames of its own", out["message"])
+        self._wait_job_finished(out["job_id"])
 
     def test_a_job_cancelled_before_it_wrote_anything_reads_cancelled(self):
         """Tooling gap 26: a cancelled track used to read as a failed one.
@@ -2060,6 +2426,7 @@ class MaskRoutesTest(unittest.TestCase):
         first = self._track(prompts={"text": [text]})
         matte_id = first["mattes"][0]["matte_id"]
         self._wait_matte_state(matte_id, ("done",))
+        self._wait_job_finished(first["job_id"])
         calls = self.sam_state.track_calls
 
         cached = self._track(prompts={"text": [text]})
@@ -2729,12 +3096,26 @@ class MaskRoutesTest(unittest.TestCase):
             self.base + f"/matte/{matte_id}/frame?time=0&width=-5")
         self.assertEqual(headers.get("X-Matte-Width"), str(width))
         self.assertEqual(headers.get("X-Matte-Width-Asked"), "-5")
+        # Round 4 finding 95: zero is a number like any other, and it used to
+        # be the one value that got neither the floor nor a header. The query
+        # value arrives as the STRING "0", which is truthy, so it became the
+        # integer 0 and then read as "no width asked for" one function down: a
+        # documented floor of 1 that skipped the one value most likely to be
+        # sent by a caller computing a width.
+        width, headers = png_and_headers(
+            self.base + f"/matte/{matte_id}/frame?time=0&width=0")
+        self.assertEqual(width, 1, "zero clamps to the documented floor")
+        self.assertEqual(headers.get("X-Matte-Width"), "1")
+        self.assertEqual(headers.get("X-Matte-Width-Asked"), "0",
+                         "and says what was asked for, the same as -5 above")
         # A request with no width at all is untouched: nothing was asked, so
-        # nothing is announced.
-        _png, headers = _post_none_get_raw(
-            self.base + f"/matte/{matte_id}/frame?time=0")
-        self.assertIsNone(headers.get("X-Matte-Width"))
-        self.assertIsNone(headers.get("X-Matte-Width-Asked"))
+        # nothing is announced. Same for `?width=` with nothing after it, which
+        # names no number.
+        for url in (f"/matte/{matte_id}/frame?time=0",
+                    f"/matte/{matte_id}/frame?time=0&width="):
+            _png, headers = _post_none_get_raw(self.base + url)
+            self.assertIsNone(headers.get("X-Matte-Width"), url)
+            self.assertIsNone(headers.get("X-Matte-Width-Asked"), url)
 
     def test_ids_from_the_service_are_never_used_as_paths(self):
         """Round 2 finding 65: the studio joined ids that came off the SAM

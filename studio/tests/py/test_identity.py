@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -902,14 +903,36 @@ class Identity(unittest.TestCase):
         `LIB.guard_read`, and both the raising half and the asking half go
         through it. The behaviour half of this rule is test_22, test_24 and
         test_25 above, which is why nothing here calls a route.
+
+        Counted as the OPERATION, not as one spelling of it (round 4 finding
+        96): this used to count the literal `clip_path(str(name or ""))`, so a
+        second copy written `clip_path(str(name))`, or with the argument split
+        over two lines, passed a test whose whole purpose was to forbid it.
+        What must appear once is the call to `LIB.guard_read` that a clip NAME
+        reaches. The file's other call is `POST /api/open`, which guards an
+        absolute path the caller handed in and never sees a clip name; that is
+        why the count is two and why this test says which is which, so a THIRD
+        call site, however it is spelled, is red.
         """
         text = (CONTENT / "studio" / "server.py").read_text()
-        resolves = text.count('clip_path(str(name or ""))')
+        rule_at = text.index("def _guard_read_clip(")
+        rule_end = text.index("\ndef ", rule_at)
+        rule_body = text[rule_at:rule_end]
+        self.assertIn("LIB.guard_read(", rule_body,
+                      "_guard_read_clip does not ask the library at all")
+        asks = [m.start() for m in re.finditer(r"LIB\.guard_read\(", text)]
+        outside = [i for i in asks if not rule_at <= i < rule_end]
         self.assertEqual(
-            resolves, 1,
-            f"{resolves} places in studio/server.py turn a clip name into a "
-            f"path for the read guard; there has to be exactly one, or the "
-            f"raising half and the asking half can answer differently")
+            len(asks), 2,
+            f"{len(asks)} places in studio/server.py ask LIB.guard_read; "
+            f"there has to be exactly one for a clip NAME (_guard_read_clip) "
+            f"plus POST /api/open's path guard, or the raising half and the "
+            f"asking half of the clip rule can answer differently")
+        self.assertEqual(len(outside), 1, outside)
+        self.assertIn(
+            "raw_open", text[max(0, outside[0] - 800):outside[0]],
+            "the second LIB.guard_read is not POST /api/open's path guard, so "
+            "it is a second implementation of the clip read rule")
         self.assertIn("def _guard_read_clip(", text)
         for caller in ("def _may_read_clip(", "    def _guard_read(self"):
             i = text.index(caller)

@@ -390,10 +390,15 @@
     }
     if (out.state === "running" || out.state === "partial") out.holding = true;
     if (jobLive(job)) out.job = job;
-    /* A finished job that failed carries the only copy of WHY (the studio
-     * writes "cancelled" there, and the service writes its own refusal), and
-     * the matte record does not: a matte that was cancelled at frame 20 is
-     * simply `partial` with no error on it. */
+    /* Which record carries the reason depends on the ending, so this reads
+     * both and prefers the matte's (out.reason is set from info.error above).
+     * A job that FAILED carries the only copy of why (the service's own
+     * refusal), and the matte it left is `partial` with no error on it: a
+     * matte cancelled at frame 20 is that shape. A job that was CANCELLED
+     * before it wrote anything is the other way round since tooling gap 26:
+     * the matte is `cancelled` and carries the reason, and the job view
+     * deliberately reports no error, because a cancel is not a failure to
+     * report. */
     if (job && !jobLive(job) && job.error && !out.reason) out.reason = String(job.error);
     return out;
   }

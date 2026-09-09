@@ -3370,7 +3370,11 @@ def matte_frame_png(matte_id: str, time_s: float, width: int | None
     info = _matte_info(matte_id)
     size = None
     asked = None
-    if width:
+    # `is not None`, not truthiness (round 4 finding 95): `?width=0` used to
+    # land here as the integer 0 and read as "no width asked for", so the one
+    # value the documented floor of 1 makes a caller expect a clamp from was
+    # the one value that got neither the clamp nor a header.
+    if width is not None:
         asked = int(width)
         w = max(1, min(asked, MAX_REQUEST_WIDTH))
         h = max(1, round(w * info.height / max(1, info.width)))
@@ -3531,7 +3535,13 @@ def _clear_matte_window(info, w_start: int, w_end: int) -> int:
     already names: the frames being cleared are ones the service is not
     touching, and the alternative (asking the service to clear a window) is a
     wire change for a case only studio knows about, because only studio knows
-    what `force` means. Returns how many frame files were removed.
+    what `force` means. That first clause is a PRECONDITION, and its one caller
+    is what enforces it (round 4 finding 91): the force branch refuses while a
+    job for this recipe is queued or running, because `MatteWriter` is built in
+    the service's own track route and rewrites its whole in-memory index at
+    least once a second while it works, so a clear under a live writer restores
+    `areas`, `scores` and `ious` for frames whose files have just gone. Returns
+    how many frame files were removed.
     """
     removed = 0
     for index in list(info.written_indices(refresh=True)):
@@ -3963,11 +3973,16 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
     resume_kind = ""       # "resume", "widen", "restart" or "force"
     restart_reason = ""
     resume_ids: dict[str, str] = {}
-    cleared_window = (req_start, req_end)   # gap 24, force only
+    # Gap 24, force only, and EMPTY until a force actually clears something
+    # (round 4 finding 94): `--force` with nothing cached for this recipe
+    # clears no frame, so the range it reports is `req_start` to `req_start`
+    # and `cleared_whole_matte` is false, rather than three missing keys on a
+    # documented field a scripted caller reads.
+    cleared_window = (req_start, req_start)
     cleared_whole = False
+    live = JOBS.get(_matte_jobs.get(rhash) or "")
+    live_now = live is not None and live.status in ("queued", "running")
     if cached_infos and not force:
-        live = JOBS.get(_matte_jobs.get(rhash) or "")
-        live_now = live is not None and live.status in ("queued", "running")
         # Only a live job whose OWN window covers this request answers it. A
         # job tracking [0, 48) is not an answer to a request for [0, 144):
         # counting it as one is finding 5 again, one step further along. Jobs
@@ -4045,21 +4060,96 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         # its own frames. The service derives the same matte id for the same
         # recipe, so in both cases the new frames land back in this matte;
         # what differs is how much of it is standing when they do.
-        span_start = min(_matte_declared_window(i)[0] for i in cached_infos)
-        span_end = max(_matte_declared_window(i)[1] for i in cached_infos)
-        cleared_whole = req_start <= span_start and req_end >= span_end
+        #
+        # There are THREE shapes, not two (round 4 finding 89). A window that
+        # only PARTLY overlaps the declared span is neither, and taking the
+        # narrow branch for it loses the frames it says it keeps: the studio
+        # keeps their files, but the window it then asks the service to track
+        # is neither equal to the matte's declared length nor inside it, so
+        # sam/store.py's `_inside_previous` reads it as a different track
+        # (correctly, by its own rule), `_carry_forward` returns early, and the
+        # kept frames end up either past the end of the new arrays (orphaned
+        # files the index cannot describe) or inside them with no area, score
+        # or IoU, while the matte still reads `done` and `quality` reports no
+        # suspect frames over frames nothing looked at. Measured both ways in
+        # sam/tests/test_store.py's own non-interior block.
+        #
+        # So it is REFUSED, before anything is deleted, and the sentence names
+        # both ranges and the two asks that do work. Refused rather than
+        # clamped to the overlap (which would silently track less than was
+        # asked for) or widened to the union (which would re-track the frames
+        # the answer calls kept): both of those answer a question the caller
+        # did not ask, and the two things a caller wants next, a repair inside
+        # the span and a widen outside it, are each one request that already
+        # behaves correctly.
+        spans = [_matte_declared_window(i) for i in cached_infos]
+        span_start = min(s for s, _e in spans)
+        span_end = max(e for _s, e in spans)
+        # A matte that declares no frames of its own (a bootstrap index written
+        # for an older or --stub service: no `frames`, no `end_frame`, so
+        # `_matte_declared_window` answers (0, 0)) has nothing to keep, so
+        # force takes the directory whatever window was asked for. Without this
+        # the refusal below would fire on the one matte force is most needed
+        # for, and the narrow branch used to report frames kept out of an empty
+        # span (round 4 finding 94).
+        declares_nothing = all(e <= s for s, e in spans)
+        cleared_whole = all(e <= s or (req_start <= s and req_end >= e)
+                            for s, e in spans)
+        inside = all(e > s and s <= req_start and req_end <= e
+                     for s, e in spans)
+        if not cleared_whole and not inside:
+            covers = "; ".join(
+                f"{i.matte_id} covers frames {s} to {e}"
+                for i, (s, e) in zip(cached_infos, spans))
+            raise StudioError(
+                f"force: this request asks for frames {req_start} to "
+                f"{req_end} and {covers}, so it overlaps part of the matte "
+                f"and hangs off it. force clears either a window INSIDE what "
+                f"the matte covers, keeping every frame outside it, or the "
+                f"whole span, taking the matte with it; a window that is "
+                f"neither would leave frames on disk that the matte's own "
+                f"index cannot describe. To repair part of it ask for frames "
+                f"{max(req_start, span_start)} to {min(req_end, span_end)}; "
+                f"to redo it ask for frames {min(req_start, span_start)} to "
+                f"{max(req_end, span_end)}. The same request WITHOUT force "
+                f"widens the matte instead and keeps every frame already "
+                f"tracked.")
+        # The frames being cleared have to be frames nothing is writing, which
+        # is what `_clear_matte_window`'s own docstring asserts and what only
+        # this check makes true (round 4 finding 91). The non-force branch
+        # above already asks whether a live job covers the request; force
+        # deletes files, so it asks the blunter question and refuses on any
+        # live job for this recipe: two writers over one matte directory is a
+        # matte whose area curve and quality flags describe frames that are
+        # not on disk, for as long as the track runs.
+        if live_now:
+            raise StudioError(
+                f"force: a track for this recipe is still running (job "
+                f"{live.id}, {live.message or 'no progress reported yet'}), "
+                f"and force deletes frames that job is writing. Cancel it "
+                f"first (POST /api/mask/jobs/{live.id}/cancel), then force "
+                f"again.")
         if cleared_whole:
             for i in cached_infos:
                 shutil.rmtree(i.path, ignore_errors=True)
             MT.forget_cache()
             cleared_window = (span_start, span_end)
-            restart_reason = (
-                f"force: frames {span_start} to {span_end} cleared, the whole "
-                f"matte, tracking again")
+            if declares_nothing:
+                restart_reason = (
+                    "force: the cached matte declares no frames of its own, "
+                    "so the whole matte was cleared, tracking again")
+            else:
+                restart_reason = (
+                    f"force: frames {span_start} to {span_end} cleared, the "
+                    f"whole matte, tracking again")
         else:
             for i in cached_infos:
                 _clear_matte_window(i, req_start, req_end)
             cleared_window = (req_start, req_end)
+            # Only ranges the matte really has frames in are named as kept:
+            # the window is inside the declared span here (anything else was
+            # refused above), so each of these two is either a real range of
+            # this matte's own frames or absent (round 4 finding 94).
             kept = []
             if span_start < req_start:
                 kept.append(f"{span_start} to {req_start}")
@@ -4198,13 +4288,21 @@ def queue_mask_track(clip: str, rotation, prompts=None, select=None,
         out["restarted"] = resume_kind in ("restart", "force")
         out["resumed_from"] = resume_from
         out["message"] = restart_reason
-        if resume_kind == "force":
-            # Gap 24: which frames force actually threw away, as a range, and
-            # whether that was all of them. A caller reading only `restarted`
-            # cannot tell a repair of one second from a redo of the matte.
-            out["cleared_start"] = cleared_window[0]
-            out["cleared_end"] = cleared_window[1]
-            out["cleared_whole_matte"] = cleared_whole
+    if force:
+        # Gap 24: which frames force actually threw away, as a range, and
+        # whether that was all of them. A caller reading only `restarted`
+        # cannot tell a repair of one second from a redo of the matte.
+        #
+        # On EVERY force, including a first track where nothing was cached to
+        # clear (round 4 finding 94): `--force`'s own help says the answer
+        # names the range either way, and a caller reading
+        # `cleared_whole_matte` on a first force used to get a missing key
+        # rather than `false`. Nothing cleared reads as an empty range
+        # (`cleared_end == cleared_start`), which is the same arithmetic a
+        # caller already does to see how much went.
+        out["cleared_start"] = cleared_window[0]
+        out["cleared_end"] = cleared_window[1]
+        out["cleared_whole_matte"] = cleared_whole
     return out
 
 
@@ -7291,9 +7389,14 @@ class Handler(BaseHTTPRequestHandler):
             matte_id = route[len("matte/"):-len("/frame")]
             info = _matte_info(matte_id)
             self._guard_read(info.clip)
+            # Parsed on PRESENCE, not on truthiness: the query value is a
+            # string, so `"0"` used to become the integer 0 and then read as
+            # no width at all one function down (round 4 finding 95). An empty
+            # `?width=` names no number and still means no width.
             width = q.get("width")
             png, headers = matte_frame_png(
-                matte_id, float(q.get("time", 0)), int(width) if width else None)
+                matte_id, float(q.get("time", 0)),
+                int(width) if width not in (None, "") else None)
             self._send(200, png, "image/png", headers)
             return
 

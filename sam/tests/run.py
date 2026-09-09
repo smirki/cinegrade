@@ -49,7 +49,7 @@ SUITE_TIMEOUT_S = 900
 
 # name, what it covers, the count it must not fall below, how it is run
 SUITES = [
-    ("test_store.py", "the matte store and steady smoothing (C2)", 53, "script"),
+    ("test_store.py", "the matte store and steady smoothing (C2)", 61, "script"),
     ("test_model_lock.py", "the machine wide model lock", 17, "script"),
     ("test_stub_backend.py", "the prompt planner and the stub backend (C7)", 31,
      "script"),

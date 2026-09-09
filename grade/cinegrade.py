@@ -2515,8 +2515,8 @@ def mask_blur_sigma(value: float, width: float) -> float:
     return min(v, MASK_BLUR_MAX) * float(width)
 
 
-# How many components one mask stack may carry, and how many one request may
-# fold across every stack it names.
+# How many components one mask stack may carry, and how many folds one request
+# may ask for across every mask it names.
 #
 # Round 3 finding 82: MASK_BLUR_MAX above bounds the cost of ONE blur and
 # says nothing about how many blurs are asked for. Nothing counted the
@@ -2530,22 +2530,41 @@ def mask_blur_sigma(value: float, width: float) -> float:
 # session. With these two caps the same worst case is 128 * 59 ms, under 8
 # seconds.
 #
+# WHERE that cost lands differs between the two halves, and the first version
+# of this comment said "the thread serving the request" for both (round 4
+# finding 92). The standalone `mask` a measurement is weighted by is folded in
+# numpy on the request thread (studio/server.py's `_mask_stack_weight` calls
+# `mask_matte` once), so MASK_STACK_MAX_COMPONENTS on its own already bounds
+# that thread. A layer's OWN mask is folded by ffmpeg in a subprocess, or by
+# gpu.js in the browser of the person who typed it, so the per request cap is a
+# bound on the size of a filter graph and on the number of gaussians a render
+# asks a machine for, not on one Python thread.
+#
+# The unit is FOLDS, not entries in `components` (round 4 finding 92 again):
+# each component is a fold of the stack, each feather and each finesse.blur is
+# a whole frame gaussian (the expensive one: 59 ms at the cap against 2.6 ms
+# with no feather), and a mask that carries no components at all is still a
+# mask. Counting components alone left the legacy window and key form free:
+# `{"mask": {"window": {"enabled": true}, "finesse": {"blur": 0.1}}}` is 65
+# bytes, so about 127,000 of them fit inside one 8 MB body and every one was
+# accepted, each carrying a gaussian at the cap.
+#
 # The numbers are far past any real grade. The largest mask stack anywhere in
 # bakeoff/ is TWO components (a person matte intersected with a skin key, in
 # bakeoff/masks/grade-C015-work.json, bakeoff/masks-sonnet/grade-C015.json and
 # the saved preset beside them), the largest whole grade is 3 layers carrying
 # 6 components between them, and the documented example in the studio-grading
 # skill is two components. So 32 per stack is sixteen times the biggest stack
-# anyone has built and 128 per request is more than twenty times the biggest
-# whole grade: a person who reaches either of these has made a mistake, which
-# is why it is REFUSED with a sentence rather than truncated.
+# anyone has built and 128 folds per request is more than twenty times the
+# biggest whole grade: a person who reaches either of these has made a mistake,
+# which is why it is REFUSED with a sentence rather than truncated.
 #
 # Counted on the block as it arrives, disabled components included, for the
 # same reason _mask_blur_controls checks a disabled component's feather: a
 # caller who pasted 40,000 components wants to hear about it, and a stack that
 # is switched off today is one toggle from being folded.
 MASK_STACK_MAX_COMPONENTS = 32
-MASK_REQUEST_MAX_COMPONENTS = 128
+MASK_REQUEST_MAX_FOLDS = 128
 
 
 def _stack_size(block) -> int:
@@ -2554,10 +2573,10 @@ def _stack_size(block) -> int:
     return len(comps) if isinstance(comps, list) else 0
 
 
-def mask_component_counts(cfg=None, mask=None) -> list[tuple[str, int]]:
-    """(what it is, how many components it carries) for every mask stack one
-    request names: each of the config's layers, and the standalone `mask`
-    block a measurement is weighted by.
+def _mask_blocks(cfg=None, mask=None) -> list[tuple[str, dict]]:
+    """(what it is, the mask block) for every mask one request names: each of
+    the config's layers, and the standalone `mask` block a measurement is
+    weighted by.
 
     A whole layer dict is accepted for `mask` as well as a bare mask block,
     because `cinegrade stats --mask` documents both.
@@ -2565,47 +2584,94 @@ def mask_component_counts(cfg=None, mask=None) -> list[tuple[str, int]]:
     out = []
     for i, layer in enumerate(config_layers(cfg or {})):
         block = (layer or {}).get("mask") if isinstance(layer, dict) else None
-        if isinstance(block, dict) and isinstance(block.get("components"), list):
-            out.append((f"layer {i}'s mask", _stack_size(block)))
+        if isinstance(block, dict):
+            out.append((f"layer {i}'s mask", block))
     if isinstance(mask, dict):
         block = mask
         if not isinstance(block.get("components"), list) and isinstance(
                 block.get("mask"), dict):
             block = block["mask"]
-        if isinstance(block.get("components"), list):
-            out.append(("the mask this measurement is weighted by",
-                        _stack_size(block)))
+        out.append(("the mask this measurement is weighted by", block))
+    return out
+
+
+def mask_component_counts(cfg=None, mask=None) -> list[tuple[str, int]]:
+    """(what it is, how many components it carries) for every mask STACK one
+    request names, which is what the per stack cap is about.
+
+    Only blocks that carry a `components` list: a legacy window and key pair
+    has no component count to compare against that cap. What it costs is
+    counted by `mask_fold_counts` below, which does see it.
+    """
+    return [(what, _stack_size(block))
+            for what, block in _mask_blocks(cfg, mask)
+            if isinstance(block.get("components"), list)]
+
+
+def _produces_mask(block) -> bool:
+    """True when this block asks for a matte at all: a component stack with
+    something in it, or the legacy pair with the window or the key switched on.
+
+    The same two shapes `mask_stack_layer` refuses the ABSENCE of, so a block
+    this answers False for is either refused there or selects nothing and costs
+    nothing.
+    """
+    if not isinstance(block, dict):
+        return False
+    if isinstance(block.get("components"), list) and block["components"]:
+        return True
+    return bool((block.get("window") or {}).get("enabled")
+                or (block.get("key") or {}).get("enabled"))
+
+
+def mask_fold_counts(cfg=None, mask=None) -> list[tuple[str, int]]:
+    """(what it is, how many folds it costs) for every mask one request names.
+
+    A fold per component, a fold per gaussian (every non zero feather and
+    finesse.blur, which is the expensive kind), and one fold for a mask that
+    produces a matte out of no components at all, so the legacy window and key
+    form is not free (round 4 finding 92): that pair builds one matte however
+    many of its two halves are switched on. A block that asks for nothing is
+    absent from this list rather than counted as zero.
+    """
+    out = []
+    for what, block in _mask_blocks(cfg, mask):
+        folds = _stack_size(block) + len(_mask_blur_controls(block))
+        if not _stack_size(block) and _produces_mask(block):
+            folds += 1
+        if folds:
+            out.append((what, folds))
     return out
 
 
 def check_mask_components(cfg=None, mask=None) -> None:
-    """Refuse a request that asks this machine to fold an absurd number of
-    mask components (finding 82).
+    """Refuse a request that asks this machine to fold an absurd amount of
+    mask (finding 82, counted as folds since round 4 finding 92).
 
     Two limits, because there are two ways to ask: one stack carrying tens of
     thousands of components, and a config carrying tens of thousands of
-    layers that each carry a legal stack. Called from `_grade_frame_stats`
+    layers that each carry a legal mask. Called from `_grade_frame_stats`
     (so `cinegrade stats` and `cinegrade sweep` are covered) and from the
     studio's stats and render guards, next to the ownership refusal, so the
     CLI and the server refuse the same request in the same sentence.
     """
-    total = 0
     for what, n in mask_component_counts(cfg, mask):
         if n > MASK_STACK_MAX_COMPONENTS:
             raise GradeError(
                 f"mask: {what} carries {n} components, and a mask stack may "
                 f"carry at most {MASK_STACK_MAX_COMPONENTS}. Every component "
-                f"is folded on the thread serving this request, and the "
-                f"biggest stack in any real grade here is two (a tracked "
-                f"matte intersected with a key), so this is a mistake rather "
-                f"than a grade. Split what you are selecting into layers, or "
-                f"track one matte for it.")
-        total += n
-    if total > MASK_REQUEST_MAX_COMPONENTS:
+                f"is a fold of the stack, and at the feather cap one costs "
+                f"about 59 ms of numpy at 960x540; the biggest stack in any "
+                f"real grade here is two (a tracked matte intersected with a "
+                f"key), so this is a mistake rather than a grade. Split what "
+                f"you are selecting into layers, or track one matte for it.")
+    total = sum(n for _what, n in mask_fold_counts(cfg, mask))
+    if total > MASK_REQUEST_MAX_FOLDS:
         raise GradeError(
-            f"mask: this request folds {total} mask components across its "
-            f"layers, and one request may fold at most "
-            f"{MASK_REQUEST_MAX_COMPONENTS}. No stack on its own is over the "
+            f"mask: this request asks for {total} mask folds across its "
+            f"layers (one per component, one per feather or finesse blur, and "
+            f"one for a mask made of neither), and one request may ask for at "
+            f"most {MASK_REQUEST_MAX_FOLDS}. No stack on its own is over the "
             f"limit; the total is. A whole real grade here carries six.")
 
 
@@ -4876,8 +4942,9 @@ def mask_stack_layer(mask: dict) -> dict:
     neither the window nor the key switched on.
 
     Since round 3 finding 82 it also refuses a stack carrying more than
-    MASK_STACK_MAX_COMPONENTS components, which is the number of blurs one
-    request can ask for rather than the width of any one of them.
+    MASK_STACK_MAX_COMPONENTS components, and a request asking for more than
+    MASK_REQUEST_MAX_FOLDS folds in total, which is how much mask arithmetic is
+    asked for rather than the width of any one gaussian.
 
     And, since round 2 finding 52, a feather or a finesse blur outside
     [0, 1]. Both are fractions of frame width, so 1.0 is already a gaussian
@@ -5888,6 +5955,17 @@ def require_server(a) -> str:
     return base
 
 
+# How much of a refused request's body this client repeats back.
+#
+# Was 400 characters, which is shorter than the studio's own longest refusals:
+# the force overlap refusal (round 4 finding 89) names the window asked for,
+# the window the matte covers, and the two requests that do work, and the CLI
+# was cutting it off mid word just before the two ranges a caller needs. A
+# limit is still here so a server answering with a page of HTML cannot fill a
+# terminal, and the studio's refusals are one sentence block each.
+STUDIO_ERROR_MAX_CHARS = 2000
+
+
 def _studio_call(base: str, path: str, method: str = "GET",
                  payload: dict | None = None,
                  headers: dict | None = None) -> dict:
@@ -5913,7 +5991,7 @@ def _studio_call(base: str, path: str, method: str = "GET",
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()[:400]
+        detail = exc.read().decode()[:STUDIO_ERROR_MAX_CHARS]
         raise GradeError(f"studio refused it: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GradeError(
@@ -5971,7 +6049,7 @@ def cmd_session(a):
         with urllib.request.urlopen(req, timeout=30) as r:
             out = json.loads(r.read().decode())
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()[:400]
+        detail = exc.read().decode()[:STUDIO_ERROR_MAX_CHARS]
         raise GradeError(f"studio refused it: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GradeError(
@@ -6492,7 +6570,7 @@ def _studio_raw_call(base: str, path: str, method: str = "GET",
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read(), dict(r.headers.items())
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
+        detail = exc.read().decode("utf-8", "replace")[:STUDIO_ERROR_MAX_CHARS]
         raise GradeError(f"studio refused it: {detail}") from exc
     except urllib.error.URLError as exc:
         raise GradeError(
@@ -6715,8 +6793,16 @@ def _cmd_mask_track(a, base: str, hdr: dict) -> None:
         # are the window being tracked now; these are the frames that were
         # deleted to make room for it, and the words say whether anything
         # outside them survived.
-        scope = ("the whole matte" if queued.get("cleared_whole_matte")
-                 else "inside the matte, frames outside this range kept")
+        # An EMPTY range is the third answer (round 4 finding 94): --force with
+        # nothing cached for this recipe cleared no frame, and the fields are
+        # on the answer anyway so a scripted caller reads a range rather than
+        # a missing key.
+        if queued.get("cleared_whole_matte"):
+            scope = "the whole matte"
+        elif queued["cleared_end"] <= queued["cleared_start"]:
+            scope = "nothing: no cached matte for this recipe"
+        else:
+            scope = "inside the matte, frames outside this range kept"
         print(f"  cleared   frames {queued['cleared_start']} to "
              f"{queued['cleared_end']}  ({scope})")
     for m in queued.get("mattes") or out.get("mattes") or []:
@@ -7871,8 +7957,12 @@ def main():
                           "them again. With --start/--end inside what the "
                           "matte already covers only those frames are "
                           "cleared and the rest are kept; over the matte's "
-                          "whole span it clears the matte. The answer names "
-                          "the range that was cleared either way. Without it "
+                          "whole span it clears the matte; a window that only "
+                          "partly overlaps its span is refused, naming both "
+                          "ranges, without clearing anything. The answer "
+                          "names the range that was cleared either way, and "
+                          "an empty range when there was nothing cached to "
+                          "clear. Without it "
                           "an identical "
                           "repeat request is free while the cached matte "
                           "still covers the window asked for, RESUMES "

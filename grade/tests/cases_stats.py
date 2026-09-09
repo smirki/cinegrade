@@ -311,6 +311,108 @@ def test_luma_spread_reports_detail_the_mean_cannot_see(ctx):
                      whole["luma"]["max"], 1.0, 1e-6)
 
 
+def _feather_fixture():
+    """A letterboxed frame, a mask on the subject, and that mask feathered.
+
+    32 rows of 64: a black bar over the top two rows and a white bar over the
+    bottom two (the letterbox), mid grey between them, and a subject whose own
+    luma ramps 0.35 to 0.65 so its extremes are nowhere near the bars'. The
+    feather is the engine's own (`mask_blur_sigma` then `gaussian_blur2d`, the
+    definition the render, the CLI and studio/static/gpu.js share), so the
+    weights outside the shape are the ones a graded frame really carries
+    rather than numbers picked here to make a point.
+    """
+    h, w = 32, 64
+    y = np.full((h, w), 0.5)
+    y[:2, :] = 0.0
+    y[h - 2:, :] = 1.0
+    subject = np.zeros((h, w))
+    subject[11:21, 20:44] = 1.0
+    y[11:21, 20:44] = np.tile(np.linspace(0.35, 0.65, 24), (10, 1))
+    sigma = H.cg.mask_blur_sigma(0.05, w)
+    return y, subject, H.cg.gaussian_blur2d(subject, sigma), sigma
+
+
+def test_feathered_min_and_max_read_the_mask_not_its_outer_tail(ctx):
+    """Round 4 finding 90: a feather's tail is not a pixel the mask selects.
+
+    Narrowing `luma.min`/`luma.max` to the weighted pixels (gap 25 above) used
+    a hard support, any weight over zero. A feather is a gaussian whose kernel
+    reaches three sigma, so the support of a feathered mask is wider than the
+    shape by that much, and a black bar the mask does not cover came back as
+    `min` 0.0 through a weight of a thousandth: the one figure a single pixel
+    can carry was the only one in the block that was not weight proportional.
+    The basis is `MASK_CORE_WEIGHT` and above, which for a gaussian is the
+    shape that was feathered.
+
+    Measurement only: this says which pixels the two numbers came from, not
+    that a feather of 0.05 or a subject at 0.5 is the right thing to grade.
+    """
+    y, subject, soft, sigma = _feather_fixture()
+    yq = _to_rgb(y)[..., 0] / 255.0        # what frame_stats actually sees
+    hard = ST.frame_stats(_to_rgb(y), weight=subject)
+    feathered = ST.frame_stats(_to_rgb(y), weight=soft)
+
+    bars = np.zeros(y.shape, dtype=bool)
+    bars[:2, :] = True
+    bars[y.shape[0] - 2:, :] = True
+    ctx.expect_true("the feather really does reach the bars: they carry a "
+                    "weight above zero, which is all the old rule asked for",
+                    float(soft[bars].max()) > 0.0,
+                    f"sigma {sigma}, largest weight on a bar "
+                    f"{float(soft[bars].max()):.3e}")
+    ctx.expect_lt("and that weight is a rounding error of the total, so the "
+                  "mean, the spread and the percentiles cannot feel it",
+                  float(soft[bars].sum() / soft.sum()), 1e-3)
+    ctx.expect_close("which the mean shows: feathering the mask moves it by "
+                     "almost nothing",
+                     feathered["luma"]["mean"], hard["luma"]["mean"], 3e-3)
+
+    ctx.expect_eq("MASK_CORE_WEIGHT is the documented half weight",
+                  ST.MASK_CORE_WEIGHT, 0.5)
+    core = soft >= ST.MASK_CORE_WEIGHT
+    # Tolerance is the row's own rounding: this block reports four places.
+    ctx.expect_close("the feathered min is the darkest pixel of the mask's "
+                     "core", feathered["luma"]["min"],
+                     float(yq[core].min()), 1e-4)
+    ctx.expect_close("and the feathered max its brightest",
+                     feathered["luma"]["max"], float(yq[core].max()), 1e-4)
+    ctx.expect_true("so neither is a bar's: the support's own extremes are "
+                    "0.0 and 1.0 and the row reports neither",
+                    feathered["luma"]["min"] > 0.0
+                    and feathered["luma"]["max"] < 1.0,
+                    f"support {float(yq[soft > 0].min())} to "
+                    f"{float(yq[soft > 0].max())}, reported "
+                    f"{feathered['luma']['min']} to "
+                    f"{feathered['luma']['max']}")
+    ctx.note(f"hard mask min/max {hard['luma']['min']}/{hard['luma']['max']}, "
+             f"feathered {feathered['luma']['min']}/"
+             f"{feathered['luma']['max']}, feather support "
+             f"{float(yq[soft > 0].min())}/{float(yq[soft > 0].max())}")
+
+    # A feather wider than the shape it feathers never reaches the core at
+    # all. That is a mask, not an error, so the two figures fall back to the
+    # pixels this weight holds above every other.
+    line = np.zeros(y.shape)
+    line[11, 20:44] = 1.0
+    faint = H.cg.gaussian_blur2d(line, sigma)
+    ctx.expect_lt("a one row mask feathered this far never reaches the core",
+                  float(faint.max()), ST.MASK_CORE_WEIGHT)
+    weak = ST.frame_stats(_to_rgb(y), weight=faint)
+    peak = faint >= float(faint.max())
+    ctx.expect_close("its min is the darkest of the pixels it weighs most",
+                     weak["luma"]["min"], float(yq[peak].min()), 1e-4)
+    ctx.expect_close("and its max the brightest of them",
+                     weak["luma"]["max"], float(yq[peak].max()), 1e-4)
+    ctx.expect_true("still not the bar it reaches, and still a number the "
+                    "mask can account for",
+                    0.0 < weak["luma"]["min"] <= weak["luma"]["max"] < 1.0,
+                    f"{weak['luma']['min']} to {weak['luma']['max']} from "
+                    f"{int(peak.sum())} pixels, support "
+                    f"{float(yq[faint > 0].min())} to "
+                    f"{float(yq[faint > 0].max())}")
+
+
 def test_a_bad_weight_shape_is_still_an_error(ctx):
     """Gap 23 turned an empty matte into a row, not every weight problem into
     one: a weight that is not the frame's size is a caller bug, and nothing a
@@ -763,6 +865,10 @@ def register(suite):
               test_luma_spread_reports_detail_the_mean_cannot_see,
               doc="std and p5_p95 move when a contrast reduction leaves the "
                   "mean where it was (gap 25)")
+    suite.add(g, "feathered_min_and_max_read_the_mask_not_its_outer_tail",
+              test_feathered_min_and_max_read_the_mask_not_its_outer_tail,
+              doc="a feather's outer tail does not decide min and max "
+                  "(round 4 finding 90)")
     suite.add(g, "a_bad_weight_shape_is_still_an_error",
               test_a_bad_weight_shape_is_still_an_error,
               doc="a wrong sized weight is a caller bug and still raises")

@@ -455,7 +455,37 @@ async function main() {
   const passed = rows.filter((r) => r.status === "PASS");
   console.log("");
   console.log(rows.length + " specs: " + passed.length + " passed, " + failed.length + " failed, " + skipped.length + " skipped.");
-  process.exit(failed.length ? 1 : 0);
+  /* Round 4 finding 97: this exited on failed.length alone, so a spec that
+   * started skipping (a fixture that stopped loading, a browser that stopped
+   * cooperating) reported success, and unlike the arc's other suites there was
+   * no floor on the pass count either. Twenty specs carry a SKIP path, and a
+   * skip is not a pass.
+   *
+   * Two rules, both only on a FULL run: a narrowed SPECS= run is a debugging
+   * aid and is held to neither. Every skip has to be named in ALLOWED_SKIPS
+   * with the reason it is allowed (the shape sam/tests/run.py's two named skips
+   * use), and the pass count has to reach EXPECTED_PASS, which is the live
+   * number and moves when a spec is added or removed. */
+  const ALLOWED_SKIPS = {};      // spec name -> why a skip of it is acceptable
+  const EXPECTED_PASS = 32;
+  let bad = failed.length > 0;
+  if (!ONLY.length) {
+    const unnamed = skipped.filter((r) => !(r.name in ALLOWED_SKIPS));
+    if (unnamed.length) {
+      console.error("[run] skipped without being named in ALLOWED_SKIPS: "
+        + unnamed.map((r) => r.name + " (" + (r.evidence || "no reason given") + ")").join(", "));
+      bad = true;
+    }
+    for (const row of skipped) {
+      if (row.name in ALLOWED_SKIPS) console.log("[run] allowed skip: " + row.name + ": " + ALLOWED_SKIPS[row.name]);
+    }
+    if (passed.length < EXPECTED_PASS) {
+      console.error("[run] " + passed.length + " specs passed and this suite declares a floor of "
+        + EXPECTED_PASS + ": a spec that stops registering or stops passing is a red run, not a quieter green one.");
+      bad = true;
+    }
+  }
+  process.exit(bad ? 1 : 0);
 }
 
 main();

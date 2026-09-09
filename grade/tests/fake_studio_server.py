@@ -583,7 +583,10 @@ class Handler(BaseHTTPRequestHandler):
                 resume_kind = ""            # resume | widen | restart | force
                 resume_from = start_frame
                 message = ""
-                cleared = None              # (start, end), force only, gap 24
+                # Force only, gap 24. EMPTY rather than None on a force that
+                # finds nothing cached, so the three documented fields are on
+                # every force answer the CLI can print (round 4 finding 94).
+                cleared = (start_frame, start_frame) if force else None
                 cleared_whole = False
                 if known and not force:
                     # studio/server.py's order, and the order matters: `stale`
@@ -644,15 +647,48 @@ class Handler(BaseHTTPRequestHandler):
                     # studio/server.py's tooling gap 24 split, mirrored: a
                     # force whose window covers everything the matte declares
                     # clears the whole matte, which is what force always did;
-                    # anything narrower clears only its own window and the
-                    # frames outside it stay where they are.
+                    # a window INSIDE the declared span clears only itself and
+                    # the frames outside it stay where they are; and a window
+                    # that overlaps part of the span and hangs off it is
+                    # refused before anything is deleted (round 4 finding 89),
+                    # because the store cannot carry the kept frames' numbers
+                    # forward across it. The refusal is mirrored here so the
+                    # CLI's own message is checked against the same 400 the
+                    # real server sends; the live job refusal beside it in
+                    # server.py is NOT mirrored, because this file's jobs never
+                    # leave `queued` on their own and it has no writer to race.
                     resume_kind, resume_from = "force", start_frame
-                    span_start = min(int(STATE.mattes[mid].get("start_frame") or 0)
-                                     for mid in known)
-                    span_end = max(int(STATE.mattes[mid].get("frames") or 0)
-                                   for mid in known)
-                    cleared_whole = (start_frame <= span_start
-                                     and end_frame >= span_end)
+                    spans = [(int(STATE.mattes[mid].get("start_frame") or 0),
+                              int(STATE.mattes[mid].get("frames") or 0))
+                             for mid in known]
+                    span_start = min(s for s, _e in spans)
+                    span_end = max(e for _s, e in spans)
+                    cleared_whole = all(e <= s or (start_frame <= s
+                                                   and end_frame >= e)
+                                        for s, e in spans)
+                    inside = all(e > s and s <= start_frame and end_frame <= e
+                                 for s, e in spans)
+                    if not cleared_whole and not inside:
+                        covers = "; ".join(
+                            f"{mid} covers frames {s} to {e}"
+                            for mid, (s, e) in zip(known, spans))
+                        self._json({"error":
+                            f"force: this request asks for frames "
+                            f"{start_frame} to {end_frame} and {covers}, so it "
+                            f"overlaps part of the matte and hangs off it. "
+                            f"force clears either a window INSIDE what the "
+                            f"matte covers, keeping every frame outside it, or "
+                            f"the whole span, taking the matte with it; a "
+                            f"window that is neither would leave frames on "
+                            f"disk that the matte's own index cannot describe. "
+                            f"To repair part of it ask for frames "
+                            f"{max(start_frame, span_start)} to "
+                            f"{min(end_frame, span_end)}; to redo it ask for "
+                            f"frames {min(start_frame, span_start)} to "
+                            f"{max(end_frame, span_end)}. The same request "
+                            f"WITHOUT force widens the matte instead and keeps "
+                            f"every frame already tracked."}, 400)
+                        return
                     if cleared_whole:
                         cleared = (span_start, span_end)
                         message = (f"force: frames {span_start} to {span_end} "
@@ -756,10 +792,13 @@ class Handler(BaseHTTPRequestHandler):
                     out["restarted"] = resume_kind in ("restart", "force")
                     out["resumed_from"] = resume_from
                     out["message"] = message
-                    if cleared is not None:
-                        out["cleared_start"] = cleared[0]
-                        out["cleared_end"] = cleared[1]
-                        out["cleared_whole_matte"] = cleared_whole
+                if force and cleared is not None:
+                    # On EVERY force, the same as the real answer: a first
+                    # force cleared nothing and says so with an empty range
+                    # rather than three missing keys (round 4 finding 94).
+                    out["cleared_start"] = cleared[0]
+                    out["cleared_end"] = cleared[1]
+                    out["cleared_whole_matte"] = cleared_whole
                 self._json(out)
                 return
             if path == "/api/frame":

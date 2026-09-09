@@ -67,7 +67,9 @@ NOTES: list[str] = []
 # Round 4 tooling: 272 -> 289, the live count after the cancelled-not-failed
 # rows for gap 26, the cleared-window checks for gap 24 and the frame width
 # checks for gap 27.
-EXPECTED_CHECKS = 289
+# Round 4 fixes: 289 -> 300, the live count after the partial overlap refusal
+# for finding 89 and the empty cleared range for finding 94.
+EXPECTED_CHECKS = 300
 
 
 def ok(label: str, cond: bool, detail: str = "") -> None:
@@ -970,6 +972,80 @@ def test_mask_gaps(base: str) -> None:
     ok("and the printed answer names the cleared range too, not just --json",
        "cleared" in r_nfp.stdout and "frames 2 to 4" in r_nfp.stdout,
        r_nfp.stdout[:400])
+
+    # -- round 4 finding 89: a force that hangs off the matte ---------------
+    # The third shape of the same request. A window inside the declared span
+    # is a repair and a window over the whole span is a redo; a window that
+    # overlaps PART of the span and hangs off one end is neither, and taking
+    # the repair branch for it deleted the overlap, kept the frames outside it
+    # on disk, and then asked the service for a window sam/store.py cannot
+    # carry those frames' numbers across, so the answer said "kept" about
+    # frames that came back numberless or unreachable. It is refused before
+    # anything is deleted, and the sentence names the two requests that work.
+    ov_t = [f / FAKE.MATTE_FPS for f in (2, 4, 6, 8)]
+    r_ov = run_cli(["mask", "track", "C015.mov", "--text", "overlap-probe",
+                   "--start", f"{ov_t[1]:.6f}", "--end", f"{ov_t[3]:.6f}",
+                   "--json"], env=env)
+    ok("a fresh recipe tracked over frames 4 to 8 only: exit 0",
+       r_ov.returncode == 0, r_ov.stderr[-300:])
+    part = json.loads(r_ov.stdout) if r_ov.returncode == 0 else {}
+    ok("and it declares that window, not the whole clip",
+       (part.get("start_frame"), part.get("end_frame")) == (4, 8), part)
+    r_ov_w = run_cli(["mask", "track", "C015.mov", "--text", "overlap-probe",
+                     "--start", f"{ov_t[1]:.6f}", "--end", f"{ov_t[3]:.6f}",
+                     "--wait"], env=env)
+    ok("and it runs to the end of that window", r_ov_w.returncode == 0,
+       r_ov_w.stderr[-300:])
+    r_hang = run_cli(["mask", "track", "C015.mov", "--text", "overlap-probe",
+                     "--start", f"{ov_t[0]:.6f}", "--end", f"{ov_t[2]:.6f}",
+                     "--force", "--json"], env=env)
+    ok("--force over frames 2 to 6 of it, which overlaps part of the matte "
+       "and hangs off the front: refused, exit non zero",
+       r_hang.returncode != 0, r_hang.stdout[:300])
+    ok("and the refusal names the window asked for and the window the matte "
+       "covers",
+       "frames 2 to 6" in r_hang.stderr and "covers frames 4 to 8"
+       in r_hang.stderr, r_hang.stderr[-400:])
+    ok("and names both requests that do work: the repair inside the span and "
+       "the redo over it",
+       "repair part of it ask for frames 4 to 6" in r_hang.stderr
+       and "redo it ask for frames 2 to 8" in r_hang.stderr,
+       r_hang.stderr[-400:])
+    ok("and it cleared nothing on the way out: the same window without "
+       "--force is still a cache hit",
+       json.loads((run_cli(["mask", "track", "C015.mov", "--text",
+                            "overlap-probe", "--start", f"{ov_t[1]:.6f}",
+                            "--end", f"{ov_t[3]:.6f}", "--json"],
+                           env=env).stdout) or "{}").get("cached") is True,
+       "the refusal deleted frames")
+    r_redo = run_cli(["mask", "track", "C015.mov", "--text", "overlap-probe",
+                     "--force", "--json"], env=env)
+    redo = json.loads(r_redo.stdout) if r_redo.returncode == 0 else {}
+    ok("while the redo the message points at is accepted and clears the "
+       "matte's own span",
+       r_redo.returncode == 0
+       and (redo.get("cleared_start"), redo.get("cleared_end"),
+            redo.get("cleared_whole_matte")) == (4, 8, True), redo)
+
+    # -- round 4 finding 94: a force with nothing cached -------------------
+    # `--force` on a recipe that was never tracked clears no frame. The three
+    # cleared fields used to be absent there, so a scripted caller reading
+    # `cleared_whole_matte` on a first force got a missing key rather than
+    # `false`, and the printed answer said nothing at all.
+    r_first = run_cli(["mask", "track", "C015.mov", "--text",
+                      "empty-force-probe", "--force", "--json"], env=env)
+    empty = json.loads(r_first.stdout) if r_first.returncode == 0 else {}
+    ok("--force on a recipe nothing was cached for: exit 0",
+       r_first.returncode == 0, r_first.stderr[-300:])
+    ok("and the cleared range is empty rather than missing, with "
+       "cleared_whole_matte false",
+       (empty.get("cleared_start"), empty.get("cleared_end"),
+        empty.get("cleared_whole_matte")) == (0, 0, False), empty)
+    r_firstp = run_cli(["mask", "track", "C015.mov", "--text",
+                       "empty-force-print", "--force"], env=env)
+    ok("and the printed answer says which of the three it was in words",
+       "no cached matte for this recipe" in r_firstp.stdout,
+       r_firstp.stdout[:400])
 
     # -- round 1 finding 40: rotation is part of the cache key -------------
     # Design rule 5 keys a track by clip identity, rotation, working width and

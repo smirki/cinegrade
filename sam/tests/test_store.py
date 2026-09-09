@@ -330,6 +330,113 @@ def main() -> int:
           len(files) == 10 and files[0] == "000000.png"
           and files[-1] == "000009.png", str(len(files)))
 
+    print("\na window that only PARTLY overlaps the matte is a different "
+          "track (gap 24, round 4 finding 89)")
+    # The third shape of `mask track --force`, and the reason the studio refuses
+    # it instead of clearing anything: the two above are an equal window (a
+    # resume) and an interior one (a repair), and BOTH carry the matte forward.
+    # A window that hangs off one end carries nothing forward, by this store's
+    # own blessed rule ("a different length is a different track"), so the
+    # frames the studio kept on disk for it end up either past the end of the
+    # new arrays or inside them with no numbers. Neither is wrong here; both
+    # are wrong to ask for, which is what studio/server.py's force branch now
+    # says in words (studio/tests/py/test_mask_routes.py's two refusal tests).
+    # Reproduction one, with the round 4 verdict's own frame numbers: a matte
+    # tracked over frames 173 to 197, forced at 144 to 192. The force clears
+    # the overlap (173 to 191), keeps 192 to 196, and re-queues 144 to 192.
+    tracked = MatteWriter(root, "m_lowend",
+                          dict(header(197), start_frame=173, end_frame=197),
+                          steady=1)
+    tracked.set_state("running")
+    for i in range(173, 197):
+        tracked.push(i, ramp(0.5), 0.9)
+    tracked.finish("done")
+    check("a matte tracked over frames 173 to 197 declares that window and "
+          "has 24 frames of numbers",
+          read_index(tracked.dir)["start_frame"] == 173
+          and read_index(tracked.dir)["end_frame"] == 197
+          and read_index(tracked.dir)["done_frames"] == 24,
+          json.dumps({k: read_index(tracked.dir)[k]
+                      for k in ("start_frame", "end_frame", "done_frames")}))
+    for i in range(173, 192):
+        (tracked.dir / frame_name(i)).unlink()
+    hangs_low = MatteWriter(root, "m_lowend",
+                            dict(header(192), start_frame=144, end_frame=192),
+                            steady=1)
+    check("a window that starts before the matte carries nothing forward: the "
+          "declared window moves to the request",
+          hangs_low.index["frames"] == 192
+          and hangs_low.index["start_frame"] == 144
+          and hangs_low.index["end_frame"] == 192,
+          f"{hangs_low.index['frames']} frames, "
+          f"{hangs_low.index['start_frame']}..{hangs_low.index['end_frame']}")
+    check("its arrays are the request's length, so the five frames the force "
+          "kept (192 to 196) have no slot in them at all, and the numbers the "
+          "first run measured are gone",
+          len(hangs_low.index["areas"]) == 192
+          and all(a is None for a in hangs_low.index["areas"]),
+          f"{len(hangs_low.index['areas'])} areas, "
+          f"{sum(a is not None for a in hangs_low.index['areas'])} of them set")
+    hangs_low.set_state("running")
+    for i in range(144, 192):
+        hangs_low.push(i, ramp(0.8), 0.7)
+    hangs_low.finish("done")
+    low_final = read_index(hangs_low.dir)
+    low_files = sorted(p.name for p in hangs_low.dir.glob("*.png"))
+    check("so after the re-track the matte reads done over a window it cannot "
+          "describe: 53 files on disk, 192 declared frames, 48 done",
+          low_final["state"] == "done" and len(low_files) == 53
+          and low_final["frames"] == 192 and low_final["done_frames"] == 48,
+          f"{low_final['state']}, {len(low_files)} files, "
+          f"{low_final['done_frames']}/{low_final['frames']}")
+    check("and the five kept frames are orphaned: their PNGs sit past the end "
+          "of every array, so no reader can reach them",
+          len(low_final["areas"]) == 192
+          and low_files[-1] == "000196.png"
+          and [n for n in low_files if int(n[:6]) >= 192]
+          == ["%06d.png" % i for i in range(192, 197)],
+          f"{len(low_final['areas'])} areas, last file {low_files[-1]}")
+
+    # Reproduction two, the mirror image, which orphans nothing and is quieter
+    # for it: a matte over frames 0 to 288 forced at 173 to 400. Every kept
+    # frame lands inside the new arrays, with no number in them.
+    over = MatteWriter(root, "m_highend", header(288), steady=1)
+    over.set_state("running")
+    for i in range(288):
+        over.push(i, ramp(0.5), 0.9)
+    over.finish("done")
+    for i in range(173, 288):
+        (over.dir / frame_name(i)).unlink()
+    hangs_high = MatteWriter(root, "m_highend",
+                             dict(header(400), start_frame=173, end_frame=400),
+                             steady=1)
+    hangs_high.set_state("running")
+    for i in range(173, 400):
+        hangs_high.push(i, ramp(0.8), 0.7)
+    hangs_high.finish("done")
+    high_final = read_index(hangs_high.dir)
+    high_files = sorted(p.name for p in hangs_high.dir.glob("*.png"))
+    check("a window that runs past the matte reads done with every frame on "
+          "disk: 400 files against 400 declared frames",
+          high_final["state"] == "done" and len(high_files) == 400
+          and high_final["frames"] == 400,
+          f"{high_final['state']}, {len(high_files)} files, "
+          f"{high_final['frames']} declared")
+    check("and the 173 frames it kept have a PNG each and no area, score or "
+          "IoU: nothing measured them, and done_frames counts only this run",
+          all(high_final["areas"][i] is None for i in range(173))
+          and all(high_final["scores"][i] is None for i in range(173))
+          and all(high_final["ious"][i] is None for i in range(173))
+          and high_final["done_frames"] == 227,
+          f"areas[0:3] {high_final['areas'][:3]}, "
+          f"{high_final['done_frames']}/{high_final['frames']}")
+    check("so the matte's own declared start moved past frames it still has "
+          "on disk: it says it starts at 173 with 173 files before that",
+          high_final["start_frame"] == 173
+          and len([n for n in high_files if int(n[:6]) < 173]) == 173,
+          f"start_frame {high_final['start_frame']}, "
+          f"{len([n for n in high_files if int(n[:6]) < 173])} files before it")
+
     print("\nindex.json is never seen half written")
     writer = MatteWriter(root, "m_atomic", header(4), steady=1)
     # The outcome is checked, not merely reached: this used to be a bare
